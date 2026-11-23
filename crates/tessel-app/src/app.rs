@@ -44,6 +44,7 @@ struct StudioState {
     gizmo_drag: Option<ui::viewport::GizmoDragState>,
     export_dialog: ui::export_dialog::ExportDialogState,
     settings_dialog: ui::settings_dialog::SettingsDialogState,
+    mcp_dialog: ui::mcp_dialog::McpDialogState,
     ai_state: ui::inspector::DirectAiUiState,
     command_palette: ui::command_palette::CommandPaletteState,
     quick_start: ui::quick_start::QuickStartState,
@@ -142,6 +143,7 @@ impl Default for StudioState {
             gizmo_drag: None,
             export_dialog,
             settings_dialog,
+            mcp_dialog: ui::mcp_dialog::McpDialogState::default(),
             ai_state,
             command_palette: ui::command_palette::CommandPaletteState::default(),
             quick_start: ui::quick_start::QuickStartState {
@@ -295,12 +297,13 @@ impl GpuState {
         let mut active_gizmo_axis = None;
         let mut quick_action = ui::quick_start::QuickStartAction::None;
         let mut top_actions = ui::top_bar::TopBarActions {
-            toggle_mcp: false,
+            open_mcp: false,
             save_project: false,
             open_project: false,
             import_mesh: false,
             open_settings: false,
         };
+        let mut toggle_mcp_server = false;
 
         let full_output = self.egui_ctx.run(raw_input, |ctx| {
             handle_global_shortcuts(
@@ -336,7 +339,7 @@ impl GpuState {
                 &mut studio.export_dialog.open,
                 mcp_port,
             );
-            top_actions.toggle_mcp |= bar.toggle_mcp;
+            top_actions.open_mcp |= bar.open_mcp;
             top_actions.save_project |= bar.save_project;
             top_actions.open_project |= bar.open_project;
             top_actions.import_mesh |= bar.import_mesh;
@@ -380,7 +383,15 @@ impl GpuState {
                 &mut studio.ai_state.config,
                 &mut studio.export_dialog.output_dir,
                 studio.live_mcp.as_ref(),
+                &mut studio.mcp_dialog.open,
             );
+            let mcp_action = ui::mcp_dialog::show_mcp_dialog(
+                ctx,
+                &mut studio.mcp_dialog,
+                studio.live_mcp.as_ref(),
+                &studio.export_dialog.output_dir,
+            );
+            toggle_mcp_server |= mcp_action.toggle_server;
             quick_action = ui::quick_start::show_quick_start(
                 ctx,
                 &mut studio.quick_start,
@@ -456,7 +467,10 @@ impl GpuState {
                 }
             }
         }
-        if top_actions.toggle_mcp {
+        if top_actions.open_mcp {
+            studio.mcp_dialog.open = true;
+        }
+        if toggle_mcp_server {
             studio.toggle_live_mcp();
         }
         if top_actions.save_project {

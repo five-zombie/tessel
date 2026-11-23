@@ -4,7 +4,7 @@ use tessel_core::{AppMode, Command, HistoryStack, SceneState};
 use super::theme::tokens;
 
 pub struct TopBarActions {
-    pub toggle_mcp: bool,
+    pub open_mcp: bool,
     pub save_project: bool,
     pub open_project: bool,
     pub import_mesh: bool,
@@ -20,7 +20,7 @@ pub fn show_top_bar(
     mcp_port: Option<u16>,
 ) -> TopBarActions {
     let mut actions = TopBarActions {
-        toggle_mcp: false,
+        open_mcp: false,
         save_project: false,
         open_project: false,
         import_mesh: false,
@@ -128,7 +128,7 @@ pub fn show_top_bar(
                         )
                         .clicked()
                     {
-                        actions.toggle_mcp = true;
+                        actions.open_mcp = true;
                     }
                     if software_fallback {
                         ui.separator();

@@ -1,6 +1,7 @@
 pub mod command_palette;
 pub mod export_dialog;
 pub mod inspector;
+pub mod mcp_dialog;
 pub mod quick_start;
 pub mod settings_dialog;
 pub mod status_bar;

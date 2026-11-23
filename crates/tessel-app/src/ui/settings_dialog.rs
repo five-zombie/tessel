@@ -38,6 +38,7 @@ impl SettingsDialogState {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn show_settings_dialog(
     ctx: &egui::Context,
     state: &mut SettingsDialogState,
@@ -46,6 +47,7 @@ pub fn show_settings_dialog(
     ai_config: &mut DirectAiConfig,
     export_dir: &mut PathBuf,
     live_mcp: Option<&LiveMcpServerHandle>,
+    mcp_dialog_open: &mut bool,
 ) {
     if !state.open {
         return;
@@ -144,52 +146,23 @@ pub fn show_settings_dialog(
                 }
             });
 
-            if let Some(mcp) = live_mcp {
-                ui.add_space(4.0);
-                ui.label(
-                    RichText::new(format!("Live MCP URL: http://127.0.0.1:{}/mcp", mcp.port))
-                        .monospace()
-                        .size(11.0)
-                        .color(tokens::PRIMARY),
-                );
-                let mut token_ro = mcp.token.clone();
-                ui.horizontal(|ui| {
-                    ui.label(
-                        RichText::new("Bearer Token:")
-                            .size(11.0)
-                            .color(tokens::ON_SURFACE_VARIANT),
-                    );
-                    ui.add(
-                        egui::TextEdit::singleline(&mut token_ro)
-                            .desired_width(175.0)
-                            .interactive(false),
-                    );
-                    if ui.small_button("Copy MCP JSON").clicked() {
-                        let snippet = format!(
-                            "{{\n  \"mcpServers\": {{\n    \"tessel-live\": {{\n      \"url\": \"http://127.0.0.1:{}/mcp\",\n      \"headers\": {{ \"Authorization\": \"Bearer {}\" }}\n    }}\n  }}\n}}",
-                            mcp.port, mcp.token
-                        );
-                        ui.ctx().copy_text(snippet);
-                        state.status_message = Some(Ok("Copied Live MCP JSON config.".into()));
-                    }
-                });
-            } else {
-                ui.horizontal(|ui| {
-                    ui.label(
-                        RichText::new("MCP HTTP is offline (click 'MCP: Offline' in Top Bar).")
-                            .size(11.0)
-                            .color(tokens::ON_SURFACE_VARIANT),
-                    );
-                    if ui.small_button("Copy Stdio JSON").clicked() {
-                        let snippet = format!(
-                            "{{\n  \"mcpServers\": {{\n    \"tessel\": {{\n      \"command\": \"tessel\",\n      \"args\": [\"mcp\", \"--export-dir\", \"{}\"]\n    }}\n  }}\n}}",
-                            state.export_dir_text.trim()
-                        );
-                        ui.ctx().copy_text(snippet);
-                        state.status_message = Some(Ok("Copied Stdio MCP JSON config.".into()));
-                    }
-                });
-            }
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                let status = match live_mcp {
+                    Some(mcp) => format!("Live MCP: http://127.0.0.1:{}/mcp", mcp.port),
+                    None => "Live MCP: Offline".into(),
+                };
+                ui.label(RichText::new(status).monospace().size(11.0).color(
+                    if live_mcp.is_some() {
+                        tokens::PRIMARY
+                    } else {
+                        tokens::ON_SURFACE_VARIANT
+                    },
+                ));
+                if ui.small_button("Open MCP Setup...").clicked() {
+                    *mcp_dialog_open = true;
+                }
+            });
 
             ui.add_space(12.0);
             ui.horizontal(|ui| {
