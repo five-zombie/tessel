@@ -8,7 +8,8 @@ pub mod scene;
 pub mod voxel;
 
 pub use character::{
-    AnimationClip, Bone, BoneChannel, BoneId, CharacterRig, Keyframe, SkinBinding,
+    AnimationClip, AutoSkinSolver, Bone, BoneChannel, BoneId, CharacterRig, Keyframe, SkinBinding,
+    VertexSkinWeights,
 };
 pub use command::{Command, HistoryStack, UndoDelta};
 pub use error::CoreError;

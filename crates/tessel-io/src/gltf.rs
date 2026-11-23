@@ -1,10 +1,11 @@
 use std::collections::BTreeMap;
 use std::io::Cursor;
 
+use glam::Vec3;
 use image::{ImageFormat, RgbaImage};
 use serde_json::{json, Value};
 use tessel_core::voxel::greedy_mesh_volume;
-use tessel_core::{Palette, PaletteIndex, SceneState};
+use tessel_core::{AutoSkinSolver, Palette, PaletteIndex, SceneState};
 
 use crate::error::IoError;
 use crate::ExportPreset;
@@ -15,15 +16,23 @@ pub(crate) struct CollectedMesh {
     pub positions: Vec<[f32; 3]>,
     pub normals: Vec<[f32; 3]>,
     pub uvs: Vec<[f32; 2]>,
+    pub joints: Vec<[u16; 4]>,
+    pub weights: Vec<[f32; 4]>,
     pub indices: Vec<u32>,
 }
 
 impl CollectedMesh {
-    pub fn from_scene_untextured(scene: &SceneState, preset: ExportPreset) -> Self {
+    pub fn from_scene_untextured(
+        scene: &SceneState,
+        preset: ExportPreset,
+        skin: Option<&AutoSkinSolver>,
+    ) -> Self {
         let scale = preset.scale_factor();
         let mut positions = Vec::new();
         let mut normals = Vec::new();
         let mut uvs = Vec::new();
+        let mut joints = Vec::new();
+        let mut weights = Vec::new();
         let mut indices = Vec::new();
 
         for (node_id, vol) in &scene.voxel_volumes {
@@ -37,6 +46,12 @@ impl CollectedMesh {
                 positions.push(v.position);
                 normals.push(v.normal);
                 uvs.push([(f32::from(v.palette_index.get()) + 0.5) / 256.0, 0.5]);
+                if let Some(solver) = skin {
+                    let sw =
+                        solver.weights_for_vertex(Some(*node_id), Vec3::from_array(v.position));
+                    joints.push(sw.joints);
+                    weights.push(sw.weights);
+                }
             }
             indices.extend(mesh.indices.into_iter().map(|i| i + base));
         }
@@ -52,13 +67,19 @@ impl CollectedMesh {
             let tri = mesh.to_triangulated_flat();
             let base = positions.len() as u32;
             for v in tri.vertices {
-                positions.push([
+                let p = [
                     v.position[0] * scale,
                     v.position[1] * scale,
                     v.position[2] * scale,
-                ]);
+                ];
+                positions.push(p);
                 normals.push(v.normal);
                 uvs.push([(f32::from(v.palette_index.get()) + 0.5) / 256.0, 0.5]);
+                if let Some(solver) = skin {
+                    let sw = solver.weights_for_vertex(Some(*node_id), Vec3::from_array(p));
+                    joints.push(sw.joints);
+                    weights.push(sw.weights);
+                }
             }
             indices.extend(tri.indices.into_iter().map(|i| i + base));
         }
@@ -67,13 +88,15 @@ impl CollectedMesh {
             positions,
             normals,
             uvs,
+            joints,
+            weights,
             indices,
         }
     }
 
     pub fn from_scene(scene: &SceneState, preset: ExportPreset) -> Result<Self, IoError> {
         let scale = preset.scale_factor();
-        let mut out = Self::from_scene_untextured(scene, preset);
+        let mut out = Self::from_scene_untextured(scene, preset, None);
         for (node_id, mesh) in &scene.lowpoly_meshes {
             let visible = scene.nodes.get(node_id).map(|n| n.visible).unwrap_or(true);
             let is_custom = mesh.texture.is_some()
@@ -139,10 +162,14 @@ pub fn export_glb_bytes(
     scene: &SceneState,
     preset: ExportPreset,
 ) -> Result<(Vec<u8>, usize), IoError> {
-    let mesh = CollectedMesh::from_scene_untextured(scene, preset);
+    let scale = preset.scale_factor();
+    let skin_solver = scene
+        .character_rig
+        .as_ref()
+        .and_then(|rig| AutoSkinSolver::from_rig(rig, scale));
+    let mesh = CollectedMesh::from_scene_untextured(scene, preset, skin_solver.as_ref());
     let has_palette_prim = !mesh.positions.is_empty() && !mesh.indices.is_empty();
     let palette_png = build_palette_png(&scene.palette)?;
-    let scale = preset.scale_factor();
 
     let mut min_pos = [f32::INFINITY; 3];
     let mut max_pos = [f32::NEG_INFINITY; 3];
@@ -252,12 +279,43 @@ pub fn export_glb_bytes(
                 "roughnessFactor": 0.85
             }
         }));
+        let mut prim_attrs = json!({
+            "POSITION": 0,
+            "NORMAL": 1,
+            "TEXCOORD_0": 2
+        });
+        if skin_solver.is_some() && mesh.joints.len() == mesh.positions.len() {
+            let j_bv = push_view(
+                &mut bin,
+                &mut buffer_views,
+                bytemuck::cast_slice(&mesh.joints),
+                Some(34962),
+            );
+            let w_bv = push_view(
+                &mut bin,
+                &mut buffer_views,
+                bytemuck::cast_slice(&mesh.weights),
+                Some(34962),
+            );
+            let j_acc = accessors.len();
+            accessors.push(json!({
+                "bufferView": j_bv,
+                "componentType": 5123,
+                "count": mesh.joints.len(),
+                "type": "VEC4"
+            }));
+            let w_acc = accessors.len();
+            accessors.push(json!({
+                "bufferView": w_bv,
+                "componentType": 5126,
+                "count": mesh.weights.len(),
+                "type": "VEC4"
+            }));
+            prim_attrs["JOINTS_0"] = json!(j_acc);
+            prim_attrs["WEIGHTS_0"] = json!(w_acc);
+        }
         primitives.push(json!({
-            "attributes": {
-                "POSITION": 0,
-                "NORMAL": 1,
-                "TEXCOORD_0": 2
-            },
+            "attributes": prim_attrs,
             "indices": 3,
             "material": 0
         }));
@@ -267,6 +325,7 @@ pub fn export_glb_bytes(
     let mut nodes: Vec<Value> = vec![json!({ "name": "TesselAsset", "mesh": 0 })];
     let mut root_nodes: Vec<usize> = vec![0];
     let mut animations: Vec<Value> = Vec::new();
+    let mut skins: Vec<Value> = Vec::new();
 
     if let Some(rig) = &scene.character_rig {
         let mut bone_to_node: BTreeMap<tessel_core::BoneId, usize> = BTreeMap::new();
@@ -298,6 +357,41 @@ pub fn export_glb_bytes(
                     }
                 }
                 None => root_nodes.push(child_idx),
+            }
+        }
+
+        if let Some(solver) = &skin_solver {
+            let joint_nodes: Vec<usize> = rig
+                .bones
+                .iter()
+                .filter_map(|b| bone_to_node.get(&b.id).copied())
+                .collect();
+            let ibm = solver.inverse_bind_matrices();
+            if !joint_nodes.is_empty() && joint_nodes.len() == ibm.len() {
+                let ibm_bv =
+                    push_view(&mut bin, &mut buffer_views, bytemuck::cast_slice(ibm), None);
+                let ibm_acc = accessors.len();
+                accessors.push(json!({
+                    "bufferView": ibm_bv,
+                    "componentType": 5126,
+                    "count": ibm.len(),
+                    "type": "MAT4"
+                }));
+                let mut skin_json = json!({
+                    "name": "TesselCharacterSkin",
+                    "inverseBindMatrices": ibm_acc,
+                    "joints": joint_nodes
+                });
+                if let Some(skel) = rig
+                    .bones
+                    .iter()
+                    .find(|b| b.parent.is_none())
+                    .and_then(|b| bone_to_node.get(&b.id).copied())
+                {
+                    skin_json["skeleton"] = json!(skel);
+                }
+                skins.push(skin_json);
+                nodes[0]["skin"] = json!(0);
             }
         }
 
@@ -492,12 +586,50 @@ pub fn export_glb_bytes(
             mat_json["normalTexture"] = json!({ "index": n_tex_idx });
         }
         materials.push(mat_json);
+        let mut custom_attrs = json!({
+            "POSITION": p_acc,
+            "NORMAL": n_acc,
+            "TEXCOORD_0": u_acc
+        });
+        if let Some(solver) = &skin_solver {
+            let mut t_joints = Vec::with_capacity(t_pos.len());
+            let mut t_weights = Vec::with_capacity(t_pos.len());
+            for &p in &t_pos {
+                let sw = solver.weights_for_vertex(Some(*node_id), Vec3::from_array(p));
+                t_joints.push(sw.joints);
+                t_weights.push(sw.weights);
+            }
+            let j_bv = push_view(
+                &mut bin,
+                &mut buffer_views,
+                bytemuck::cast_slice(&t_joints),
+                Some(34962),
+            );
+            let w_bv = push_view(
+                &mut bin,
+                &mut buffer_views,
+                bytemuck::cast_slice(&t_weights),
+                Some(34962),
+            );
+            let j_acc = accessors.len();
+            accessors.push(json!({
+                "bufferView": j_bv,
+                "componentType": 5123,
+                "count": t_joints.len(),
+                "type": "VEC4"
+            }));
+            let w_acc = accessors.len();
+            accessors.push(json!({
+                "bufferView": w_bv,
+                "componentType": 5126,
+                "count": t_weights.len(),
+                "type": "VEC4"
+            }));
+            custom_attrs["JOINTS_0"] = json!(j_acc);
+            custom_attrs["WEIGHTS_0"] = json!(w_acc);
+        }
         primitives.push(json!({
-            "attributes": {
-                "POSITION": p_acc,
-                "NORMAL": n_acc,
-                "TEXCOORD_0": u_acc
-            },
+            "attributes": custom_attrs,
             "indices": i_acc,
             "material": mat_idx
         }));
@@ -536,6 +668,9 @@ pub fn export_glb_bytes(
 
     if !animations.is_empty() {
         gltf_json["animations"] = Value::Array(animations);
+    }
+    if !skins.is_empty() {
+        gltf_json["skins"] = Value::Array(skins);
     }
 
     let mut json_bytes = serde_json::to_vec(&gltf_json)?;
@@ -657,7 +792,22 @@ mod tests {
         assert_eq!(parsed.materials().count(), 1);
         assert_eq!(parsed.images().count(), 1);
         assert_eq!(parsed.animations().count(), 2); // Idle + Walk
+        assert_eq!(parsed.skins().count(), 1);
+        let skin = parsed.skins().next().unwrap();
+        assert_eq!(skin.joints().count(), 7);
+        assert!(skin.inverse_bind_matrices().is_some());
+        assert!(parsed.nodes().next().unwrap().skin().is_some());
         assert!(parsed.nodes().count() >= 8); // Mesh + 7 biped bones
-        assert!(parsed.blob.is_some());
+        let blob = parsed.blob.as_ref().unwrap();
+        let prim = parsed.meshes().next().unwrap().primitives().next().unwrap();
+        let reader = prim.reader(|_| Some(blob.as_slice()));
+        let joints: Vec<[u16; 4]> = reader.read_joints(0).unwrap().into_u16().collect();
+        let weights: Vec<[f32; 4]> = reader.read_weights(0).unwrap().into_f32().collect();
+        assert!(!joints.is_empty());
+        assert_eq!(joints.len(), weights.len());
+        for w in &weights {
+            let sum: f32 = w.iter().sum();
+            assert!((sum - 1.0).abs() < 1e-4, "weights must sum to 1.0: {w:?}");
+        }
     }
 }
