@@ -6,6 +6,13 @@ on:
     tags: ["v*"]
   pull_request:
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
 jobs:
   check-and-test:
     name: Format, Clippy & Test (${{ matrix.os }})
@@ -19,9 +26,10 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
       - name: Install Linux desktop libs
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y libxkbcommon-dev libwayland-dev libx11-dev
+        run: sudo apt-get update && sudo apt-get install -y pkg-config libxkbcommon-dev libwayland-dev libx11-dev
       - name: Check formatting
         run: cargo fmt --check
       - name: Run Clippy
@@ -34,22 +42,44 @@ jobs:
     needs: check-and-test
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ${{ matrix.os }}
+    permissions:
+      contents: write
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest, macos-latest]
+        include:
+          - os: ubuntu-latest
+            artifact: tessel-linux-x86_64
+          - os: windows-latest
+            artifact: tessel-windows-x86_64
+          - os: macos-latest
+            artifact: tessel-macos-arm64
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
       - name: Install Linux desktop libs
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y libxkbcommon-dev libwayland-dev libx11-dev
+        run: sudo apt-get update && sudo apt-get install -y pkg-config libxkbcommon-dev libwayland-dev libx11-dev
       - name: Build release binary
         run: cargo build --release -p tessel-app
-      - name: Upload release artifact
+      - name: Package binary & checksum
+        shell: bash
+        run: |
+          mkdir -p dist
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            cp target/release/tessel.exe "dist/${{ matrix.artifact }}.exe"
+            (cd dist && sha256sum "${{ matrix.artifact }}.exe" > "${{ matrix.artifact }}.sha256")
+          else
+            cp target/release/tessel "dist/${{ matrix.artifact }}"
+            (cd dist && shasum -a 256 "${{ matrix.artifact }}" > "${{ matrix.artifact }}.sha256" || sha256sum "${{ matrix.artifact }}" > "${{ matrix.artifact }}.sha256")
+          fi
+      - name: Upload workflow artifact
         uses: actions/upload-artifact@v4
         with:
-          name: tessel-${{ matrix.os }}
-          path: |
-            target/release/tessel
-            target/release/tessel.exe
+          name: ${{ matrix.artifact }}
+          path: dist/*
+      - name: Attach to GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
