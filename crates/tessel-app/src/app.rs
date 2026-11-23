@@ -55,17 +55,31 @@ struct StudioState {
 }
 
 impl StudioState {
-    fn poll_live_mcp(&mut self, preview_png: Option<&[u8]>) {
+    fn poll_live_mcp(&mut self, mut capture_preview: impl FnMut() -> Option<Vec<u8>>) {
         let Some(handle) = &self.live_mcp else {
             return;
         };
+        let mut cached_preview: Option<Option<Vec<u8>>> = None;
         while let Ok(req) = handle.rx.try_recv() {
+            let wants_preview = req
+                .payload
+                .get("params")
+                .and_then(|p| p.get("uri"))
+                .and_then(|u| u.as_str())
+                == Some("tessel://viewport/preview");
+            let preview_bytes = if wants_preview {
+                cached_preview
+                    .get_or_insert_with(&mut capture_preview)
+                    .as_deref()
+            } else {
+                None
+            };
             let reply = dispatch_mcp_message_with_preview(
                 &req.payload,
                 &mut self.scene,
                 &mut self.history,
                 &self.export_dialog.output_dir,
-                preview_png,
+                preview_bytes,
             );
             let _ = req.reply_tx.send(reply);
         }
@@ -281,14 +295,11 @@ impl GpuState {
     }
 
     fn render(&mut self, studio: &mut StudioState) -> Result<(), RenderError> {
-        let preview_png = if studio.live_mcp.is_some() {
+        studio.poll_live_mcp(|| {
             self.viewport_renderer
                 .capture_png_bytes(&self.device, &self.queue)
                 .ok()
-        } else {
-            None
-        };
-        studio.poll_live_mcp(preview_png.as_deref());
+        });
         studio.project_files.tick_autosave(&studio.scene);
 
         let raw_input = self.egui_state.take_egui_input(&self.window);
