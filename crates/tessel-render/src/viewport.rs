@@ -179,6 +179,7 @@ impl ViewportRenderer {
             indices.extend(mesh.indices.into_iter().map(|idx| idx + base));
         }
 
+        let mut textured_items = Vec::new();
         for (node_id, mesh) in &scene.lowpoly_meshes {
             let (visible, node_mat) = scene
                 .nodes
@@ -203,32 +204,54 @@ impl ViewportRenderer {
                 .and_then(|rig| rig.bindings.iter().find(|b| b.node_id == *node_id))
                 .and_then(|binding| bone_mats.as_ref().and_then(|m| m.get(&binding.bone_id)))
                 .copied();
+            let combined_mat = match bound_mat {
+                Some(bm) => node_mat * bm,
+                None => node_mat,
+            };
 
             let tri = mesh.to_triangulated_flat();
-            let base = vertices.len() as u32;
-            for v in tri.vertices {
-                let u = (f32::from(v.palette_index.get()) + 0.5) / 256.0;
-                let combined_mat = match bound_mat {
-                    Some(bm) => node_mat * bm,
-                    None => node_mat,
-                };
-                let pos = combined_mat
-                    .transform_point3(glam::Vec3::from_array(v.position))
-                    .to_array();
-                let norm = combined_mat
-                    .transform_vector3(glam::Vec3::from_array(v.normal))
-                    .normalize_or_zero()
-                    .to_array();
-                vertices.push(StudioVertex3D {
-                    position: pos,
-                    normal: norm,
-                    palette_uv: [u, 0.5],
-                    ao: 1.0,
-                });
+            if let Some(tex) = &mesh.texture {
+                let mut t_verts = Vec::with_capacity(tri.vertices.len());
+                for v in tri.vertices {
+                    let pos = combined_mat
+                        .transform_point3(glam::Vec3::from_array(v.position))
+                        .to_array();
+                    let norm = combined_mat
+                        .transform_vector3(glam::Vec3::from_array(v.normal))
+                        .normalize_or_zero()
+                        .to_array();
+                    t_verts.push(StudioVertex3D {
+                        position: pos,
+                        normal: norm,
+                        palette_uv: v.uv,
+                        ao: 1.0,
+                    });
+                }
+                textured_items.push((tex, t_verts, tri.indices));
+            } else {
+                let base = vertices.len() as u32;
+                for v in tri.vertices {
+                    let u = (f32::from(v.palette_index.get()) + 0.5) / 256.0;
+                    let pos = combined_mat
+                        .transform_point3(glam::Vec3::from_array(v.position))
+                        .to_array();
+                    let norm = combined_mat
+                        .transform_vector3(glam::Vec3::from_array(v.normal))
+                        .normalize_or_zero()
+                        .to_array();
+                    vertices.push(StudioVertex3D {
+                        position: pos,
+                        normal: norm,
+                        palette_uv: [u, 0.5],
+                        ao: 1.0,
+                    });
+                }
+                indices.extend(tri.indices.into_iter().map(|idx| idx + base));
             }
-            indices.extend(tri.indices.into_iter().map(|idx| idx + base));
         }
         self.mesh_pass.upload_mesh(device, &vertices, &indices);
+        self.mesh_pass
+            .upload_textured_meshes(device, queue, &textured_items);
         self.last_uploaded_revision = scene.revision;
     }
 
@@ -241,6 +264,7 @@ impl ViewportRenderer {
         camera_3d: &OrbitCamera,
         camera_2d: &PixelCamera2D,
         pixels_per_point: f32,
+        render_preview: bool,
     ) {
         match scene.active_mode {
             AppMode::Pixel => {
@@ -291,9 +315,13 @@ impl ViewportRenderer {
                     occlusion_query_set: None,
                     timestamp_writes: None,
                 });
-                self.grid_pass.draw(&mut pass);
+                if !render_preview {
+                    self.grid_pass.draw(&mut pass);
+                }
                 self.mesh_pass.draw(&mut pass);
-                self.overlay_pass.draw(&mut pass);
+                if !render_preview {
+                    self.overlay_pass.draw(&mut pass);
+                }
             }
         }
     }

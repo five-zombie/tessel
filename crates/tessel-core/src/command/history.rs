@@ -529,4 +529,44 @@ mod tests {
             Some(color)
         );
     }
+
+    #[test]
+    fn paint_and_fill_mesh_texture_undo_redo_roundtrip() {
+        let mut scene = SceneState::new();
+        let mut history = HistoryStack::new();
+        let black = PaletteIndex::new(1).unwrap();
+
+        history
+            .execute(
+                &mut scene,
+                Command::CreatePrimitiveMesh {
+                    name: "CatBody".into(),
+                    kind: crate::mesh::PrimitiveKind::Cube,
+                    size: 1.0,
+                    material: black,
+                },
+            )
+            .unwrap();
+        let id = scene.active_lowpoly_node().unwrap();
+        assert!(scene.lowpoly_meshes[&id].texture.is_none());
+
+        history
+            .execute(
+                &mut scene,
+                Command::PaintMeshTexture {
+                    node_id: id,
+                    uv: [0.5, 0.5],
+                    radius_px: 8.0,
+                    color: Rgba8::rgb(255, 255, 255),
+                },
+            )
+            .unwrap();
+        assert!(scene.lowpoly_meshes[&id].texture.is_some());
+
+        history.undo(&mut scene).unwrap();
+        assert!(scene.lowpoly_meshes[&id].texture.is_none());
+
+        history.redo(&mut scene).unwrap();
+        assert!(scene.lowpoly_meshes[&id].texture.is_some());
+    }
 }

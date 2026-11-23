@@ -4,11 +4,13 @@ use serde::{Deserialize, Serialize};
 use crate::palette::PaletteIndex;
 
 use super::face::Face;
+use super::texture::{box_atlas_uv, MeshTexture};
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct TriVertex {
     pub position: [f32; 3],
     pub normal: [f32; 3],
+    pub uv: [f32; 2],
     pub palette_index: PaletteIndex,
 }
 
@@ -18,16 +20,33 @@ pub struct TriangulatedMesh {
     pub indices: Vec<u32>,
 }
 
-/// Unit Anchor: Editable indexed low-poly mesh supporting triangles & quads with flat shading.
+/// Unit Anchor: Editable indexed low-poly mesh supporting triangles & quads with flat shading
+/// and optional auto-UV RGBA texture painting.
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 pub struct LowPolyMesh {
     pub vertices: Vec<Vec3>,
     pub faces: Vec<Face>,
+    #[serde(default)]
+    pub texture: Option<MeshTexture>,
 }
 
 impl LowPolyMesh {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub fn bounds(&self) -> (Vec3, Vec3) {
+        let mut min = Vec3::splat(f32::INFINITY);
+        let mut max = Vec3::splat(f32::NEG_INFINITY);
+        for &v in &self.vertices {
+            min = min.min(v);
+            max = max.max(v);
+        }
+        if !min.is_finite() || !max.is_finite() {
+            (Vec3::ZERO, Vec3::ONE)
+        } else {
+            (min, max)
+        }
     }
 
     pub fn triangle_count(&self) -> usize {
@@ -37,9 +56,10 @@ impl LowPolyMesh {
             .sum()
     }
 
-    /// Triangulates all faces into flat-shaded triangles with CCW outward normals.
+    /// Triangulates all faces into flat-shaded triangles with CCW outward normals and auto-UVs.
     pub fn to_triangulated_flat(&self) -> TriangulatedMesh {
         let mut out = TriangulatedMesh::default();
+        let (min_b, max_b) = self.bounds();
         for face in &self.faces {
             if face.vertices.len() < 3 {
                 continue;
@@ -68,16 +88,19 @@ impl LowPolyMesh {
                 out.vertices.push(TriVertex {
                     position: p0.to_array(),
                     normal: n_arr,
+                    uv: box_atlas_uv(p0, normal, min_b, max_b),
                     palette_index: face.material,
                 });
                 out.vertices.push(TriVertex {
                     position: p1.to_array(),
                     normal: n_arr,
+                    uv: box_atlas_uv(p1, normal, min_b, max_b),
                     palette_index: face.material,
                 });
                 out.vertices.push(TriVertex {
                     position: p2.to_array(),
                     normal: n_arr,
+                    uv: box_atlas_uv(p2, normal, min_b, max_b),
                     palette_index: face.material,
                 });
                 out.indices.extend_from_slice(&[base, base + 1, base + 2]);

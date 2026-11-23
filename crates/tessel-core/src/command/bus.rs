@@ -3,8 +3,10 @@ use serde::{Deserialize, Serialize};
 
 use crate::character::{AnimationClip, BoneId, CharacterRig, Keyframe, SkinBinding};
 use crate::error::CoreError;
-use crate::mesh::{ops as mesh_ops, FaceId, LowPolyMesh, PrimitiveKind};
-use crate::palette::{PaletteEntry, PaletteIndex};
+use crate::mesh::{
+    ops as mesh_ops, FaceId, LowPolyMesh, MeshTexture, PrimitiveKind, DEFAULT_MESH_TEX_SIZE,
+};
+use crate::palette::{PaletteEntry, PaletteIndex, Rgba8};
 use crate::pixel::{FrameIndex, LayerId, PixelCanvas, PixelEdit, PixelFrame, PixelLayer};
 use crate::scene::{AppMode, NodeId, NodeKind, SceneNode, SceneState, Transform};
 use crate::voxel::{ops as voxel_ops, VoxelCoord, VoxelEdit, VoxelVolume};
@@ -103,6 +105,16 @@ pub enum Command {
     SmoothSubdivideMesh {
         node_id: NodeId,
     },
+    PaintMeshTexture {
+        node_id: NodeId,
+        uv: [f32; 2],
+        radius_px: f32,
+        color: Rgba8,
+    },
+    FillMeshTexture {
+        node_id: NodeId,
+        color: Rgba8,
+    },
     ApplyBipedRig,
     SetBoneRotation {
         bone_id: BoneId,
@@ -138,10 +150,10 @@ pub enum UndoDelta {
         previous_selection: Option<NodeId>,
     },
     RestoreNode {
-        node: SceneNode,
-        pixel_canvas: Option<PixelCanvas>,
-        voxel_volume: Option<VoxelVolume>,
-        lowpoly_mesh: Option<LowPolyMesh>,
+        node: Box<SceneNode>,
+        pixel_canvas: Option<Box<PixelCanvas>>,
+        voxel_volume: Option<Box<VoxelVolume>>,
+        lowpoly_mesh: Option<Box<LowPolyMesh>>,
         previous_selection: Option<NodeId>,
     },
     RestoreSelection(Option<NodeId>),
@@ -186,6 +198,15 @@ pub enum UndoDelta {
     RestoreLowPolyMesh {
         node_id: NodeId,
         previous_mesh: LowPolyMesh,
+    },
+    RestoreMeshTexturePixels {
+        node_id: NodeId,
+        was_none: bool,
+        previous_pixels: Vec<(usize, [u8; 4])>,
+    },
+    RestoreMeshTextureFull {
+        node_id: NodeId,
+        previous: Option<MeshTexture>,
     },
     RestoreCharacterRig(Option<CharacterRig>),
     RestoreBoneRotation {
@@ -279,10 +300,10 @@ impl Command {
                     scene.selected_node = None;
                 }
                 UndoDelta::RestoreNode {
-                    node,
-                    pixel_canvas,
-                    voxel_volume,
-                    lowpoly_mesh,
+                    node: Box::new(node),
+                    pixel_canvas: pixel_canvas.map(Box::new),
+                    voxel_volume: voxel_volume.map(Box::new),
+                    lowpoly_mesh: lowpoly_mesh.map(Box::new),
                     previous_selection,
                 }
             }
@@ -640,6 +661,55 @@ impl Command {
                     previous_mesh: current,
                 }
             }
+            Self::PaintMeshTexture {
+                node_id,
+                uv,
+                radius_px,
+                color,
+            } => {
+                let base_color = scene
+                    .lowpoly_meshes
+                    .get(node_id)
+                    .and_then(|m| m.faces.first())
+                    .and_then(|f| scene.palette.get(f.material))
+                    .map(|e| e.color)
+                    .unwrap_or(Rgba8::rgb(225, 226, 235));
+                let mesh = scene
+                    .lowpoly_meshes
+                    .get_mut(node_id)
+                    .ok_or(CoreError::LowPolyMeshNotFound(*node_id))?;
+                let was_none = mesh.texture.is_none();
+                let tex = mesh.texture.get_or_insert_with(|| {
+                    MeshTexture::solid(DEFAULT_MESH_TEX_SIZE, DEFAULT_MESH_TEX_SIZE, base_color)
+                });
+                let previous_pixels = tex.paint_disc(*uv, *radius_px, *color);
+                UndoDelta::RestoreMeshTexturePixels {
+                    node_id: *node_id,
+                    was_none,
+                    previous_pixels,
+                }
+            }
+            Self::FillMeshTexture { node_id, color } => {
+                let mesh = scene
+                    .lowpoly_meshes
+                    .get_mut(node_id)
+                    .ok_or(CoreError::LowPolyMeshNotFound(*node_id))?;
+                let previous = mesh.texture.clone();
+                match &mut mesh.texture {
+                    Some(tex) => tex.fill(*color),
+                    None => {
+                        mesh.texture = Some(MeshTexture::solid(
+                            DEFAULT_MESH_TEX_SIZE,
+                            DEFAULT_MESH_TEX_SIZE,
+                            *color,
+                        ));
+                    }
+                }
+                UndoDelta::RestoreMeshTextureFull {
+                    node_id: *node_id,
+                    previous,
+                }
+            }
             Self::ApplyBipedRig => {
                 let prev = scene.character_rig.replace(CharacterRig::biped_template());
                 UndoDelta::RestoreCharacterRig(prev)
@@ -803,15 +873,15 @@ impl UndoDelta {
                 previous_selection,
             } => {
                 if let Some(canvas) = pixel_canvas {
-                    scene.pixel_canvases.insert(node.id, canvas.clone());
+                    scene.pixel_canvases.insert(node.id, (**canvas).clone());
                 }
                 if let Some(volume) = voxel_volume {
-                    scene.voxel_volumes.insert(node.id, volume.clone());
+                    scene.voxel_volumes.insert(node.id, (**volume).clone());
                 }
                 if let Some(mesh) = lowpoly_mesh {
-                    scene.lowpoly_meshes.insert(node.id, mesh.clone());
+                    scene.lowpoly_meshes.insert(node.id, (**mesh).clone());
                 }
-                scene.nodes.insert(node.id, node.clone());
+                scene.nodes.insert(node.id, (**node).clone());
                 scene.selected_node = *previous_selection;
             }
             Self::RestoreSelection(prev) => {
@@ -930,6 +1000,28 @@ impl UndoDelta {
                 previous_mesh,
             } => {
                 scene.lowpoly_meshes.insert(*node_id, previous_mesh.clone());
+            }
+            Self::RestoreMeshTexturePixels {
+                node_id,
+                was_none,
+                previous_pixels,
+            } => {
+                let mesh = scene
+                    .lowpoly_meshes
+                    .get_mut(node_id)
+                    .ok_or(CoreError::LowPolyMeshNotFound(*node_id))?;
+                if *was_none {
+                    mesh.texture = None;
+                } else if let Some(tex) = &mut mesh.texture {
+                    tex.restore_pixels(previous_pixels);
+                }
+            }
+            Self::RestoreMeshTextureFull { node_id, previous } => {
+                let mesh = scene
+                    .lowpoly_meshes
+                    .get_mut(node_id)
+                    .ok_or(CoreError::LowPolyMeshNotFound(*node_id))?;
+                mesh.texture = previous.clone();
             }
             Self::RestoreCharacterRig(prev) => {
                 scene.character_rig = prev.clone();

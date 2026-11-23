@@ -1,19 +1,30 @@
-use tessel_core::{Palette, PaletteIndex};
+use tessel_core::{MeshTexture, Palette, PaletteIndex};
 use wgpu::util::DeviceExt;
 
 use crate::vertex::{CameraUniform, StudioVertex3D};
 
 const MESH_SHADER_WGSL: &str = include_str!("../../../assets/shaders/mesh_3d.wgsl");
 
-/// Renders shaded 3D Voxel & Low-Poly meshes using a 256x1 palette texture and depth testing.
+struct TexturedMeshDraw {
+    _texture: wgpu::Texture,
+    bind_group: wgpu::BindGroup,
+    vertex_buffer: wgpu::Buffer,
+    index_buffer: wgpu::Buffer,
+    index_count: u32,
+}
+
+/// Renders shaded 3D Voxel & Low-Poly meshes using a 256x1 palette texture (or per-mesh RGBA texture) and depth testing.
 pub struct MeshPass {
     pipeline: wgpu::RenderPipeline,
+    bgl: wgpu::BindGroupLayout,
     camera_buffer: wgpu::Buffer,
     palette_texture: wgpu::Texture,
+    sampler: wgpu::Sampler,
     bind_group: wgpu::BindGroup,
     vertex_buffer: Option<wgpu::Buffer>,
     index_buffer: Option<wgpu::Buffer>,
     index_count: u32,
+    textured_draws: Vec<TexturedMeshDraw>,
 }
 
 impl MeshPass {
@@ -183,12 +194,15 @@ impl MeshPass {
 
         Self {
             pipeline,
+            bgl,
             camera_buffer,
             palette_texture,
+            sampler,
             bind_group,
             vertex_buffer: None,
             index_buffer: None,
             index_count: 0,
+            textured_draws: Vec::new(),
         }
     }
 
@@ -255,21 +269,114 @@ impl MeshPass {
         self.index_count = indices.len() as u32;
     }
 
+    pub fn upload_textured_meshes(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        items: &[(&MeshTexture, Vec<StudioVertex3D>, Vec<u32>)],
+    ) {
+        self.textured_draws.clear();
+        for (tex, vertices, indices) in items {
+            if vertices.is_empty() || indices.is_empty() || tex.width == 0 || tex.height == 0 {
+                continue;
+            }
+            let expected = (tex.width as usize)
+                .saturating_mul(tex.height as usize)
+                .saturating_mul(4);
+            if tex.rgba.len() < expected {
+                continue;
+            }
+            let gpu_tex = device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("tessel-lowpoly-rgba-tex"),
+                size: wgpu::Extent3d {
+                    width: tex.width,
+                    height: tex.height,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: wgpu::TextureFormat::Rgba8UnormSrgb,
+                usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+                view_formats: &[],
+            });
+            queue.write_texture(
+                wgpu::TexelCopyTextureInfo {
+                    texture: &gpu_tex,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                &tex.rgba[..expected],
+                wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(tex.width * 4),
+                    rows_per_image: Some(tex.height),
+                },
+                wgpu::Extent3d {
+                    width: tex.width,
+                    height: tex.height,
+                    depth_or_array_layers: 1,
+                },
+            );
+            let view = gpu_tex.create_view(&wgpu::TextureViewDescriptor::default());
+            let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("tessel-lowpoly-tex-bg"),
+                layout: &self.bgl,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: self.camera_buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::TextureView(&view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: wgpu::BindingResource::Sampler(&self.sampler),
+                    },
+                ],
+            });
+            let vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("tessel-textured-mesh-vb"),
+                contents: bytemuck::cast_slice(vertices),
+                usage: wgpu::BufferUsages::VERTEX,
+            });
+            let index_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("tessel-textured-mesh-ib"),
+                contents: bytemuck::cast_slice(indices),
+                usage: wgpu::BufferUsages::INDEX,
+            });
+            self.textured_draws.push(TexturedMeshDraw {
+                _texture: gpu_tex,
+                bind_group,
+                vertex_buffer,
+                index_buffer,
+                index_count: indices.len() as u32,
+            });
+        }
+    }
+
     pub fn update_camera(&self, queue: &wgpu::Queue, uniform: &CameraUniform) {
         queue.write_buffer(&self.camera_buffer, 0, bytemuck::bytes_of(uniform));
     }
 
     pub fn draw<'a>(&'a self, pass: &mut wgpu::RenderPass<'a>) {
-        let (Some(vb), Some(ib)) = (&self.vertex_buffer, &self.index_buffer) else {
-            return;
-        };
-        if self.index_count == 0 {
-            return;
-        }
         pass.set_pipeline(&self.pipeline);
-        pass.set_bind_group(0, &self.bind_group, &[]);
-        pass.set_vertex_buffer(0, vb.slice(..));
-        pass.set_index_buffer(ib.slice(..), wgpu::IndexFormat::Uint32);
-        pass.draw_indexed(0..self.index_count, 0, 0..1);
+        if let (Some(vb), Some(ib)) = (&self.vertex_buffer, &self.index_buffer) {
+            if self.index_count > 0 {
+                pass.set_bind_group(0, &self.bind_group, &[]);
+                pass.set_vertex_buffer(0, vb.slice(..));
+                pass.set_index_buffer(ib.slice(..), wgpu::IndexFormat::Uint32);
+                pass.draw_indexed(0..self.index_count, 0, 0..1);
+            }
+        }
+        for draw in &self.textured_draws {
+            pass.set_bind_group(0, &draw.bind_group, &[]);
+            pass.set_vertex_buffer(0, draw.vertex_buffer.slice(..));
+            pass.set_index_buffer(draw.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+            pass.draw_indexed(0..draw.index_count, 0, 0..1);
+        }
     }
 }

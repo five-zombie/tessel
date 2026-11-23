@@ -33,6 +33,7 @@ pub fn show_viewport(
     pixel_drag_start: &mut Option<PixelCoord>,
     gizmo_drag: &mut Option<GizmoDragState>,
     free_view: &mut bool,
+    render_preview: &mut bool,
 ) -> ((u32, u32), Option<VoxelCoord>, Option<GizmoAxis>) {
     let mut desired_size = (1, 1);
     let mut hover_voxel = None;
@@ -76,7 +77,10 @@ pub fn show_viewport(
                 gizmo_drag,
                 &mut active_gizmo_axis,
             );
-            handle_3d_viewport_input(ui, &response, camera_3d, *free_view && !gizmo_consumed);
+            let allow_primary_orbit = *free_view
+                && !gizmo_consumed
+                && !(scene.active_mode == AppMode::LowPoly && scene.lowpoly_paint_mode);
+            handle_3d_viewport_input(ui, &response, camera_3d, allow_primary_orbit);
 
             if !gizmo_consumed {
                 match scene.active_mode {
@@ -85,7 +89,12 @@ pub fn show_viewport(
                         handle_voxel_click_input(ui, rect, &response, scene, history, camera_3d);
                     }
                     AppMode::LowPoly => {
-                        if response.clicked_by(egui::PointerButton::Primary) {
+                        let paint_active = scene.lowpoly_paint_mode
+                            && (response.clicked_by(egui::PointerButton::Primary)
+                                || response.dragged_by(egui::PointerButton::Primary));
+                        let pick_active = !scene.lowpoly_paint_mode
+                            && response.clicked_by(egui::PointerButton::Primary);
+                        if paint_active || pick_active {
                             if let Some(pointer) = response.interact_pointer_pos() {
                                 let uv = [
                                     (pointer.x - rect.min.x) / rect.width().max(1.0),
@@ -94,11 +103,47 @@ pub fn show_viewport(
                                 let aspect = rect.width() / rect.height().max(1.0);
                                 let (orig, dir) = camera_3d.screen_ray(uv, aspect);
                                 if let Some(node_id) = scene.active_lowpoly_node() {
-                                    if let Some(mesh) = scene.lowpoly_meshes.get(&node_id) {
-                                        scene.selected_face =
-                                            tessel_core::mesh::ops::raycast_mesh_face(
-                                                mesh, orig, dir,
+                                    let node_mat = scene
+                                        .nodes
+                                        .get(&node_id)
+                                        .map(|n| {
+                                            glam::Mat4::from_scale_rotation_translation(
+                                                n.transform.scale,
+                                                n.transform.rotation,
+                                                n.transform.translation,
+                                            )
+                                        })
+                                        .unwrap_or(glam::Mat4::IDENTITY);
+                                    let inv = node_mat.inverse();
+                                    let local_orig = inv.transform_point3(orig);
+                                    let local_dir = inv.transform_vector3(dir).normalize_or_zero();
+                                    let hit = scene.lowpoly_meshes.get(&node_id).and_then(|mesh| {
+                                        tessel_core::mesh::ops::raycast_mesh_hit(
+                                            mesh, local_orig, local_dir,
+                                        )
+                                    });
+                                    if let Some(h) = hit {
+                                        if paint_active {
+                                            let color = scene
+                                                .palette
+                                                .get(scene.active_color)
+                                                .map(|e| e.color)
+                                                .unwrap_or(tessel_core::Rgba8::rgb(225, 226, 235));
+                                            let _ = history.execute(
+                                                scene,
+                                                Command::PaintMeshTexture {
+                                                    node_id,
+                                                    uv: h.uv,
+                                                    radius_px: scene.lowpoly_brush_radius,
+                                                    color,
+                                                },
                                             );
+                                        } else {
+                                            scene.selected_face = Some(h.face_id);
+                                            scene.mark_modified();
+                                        }
+                                    } else if pick_active {
+                                        scene.selected_face = None;
                                         scene.mark_modified();
                                     }
                                 }
@@ -126,8 +171,16 @@ pub fn show_viewport(
             }
         }
 
-        show_viewport_hud(ui, rect, scene.active_mode, camera_3d, camera_2d, free_view);
-        if scene.active_mode != AppMode::Pixel {
+        show_viewport_hud(
+            ui,
+            rect,
+            scene.active_mode,
+            camera_3d,
+            camera_2d,
+            free_view,
+            render_preview,
+        );
+        if scene.active_mode != AppMode::Pixel && !*render_preview {
             draw_camera_compass(ui, rect, camera_3d);
         }
     });
@@ -280,6 +333,7 @@ fn show_viewport_hud(
     camera_3d: &mut OrbitCamera,
     camera_2d: &mut PixelCamera2D,
     free_view: &mut bool,
+    render_preview: &mut bool,
 ) {
     let hud_pos = rect.right_top() + egui::vec2(-10.0, 10.0);
     egui::Area::new(egui::Id::new("tessel_viewport_hud"))
@@ -338,6 +392,25 @@ fn show_viewport_hud(
                                 .clicked()
                             {
                                 *free_view = !*free_view;
+                            }
+                            let (prev_fill, prev_text) = if *render_preview {
+                                (tokens::PRIMARY_CONTAINER, tokens::ON_PRIMARY)
+                            } else {
+                                (tokens::SURFACE_HIGH, tokens::ON_SURFACE)
+                            };
+                            if ui
+                                .add(
+                                    egui::Button::new(
+                                        RichText::new("Preview").size(11.0).color(prev_text),
+                                    )
+                                    .fill(prev_fill),
+                                )
+                                .on_hover_text(
+                                    "Render Preview: hide grid, wireframe, gizmo, and compass",
+                                )
+                                .clicked()
+                            {
+                                *render_preview = !*render_preview;
                             }
                             let presets = [
                                 ("Iso", CameraPreset::Iso),

@@ -93,6 +93,34 @@ pub fn tool_definitions() -> Vec<Value> {
             }
         }),
         json!({
+            "name": "mesh_fill_texture",
+            "description": "Fill the entire auto-UV RGBA texture of a Low-Poly mesh with a solid palette color.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "node_id": { "type": "integer" },
+                    "palette_index": { "type": "integer", "minimum": 1, "maximum": 255 }
+                },
+                "required": ["palette_index"]
+            }
+        }),
+        json!({
+            "name": "mesh_paint_spot",
+            "description": "Paint a circular spot onto a Low-Poly mesh's auto-UV texture at a 3D surface point+normal (or direct UV).",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "node_id": { "type": "integer" },
+                    "point": { "type": "array", "items": { "type": "number" }, "minItems": 3, "maxItems": 3 },
+                    "normal": { "type": "array", "items": { "type": "number" }, "minItems": 3, "maxItems": 3 },
+                    "uv": { "type": "array", "items": { "type": "number" }, "minItems": 2, "maxItems": 2 },
+                    "radius_px": { "type": "number", "minimum": 1.0, "maximum": 96.0 },
+                    "palette_index": { "type": "integer", "minimum": 1, "maximum": 255 }
+                },
+                "required": ["palette_index"]
+            }
+        }),
+        json!({
             "name": "character_apply_biped_rig",
             "description": "Apply the starter 7-bone biped humanoid skeleton with Idle & Walk animations.",
             "inputSchema": { "type": "object", "properties": {} }

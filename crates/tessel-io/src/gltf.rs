@@ -19,7 +19,7 @@ pub(crate) struct CollectedMesh {
 }
 
 impl CollectedMesh {
-    pub fn from_scene(scene: &SceneState, preset: ExportPreset) -> Result<Self, IoError> {
+    pub fn from_scene_untextured(scene: &SceneState, preset: ExportPreset) -> Self {
         let scale = preset.scale_factor();
         let mut positions = Vec::new();
         let mut normals = Vec::new();
@@ -43,7 +43,7 @@ impl CollectedMesh {
 
         for (node_id, mesh) in &scene.lowpoly_meshes {
             let visible = scene.nodes.get(node_id).map(|n| n.visible).unwrap_or(true);
-            if !visible || mesh.faces.is_empty() {
+            if !visible || mesh.faces.is_empty() || mesh.texture.is_some() {
                 continue;
             }
             let tri = mesh.to_triangulated_flat();
@@ -60,17 +60,49 @@ impl CollectedMesh {
             indices.extend(tri.indices.into_iter().map(|i| i + base));
         }
 
-        if positions.is_empty() || indices.is_empty() {
-            return Err(IoError::EmptyCanvas);
-        }
-
-        Ok(Self {
+        Self {
             positions,
             normals,
             uvs,
             indices,
-        })
+        }
     }
+
+    pub fn from_scene(scene: &SceneState, preset: ExportPreset) -> Result<Self, IoError> {
+        let scale = preset.scale_factor();
+        let mut out = Self::from_scene_untextured(scene, preset);
+        for (node_id, mesh) in &scene.lowpoly_meshes {
+            let visible = scene.nodes.get(node_id).map(|n| n.visible).unwrap_or(true);
+            if !visible || mesh.faces.is_empty() || mesh.texture.is_none() {
+                continue;
+            }
+            let tri = mesh.to_triangulated_flat();
+            let base = out.positions.len() as u32;
+            for v in tri.vertices {
+                out.positions.push([
+                    v.position[0] * scale,
+                    v.position[1] * scale,
+                    v.position[2] * scale,
+                ]);
+                out.normals.push(v.normal);
+                out.uvs.push(v.uv);
+            }
+            out.indices
+                .extend(tri.indices.into_iter().map(|i| i + base));
+        }
+        if out.positions.is_empty() || out.indices.is_empty() {
+            return Err(IoError::EmptyCanvas);
+        }
+        Ok(out)
+    }
+}
+
+fn encode_rgba_png(width: u32, height: u32, rgba: &[u8]) -> Result<Vec<u8>, IoError> {
+    let img = RgbaImage::from_raw(width, height, rgba.to_vec())
+        .ok_or(IoError::InvalidDimensions(width, height))?;
+    let mut buf = Cursor::new(Vec::new());
+    img.write_to(&mut buf, ImageFormat::Png)?;
+    Ok(buf.into_inner())
 }
 
 fn build_palette_png(palette: &Palette) -> Result<Vec<u8>, IoError> {
@@ -86,10 +118,7 @@ fn build_palette_png(palette: &Palette) -> Result<Vec<u8>, IoError> {
             }
         }
     }
-    let img = RgbaImage::from_raw(256, 1, rgba).ok_or(IoError::InvalidDimensions(256, 1))?;
-    let mut buf = Cursor::new(Vec::new());
-    img.write_to(&mut buf, ImageFormat::Png)?;
-    Ok(buf.into_inner())
+    encode_rgba_png(256, 1, &rgba)
 }
 
 fn pad4(buf: &mut Vec<u8>, pad_byte: u8) {
@@ -104,7 +133,8 @@ pub fn export_glb_bytes(
     scene: &SceneState,
     preset: ExportPreset,
 ) -> Result<(Vec<u8>, usize), IoError> {
-    let mesh = CollectedMesh::from_scene(scene, preset)?;
+    let mesh = CollectedMesh::from_scene_untextured(scene, preset);
+    let has_palette_prim = !mesh.positions.is_empty() && !mesh.indices.is_empty();
     let palette_png = build_palette_png(&scene.palette)?;
     let scale = preset.scale_factor();
 
@@ -140,58 +170,93 @@ pub fn export_glb_bytes(
             idx
         };
 
-    let pos_bv = push_view(
-        &mut bin,
-        &mut buffer_views,
-        bytemuck::cast_slice(&mesh.positions),
-        Some(34962),
-    );
-    let norm_bv = push_view(
-        &mut bin,
-        &mut buffer_views,
-        bytemuck::cast_slice(&mesh.normals),
-        Some(34962),
-    );
-    let uv_bv = push_view(
-        &mut bin,
-        &mut buffer_views,
-        bytemuck::cast_slice(&mesh.uvs),
-        Some(34962),
-    );
-    let idx_bv = push_view(
-        &mut bin,
-        &mut buffer_views,
-        bytemuck::cast_slice(&mesh.indices),
-        Some(34963),
-    );
-    let img_bv = push_view(&mut bin, &mut buffer_views, &palette_png, None);
+    let mut images: Vec<Value> = Vec::new();
+    let mut textures: Vec<Value> = Vec::new();
+    let mut materials: Vec<Value> = Vec::new();
+    let mut primitives: Vec<Value> = Vec::new();
+    let mut total_triangles = 0usize;
 
-    accessors.push(json!({
-        "bufferView": pos_bv,
-        "componentType": 5126,
-        "count": mesh.positions.len(),
-        "type": "VEC3",
-        "min": min_pos,
-        "max": max_pos
-    }));
-    accessors.push(json!({
-        "bufferView": norm_bv,
-        "componentType": 5126,
-        "count": mesh.normals.len(),
-        "type": "VEC3"
-    }));
-    accessors.push(json!({
-        "bufferView": uv_bv,
-        "componentType": 5126,
-        "count": mesh.uvs.len(),
-        "type": "VEC2"
-    }));
-    accessors.push(json!({
-        "bufferView": idx_bv,
-        "componentType": 5125,
-        "count": mesh.indices.len(),
-        "type": "SCALAR"
-    }));
+    if has_palette_prim {
+        let pos_bv = push_view(
+            &mut bin,
+            &mut buffer_views,
+            bytemuck::cast_slice(&mesh.positions),
+            Some(34962),
+        );
+        let norm_bv = push_view(
+            &mut bin,
+            &mut buffer_views,
+            bytemuck::cast_slice(&mesh.normals),
+            Some(34962),
+        );
+        let uv_bv = push_view(
+            &mut bin,
+            &mut buffer_views,
+            bytemuck::cast_slice(&mesh.uvs),
+            Some(34962),
+        );
+        let idx_bv = push_view(
+            &mut bin,
+            &mut buffer_views,
+            bytemuck::cast_slice(&mesh.indices),
+            Some(34963),
+        );
+        let img_bv = push_view(&mut bin, &mut buffer_views, &palette_png, None);
+
+        accessors.push(json!({
+            "bufferView": pos_bv,
+            "componentType": 5126,
+            "count": mesh.positions.len(),
+            "type": "VEC3",
+            "min": min_pos,
+            "max": max_pos
+        }));
+        accessors.push(json!({
+            "bufferView": norm_bv,
+            "componentType": 5126,
+            "count": mesh.normals.len(),
+            "type": "VEC3"
+        }));
+        accessors.push(json!({
+            "bufferView": uv_bv,
+            "componentType": 5126,
+            "count": mesh.uvs.len(),
+            "type": "VEC2"
+        }));
+        accessors.push(json!({
+            "bufferView": idx_bv,
+            "componentType": 5125,
+            "count": mesh.indices.len(),
+            "type": "SCALAR"
+        }));
+
+        images.push(json!({
+            "bufferView": img_bv,
+            "mimeType": "image/png"
+        }));
+        textures.push(json!({
+            "sampler": 0,
+            "source": 0
+        }));
+        materials.push(json!({
+            "name": "TesselPaletteMaterial",
+            "pbrMetallicRoughness": {
+                "baseColorTexture": { "index": 0 },
+                "metallicFactor": 0.0,
+                "roughnessFactor": 0.85
+            }
+        }));
+        primitives.push(json!({
+            "attributes": {
+                "POSITION": 0,
+                "NORMAL": 1,
+                "TEXCOORD_0": 2
+            },
+            "indices": 3,
+            "material": 0
+        }));
+        total_triangles += mesh.indices.len() / 3;
+    }
 
     let mut nodes: Vec<Value> = vec![json!({ "name": "TesselAsset", "mesh": 0 })];
     let mut root_nodes: Vec<usize> = vec![0];
@@ -299,6 +364,112 @@ pub fn export_glb_bytes(
         }
     }
 
+    // Export any textured Low-Poly meshes as separate primitives with embedded RGBA PNG textures.
+    for (node_id, lp_mesh) in &scene.lowpoly_meshes {
+        let visible = scene.nodes.get(node_id).map(|n| n.visible).unwrap_or(true);
+        let Some(tex) = &lp_mesh.texture else {
+            continue;
+        };
+        if !visible || lp_mesh.faces.is_empty() {
+            continue;
+        }
+        let tri = lp_mesh.to_triangulated_flat();
+        if tri.vertices.is_empty() || tri.indices.is_empty() {
+            continue;
+        }
+        let mut t_pos = Vec::with_capacity(tri.vertices.len());
+        let mut t_norm = Vec::with_capacity(tri.vertices.len());
+        let mut t_uv = Vec::with_capacity(tri.vertices.len());
+        let mut t_min = [f32::INFINITY; 3];
+        let mut t_max = [f32::NEG_INFINITY; 3];
+        for v in &tri.vertices {
+            let p = [
+                v.position[0] * scale,
+                v.position[1] * scale,
+                v.position[2] * scale,
+            ];
+            for axis in 0..3 {
+                t_min[axis] = t_min[axis].min(p[axis]);
+                t_max[axis] = t_max[axis].max(p[axis]);
+            }
+            t_pos.push(p);
+            t_norm.push(v.normal);
+            t_uv.push(v.uv);
+        }
+        let tex_png = encode_rgba_png(tex.width, tex.height, &tex.rgba)?;
+        let p_bv = push_view(
+            &mut bin,
+            &mut buffer_views,
+            bytemuck::cast_slice(&t_pos),
+            Some(34962),
+        );
+        let n_bv = push_view(
+            &mut bin,
+            &mut buffer_views,
+            bytemuck::cast_slice(&t_norm),
+            Some(34962),
+        );
+        let u_bv = push_view(
+            &mut bin,
+            &mut buffer_views,
+            bytemuck::cast_slice(&t_uv),
+            Some(34962),
+        );
+        let i_bv = push_view(
+            &mut bin,
+            &mut buffer_views,
+            bytemuck::cast_slice(&tri.indices),
+            Some(34963),
+        );
+        let t_img_bv = push_view(&mut bin, &mut buffer_views, &tex_png, None);
+
+        let p_acc = accessors.len();
+        accessors.push(json!({
+            "bufferView": p_bv, "componentType": 5126, "count": t_pos.len(),
+            "type": "VEC3", "min": t_min, "max": t_max
+        }));
+        let n_acc = accessors.len();
+        accessors.push(json!({
+            "bufferView": n_bv, "componentType": 5126, "count": t_norm.len(), "type": "VEC3"
+        }));
+        let u_acc = accessors.len();
+        accessors.push(json!({
+            "bufferView": u_bv, "componentType": 5126, "count": t_uv.len(), "type": "VEC2"
+        }));
+        let i_acc = accessors.len();
+        accessors.push(json!({
+            "bufferView": i_bv, "componentType": 5125, "count": tri.indices.len(), "type": "SCALAR"
+        }));
+
+        let img_idx = images.len();
+        images.push(json!({ "bufferView": t_img_bv, "mimeType": "image/png" }));
+        let tex_idx = textures.len();
+        textures.push(json!({ "sampler": 0, "source": img_idx }));
+        let mat_idx = materials.len();
+        materials.push(json!({
+            "name": format!("TesselMeshTexture_{}", node_id.0),
+            "pbrMetallicRoughness": {
+                "baseColorTexture": { "index": tex_idx },
+                "metallicFactor": 0.0,
+                "roughnessFactor": 0.85
+            }
+        }));
+        primitives.push(json!({
+            "attributes": {
+                "POSITION": p_acc,
+                "NORMAL": n_acc,
+                "TEXCOORD_0": u_acc
+            },
+            "indices": i_acc,
+            "material": mat_idx
+        }));
+        total_triangles += tri.indices.len() / 3;
+    }
+
+    if primitives.is_empty() {
+        return Err(IoError::EmptyCanvas);
+    }
+
     let mut gltf_json = json!({
         "asset": {
             "version": "2.0",
@@ -313,33 +484,12 @@ pub fn export_glb_bytes(
             "wrapS": 33071,
             "wrapT": 33071
         }],
-        "images": [{
-            "bufferView": img_bv,
-            "mimeType": "image/png"
-        }],
-        "textures": [{
-            "sampler": 0,
-            "source": 0
-        }],
-        "materials": [{
-            "name": "TesselPaletteMaterial",
-            "pbrMetallicRoughness": {
-                "baseColorTexture": { "index": 0 },
-                "metallicFactor": 0.0,
-                "roughnessFactor": 0.85
-            }
-        }],
+        "images": images,
+        "textures": textures,
+        "materials": materials,
         "meshes": [{
             "name": "TesselMesh",
-            "primitives": [{
-                "attributes": {
-                    "POSITION": 0,
-                    "NORMAL": 1,
-                    "TEXCOORD_0": 2
-                },
-                "indices": 3,
-                "material": 0
-            }]
+            "primitives": primitives
         }],
         "buffers": [{ "byteLength": bin.len() }],
         "bufferViews": buffer_views,
@@ -367,13 +517,41 @@ pub fn export_glb_bytes(
     glb.extend_from_slice(&0x004E_4942u32.to_le_bytes()); // BIN
     glb.extend_from_slice(&bin);
 
-    Ok((glb, mesh.indices.len() / 3))
+    Ok((glb, total_triangles))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tessel_core::{Command, VoxelCoord};
+    use tessel_core::{Command, PrimitiveKind, Rgba8, VoxelCoord};
+
+    #[test]
+    fn glb_export_embeds_painted_mesh_rgba_texture() {
+        let mut scene = SceneState::new();
+        Command::CreatePrimitiveMesh {
+            name: "PaintedCube".into(),
+            kind: PrimitiveKind::Cube,
+            size: 1.0,
+            material: PaletteIndex::new(1).unwrap(),
+        }
+        .apply(&mut scene)
+        .unwrap();
+        let node_id = scene.active_lowpoly_node().unwrap();
+        Command::PaintMeshTexture {
+            node_id,
+            uv: [0.5, 0.75],
+            radius_px: 12.0,
+            color: Rgba8::rgb(255, 255, 255),
+        }
+        .apply(&mut scene)
+        .unwrap();
+
+        let (glb, tris) = export_glb_bytes(&scene, ExportPreset::Godot4).unwrap();
+        assert_eq!(tris, 12);
+        let parsed = gltf::Gltf::from_slice(&glb).unwrap();
+        assert_eq!(parsed.images().count(), 1);
+        assert_eq!(parsed.materials().count(), 1);
+    }
 
     #[test]
     fn glb_export_passes_gltf_parser_validation_with_animations() {

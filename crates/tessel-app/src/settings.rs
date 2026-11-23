@@ -157,6 +157,7 @@ fn mcp_token_file(paths: &AppPaths) -> PathBuf {
 /// Loads the persistent Live MCP bearer token (OS Keyring or `<config_dir>/mcp_token`),
 /// creating and saving one only on first use so the token stays stable across restarts.
 pub fn load_or_create_mcp_token(paths: &AppPaths) -> String {
+    #[cfg(not(test))]
     if let Ok(entry) = keyring::Entry::new("tessel", "mcp_live_token") {
         if let Ok(tok) = entry.get_password() {
             let trimmed = tok.trim();
@@ -184,6 +185,7 @@ pub fn rotate_mcp_token(paths: &AppPaths) -> String {
 }
 
 fn save_mcp_token(paths: &AppPaths, token: &str) {
+    #[cfg(not(test))]
     if let Ok(entry) = keyring::Entry::new("tessel", "mcp_live_token") {
         let _ = entry.set_password(token);
     }

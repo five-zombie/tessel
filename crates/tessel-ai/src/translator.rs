@@ -277,6 +277,89 @@ pub fn execute_tool_call(
                 "faces": faces
             }))
         }
+        "mesh_fill_texture" => {
+            let node_id = args
+                .get("node_id")
+                .and_then(Value::as_u64)
+                .map(NodeId)
+                .or_else(|| scene.active_lowpoly_node())
+                .ok_or_else(|| AiError::InvalidArguments("no low-poly mesh found".into()))?;
+            let idx = parse_palette_index(args, 3)?;
+            let color = scene
+                .palette
+                .get(idx)
+                .map(|e| e.color)
+                .ok_or_else(|| AiError::InvalidArguments("palette index not defined".into()))?;
+            history.execute(scene, Command::FillMeshTexture { node_id, color })?;
+            Ok(json!({ "ok": true, "node_id": node_id.0 }))
+        }
+        "mesh_paint_spot" => {
+            let node_id = args
+                .get("node_id")
+                .and_then(Value::as_u64)
+                .map(NodeId)
+                .or_else(|| scene.active_lowpoly_node())
+                .ok_or_else(|| AiError::InvalidArguments("no low-poly mesh found".into()))?;
+            let idx = parse_palette_index(args, 3)?;
+            let color = scene
+                .palette
+                .get(idx)
+                .map(|e| e.color)
+                .ok_or_else(|| AiError::InvalidArguments("palette index not defined".into()))?;
+            let radius_px = args
+                .get("radius_px")
+                .and_then(Value::as_f64)
+                .unwrap_or(10.0) as f32;
+            let uv = if let Some(uv_arr) = args.get("uv").and_then(Value::as_array) {
+                if uv_arr.len() != 2 {
+                    return Err(AiError::InvalidArguments("'uv' must have 2 numbers".into()));
+                }
+                [
+                    uv_arr[0].as_f64().unwrap_or(0.5) as f32,
+                    uv_arr[1].as_f64().unwrap_or(0.5) as f32,
+                ]
+            } else {
+                let p_arr = args
+                    .get("point")
+                    .and_then(Value::as_array)
+                    .ok_or_else(|| AiError::InvalidArguments("missing 'uv' or 'point'".into()))?;
+                let n_arr = args
+                    .get("normal")
+                    .and_then(Value::as_array)
+                    .ok_or_else(|| AiError::InvalidArguments("missing 'normal'".into()))?;
+                if p_arr.len() != 3 || n_arr.len() != 3 {
+                    return Err(AiError::InvalidArguments(
+                        "'point' and 'normal' must have 3 numbers".into(),
+                    ));
+                }
+                let point = glam::Vec3::new(
+                    p_arr[0].as_f64().unwrap_or(0.0) as f32,
+                    p_arr[1].as_f64().unwrap_or(0.0) as f32,
+                    p_arr[2].as_f64().unwrap_or(0.0) as f32,
+                );
+                let normal = glam::Vec3::new(
+                    n_arr[0].as_f64().unwrap_or(0.0) as f32,
+                    n_arr[1].as_f64().unwrap_or(1.0) as f32,
+                    n_arr[2].as_f64().unwrap_or(0.0) as f32,
+                );
+                let (min_b, max_b) = scene
+                    .lowpoly_meshes
+                    .get(&node_id)
+                    .map(|m| m.bounds())
+                    .ok_or_else(|| AiError::InvalidArguments("low-poly mesh not found".into()))?;
+                tessel_core::box_atlas_uv(point, normal, min_b, max_b)
+            };
+            history.execute(
+                scene,
+                Command::PaintMeshTexture {
+                    node_id,
+                    uv,
+                    radius_px,
+                    color,
+                },
+            )?;
+            Ok(json!({ "ok": true, "node_id": node_id.0, "uv": uv }))
+        }
         "character_apply_biped_rig" => {
             history.execute(scene, Command::ApplyBipedRig)?;
             Ok(json!({ "ok": true, "bones": 7 }))

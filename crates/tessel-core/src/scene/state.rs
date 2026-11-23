@@ -35,6 +35,10 @@ pub struct SceneState {
     pub pixel_symmetry: Symmetry2D,
     pub voxel_tool: VoxelTool,
     pub voxel_symmetry: Symmetry3D,
+    #[serde(default)]
+    pub lowpoly_paint_mode: bool,
+    #[serde(default = "default_lowpoly_brush_radius")]
+    pub lowpoly_brush_radius: f32,
     pub nodes: BTreeMap<NodeId, SceneNode>,
     pub pixel_canvases: BTreeMap<NodeId, PixelCanvas>,
     pub voxel_volumes: BTreeMap<NodeId, VoxelVolume>,
@@ -54,6 +58,10 @@ fn default_light_azimuth() -> f32 {
 
 fn default_light_elevation() -> f32 {
     0.92
+}
+
+fn default_lowpoly_brush_radius() -> f32 {
+    10.0
 }
 
 impl SceneState {
@@ -76,6 +84,8 @@ impl SceneState {
             pixel_symmetry: Symmetry2D::default(),
             voxel_tool: VoxelTool::Place,
             voxel_symmetry: Symmetry3D::default(),
+            lowpoly_paint_mode: false,
+            lowpoly_brush_radius: default_lowpoly_brush_radius(),
             nodes: BTreeMap::new(),
             pixel_canvases: BTreeMap::new(),
             voxel_volumes: BTreeMap::new(),

@@ -136,7 +136,11 @@ pub fn import_obj_str(obj_text: &str, material: PaletteIndex) -> Result<LowPolyM
             "OBJ file contains no valid mesh faces".into(),
         ));
     }
-    Ok(LowPolyMesh { vertices, faces })
+    Ok(LowPolyMesh {
+        vertices,
+        faces,
+        texture: None,
+    })
 }
 
 /// Imports a binary glTF 2.0 (`.glb`) buffer into a `LowPolyMesh`.
@@ -182,7 +186,11 @@ pub fn import_glb_bytes(bytes: &[u8], material: PaletteIndex) -> Result<LowPolyM
             "GLB file contains no triangle geometry".into(),
         ));
     }
-    Ok(LowPolyMesh { vertices, faces })
+    Ok(LowPolyMesh {
+        vertices,
+        faces,
+        texture: None,
+    })
 }
 
 /// Imports a `.obj` or `.glb` 3D mesh from disk, returning `(asset_name, mesh)`.

@@ -105,6 +105,33 @@ pub fn show_toolbar(ctx: &egui::Context, scene: &mut SceneState, history: &mut H
                         }
                         ui.separator();
                         if let Some(node_id) = scene.active_lowpoly_node() {
+                            if tool_button(ui, "Paint", scene.lowpoly_paint_mode) {
+                                scene.lowpoly_paint_mode = !scene.lowpoly_paint_mode;
+                            }
+                            if scene.lowpoly_paint_mode {
+                                ui.label(
+                                    RichText::new(format!("R: {:.0}", scene.lowpoly_brush_radius))
+                                        .monospace()
+                                        .size(10.0)
+                                        .color(tokens::ON_SURFACE_VARIANT),
+                                );
+                                ui.add(
+                                    egui::Slider::new(&mut scene.lowpoly_brush_radius, 2.0..=40.0)
+                                        .show_value(false),
+                                );
+                                if action_button(ui, "Fill Tex") {
+                                    let color = scene
+                                        .palette
+                                        .get(scene.active_color)
+                                        .map(|e| e.color)
+                                        .unwrap_or(tessel_core::Rgba8::rgb(225, 226, 235));
+                                    let _ = history.execute(
+                                        scene,
+                                        Command::FillMeshTexture { node_id, color },
+                                    );
+                                }
+                            }
+                            ui.separator();
                             if action_button(ui, "Extrude") {
                                 let face_id = scene.selected_face.unwrap_or(FaceId(0));
                                 let _ = history.execute(

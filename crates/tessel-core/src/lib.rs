@@ -12,7 +12,10 @@ pub use character::{
 };
 pub use command::{Command, HistoryStack, UndoDelta};
 pub use error::CoreError;
-pub use mesh::{Face, FaceId, LowPolyMesh, PrimitiveKind, TriVertex, TriangulatedMesh, VertexId};
+pub use mesh::{
+    box_atlas_uv, Face, FaceId, LowPolyMesh, MeshTexture, PrimitiveKind, TriVertex,
+    TriangulatedMesh, VertexId, DEFAULT_MESH_TEX_SIZE,
+};
 pub use palette::{Palette, PaletteEntry, PaletteIndex, Rgba8};
 pub use pixel::{
     FrameIndex, LayerId, PixelCanvas, PixelCoord, PixelEdit, PixelFrame, PixelLayer, PixelTool,

@@ -34,7 +34,11 @@ pub fn create_primitive(kind: PrimitiveKind, size: f32, material: PaletteIndex) 
                 Face::new(vec![3, 2, 6, 7], material), // +Y top
                 Face::new(vec![4, 5, 1, 0], material), // -Y bottom
             ];
-            LowPolyMesh { vertices, faces }
+            LowPolyMesh {
+                vertices,
+                faces,
+                texture: None,
+            }
         }
         PrimitiveKind::Plane => {
             let vertices = vec![
@@ -44,7 +48,11 @@ pub fn create_primitive(kind: PrimitiveKind, size: f32, material: PaletteIndex) 
                 Vec3::new(-h, 0.0, -h),
             ];
             let faces = vec![Face::new(vec![0, 1, 2, 3], material)];
-            LowPolyMesh { vertices, faces }
+            LowPolyMesh {
+                vertices,
+                faces,
+                texture: None,
+            }
         }
         PrimitiveKind::Cylinder => create_cylinder(8, h, s, material),
         PrimitiveKind::Cone => create_cone(8, h, s, material),
@@ -82,7 +90,11 @@ fn create_cylinder(
     top.reverse();
     faces.push(Face::new(top, material));
     faces.push(Face::new(bottom, material));
-    LowPolyMesh { vertices, faces }
+    LowPolyMesh {
+        vertices,
+        faces,
+        texture: None,
+    }
 }
 
 fn create_cone(segments: usize, radius: f32, height: f32, material: PaletteIndex) -> LowPolyMesh {
@@ -102,7 +114,11 @@ fn create_cone(segments: usize, radius: f32, height: f32, material: PaletteIndex
         bottom.push(i);
     }
     faces.push(Face::new(bottom, material));
-    LowPolyMesh { vertices, faces }
+    LowPolyMesh {
+        vertices,
+        faces,
+        texture: None,
+    }
 }
 
 /// Extrudes `face_id` along its face normal by `distance`.
@@ -317,6 +333,7 @@ pub fn smooth_subdivide_mesh(mesh: &LowPolyMesh) -> Result<LowPolyMesh, CoreErro
     Ok(LowPolyMesh {
         vertices: new_vertices,
         faces: new_faces,
+        texture: mesh.texture.clone(),
     })
 }
 
@@ -351,18 +368,32 @@ pub fn voxel_to_lowpoly(volume: &VoxelVolume, unit_scale: f32) -> LowPolyMesh {
         faces.push(Face::new(face_verts, mat));
     }
 
-    LowPolyMesh { vertices, faces }
+    LowPolyMesh {
+        vertices,
+        faces,
+        texture: None,
+    }
 }
 
-/// Möller–Trumbore raycast picking returning the closest hit `FaceId` on `mesh`.
-pub fn raycast_mesh_face(mesh: &LowPolyMesh, ray_origin: Vec3, ray_dir: Vec3) -> Option<FaceId> {
+/// Detailed raycast hit on a `LowPolyMesh`, including the auto-UV coordinate for 3D texture painting.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct MeshRayHit {
+    pub face_id: FaceId,
+    pub point: Vec3,
+    pub normal: Vec3,
+    pub uv: [f32; 2],
+}
+
+/// Möller–Trumbore raycast returning closest hit face, 3D point, normal, and box-atlas UV.
+pub fn raycast_mesh_hit(mesh: &LowPolyMesh, ray_origin: Vec3, ray_dir: Vec3) -> Option<MeshRayHit> {
     let dir = ray_dir.normalize_or_zero();
     if dir.length_squared() < 1e-6 {
         return None;
     }
 
+    let (min_b, max_b) = mesh.bounds();
     let mut closest_t = f32::INFINITY;
-    let mut best_face = None;
+    let mut best: Option<MeshRayHit> = None;
 
     for (face_idx, face) in mesh.faces.iter().enumerate() {
         if face.vertices.len() < 3 {
@@ -381,13 +412,26 @@ pub fn raycast_mesh_face(mesh: &LowPolyMesh, ray_origin: Vec3, ray_dir: Vec3) ->
             if let Some(t) = ray_triangle_intersect(ray_origin, dir, p0, p1, p2) {
                 if t < closest_t {
                     closest_t = t;
-                    best_face = Some(FaceId(face_idx));
+                    let point = ray_origin + dir * t;
+                    let normal = (p1 - p0).cross(p2 - p0).normalize_or_zero();
+                    let uv = super::texture::box_atlas_uv(point, normal, min_b, max_b);
+                    best = Some(MeshRayHit {
+                        face_id: FaceId(face_idx),
+                        point,
+                        normal,
+                        uv,
+                    });
                 }
             }
         }
     }
 
-    best_face
+    best
+}
+
+/// Möller–Trumbore raycast picking returning the closest hit `FaceId` on `mesh`.
+pub fn raycast_mesh_face(mesh: &LowPolyMesh, ray_origin: Vec3, ray_dir: Vec3) -> Option<FaceId> {
+    raycast_mesh_hit(mesh, ray_origin, ray_dir).map(|h| h.face_id)
 }
 
 fn ray_triangle_intersect(orig: Vec3, dir: Vec3, v0: Vec3, v1: Vec3, v2: Vec3) -> Option<f32> {

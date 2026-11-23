@@ -45,6 +45,7 @@ struct StudioState {
     pixel_drag_start: Option<PixelCoord>,
     gizmo_drag: Option<ui::viewport::GizmoDragState>,
     free_view: bool,
+    render_preview: bool,
     export_dialog: ui::export_dialog::ExportDialogState,
     settings_dialog: ui::settings_dialog::SettingsDialogState,
     mcp_dialog: ui::mcp_dialog::McpDialogState,
@@ -162,6 +163,7 @@ impl Default for StudioState {
             pixel_drag_start: None,
             gizmo_drag: None,
             free_view: true,
+            render_preview: false,
             export_dialog,
             settings_dialog,
             mcp_dialog: ui::mcp_dialog::McpDialogState::default(),
@@ -394,6 +396,7 @@ impl GpuState {
                 &mut studio.pixel_drag_start,
                 &mut studio.gizmo_drag,
                 &mut studio.free_view,
+                &mut studio.render_preview,
             );
             desired_viewport = vp_size;
             hover_voxel = hv;
@@ -590,6 +593,7 @@ impl GpuState {
             &studio.camera_3d,
             &studio.camera_2d,
             self.window.scale_factor() as f32,
+            studio.render_preview,
         );
 
         let screen_descriptor = egui_wgpu::ScreenDescriptor {
