@@ -792,6 +792,7 @@ impl UndoDelta {
                 scene.pixel_canvases.remove(id);
                 scene.voxel_volumes.remove(id);
                 scene.lowpoly_meshes.remove(id);
+                scene.rollback_node_id(*id);
                 scene.selected_node = *previous_selection;
             }
             Self::RestoreNode {
@@ -867,6 +868,7 @@ impl UndoDelta {
                 frame_ref.layers.retain(|l| l.id != *layer_id);
                 frame_ref.active_layer =
                     (*previous_active).min(frame_ref.layers.len().saturating_sub(1));
+                canvas.rollback_layer_id(*layer_id);
             }
             Self::RestorePixelLayerVisible {
                 node_id,
@@ -894,7 +896,11 @@ impl UndoDelta {
                     .pixel_canvases
                     .get_mut(node_id)
                     .ok_or(CoreError::PixelCanvasNotFound(*node_id))?;
-                canvas.frames.pop();
+                if let Some(popped) = canvas.frames.pop() {
+                    if let Some(first) = popped.layers.first() {
+                        canvas.rollback_layer_id(first.id);
+                    }
+                }
                 canvas.active_frame = (*previous_active).min(canvas.frames.len().saturating_sub(1));
             }
             Self::RestoreActivePixelFrame {

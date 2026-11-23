@@ -68,6 +68,13 @@ impl PixelCanvas {
         id
     }
 
+    /// Rewinds `next_layer_id` when undoing the most recently allocated layer so Redo reproduces the exact ID.
+    pub fn rollback_layer_id(&mut self, id: LayerId) {
+        if self.next_layer_id == id.0.saturating_add(1) {
+            self.next_layer_id = id.0;
+        }
+    }
+
     pub fn current_frame(&self) -> Option<&PixelFrame> {
         self.frames.get(self.active_frame)
     }

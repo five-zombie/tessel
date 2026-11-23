@@ -433,4 +433,100 @@ mod tests {
         history.undo(&mut scene).unwrap();
         assert_eq!(scene.character_rig.as_ref().unwrap().animations.len(), 2);
     }
+
+    #[test]
+    fn undo_and_redo_node_and_layer_creation_preserve_deterministic_ids() {
+        let mut scene = SceneState::new();
+        let mut history = HistoryStack::new();
+        let color = PaletteIndex::new(4).unwrap();
+
+        // 1. Node creation followed by mutation referencing that NodeId
+        history
+            .execute(
+                &mut scene,
+                Command::CreateVoxelVolume {
+                    name: "Hero".into(),
+                },
+            )
+            .unwrap();
+        let voxel_id = scene.selected_node.unwrap();
+        history
+            .execute(
+                &mut scene,
+                Command::FillVoxelBox {
+                    node_id: voxel_id,
+                    min: crate::voxel::VoxelCoord::new(0, 0, 0),
+                    max: crate::voxel::VoxelCoord::new(1, 1, 1),
+                    color: Some(color),
+                    hollow: false,
+                },
+            )
+            .unwrap();
+
+        // Undo both, then Redo both — Redo must recreate exact same voxel_id
+        history.undo(&mut scene).unwrap();
+        history.undo(&mut scene).unwrap();
+        assert!(scene.nodes.is_empty());
+
+        history.redo(&mut scene).unwrap();
+        assert_eq!(scene.selected_node, Some(voxel_id));
+        history.redo(&mut scene).unwrap();
+        assert_eq!(scene.voxel_volumes[&voxel_id].voxel_count(), 8);
+
+        // 2. Pixel layer creation followed by draw referencing that LayerId
+        history
+            .execute(
+                &mut scene,
+                Command::CreatePixelCanvas {
+                    name: "Sprite".into(),
+                    width: 8,
+                    height: 8,
+                },
+            )
+            .unwrap();
+        let px_id = scene.selected_node.unwrap();
+        history
+            .execute(
+                &mut scene,
+                Command::AddPixelLayer {
+                    node_id: px_id,
+                    frame: crate::pixel::FrameIndex(0),
+                    name: "Overlay".into(),
+                },
+            )
+            .unwrap();
+        let layer_id = scene.pixel_canvases[&px_id]
+            .current_frame()
+            .unwrap()
+            .active_layer_id()
+            .unwrap();
+        history
+            .execute(
+                &mut scene,
+                Command::DrawPixels {
+                    node_id: px_id,
+                    frame: crate::pixel::FrameIndex(0),
+                    layer_id,
+                    edits: vec![crate::pixel::PixelEdit {
+                        coord: crate::pixel::PixelCoord::new(1, 1),
+                        color: Some(color),
+                    }],
+                },
+            )
+            .unwrap();
+
+        history.undo(&mut scene).unwrap();
+        history.undo(&mut scene).unwrap();
+        history.redo(&mut scene).unwrap();
+        history.redo(&mut scene).unwrap();
+        assert_eq!(
+            scene.pixel_canvases[&px_id]
+                .current_frame()
+                .unwrap()
+                .layer(layer_id)
+                .unwrap()
+                .get(crate::pixel::PixelCoord::new(1, 1)),
+            Some(color)
+        );
+    }
 }

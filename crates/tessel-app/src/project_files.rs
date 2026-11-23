@@ -12,6 +12,7 @@ pub struct ProjectFileManager {
     pub recovery_path: PathBuf,
     last_saved_revision: u64,
     last_autosave_at: Instant,
+    autosave_paused: bool,
 }
 
 impl Default for ProjectFileManager {
@@ -24,6 +25,7 @@ impl Default for ProjectFileManager {
             recovery_path,
             last_saved_revision: 0,
             last_autosave_at: Instant::now(),
+            autosave_paused: false,
         }
     }
 }
@@ -35,7 +37,16 @@ impl ProjectFileManager {
             recovery_path,
             last_saved_revision: 0,
             last_autosave_at: Instant::now(),
+            autosave_paused: false,
         }
+    }
+
+    pub fn mark_baseline_revision(&mut self, revision: u64) {
+        self.last_saved_revision = revision;
+    }
+
+    pub fn set_autosave_paused(&mut self, paused: bool) {
+        self.autosave_paused = paused;
     }
 
     pub fn has_recovery_snapshot(&self) -> bool {
@@ -93,7 +104,7 @@ impl ProjectFileManager {
 
     /// Writes a lightweight atomic recovery snapshot every 60 seconds if the scene changed.
     pub fn tick_autosave(&mut self, scene: &SceneState) {
-        if scene.revision == self.last_saved_revision {
+        if self.autosave_paused || scene.revision == self.last_saved_revision {
             return;
         }
         if self.last_autosave_at.elapsed() < AUTOSAVE_INTERVAL {
@@ -103,5 +114,37 @@ impl ProjectFileManager {
             self.last_saved_revision = scene.revision;
             self.last_autosave_at = Instant::now();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn paused_or_baseline_autosave_never_overwrites_existing_recovery_snapshot() {
+        let dir = std::env::temp_dir().join("tessel_recovery_guard_test");
+        let _ = std::fs::create_dir_all(&dir);
+        let recovery_path = dir.join("autosave.tessel");
+        std::fs::write(&recovery_path, b"PREVIOUS_CRASH_SNAPSHOT").unwrap();
+
+        let mut scene = SceneState::new();
+        scene.mark_modified();
+        scene.mark_modified();
+
+        let mut mgr = ProjectFileManager::with_recovery_path(recovery_path.clone());
+        mgr.mark_baseline_revision(scene.revision);
+        mgr.set_autosave_paused(true);
+        mgr.last_autosave_at = Instant::now() - Duration::from_secs(120);
+
+        // Even with elapsed > 60s and a new modification while paused, recovery snapshot is preserved.
+        scene.mark_modified();
+        mgr.tick_autosave(&scene);
+        assert_eq!(
+            std::fs::read(&recovery_path).unwrap(),
+            b"PREVIOUS_CRASH_SNAPSHOT"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

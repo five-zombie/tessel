@@ -93,9 +93,8 @@ impl StudioState {
             match LiveMcpServerHandle::start(38421) {
                 Ok(handle) => {
                     tracing::info!(
-                        "Live MCP HTTP server listening on http://127.0.0.1:{}/mcp (token: {})",
-                        handle.port,
-                        handle.token
+                        "Live MCP HTTP server listening on http://127.0.0.1:{}/mcp",
+                        handle.port
                     );
                     self.live_mcp = Some(handle);
                 }
@@ -111,7 +110,7 @@ impl Default for StudioState {
     fn default() -> Self {
         let paths = AppPaths::resolve();
         let settings = AppSettings::load(&paths);
-        let project_files = ProjectFileManager::with_recovery_path(paths.recovery_file.clone());
+        let mut project_files = ProjectFileManager::with_recovery_path(paths.recovery_file.clone());
         let has_recovery = project_files.has_recovery_snapshot();
 
         let mut scene = SceneState::new();
@@ -135,6 +134,8 @@ impl Default for StudioState {
             }
             .apply(&mut scene);
         }
+        project_files.mark_baseline_revision(scene.revision);
+        project_files.set_autosave_paused(has_recovery);
 
         let export_dialog = ui::export_dialog::ExportDialogState {
             output_dir: settings.allowed_export_dir.clone(),
@@ -300,6 +301,9 @@ impl GpuState {
                 .capture_png_bytes(&self.device, &self.queue)
                 .ok()
         });
+        studio
+            .project_files
+            .set_autosave_paused(studio.quick_start.open && studio.quick_start.has_recovery);
         studio.project_files.tick_autosave(&studio.scene);
 
         let raw_input = self.egui_state.take_egui_input(&self.window);

@@ -96,6 +96,13 @@ impl SceneState {
         id
     }
 
+    /// Rewinds `next_node_id` when undoing the most recently allocated node so Redo reproduces the exact ID.
+    pub fn rollback_node_id(&mut self, id: NodeId) {
+        if self.next_node_id == id.0.saturating_add(1) {
+            self.next_node_id = id.0;
+        }
+    }
+
     pub fn mark_modified(&mut self) {
         self.revision = self.revision.saturating_add(1);
         self.dirty_viewport = true;
