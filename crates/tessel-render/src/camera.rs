@@ -7,6 +7,35 @@ const MAX_PITCH: f32 = 1.52;
 const MIN_DISTANCE: f32 = 1.0;
 const MAX_DISTANCE: f32 = 120.0;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GizmoAxis {
+    X,
+    Y,
+    Z,
+}
+
+impl GizmoAxis {
+    pub const ALL: [Self; 3] = [Self::X, Self::Y, Self::Z];
+
+    pub const fn dir(self) -> Vec3 {
+        match self {
+            Self::X => Vec3::X,
+            Self::Y => Vec3::Y,
+            Self::Z => Vec3::Z,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CameraPreset {
+    Iso,
+    Front,
+    Back,
+    Right,
+    Left,
+    Top,
+}
+
 /// Right-Handed Y-Up orbit camera for 3D viewport navigation.
 #[derive(Debug, Clone, Copy)]
 pub struct OrbitCamera {
@@ -64,6 +93,39 @@ impl OrbitCamera {
         self.distance = (self.distance * factor).clamp(MIN_DISTANCE, MAX_DISTANCE);
     }
 
+    pub fn zoom_step(&mut self, multiplier: f32) {
+        self.distance = (self.distance * multiplier).clamp(MIN_DISTANCE, MAX_DISTANCE);
+    }
+
+    pub fn set_preset(&mut self, preset: CameraPreset) {
+        match preset {
+            CameraPreset::Iso => {
+                self.yaw = 0.72;
+                self.pitch = 0.45;
+            }
+            CameraPreset::Front => {
+                self.yaw = 0.0;
+                self.pitch = 0.05;
+            }
+            CameraPreset::Back => {
+                self.yaw = std::f32::consts::PI;
+                self.pitch = 0.05;
+            }
+            CameraPreset::Right => {
+                self.yaw = std::f32::consts::FRAC_PI_2;
+                self.pitch = 0.05;
+            }
+            CameraPreset::Left => {
+                self.yaw = -std::f32::consts::FRAC_PI_2;
+                self.pitch = 0.05;
+            }
+            CameraPreset::Top => {
+                self.yaw = 0.0;
+                self.pitch = MAX_PITCH;
+            }
+        }
+    }
+
     pub fn view_proj(&self, aspect: f32) -> Mat4 {
         let safe_aspect = aspect.max(0.01);
         let view = Mat4::look_at_rh(self.position(), self.target, Vec3::Y);
@@ -71,14 +133,27 @@ impl OrbitCamera {
         proj * view
     }
 
-    pub fn to_uniform(&self, aspect: f32) -> CameraUniform {
+    pub fn to_uniform(
+        &self,
+        aspect: f32,
+        light_azimuth: f32,
+        light_elevation: f32,
+    ) -> CameraUniform {
         let vp = self.view_proj(aspect);
         let inv_vp = vp.inverse();
         let pos = self.position();
+        let cos_e = light_elevation.cos();
+        let light_dir = Vec3::new(
+            cos_e * light_azimuth.sin(),
+            light_elevation.sin(),
+            cos_e * light_azimuth.cos(),
+        )
+        .normalize_or_zero();
         CameraUniform {
             view_proj: vp.to_cols_array_2d(),
             inv_view_proj: inv_vp.to_cols_array_2d(),
             camera_pos: [pos.x, pos.y, pos.z, 1.0],
+            light_dir: [light_dir.x, light_dir.y, light_dir.z, 0.0],
         }
     }
 
@@ -92,6 +167,58 @@ impl OrbitCamera {
         let far = inv_vp.project_point3(Vec3::new(ndc_x, ndc_y, 1.0));
         (near, (far - near).normalize_or_zero())
     }
+}
+
+/// Closest parameter `s` along line `(line_origin + s * line_dir)` to ray `(ray_origin + t * ray_dir)`.
+pub fn closest_point_on_axis(
+    ray_origin: Vec3,
+    ray_dir: Vec3,
+    line_origin: Vec3,
+    line_dir: Vec3,
+) -> Option<(f32, f32)> {
+    let w0 = line_origin - ray_origin;
+    let a = line_dir.dot(line_dir);
+    let b = line_dir.dot(ray_dir);
+    let c = ray_dir.dot(ray_dir);
+    let d = line_dir.dot(w0);
+    let e = ray_dir.dot(w0);
+    let denom = a * c - b * b;
+    if denom.abs() < 1e-6 {
+        return None;
+    }
+    let s = (b * e - c * d) / denom;
+    let t = (a * e - b * d) / denom;
+    if t < 0.0 {
+        return None;
+    }
+    let p_line = line_origin + line_dir * s;
+    let p_ray = ray_origin + ray_dir * t;
+    Some((s, (p_line - p_ray).length()))
+}
+
+/// Picks the closest X/Y/Z move gizmo axis handle at `gizmo_origin`.
+pub fn pick_move_gizmo(
+    ray_origin: Vec3,
+    ray_dir: Vec3,
+    gizmo_origin: Vec3,
+    axis_len: f32,
+    hit_radius: f32,
+) -> Option<GizmoAxis> {
+    let mut best: Option<(GizmoAxis, f32)> = None;
+    for axis in GizmoAxis::ALL {
+        let Some((s, dist)) = closest_point_on_axis(ray_origin, ray_dir, gizmo_origin, axis.dir())
+        else {
+            continue;
+        };
+        if s >= 0.05
+            && s <= axis_len + 0.12
+            && dist <= hit_radius
+            && best.is_none_or(|(_, best_d)| dist < best_d)
+        {
+            best = Some((axis, dist));
+        }
+    }
+    best.map(|(a, _)| a)
 }
 
 impl Default for OrbitCamera {

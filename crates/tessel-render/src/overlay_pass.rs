@@ -3,7 +3,10 @@ use glam::Vec3;
 use tessel_core::{AppMode, SceneState, VoxelCoord};
 use wgpu::util::DeviceExt;
 
+use crate::camera::GizmoAxis;
 use crate::vertex::CameraUniform;
+
+pub const GIZMO_AXIS_LEN: f32 = 0.85;
 
 const OVERLAY_SHADER_WGSL: &str = include_str!("../../../assets/shaders/overlay.wgsl");
 
@@ -38,6 +41,7 @@ impl OverlayPass {
             view_proj: glam::Mat4::IDENTITY.to_cols_array_2d(),
             inv_view_proj: glam::Mat4::IDENTITY.to_cols_array_2d(),
             camera_pos: [0.0, 5.0, 5.0, 1.0],
+            light_dir: [0.55, 0.82, 0.45, 0.0],
         };
         let camera_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("tessel-overlay-camera-uniform"),
@@ -140,6 +144,7 @@ impl OverlayPass {
         device: &wgpu::Device,
         scene: &SceneState,
         hover_voxel: Option<VoxelCoord>,
+        active_gizmo_axis: Option<GizmoAxis>,
     ) {
         let mut lines = Vec::new();
         let amber = [0.90, 0.54, 0.24, 0.95];
@@ -156,7 +161,18 @@ impl OverlayPass {
                 }
             }
             AppMode::LowPoly => {
-                for mesh in scene.lowpoly_meshes.values() {
+                for (node_id, mesh) in &scene.lowpoly_meshes {
+                    let node_mat = scene
+                        .nodes
+                        .get(node_id)
+                        .map(|n| {
+                            glam::Mat4::from_scale_rotation_translation(
+                                n.transform.scale,
+                                n.transform.rotation,
+                                n.transform.translation,
+                            )
+                        })
+                        .unwrap_or(glam::Mat4::IDENTITY);
                     for (fi, face) in mesh.faces.iter().enumerate() {
                         let color = if scene.selected_face == Some(tessel_core::FaceId(fi)) {
                             amber
@@ -168,7 +184,12 @@ impl OverlayPass {
                             let a = mesh.vertices.get(face.vertices[i]);
                             let b = mesh.vertices.get(face.vertices[(i + 1) % n]);
                             if let (Some(&pa), Some(&pb)) = (a, b) {
-                                push_line(&mut lines, pa, pb, color);
+                                push_line(
+                                    &mut lines,
+                                    node_mat.transform_point3(pa),
+                                    node_mat.transform_point3(pb),
+                                    color,
+                                );
                             }
                         }
                     }
@@ -217,6 +238,15 @@ impl OverlayPass {
                 }
             }
             AppMode::Pixel => {}
+        }
+
+        if scene.active_mode != AppMode::Pixel {
+            if let Some(selected_id) = scene.selected_node {
+                if let Some(node) = scene.nodes.get(&selected_id) {
+                    push_move_gizmo(&mut lines, node.transform.translation, active_gizmo_axis);
+                }
+            }
+            push_light_direction_indicator(&mut lines, scene.light_azimuth, scene.light_elevation);
         }
 
         if lines.is_empty() {
@@ -291,4 +321,71 @@ fn push_wire_box(out: &mut Vec<OverlayVertex>, min: Vec3, max: Vec3, color: [f32
     for (i, j) in edges {
         push_line(out, c[i], c[j], color);
     }
+}
+
+fn push_move_gizmo(out: &mut Vec<OverlayVertex>, origin: Vec3, active: Option<GizmoAxis>) {
+    let axes = [
+        (GizmoAxis::X, Vec3::X, [0.95, 0.30, 0.30, 1.0]),
+        (GizmoAxis::Y, Vec3::Y, [0.35, 0.88, 0.42, 1.0]),
+        (GizmoAxis::Z, Vec3::Z, [0.32, 0.58, 0.96, 1.0]),
+    ];
+    let highlight = [1.0, 0.92, 0.40, 1.0];
+
+    for (axis, dir, base_color) in axes {
+        let color = if active == Some(axis) {
+            highlight
+        } else {
+            base_color
+        };
+        let tip = origin + dir * GIZMO_AXIS_LEN;
+        push_line(out, origin, tip, color);
+
+        // Simple 3D arrowhead fins
+        let ortho_a = if dir.y.abs() < 0.9 {
+            dir.cross(Vec3::Y).normalize()
+        } else {
+            dir.cross(Vec3::X).normalize()
+        };
+        let ortho_b = dir.cross(ortho_a).normalize();
+        let back = tip - dir * 0.12;
+        let spread = 0.045;
+        push_line(out, tip, back + ortho_a * spread, color);
+        push_line(out, tip, back - ortho_a * spread, color);
+        push_line(out, tip, back + ortho_b * spread, color);
+        push_line(out, tip, back - ortho_b * spread, color);
+    }
+}
+
+fn push_light_direction_indicator(out: &mut Vec<OverlayVertex>, azimuth: f32, elevation: f32) {
+    let cos_e = elevation.cos();
+    let dir = Vec3::new(
+        cos_e * azimuth.sin(),
+        elevation.sin(),
+        cos_e * azimuth.cos(),
+    )
+    .normalize_or_zero();
+
+    let sun_pos = dir * 2.4;
+    let tip = dir * 1.45;
+    let sun_color = [1.0, 0.86, 0.38, 0.95];
+
+    // Ray pointing toward scene origin
+    push_line(out, sun_pos, tip, sun_color);
+
+    // Small sun cross marker at `sun_pos`
+    let r = 0.09;
+    push_line(out, sun_pos - Vec3::X * r, sun_pos + Vec3::X * r, sun_color);
+    push_line(out, sun_pos - Vec3::Y * r, sun_pos + Vec3::Y * r, sun_color);
+    push_line(out, sun_pos - Vec3::Z * r, sun_pos + Vec3::Z * r, sun_color);
+
+    // Arrowhead pointing toward origin
+    let inward = -dir;
+    let ortho_a = if inward.y.abs() < 0.9 {
+        inward.cross(Vec3::Y).normalize()
+    } else {
+        inward.cross(Vec3::X).normalize()
+    };
+    let back = tip - inward * 0.1;
+    push_line(out, tip, back + ortho_a * 0.04, sun_color);
+    push_line(out, tip, back - ortho_a * 0.04, sun_color);
 }

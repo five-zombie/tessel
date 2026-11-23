@@ -297,6 +297,30 @@ mod tests {
         history.undo(&mut scene).unwrap();
         assert_eq!(scene.lowpoly_meshes[&mesh_id].faces.len(), 6);
 
+        history
+            .execute(
+                &mut scene,
+                Command::InsetMeshFace {
+                    node_id: mesh_id,
+                    face_id: FaceId(4),
+                    factor: 0.3,
+                },
+            )
+            .unwrap();
+        assert_eq!(scene.lowpoly_meshes[&mesh_id].faces.len(), 10);
+        history.undo(&mut scene).unwrap();
+        assert_eq!(scene.lowpoly_meshes[&mesh_id].faces.len(), 6);
+
+        history
+            .execute(
+                &mut scene,
+                Command::SmoothSubdivideMesh { node_id: mesh_id },
+            )
+            .unwrap();
+        assert_eq!(scene.lowpoly_meshes[&mesh_id].faces.len(), 24);
+        history.undo(&mut scene).unwrap();
+        assert_eq!(scene.lowpoly_meshes[&mesh_id].faces.len(), 6);
+
         history.execute(&mut scene, Command::ApplyBipedRig).unwrap();
         assert!(scene.character_rig.is_some());
         history
@@ -320,5 +344,35 @@ mod tests {
                 .rotation,
             Quat::IDENTITY
         );
+
+        let moved = Transform {
+            translation: glam::Vec3::new(1.5, 0.0, -0.5),
+            ..Transform::default()
+        };
+        history
+            .execute(
+                &mut scene,
+                Command::SetNodeTransform {
+                    node_id: mesh_id,
+                    transform: moved,
+                },
+            )
+            .unwrap();
+        assert_eq!(scene.nodes[&mesh_id].transform.translation.x, 1.5);
+        history.undo(&mut scene).unwrap();
+        assert_eq!(scene.nodes[&mesh_id].transform.translation.x, 0.0);
+
+        history
+            .execute(
+                &mut scene,
+                Command::BindNodeToBone {
+                    node_id: mesh_id,
+                    bone_id: Some(BoneId(2)),
+                },
+            )
+            .unwrap();
+        assert_eq!(scene.character_rig.as_ref().unwrap().bindings.len(), 1);
+        history.undo(&mut scene).unwrap();
+        assert!(scene.character_rig.as_ref().unwrap().bindings.is_empty());
     }
 }

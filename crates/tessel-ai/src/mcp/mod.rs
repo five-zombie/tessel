@@ -3,6 +3,7 @@ pub mod http;
 use std::io::{self, BufRead, Write};
 use std::path::PathBuf;
 
+use base64::Engine as _;
 use serde_json::{json, Value};
 use tessel_core::{HistoryStack, SceneState};
 
@@ -17,6 +18,17 @@ pub fn dispatch_mcp_message(
     scene: &mut SceneState,
     history: &mut HistoryStack,
     allowed_export_dir: &std::path::Path,
+) -> Option<Value> {
+    dispatch_mcp_message_with_preview(request, scene, history, allowed_export_dir, None)
+}
+
+/// Processes a single JSON-RPC 2.0 MCP request with an optional PNG viewport snapshot for `tessel://viewport/preview`.
+pub fn dispatch_mcp_message_with_preview(
+    request: &Value,
+    scene: &mut SceneState,
+    history: &mut HistoryStack,
+    allowed_export_dir: &std::path::Path,
+    preview_png: Option<&[u8]>,
 ) -> Option<Value> {
     let id = request.get("id").cloned();
     let method = request.get("method").and_then(Value::as_str).unwrap_or("");
@@ -69,6 +81,11 @@ pub fn dispatch_mcp_message(
                     "uri": "tessel://palette/current",
                     "name": "Active Palette",
                     "mimeType": "application/json"
+                },
+                {
+                    "uri": "tessel://viewport/preview",
+                    "name": "Viewport Preview Snapshot",
+                    "mimeType": "image/png"
                 }
             ]
         })),
@@ -89,6 +106,19 @@ pub fn dispatch_mcp_message(
                         "text": palette_summary_json(scene).to_string()
                     }]
                 })),
+                "tessel://viewport/preview" => match preview_png {
+                    Some(bytes) => Ok(json!({
+                        "contents": [{
+                            "uri": uri,
+                            "mimeType": "image/png",
+                            "blob": base64::engine::general_purpose::STANDARD.encode(bytes)
+                        }]
+                    })),
+                    None => Err((
+                        -32603,
+                        "viewport preview is only available when the Tessel GUI is running".into(),
+                    )),
+                },
                 _ => Err((-32602, format!("unknown resource URI '{uri}'"))),
             }
         }
@@ -266,5 +296,28 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("OUT_OF_BOUNDS"));
+    }
+
+    #[test]
+    fn mcp_viewport_preview_returns_base64_png_when_available() {
+        let mut scene = SceneState::new();
+        let mut history = HistoryStack::new();
+        let dir = std::env::temp_dir();
+        let fake_png = [0x89u8, 0x50, 0x4E, 0x47];
+        let resp = dispatch_mcp_message_with_preview(
+            &json!({
+                "jsonrpc": "2.0",
+                "id": 9,
+                "method": "resources/read",
+                "params": { "uri": "tessel://viewport/preview" }
+            }),
+            &mut scene,
+            &mut history,
+            &dir,
+            Some(&fake_png),
+        )
+        .unwrap();
+        assert_eq!(resp["result"]["contents"][0]["mimeType"], "image/png");
+        assert_eq!(resp["result"]["contents"][0]["blob"], "iVBORw==");
     }
 }

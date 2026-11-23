@@ -147,6 +147,179 @@ pub fn extrude_face(
     Ok(next)
 }
 
+/// Insets `face_id` toward its centroid by `factor` (clamped to `0.05..=0.9`) and adds side quads.
+pub fn inset_face(
+    mesh: &LowPolyMesh,
+    face_id: FaceId,
+    factor: f32,
+) -> Result<LowPolyMesh, CoreError> {
+    let face = mesh.faces.get(face_id.0).ok_or(CoreError::OutOfBounds)?;
+    if face.vertices.len() < 3 {
+        return Err(CoreError::OutOfBounds);
+    }
+
+    let t = factor.clamp(0.05, 0.9);
+    let mut centroid = Vec3::ZERO;
+    for &vi in &face.vertices {
+        centroid += *mesh.vertices.get(vi).ok_or(CoreError::OutOfBounds)?;
+    }
+    centroid /= face.vertices.len() as f32;
+
+    let mut next = mesh.clone();
+    let old_verts = face.vertices.clone();
+    let material = face.material;
+    let mut new_verts = Vec::with_capacity(old_verts.len());
+
+    for &vi in &old_verts {
+        let p = next.vertices[vi];
+        let idx = next.vertices.len();
+        next.vertices.push(p.lerp(centroid, t));
+        new_verts.push(idx);
+    }
+
+    next.faces[face_id.0] = Face::new(new_verts.clone(), material);
+    let n = old_verts.len();
+    for i in 0..n {
+        let j = (i + 1) % n;
+        next.faces.push(Face::new(
+            vec![old_verts[i], old_verts[j], new_verts[j], new_verts[i]],
+            material,
+        ));
+    }
+
+    Ok(next)
+}
+
+/// Applies one iteration of Catmull-Clark smooth subdivision to `mesh`.
+/// Turns sharp corners (e.g. a Cube) into a rounded box and progressively into a smooth sphere.
+pub fn smooth_subdivide_mesh(mesh: &LowPolyMesh) -> Result<LowPolyMesh, CoreError> {
+    if mesh.faces.is_empty() || mesh.faces.len() > 8_000 {
+        return Err(CoreError::OutOfBounds);
+    }
+
+    let num_verts = mesh.vertices.len();
+    let num_faces = mesh.faces.len();
+
+    // 1. Face points
+    let mut face_points = Vec::with_capacity(num_faces);
+    for face in &mesh.faces {
+        if face.vertices.len() < 3 {
+            return Err(CoreError::OutOfBounds);
+        }
+        let mut sum = Vec3::ZERO;
+        for &vi in &face.vertices {
+            sum += *mesh.vertices.get(vi).ok_or(CoreError::OutOfBounds)?;
+        }
+        face_points.push(sum / face.vertices.len() as f32);
+    }
+
+    // 2. Canonical edge -> incident faces & vertex adjacency
+    let mut edge_faces: BTreeMap<(usize, usize), Vec<usize>> = BTreeMap::new();
+    let mut vert_faces: Vec<Vec<usize>> = vec![Vec::new(); num_verts];
+    let mut vert_edges: Vec<Vec<(usize, usize)>> = vec![Vec::new(); num_verts];
+
+    let canon = |a: usize, b: usize| -> (usize, usize) {
+        if a < b {
+            (a, b)
+        } else {
+            (b, a)
+        }
+    };
+
+    for (fi, face) in mesh.faces.iter().enumerate() {
+        let n = face.vertices.len();
+        for i in 0..n {
+            let v0 = face.vertices[i];
+            let v1 = face.vertices[(i + 1) % n];
+            vert_faces[v0].push(fi);
+            let e = canon(v0, v1);
+            edge_faces.entry(e).or_default().push(fi);
+            if !vert_edges[v0].contains(&e) {
+                vert_edges[v0].push(e);
+            }
+            if !vert_edges[v1].contains(&e) {
+                vert_edges[v1].push(e);
+            }
+        }
+    }
+
+    // 3. Allocate new vertex buffer: [0..num_verts] = updated originals, then face points, then edge points
+    let mut new_vertices = Vec::with_capacity(num_verts + num_faces + edge_faces.len());
+    for vi in 0..num_verts {
+        let old_p = mesh.vertices[vi];
+        let boundary_edges: Vec<(usize, usize)> = vert_edges[vi]
+            .iter()
+            .copied()
+            .filter(|e| edge_faces.get(e).is_some_and(|fs| fs.len() < 2))
+            .collect();
+
+        if !boundary_edges.is_empty() {
+            let mut sum = old_p * 2.0;
+            for (a, b) in &boundary_edges {
+                sum += (mesh.vertices[*a] + mesh.vertices[*b]) * 0.5;
+            }
+            new_vertices.push(sum / (2.0 + boundary_edges.len() as f32));
+        } else if vert_faces[vi].is_empty() {
+            new_vertices.push(old_p);
+        } else {
+            let n = vert_faces[vi].len() as f32;
+            let mut avg_f = Vec3::ZERO;
+            for &fi in &vert_faces[vi] {
+                avg_f += face_points[fi];
+            }
+            avg_f /= n;
+
+            let mut avg_r = Vec3::ZERO;
+            for &(a, b) in &vert_edges[vi] {
+                avg_r += (mesh.vertices[a] + mesh.vertices[b]) * 0.5;
+            }
+            avg_r /= vert_edges[vi].len().max(1) as f32;
+
+            let updated = (avg_f + 2.0 * avg_r + (n - 3.0).max(0.0) * old_p) / n;
+            new_vertices.push(updated);
+        }
+    }
+
+    let face_pt_offset = new_vertices.len();
+    new_vertices.extend(face_points.iter().copied());
+
+    let mut edge_pt_index: BTreeMap<(usize, usize), usize> = BTreeMap::new();
+    for (&(a, b), fs) in &edge_faces {
+        let mid = (mesh.vertices[a] + mesh.vertices[b]) * 0.5;
+        let ep = if fs.len() == 2 {
+            (mesh.vertices[a] + mesh.vertices[b] + face_points[fs[0]] + face_points[fs[1]]) * 0.25
+        } else {
+            mid
+        };
+        let idx = new_vertices.len();
+        new_vertices.push(ep);
+        edge_pt_index.insert((a, b), idx);
+    }
+
+    // 4. Emit 1 quad per corner of every original face
+    let mut new_faces = Vec::with_capacity(num_faces * 4);
+    for (fi, face) in mesh.faces.iter().enumerate() {
+        let n = face.vertices.len();
+        let f_idx = face_pt_offset + fi;
+        for i in 0..n {
+            let v_curr = face.vertices[i];
+            let v_next = face.vertices[(i + 1) % n];
+            let v_prev = face.vertices[(i + n - 1) % n];
+            let e_next = edge_pt_index[&canon(v_curr, v_next)];
+            let e_prev = edge_pt_index[&canon(v_prev, v_curr)];
+            new_faces.push(Face::new(
+                vec![v_curr, e_next, f_idx, e_prev],
+                face.material,
+            ));
+        }
+    }
+
+    Ok(LowPolyMesh {
+        vertices: new_vertices,
+        faces: new_faces,
+    })
+}
+
 /// Converts a `VoxelVolume` into an optimized welded `LowPolyMesh` via Greedy Meshing.
 pub fn voxel_to_lowpoly(volume: &VoxelVolume, unit_scale: f32) -> LowPolyMesh {
     let greedy = greedy_mesh_volume(volume, unit_scale);
@@ -272,5 +445,18 @@ mod tests {
         let cube = create_primitive(PrimitiveKind::Cube, 1.0, mat);
         let hit = raycast_mesh_face(&cube, Vec3::new(0.0, 0.5, 3.0), Vec3::new(0.0, 0.0, -1.0));
         assert_eq!(hit, Some(FaceId(0))); // +Z front face
+    }
+
+    #[test]
+    fn smooth_subdivide_turns_cube_into_rounded_mesh_and_sphere() {
+        let mat = PaletteIndex::new(4).unwrap();
+        let cube = create_primitive(PrimitiveKind::Cube, 1.0, mat);
+        let round1 = smooth_subdivide_mesh(&cube).unwrap();
+        assert_eq!(round1.faces.len(), 24);
+        assert_eq!(round1.vertices.len(), 26);
+
+        let round2 = smooth_subdivide_mesh(&round1).unwrap();
+        assert_eq!(round2.faces.len(), 96);
+        assert_eq!(round2.to_triangulated_flat().indices.len(), 96 * 6);
     }
 }

@@ -2,6 +2,7 @@ struct CameraUniform {
     view_proj: mat4x4<f32>,
     inv_view_proj: mat4x4<f32>,
     camera_pos: vec4<f32>,
+    light_dir: vec4<f32>,
 };
 
 @group(0) @binding(0)
@@ -43,8 +44,8 @@ fn vs_main(in: VertexIn) -> VertexOut {
 fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
     let base_color = textureSample(palette_tex, palette_sampler, in.palette_uv).rgb;
     let n = normalize(in.normal);
-    let key_dir = normalize(vec3<f32>(0.55, 0.82, 0.45));
-    let fill_dir = normalize(vec3<f32>(-0.6, 0.3, -0.5));
+    let key_dir = normalize(camera.light_dir.xyz);
+    let fill_dir = normalize(vec3<f32>(-key_dir.x, 0.35, -key_dir.z));
 
     let ndl = max(dot(n, key_dir), 0.0);
     let fill = max(dot(n, fill_dir), 0.0) * 0.28;

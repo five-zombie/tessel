@@ -1,7 +1,7 @@
 use glam::Quat;
 use serde::{Deserialize, Serialize};
 
-use crate::character::{BoneId, CharacterRig};
+use crate::character::{BoneId, CharacterRig, SkinBinding};
 use crate::error::CoreError;
 use crate::mesh::{ops as mesh_ops, FaceId, LowPolyMesh, PrimitiveKind};
 use crate::palette::{PaletteEntry, PaletteIndex};
@@ -25,6 +25,10 @@ pub enum Command {
     },
     DeleteNode(NodeId),
     SelectNode(Option<NodeId>),
+    SetNodeTransform {
+        node_id: NodeId,
+        transform: Transform,
+    },
     SetPaletteEntry {
         index: PaletteIndex,
         entry: PaletteEntry,
@@ -87,10 +91,22 @@ pub enum Command {
         face_id: FaceId,
         distance: f32,
     },
+    InsetMeshFace {
+        node_id: NodeId,
+        face_id: FaceId,
+        factor: f32,
+    },
+    SmoothSubdivideMesh {
+        node_id: NodeId,
+    },
     ApplyBipedRig,
     SetBoneRotation {
         bone_id: BoneId,
         rotation: Quat,
+    },
+    BindNodeToBone {
+        node_id: NodeId,
+        bone_id: Option<BoneId>,
     },
     Transaction(Vec<Command>),
 }
@@ -111,6 +127,10 @@ pub enum UndoDelta {
         previous_selection: Option<NodeId>,
     },
     RestoreSelection(Option<NodeId>),
+    RestoreNodeTransform {
+        node_id: NodeId,
+        previous: Transform,
+    },
     RestorePaletteEntry {
         index: PaletteIndex,
         previous: Option<PaletteEntry>,
@@ -153,6 +173,10 @@ pub enum UndoDelta {
     RestoreBoneRotation {
         bone_id: BoneId,
         previous: Quat,
+    },
+    RestoreNodeBoneBinding {
+        node_id: NodeId,
+        previous: Option<BoneId>,
     },
     Transaction(Vec<UndoDelta>),
 }
@@ -245,6 +269,18 @@ impl Command {
                 let prev = scene.selected_node;
                 scene.selected_node = *target;
                 UndoDelta::RestoreSelection(prev)
+            }
+            Self::SetNodeTransform { node_id, transform } => {
+                let node = scene
+                    .nodes
+                    .get_mut(node_id)
+                    .ok_or(CoreError::NodeNotFound(*node_id))?;
+                let previous = node.transform;
+                node.transform = *transform;
+                UndoDelta::RestoreNodeTransform {
+                    node_id: *node_id,
+                    previous,
+                }
             }
             Self::SetPaletteEntry { index, entry } => {
                 let previous = scene.palette.set(*index, entry.clone());
@@ -528,6 +564,36 @@ impl Command {
                     previous_mesh: current,
                 }
             }
+            Self::InsetMeshFace {
+                node_id,
+                face_id,
+                factor,
+            } => {
+                let current = scene
+                    .lowpoly_meshes
+                    .get(node_id)
+                    .ok_or(CoreError::LowPolyMeshNotFound(*node_id))?
+                    .clone();
+                let next = mesh_ops::inset_face(&current, *face_id, *factor)?;
+                scene.lowpoly_meshes.insert(*node_id, next);
+                UndoDelta::RestoreLowPolyMesh {
+                    node_id: *node_id,
+                    previous_mesh: current,
+                }
+            }
+            Self::SmoothSubdivideMesh { node_id } => {
+                let current = scene
+                    .lowpoly_meshes
+                    .get(node_id)
+                    .ok_or(CoreError::LowPolyMeshNotFound(*node_id))?
+                    .clone();
+                let next = mesh_ops::smooth_subdivide_mesh(&current)?;
+                scene.lowpoly_meshes.insert(*node_id, next);
+                UndoDelta::RestoreLowPolyMesh {
+                    node_id: *node_id,
+                    previous_mesh: current,
+                }
+            }
             Self::ApplyBipedRig => {
                 let prev = scene.character_rig.replace(CharacterRig::biped_template());
                 UndoDelta::RestoreCharacterRig(prev)
@@ -542,6 +608,36 @@ impl Command {
                 bone.pose_local.rotation = *rotation;
                 UndoDelta::RestoreBoneRotation {
                     bone_id: *bone_id,
+                    previous,
+                }
+            }
+            Self::BindNodeToBone { node_id, bone_id } => {
+                if !scene.nodes.contains_key(node_id) {
+                    return Err(CoreError::NodeNotFound(*node_id));
+                }
+                let rig = scene
+                    .character_rig
+                    .as_mut()
+                    .ok_or(CoreError::CharacterRigNotFound)?;
+                if let Some(bid) = bone_id {
+                    if rig.bone(*bid).is_none() {
+                        return Err(CoreError::OutOfBounds);
+                    }
+                }
+                let previous = rig
+                    .bindings
+                    .iter()
+                    .find(|b| b.node_id == *node_id)
+                    .map(|b| b.bone_id);
+                rig.bindings.retain(|b| b.node_id != *node_id);
+                if let Some(bid) = bone_id {
+                    rig.bindings.push(SkinBinding {
+                        node_id: *node_id,
+                        bone_id: *bid,
+                    });
+                }
+                UndoDelta::RestoreNodeBoneBinding {
+                    node_id: *node_id,
                     previous,
                 }
             }
@@ -607,6 +703,13 @@ impl UndoDelta {
             }
             Self::RestoreSelection(prev) => {
                 scene.selected_node = *prev;
+            }
+            Self::RestoreNodeTransform { node_id, previous } => {
+                let node = scene
+                    .nodes
+                    .get_mut(node_id)
+                    .ok_or(CoreError::NodeNotFound(*node_id))?;
+                node.transform = *previous;
             }
             Self::RestorePaletteEntry { index, previous } => match previous {
                 Some(entry) => {
@@ -720,6 +823,19 @@ impl UndoDelta {
                     .ok_or(CoreError::CharacterRigNotFound)?;
                 let bone = rig.bone_mut(*bone_id).ok_or(CoreError::OutOfBounds)?;
                 bone.pose_local.rotation = *previous;
+            }
+            Self::RestoreNodeBoneBinding { node_id, previous } => {
+                let rig = scene
+                    .character_rig
+                    .as_mut()
+                    .ok_or(CoreError::CharacterRigNotFound)?;
+                rig.bindings.retain(|b| b.node_id != *node_id);
+                if let Some(bid) = previous {
+                    rig.bindings.push(SkinBinding {
+                        node_id: *node_id,
+                        bone_id: *bid,
+                    });
+                }
             }
             Self::Transaction(deltas) => {
                 for delta in deltas.iter().rev() {

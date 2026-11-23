@@ -26,6 +26,7 @@ impl GridPass {
             view_proj: glam::Mat4::IDENTITY.to_cols_array_2d(),
             inv_view_proj: glam::Mat4::IDENTITY.to_cols_array_2d(),
             camera_pos: [0.0, 5.0, 5.0, 1.0],
+            light_dir: [0.55, 0.82, 0.45, 0.0],
         };
         let camera_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("tessel-camera-uniform"),

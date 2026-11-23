@@ -15,7 +15,8 @@ pub use error::IoError;
 pub use gltf::export_glb_bytes;
 pub use mesh_io::{export_obj_string, export_stl_bytes};
 pub use project::{
-    decode_tessel_project, encode_tessel_project, load_tessel_project, save_tessel_project_atomic,
+    decode_tessel_project, encode_tessel_project, encode_tessel_project_with_thumbnail,
+    load_tessel_project, save_tessel_project_atomic, save_tessel_project_with_thumbnail,
     CURRENT_SCHEMA_VERSION,
 };
 pub use sprite::{

@@ -7,12 +7,13 @@ use winit::event::WindowEvent;
 use winit::event_loop::{ActiveEventLoop, EventLoop};
 use winit::window::{Window, WindowId};
 
-use tessel_ai::{dispatch_mcp_message, LiveMcpServerHandle};
-use tessel_core::{Command, HistoryStack, SceneState};
+use tessel_ai::{dispatch_mcp_message_with_preview, LiveMcpServerHandle};
+use tessel_core::{Command, HistoryStack, PixelCoord, SceneState};
 use tessel_render::{OrbitCamera, PixelCamera2D, RenderError, ViewportRenderer};
 
 use crate::input::handle_global_shortcuts;
 use crate::project_files::ProjectFileManager;
+use crate::settings::{load_api_key_from_keyring, AppPaths, AppSettings};
 use crate::ui;
 
 #[derive(Debug, Error)]
@@ -39,24 +40,30 @@ struct StudioState {
     history: HistoryStack,
     camera_3d: OrbitCamera,
     camera_2d: PixelCamera2D,
+    pixel_drag_start: Option<PixelCoord>,
+    gizmo_drag: Option<ui::viewport::GizmoDragState>,
     export_dialog: ui::export_dialog::ExportDialogState,
     ai_state: ui::inspector::DirectAiUiState,
     command_palette: ui::command_palette::CommandPaletteState,
+    quick_start: ui::quick_start::QuickStartState,
     project_files: ProjectFileManager,
+    paths: AppPaths,
+    settings: AppSettings,
     live_mcp: Option<LiveMcpServerHandle>,
 }
 
 impl StudioState {
-    fn poll_live_mcp(&mut self) {
+    fn poll_live_mcp(&mut self, preview_png: Option<&[u8]>) {
         let Some(handle) = &self.live_mcp else {
             return;
         };
         while let Ok(req) = handle.rx.try_recv() {
-            let reply = dispatch_mcp_message(
+            let reply = dispatch_mcp_message_with_preview(
                 &req.payload,
                 &mut self.scene,
                 &mut self.history,
                 &self.export_dialog.output_dir,
+                preview_png,
             );
             let _ = req.reply_tx.send(reply);
         }
@@ -86,6 +93,11 @@ impl StudioState {
 
 impl Default for StudioState {
     fn default() -> Self {
+        let paths = AppPaths::resolve();
+        let settings = AppSettings::load(&paths);
+        let project_files = ProjectFileManager::with_recovery_path(paths.recovery_file.clone());
+        let has_recovery = project_files.has_recovery_snapshot();
+
         let mut scene = SceneState::new();
         let _ = Command::CreatePixelCanvas {
             name: "Sprite 32x32".into(),
@@ -107,15 +119,36 @@ impl Default for StudioState {
             }
             .apply(&mut scene);
         }
+
+        let export_dialog = ui::export_dialog::ExportDialogState {
+            output_dir: settings.allowed_export_dir.clone(),
+            ..Default::default()
+        };
+
+        let mut ai_state = ui::inspector::DirectAiUiState::default();
+        ai_state.config.provider = settings.ai_provider;
+        ai_state.config.model = settings.ai_model.clone();
+        ai_state.config.base_url = settings.ai_base_url.clone();
+        ai_state.config.api_key = load_api_key_from_keyring(settings.ai_provider);
+
         Self {
             scene,
             history: HistoryStack::new(),
             camera_3d: OrbitCamera::new(),
             camera_2d: PixelCamera2D::new(),
-            export_dialog: ui::export_dialog::ExportDialogState::default(),
-            ai_state: ui::inspector::DirectAiUiState::default(),
+            pixel_drag_start: None,
+            gizmo_drag: None,
+            export_dialog,
+            ai_state,
             command_palette: ui::command_palette::CommandPaletteState::default(),
-            project_files: ProjectFileManager::default(),
+            quick_start: ui::quick_start::QuickStartState {
+                open: true,
+                has_recovery,
+                error_message: None,
+            },
+            project_files,
+            paths,
+            settings,
             live_mcp: None,
         }
     }
@@ -243,12 +276,21 @@ impl GpuState {
     }
 
     fn render(&mut self, studio: &mut StudioState) -> Result<(), RenderError> {
-        studio.poll_live_mcp();
+        let preview_png = if studio.live_mcp.is_some() {
+            self.viewport_renderer
+                .capture_png_bytes(&self.device, &self.queue)
+                .ok()
+        } else {
+            None
+        };
+        studio.poll_live_mcp(preview_png.as_deref());
         studio.project_files.tick_autosave(&studio.scene);
 
         let raw_input = self.egui_state.take_egui_input(&self.window);
         let mut desired_viewport = self.viewport_renderer.size();
         let mut hover_voxel = None;
+        let mut active_gizmo_axis = None;
+        let mut quick_action = ui::quick_start::QuickStartAction::None;
         let mut top_actions = ui::top_bar::TopBarActions {
             toggle_mcp: false,
             save_project: false,
@@ -306,17 +348,25 @@ impl GpuState {
                 &mut studio.ai_state,
                 &studio.export_dialog.output_dir,
             );
-            let (vp_size, hv) = ui::viewport::show_viewport(
+            let (vp_size, hv, g_axis) = ui::viewport::show_viewport(
                 ctx,
                 self.viewport_texture_id,
                 &mut studio.scene,
                 &mut studio.history,
                 &mut studio.camera_3d,
                 &mut studio.camera_2d,
+                &mut studio.pixel_drag_start,
+                &mut studio.gizmo_drag,
             );
             desired_viewport = vp_size;
             hover_voxel = hv;
+            active_gizmo_axis = g_axis;
             ui::export_dialog::show_export_dialog(ctx, &studio.scene, &mut studio.export_dialog);
+            quick_action = ui::quick_start::show_quick_start(
+                ctx,
+                &mut studio.quick_start,
+                &studio.settings.recent_projects,
+            );
             ui::command_palette::show_command_palette(
                 ctx,
                 &mut studio.command_palette,
@@ -328,12 +378,60 @@ impl GpuState {
             );
         });
 
+        match quick_action {
+            ui::quick_start::QuickStartAction::RecoverSession => {
+                match studio.project_files.load_recovery_snapshot() {
+                    Ok(loaded) => {
+                        studio.scene = loaded;
+                        studio.history = HistoryStack::new();
+                    }
+                    Err(err) => {
+                        studio.quick_start.open = true;
+                        studio.quick_start.error_message = Some(err);
+                    }
+                }
+            }
+            ui::quick_start::QuickStartAction::OpenRecent(path) => {
+                match studio.project_files.load_from_path(path.clone()) {
+                    Ok(loaded) => {
+                        studio.scene = loaded;
+                        studio.history = HistoryStack::new();
+                        studio.settings.record_recent_project(path);
+                        studio.settings.save(&studio.paths);
+                    }
+                    Err(err) => {
+                        studio.quick_start.open = true;
+                        studio.quick_start.error_message = Some(err);
+                    }
+                }
+            }
+            other => {
+                ui::quick_start::apply_quick_start_preset(
+                    &other,
+                    &mut studio.scene,
+                    &mut studio.history,
+                );
+            }
+        }
+
         if top_actions.toggle_mcp {
             studio.toggle_live_mcp();
         }
         if top_actions.save_project {
-            if let Err(err) = studio.project_files.save_with_dialog(&studio.scene) {
-                tracing::error!("Save project failed: {err}");
+            let thumb = self
+                .viewport_renderer
+                .capture_png_bytes(&self.device, &self.queue)
+                .ok();
+            match studio
+                .project_files
+                .save_with_dialog(&studio.scene, thumb.as_deref())
+            {
+                Ok(Some(path)) => {
+                    studio.settings.record_recent_project(path);
+                    studio.settings.save(&studio.paths);
+                }
+                Ok(None) => {}
+                Err(err) => tracing::error!("Save project failed: {err}"),
             }
         }
         if top_actions.open_project {
@@ -341,6 +439,10 @@ impl GpuState {
                 Ok(Some(loaded)) => {
                     studio.scene = loaded;
                     studio.history = HistoryStack::new();
+                    if let Some(path) = studio.project_files.current_path.clone() {
+                        studio.settings.record_recent_project(path);
+                        studio.settings.save(&studio.paths);
+                    }
                 }
                 Ok(None) => {}
                 Err(err) => tracing::error!("Open project failed: {err}"),
@@ -362,8 +464,13 @@ impl GpuState {
             );
         }
 
-        self.viewport_renderer
-            .sync_scene(&self.device, &self.queue, &studio.scene, hover_voxel);
+        self.viewport_renderer.sync_scene(
+            &self.device,
+            &self.queue,
+            &studio.scene,
+            hover_voxel,
+            active_gizmo_axis,
+        );
 
         let frame = match self.surface.get_current_texture() {
             Ok(frame) => frame,
@@ -388,7 +495,7 @@ impl GpuState {
         self.viewport_renderer.render(
             &self.queue,
             &mut encoder,
-            studio.scene.active_mode,
+            &studio.scene,
             &studio.camera_3d,
             &studio.camera_2d,
             self.window.scale_factor() as f32,

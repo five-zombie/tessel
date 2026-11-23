@@ -116,6 +116,21 @@ pub fn show_toolbar(ctx: &egui::Context, scene: &mut SceneState, history: &mut H
                                     },
                                 );
                             }
+                            if action_button(ui, "Inset") {
+                                let face_id = scene.selected_face.unwrap_or(FaceId(0));
+                                let _ = history.execute(
+                                    scene,
+                                    Command::InsetMeshFace {
+                                        node_id,
+                                        face_id,
+                                        factor: 0.3,
+                                    },
+                                );
+                            }
+                            if action_button(ui, "Smooth") {
+                                let _ = history
+                                    .execute(scene, Command::SmoothSubdivideMesh { node_id });
+                            }
                         }
                     }
                     AppMode::Character => {

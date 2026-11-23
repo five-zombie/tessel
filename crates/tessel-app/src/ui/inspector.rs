@@ -107,6 +107,10 @@ pub fn show_inspector(
                 ui.add_space(10.0);
                 ui.separator();
                 ui.add_space(8.0);
+                show_transform_and_lighting_section(ui, scene, history);
+                ui.add_space(10.0);
+                ui.separator();
+                ui.add_space(8.0);
                 show_direct_ai_section(ui, scene, ai_state);
             });
         });
@@ -351,6 +355,51 @@ fn show_character_rig_section(
         .iter()
         .map(|b| (b.id, b.name.clone(), b.pose_local.rotation))
         .collect();
+    let current_binding = scene.selected_node.and_then(|nid| {
+        rig.bindings
+            .iter()
+            .find(|b| b.node_id == nid)
+            .map(|b| b.bone_id)
+    });
+
+    if let Some(selected_id) = scene.selected_node {
+        if let Some(node) = scene.nodes.get(&selected_id) {
+            ui.label(
+                RichText::new(format!("Bind '{}' to Bone:", node.name))
+                    .size(11.0)
+                    .color(tokens::ON_SURFACE_VARIANT),
+            );
+            ui.horizontal_wrapped(|ui| {
+                if ui
+                    .selectable_label(current_binding.is_none(), "None")
+                    .clicked()
+                {
+                    let _ = history.execute(
+                        scene,
+                        Command::BindNodeToBone {
+                            node_id: selected_id,
+                            bone_id: None,
+                        },
+                    );
+                }
+                for (bid, bname, _) in &bones {
+                    if ui
+                        .selectable_label(current_binding == Some(*bid), bname)
+                        .clicked()
+                    {
+                        let _ = history.execute(
+                            scene,
+                            Command::BindNodeToBone {
+                                node_id: selected_id,
+                                bone_id: Some(*bid),
+                            },
+                        );
+                    }
+                }
+            });
+            ui.add_space(6.0);
+        }
+    }
 
     for (bone_id, name, rot) in bones {
         let (mut rx, mut ry, mut rz) = rot.to_euler(glam::EulerRot::XYZ);
@@ -411,6 +460,160 @@ fn show_outliner_section(ui: &mut egui::Ui, scene: &mut SceneState, history: &mu
     }
 }
 
+fn show_transform_and_lighting_section(
+    ui: &mut egui::Ui,
+    scene: &mut SceneState,
+    history: &mut HistoryStack,
+) {
+    if let Some(node_id) = scene.selected_node {
+        if let Some((node_name, mut tx)) = scene
+            .nodes
+            .get(&node_id)
+            .map(|n| (n.name.clone(), n.transform))
+        {
+            let (mut rx, mut ry, mut rz) = tx.rotation.to_euler(glam::EulerRot::XYZ);
+            let mut rx_deg = rx.to_degrees();
+            let mut ry_deg = ry.to_degrees();
+            let mut rz_deg = rz.to_degrees();
+
+            ui.horizontal(|ui| {
+                ui.label(
+                    RichText::new(format!("Transform ({node_name})"))
+                        .strong()
+                        .size(12.5)
+                        .color(tokens::ON_SURFACE),
+                );
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.small_button("Reset").clicked() {
+                        let _ = history.execute(
+                            scene,
+                            Command::SetNodeTransform {
+                                node_id,
+                                transform: tessel_core::Transform::default(),
+                            },
+                        );
+                    }
+                });
+            });
+
+            let mut changed = false;
+            ui.horizontal(|ui| {
+                ui.label(
+                    RichText::new("Pos")
+                        .size(11.0)
+                        .color(tokens::ON_SURFACE_VARIANT),
+                );
+                changed |= ui
+                    .add(
+                        egui::DragValue::new(&mut tx.translation.x)
+                            .speed(0.05)
+                            .prefix("X "),
+                    )
+                    .changed();
+                changed |= ui
+                    .add(
+                        egui::DragValue::new(&mut tx.translation.y)
+                            .speed(0.05)
+                            .prefix("Y "),
+                    )
+                    .changed();
+                changed |= ui
+                    .add(
+                        egui::DragValue::new(&mut tx.translation.z)
+                            .speed(0.05)
+                            .prefix("Z "),
+                    )
+                    .changed();
+            });
+            ui.horizontal(|ui| {
+                ui.label(
+                    RichText::new("Rot")
+                        .size(11.0)
+                        .color(tokens::ON_SURFACE_VARIANT),
+                );
+                changed |= ui
+                    .add(egui::DragValue::new(&mut rx_deg).speed(1.0).prefix("X "))
+                    .changed();
+                changed |= ui
+                    .add(egui::DragValue::new(&mut ry_deg).speed(1.0).prefix("Y "))
+                    .changed();
+                changed |= ui
+                    .add(egui::DragValue::new(&mut rz_deg).speed(1.0).prefix("Z "))
+                    .changed();
+            });
+            ui.horizontal(|ui| {
+                ui.label(
+                    RichText::new("Scale")
+                        .size(11.0)
+                        .color(tokens::ON_SURFACE_VARIANT),
+                );
+                changed |= ui
+                    .add(
+                        egui::DragValue::new(&mut tx.scale.x)
+                            .speed(0.02)
+                            .range(0.05..=20.0)
+                            .prefix("X "),
+                    )
+                    .changed();
+                changed |= ui
+                    .add(
+                        egui::DragValue::new(&mut tx.scale.y)
+                            .speed(0.02)
+                            .range(0.05..=20.0)
+                            .prefix("Y "),
+                    )
+                    .changed();
+                changed |= ui
+                    .add(
+                        egui::DragValue::new(&mut tx.scale.z)
+                            .speed(0.02)
+                            .range(0.05..=20.0)
+                            .prefix("Z "),
+                    )
+                    .changed();
+            });
+
+            if changed {
+                rx = rx_deg.to_radians();
+                ry = ry_deg.to_radians();
+                rz = rz_deg.to_radians();
+                tx.rotation = glam::Quat::from_euler(glam::EulerRot::XYZ, rx, ry, rz);
+                let _ = history.execute(
+                    scene,
+                    Command::SetNodeTransform {
+                        node_id,
+                        transform: tx,
+                    },
+                );
+            }
+            ui.add_space(6.0);
+        }
+    }
+
+    if scene.active_mode != AppMode::Pixel {
+        ui.label(
+            RichText::new("Studio Lighting")
+                .strong()
+                .size(12.5)
+                .color(tokens::ON_SURFACE),
+        );
+        let mut az_deg = scene.light_azimuth.to_degrees();
+        let mut el_deg = scene.light_elevation.to_degrees();
+        if ui
+            .add(egui::Slider::new(&mut az_deg, -180.0..=180.0).text("Azimuth"))
+            .changed()
+        {
+            scene.light_azimuth = az_deg.to_radians();
+        }
+        if ui
+            .add(egui::Slider::new(&mut el_deg, 5.0..=89.0).text("Elevation"))
+            .changed()
+        {
+            scene.light_elevation = el_deg.to_radians();
+        }
+    }
+}
+
 fn show_direct_ai_section(ui: &mut egui::Ui, scene: &SceneState, ai_state: &mut DirectAiUiState) {
     ui.label(
         RichText::new("Direct AI")
@@ -428,6 +631,7 @@ fn show_direct_ai_section(ui: &mut egui::Ui, scene: &SceneState, ai_state: &mut 
             {
                 ai_state.config.provider = provider;
                 ai_state.config.model = provider.default_model().into();
+                ai_state.config.api_key = crate::settings::load_api_key_from_keyring(provider);
             }
         }
     });
@@ -449,6 +653,14 @@ fn show_direct_ai_section(ui: &mut egui::Ui, scene: &SceneState, ai_state: &mut 
                     .color(tokens::ON_SURFACE_VARIANT),
             );
             ui.add(egui::TextEdit::singleline(&mut ai_state.config.api_key).password(true));
+            if ui.small_button("Save").clicked() {
+                if let Err(err) = crate::settings::save_api_key_to_keyring(
+                    ai_state.config.provider,
+                    &ai_state.config.api_key,
+                ) {
+                    ai_state.last_result = Some(Err(format!("Keyring error: {err}")));
+                }
+            }
         });
     }
 

@@ -7,7 +7,7 @@ pub mod pixel_pass;
 pub mod vertex;
 pub mod viewport;
 
-pub use camera::OrbitCamera;
+pub use camera::{closest_point_on_axis, pick_move_gizmo, CameraPreset, GizmoAxis, OrbitCamera};
 pub use error::RenderError;
 pub use pixel_pass::PixelCamera2D;
 pub use vertex::{CameraUniform, StudioVertex3D};

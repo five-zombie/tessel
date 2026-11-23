@@ -30,6 +30,10 @@ impl PixelCamera2D {
         self.zoom = (self.zoom * factor).clamp(2.0, 64.0);
     }
 
+    pub fn zoom_step(&mut self, multiplier: f32) {
+        self.zoom = (self.zoom * multiplier).clamp(2.0, 64.0);
+    }
+
     /// Converts a local viewport pixel position (logical or physical matching `viewport_size`)
     /// into a canvas pixel coordinate `(x, y)` if inside bounds.
     pub fn screen_to_canvas(

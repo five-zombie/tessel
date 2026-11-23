@@ -1,7 +1,11 @@
+use std::io::Cursor;
+
+use image::{ImageFormat, RgbaImage};
 use tessel_core::voxel::greedy_mesh_volume;
 use tessel_core::{AppMode, SceneState, VoxelCoord};
 
-use crate::camera::OrbitCamera;
+use crate::camera::{GizmoAxis, OrbitCamera};
+use crate::error::RenderError;
 use crate::grid_pass::GridPass;
 use crate::mesh_pass::MeshPass;
 use crate::overlay_pass::OverlayPass;
@@ -32,6 +36,8 @@ pub struct ViewportRenderer {
     pixel_pass: PixelPass,
     last_uploaded_revision: u64,
     last_hover_voxel: Option<VoxelCoord>,
+    last_gizmo_axis: Option<GizmoAxis>,
+    last_light_angles: (f32, f32),
 }
 
 impl ViewportRenderer {
@@ -55,6 +61,8 @@ impl ViewportRenderer {
             pixel_pass,
             last_uploaded_revision: u64::MAX,
             last_hover_voxel: None,
+            last_gizmo_axis: None,
+            last_light_angles: (f32::NAN, f32::NAN),
         }
     }
 
@@ -88,12 +96,19 @@ impl ViewportRenderer {
         queue: &wgpu::Queue,
         scene: &SceneState,
         hover_voxel: Option<VoxelCoord>,
+        active_gizmo_axis: Option<GizmoAxis>,
     ) {
         let scene_changed = self.last_uploaded_revision != scene.revision;
         let hover_changed = self.last_hover_voxel != hover_voxel;
-        if scene_changed || hover_changed {
-            self.overlay_pass.update_lines(device, scene, hover_voxel);
+        let gizmo_changed = self.last_gizmo_axis != active_gizmo_axis;
+        let light_angles = (scene.light_azimuth, scene.light_elevation);
+        let light_changed = self.last_light_angles != light_angles;
+        if scene_changed || hover_changed || gizmo_changed || light_changed {
+            self.overlay_pass
+                .update_lines(device, scene, hover_voxel, active_gizmo_axis);
             self.last_hover_voxel = hover_voxel;
+            self.last_gizmo_axis = active_gizmo_axis;
+            self.last_light_angles = light_angles;
         }
         if !scene_changed {
             return;
@@ -108,20 +123,55 @@ impl ViewportRenderer {
             }
         }
 
+        let bone_mats = scene
+            .character_rig
+            .as_ref()
+            .map(|r| r.world_pose_matrices());
+
         let mut vertices = Vec::new();
         let mut indices = Vec::new();
         for (node_id, vol) in &scene.voxel_volumes {
-            let visible = scene.nodes.get(node_id).map(|n| n.visible).unwrap_or(true);
+            let (visible, node_mat) = scene
+                .nodes
+                .get(node_id)
+                .map(|n| {
+                    (
+                        n.visible,
+                        glam::Mat4::from_scale_rotation_translation(
+                            n.transform.scale,
+                            n.transform.rotation,
+                            n.transform.translation,
+                        ),
+                    )
+                })
+                .unwrap_or((true, glam::Mat4::IDENTITY));
             if !visible || vol.is_empty() {
                 continue;
             }
+            let bound_mat = scene
+                .character_rig
+                .as_ref()
+                .and_then(|rig| rig.bindings.iter().find(|b| b.node_id == *node_id))
+                .and_then(|binding| bone_mats.as_ref().and_then(|m| m.get(&binding.bone_id)))
+                .copied();
+            let combined_mat = match bound_mat {
+                Some(bm) => node_mat * bm,
+                None => node_mat,
+            };
             let mesh = greedy_mesh_volume(vol, scene.unit_scale);
             let base = vertices.len() as u32;
             for v in mesh.vertices {
                 let u = (f32::from(v.palette_index.get()) + 0.5) / 256.0;
+                let pos = combined_mat
+                    .transform_point3(glam::Vec3::from_array(v.position))
+                    .to_array();
+                let norm = combined_mat
+                    .transform_vector3(glam::Vec3::from_array(v.normal))
+                    .normalize_or_zero()
+                    .to_array();
                 vertices.push(StudioVertex3D {
-                    position: v.position,
-                    normal: v.normal,
+                    position: pos,
+                    normal: norm,
                     palette_uv: [u, 0.5],
                     ao: v.ao,
                 });
@@ -129,13 +179,21 @@ impl ViewportRenderer {
             indices.extend(mesh.indices.into_iter().map(|idx| idx + base));
         }
 
-        let bone_mats = scene
-            .character_rig
-            .as_ref()
-            .map(|r| r.world_pose_matrices());
-
         for (node_id, mesh) in &scene.lowpoly_meshes {
-            let visible = scene.nodes.get(node_id).map(|n| n.visible).unwrap_or(true);
+            let (visible, node_mat) = scene
+                .nodes
+                .get(node_id)
+                .map(|n| {
+                    (
+                        n.visible,
+                        glam::Mat4::from_scale_rotation_translation(
+                            n.transform.scale,
+                            n.transform.rotation,
+                            n.transform.translation,
+                        ),
+                    )
+                })
+                .unwrap_or((true, glam::Mat4::IDENTITY));
             if !visible || mesh.faces.is_empty() {
                 continue;
             }
@@ -150,16 +208,17 @@ impl ViewportRenderer {
             let base = vertices.len() as u32;
             for v in tri.vertices {
                 let u = (f32::from(v.palette_index.get()) + 0.5) / 256.0;
-                let (pos, norm) = match bound_mat {
-                    Some(mat) => {
-                        let p = mat.transform_point3(glam::Vec3::from_array(v.position));
-                        let n = mat
-                            .transform_vector3(glam::Vec3::from_array(v.normal))
-                            .normalize_or_zero();
-                        (p.to_array(), n.to_array())
-                    }
-                    None => (v.position, v.normal),
+                let combined_mat = match bound_mat {
+                    Some(bm) => node_mat * bm,
+                    None => node_mat,
                 };
+                let pos = combined_mat
+                    .transform_point3(glam::Vec3::from_array(v.position))
+                    .to_array();
+                let norm = combined_mat
+                    .transform_vector3(glam::Vec3::from_array(v.normal))
+                    .normalize_or_zero()
+                    .to_array();
                 vertices.push(StudioVertex3D {
                     position: pos,
                     normal: norm,
@@ -173,16 +232,17 @@ impl ViewportRenderer {
         self.last_uploaded_revision = scene.revision;
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn render(
         &self,
         queue: &wgpu::Queue,
         encoder: &mut wgpu::CommandEncoder,
-        mode: AppMode,
+        scene: &SceneState,
         camera_3d: &OrbitCamera,
         camera_2d: &PixelCamera2D,
         pixels_per_point: f32,
     ) {
-        match mode {
+        match scene.active_mode {
             AppMode::Pixel => {
                 self.pixel_pass
                     .update_view(queue, self.size, camera_2d, pixels_per_point);
@@ -204,7 +264,8 @@ impl ViewportRenderer {
             }
             AppMode::Voxel | AppMode::LowPoly | AppMode::Character => {
                 let aspect = self.size.0 as f32 / self.size.1.max(1) as f32;
-                let uniform = camera_3d.to_uniform(aspect);
+                let uniform =
+                    camera_3d.to_uniform(aspect, scene.light_azimuth, scene.light_elevation);
                 self.grid_pass.update_camera(queue, &uniform);
                 self.mesh_pass.update_camera(queue, &uniform);
                 self.overlay_pass.update_camera(queue, &uniform);
@@ -236,6 +297,78 @@ impl ViewportRenderer {
             }
         }
     }
+
+    /// Captures the current offscreen viewport texture as PNG bytes for MCP `tessel://viewport/preview`.
+    pub fn capture_png_bytes(
+        &self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+    ) -> Result<Vec<u8>, RenderError> {
+        let (width, height) = self.size;
+        let bytes_per_pixel = 4u32;
+        let unpadded_bpr = width * bytes_per_pixel;
+        let align = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
+        let padded_bpr = unpadded_bpr.div_ceil(align) * align;
+
+        let staging = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("tessel-viewport-readback"),
+            size: u64::from(padded_bpr) * u64::from(height),
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("tessel-viewport-capture-encoder"),
+        });
+        encoder.copy_texture_to_buffer(
+            wgpu::TexelCopyTextureInfo {
+                texture: &self.color_texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::TexelCopyBufferInfo {
+                buffer: &staging,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(padded_bpr),
+                    rows_per_image: Some(height),
+                },
+            },
+            wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+        );
+        queue.submit(Some(encoder.finish()));
+
+        let slice = staging.slice(..);
+        let (tx, rx) = std::sync::mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |res| {
+            let _ = tx.send(res);
+        });
+        device.poll(wgpu::Maintain::Wait);
+        rx.recv()
+            .map_err(|e| RenderError::PreviewEncode(e.to_string()))?
+            .map_err(|e| RenderError::PreviewEncode(e.to_string()))?;
+
+        let mapped = slice.get_mapped_range();
+        let mut rgba = Vec::with_capacity((width as usize) * (height as usize) * 4);
+        for row in 0..height as usize {
+            let start = row * (padded_bpr as usize);
+            rgba.extend_from_slice(&mapped[start..start + (unpadded_bpr as usize)]);
+        }
+        drop(mapped);
+        staging.unmap();
+
+        let img = RgbaImage::from_raw(width, height, rgba)
+            .ok_or_else(|| RenderError::PreviewEncode("invalid image buffer size".into()))?;
+        let mut out = Cursor::new(Vec::new());
+        img.write_to(&mut out, ImageFormat::Png)
+            .map_err(|e| RenderError::PreviewEncode(e.to_string()))?;
+        Ok(out.into_inner())
+    }
 }
 
 fn create_color_target(
@@ -254,7 +387,9 @@ fn create_color_target(
         sample_count: 1,
         dimension: wgpu::TextureDimension::D2,
         format: VIEWPORT_FORMAT,
-        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+            | wgpu::TextureUsages::TEXTURE_BINDING
+            | wgpu::TextureUsages::COPY_SRC,
         view_formats: &[],
     });
     let view = texture.create_view(&wgpu::TextureViewDescriptor::default());

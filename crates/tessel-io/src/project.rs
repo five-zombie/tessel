@@ -20,6 +20,14 @@ pub struct ProjectManifest {
 
 /// Serializes `SceneState` into `.tessel` ZIP archive bytes.
 pub fn encode_tessel_project(scene: &SceneState) -> Result<Vec<u8>, IoError> {
+    encode_tessel_project_with_thumbnail(scene, None)
+}
+
+/// Serializes `SceneState` and optional `thumbnail.png` into `.tessel` ZIP archive bytes.
+pub fn encode_tessel_project_with_thumbnail(
+    scene: &SceneState,
+    thumbnail_png: Option<&[u8]>,
+) -> Result<Vec<u8>, IoError> {
     let manifest = ProjectManifest {
         format: "tessel-project".into(),
         schema_version: CURRENT_SCHEMA_VERSION,
@@ -36,6 +44,11 @@ pub fn encode_tessel_project(scene: &SceneState) -> Result<Vec<u8>, IoError> {
 
         zip.start_file("scene.json", opts)?;
         zip.write_all(&serde_json::to_vec(scene)?)?;
+
+        if let Some(png) = thumbnail_png {
+            zip.start_file("thumbnail.png", opts)?;
+            zip.write_all(png)?;
+        }
 
         zip.finish()?;
     }
@@ -65,7 +78,16 @@ pub fn decode_tessel_project(bytes: &[u8]) -> Result<SceneState, IoError> {
 
 /// Atomically writes a `.tessel` project file (`<path>.tmp` -> `sync_all` -> `rename`).
 pub fn save_tessel_project_atomic(path: &Path, scene: &SceneState) -> Result<(), IoError> {
-    let bytes = encode_tessel_project(scene)?;
+    save_tessel_project_with_thumbnail(path, scene, None)
+}
+
+/// Atomically writes a `.tessel` project file with an optional `thumbnail.png` entry.
+pub fn save_tessel_project_with_thumbnail(
+    path: &Path,
+    scene: &SceneState,
+    thumbnail_png: Option<&[u8]>,
+) -> Result<(), IoError> {
+    let bytes = encode_tessel_project_with_thumbnail(scene, thumbnail_png)?;
     if let Some(parent) = path.parent() {
         if !parent.as_os_str().is_empty() {
             fs::create_dir_all(parent)?;
@@ -93,7 +115,7 @@ mod tests {
     use tessel_core::{Command, PaletteIndex, VoxelCoord};
 
     #[test]
-    fn tessel_project_roundtrip_preserves_scene() {
+    fn tessel_project_roundtrip_preserves_scene_and_thumbnail() {
         let mut scene = SceneState::new();
         Command::CreateVoxelVolume {
             name: "Statue".into(),
@@ -111,7 +133,11 @@ mod tests {
         .apply(&mut scene)
         .unwrap();
 
-        let encoded = encode_tessel_project(&scene).unwrap();
+        let fake_thumb = [0x89u8, 0x50, 0x4E, 0x47];
+        let encoded = encode_tessel_project_with_thumbnail(&scene, Some(&fake_thumb)).unwrap();
+        let archive = ZipArchive::new(Cursor::new(&encoded)).unwrap();
+        assert!(archive.file_names().any(|n| n == "thumbnail.png"));
+
         let decoded = decode_tessel_project(&encoded).unwrap();
         assert_eq!(decoded.voxel_volumes[&id].voxel_count(), 8);
         assert_eq!(decoded.nodes[&id].name, "Statue");

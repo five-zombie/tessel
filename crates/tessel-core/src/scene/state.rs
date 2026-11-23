@@ -25,6 +25,10 @@ pub struct SceneNode {
 pub struct SceneState {
     pub active_mode: AppMode,
     pub unit_scale: f32,
+    #[serde(default = "default_light_azimuth")]
+    pub light_azimuth: f32,
+    #[serde(default = "default_light_elevation")]
+    pub light_elevation: f32,
     pub palette: Palette,
     pub active_color: PaletteIndex,
     pub pixel_tool: PixelTool,
@@ -44,6 +48,14 @@ pub struct SceneState {
     pub dirty_viewport: bool,
 }
 
+fn default_light_azimuth() -> f32 {
+    0.72
+}
+
+fn default_light_elevation() -> f32 {
+    0.92
+}
+
 impl SceneState {
     pub fn new() -> Self {
         let active_color = PaletteIndex::new(4).unwrap_or_else(|_| {
@@ -56,6 +68,8 @@ impl SceneState {
         Self {
             active_mode: AppMode::Voxel,
             unit_scale: 0.1,
+            light_azimuth: default_light_azimuth(),
+            light_elevation: default_light_elevation(),
             palette: Palette::studio_default(),
             active_color,
             pixel_tool: PixelTool::Pencil,

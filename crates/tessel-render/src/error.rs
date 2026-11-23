@@ -16,4 +16,7 @@ pub enum RenderError {
 
     #[error("failed to acquire surface texture: {0}")]
     SurfaceTexture(#[from] wgpu::SurfaceError),
+
+    #[error("failed to encode viewport preview PNG: {0}")]
+    PreviewEncode(String),
 }

@@ -10,11 +10,12 @@ pub struct StudioVertex3D {
     pub ao: f32,
 }
 
-/// Shared per-frame camera uniform matching `assets/shaders/grid.wgsl`.
+/// Shared per-frame camera & lighting uniform matching 3D WGSL shaders.
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Pod, Zeroable)]
 pub struct CameraUniform {
     pub view_proj: [[f32; 4]; 4],
     pub inv_view_proj: [[f32; 4]; 4],
     pub camera_pos: [f32; 4],
+    pub light_dir: [f32; 4],
 }

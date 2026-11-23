@@ -29,7 +29,37 @@ impl Default for ProjectFileManager {
 }
 
 impl ProjectFileManager {
-    pub fn save_with_dialog(&mut self, scene: &SceneState) -> Result<Option<PathBuf>, String> {
+    pub fn with_recovery_path(recovery_path: PathBuf) -> Self {
+        Self {
+            current_path: None,
+            recovery_path,
+            last_saved_revision: 0,
+            last_autosave_at: Instant::now(),
+        }
+    }
+
+    pub fn has_recovery_snapshot(&self) -> bool {
+        self.recovery_path.exists()
+    }
+
+    pub fn load_recovery_snapshot(&mut self) -> Result<SceneState, String> {
+        let loaded = load_tessel_project(&self.recovery_path).map_err(|e| e.to_string())?;
+        self.last_saved_revision = loaded.revision;
+        Ok(loaded)
+    }
+
+    pub fn load_from_path(&mut self, path: PathBuf) -> Result<SceneState, String> {
+        let loaded = load_tessel_project(&path).map_err(|e| e.to_string())?;
+        self.current_path = Some(path);
+        self.last_saved_revision = loaded.revision;
+        Ok(loaded)
+    }
+
+    pub fn save_with_dialog(
+        &mut self,
+        scene: &SceneState,
+        thumbnail_png: Option<&[u8]>,
+    ) -> Result<Option<PathBuf>, String> {
         let target = match &self.current_path {
             Some(p) => Some(p.clone()),
             None => rfd::FileDialog::new()
@@ -40,7 +70,8 @@ impl ProjectFileManager {
         let Some(path) = target else {
             return Ok(None);
         };
-        save_tessel_project_atomic(&path, scene).map_err(|e| e.to_string())?;
+        tessel_io::save_tessel_project_with_thumbnail(&path, scene, thumbnail_png)
+            .map_err(|e| e.to_string())?;
         self.current_path = Some(path.clone());
         self.last_saved_revision = scene.revision;
         let _ = std::fs::remove_file(&self.recovery_path);
