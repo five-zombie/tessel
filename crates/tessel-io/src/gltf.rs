@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 use std::io::Cursor;
 
-use glam::Vec3;
+use glam::{Mat4, Vec3};
 use image::{ImageFormat, RgbaImage};
 use serde_json::{json, Value};
 use tessel_core::voxel::greedy_mesh_volume;
@@ -9,6 +9,26 @@ use tessel_core::{AutoSkinSolver, Palette, PaletteIndex, SceneState};
 
 use crate::error::IoError;
 use crate::ExportPreset;
+
+fn node_world_matrices(scene: &SceneState, node_id: tessel_core::NodeId) -> (Mat4, Mat4) {
+    let mat = scene
+        .nodes
+        .get(&node_id)
+        .map(|n| {
+            Mat4::from_scale_rotation_translation(
+                n.transform.scale,
+                n.transform.rotation,
+                n.transform.translation,
+            )
+        })
+        .unwrap_or(Mat4::IDENTITY);
+    let normal_mat = if mat.determinant().abs() > 1e-8 {
+        mat.inverse().transpose()
+    } else {
+        mat
+    };
+    (mat, normal_mat)
+}
 
 /// Collects all visible 3D geometry (voxels + low-poly meshes) into flat indexed buffers
 /// scaled by `preset.scale_factor()`.
@@ -40,15 +60,19 @@ impl CollectedMesh {
             if !visible || vol.is_empty() {
                 continue;
             }
-            let mesh = greedy_mesh_volume(vol, scene.unit_scale * scale);
+            let (node_mat, normal_mat) = node_world_matrices(scene, *node_id);
+            let mesh = greedy_mesh_volume(vol, scene.unit_scale);
             let base = positions.len() as u32;
             for v in mesh.vertices {
-                positions.push(v.position);
-                normals.push(v.normal);
+                let wp = node_mat.transform_point3(Vec3::from_array(v.position)) * scale;
+                let wn = normal_mat
+                    .transform_vector3(Vec3::from_array(v.normal))
+                    .normalize_or_zero();
+                positions.push(wp.to_array());
+                normals.push(wn.to_array());
                 uvs.push([(f32::from(v.palette_index.get()) + 0.5) / 256.0, 0.5]);
                 if let Some(solver) = skin {
-                    let sw =
-                        solver.weights_for_vertex(Some(*node_id), Vec3::from_array(v.position));
+                    let sw = solver.weights_for_vertex(Some(*node_id), wp);
                     joints.push(sw.joints);
                     weights.push(sw.weights);
                 }
@@ -64,19 +88,19 @@ impl CollectedMesh {
             if !visible || mesh.faces.is_empty() || is_custom {
                 continue;
             }
+            let (node_mat, normal_mat) = node_world_matrices(scene, *node_id);
             let tri = mesh.to_triangulated_flat();
             let base = positions.len() as u32;
             for v in tri.vertices {
-                let p = [
-                    v.position[0] * scale,
-                    v.position[1] * scale,
-                    v.position[2] * scale,
-                ];
-                positions.push(p);
-                normals.push(v.normal);
+                let wp = node_mat.transform_point3(Vec3::from_array(v.position)) * scale;
+                let wn = normal_mat
+                    .transform_vector3(Vec3::from_array(v.normal))
+                    .normalize_or_zero();
+                positions.push(wp.to_array());
+                normals.push(wn.to_array());
                 uvs.push([(f32::from(v.palette_index.get()) + 0.5) / 256.0, 0.5]);
                 if let Some(solver) = skin {
-                    let sw = solver.weights_for_vertex(Some(*node_id), Vec3::from_array(p));
+                    let sw = solver.weights_for_vertex(Some(*node_id), wp);
                     joints.push(sw.joints);
                     weights.push(sw.weights);
                 }
@@ -105,15 +129,16 @@ impl CollectedMesh {
             if !visible || mesh.faces.is_empty() || !is_custom {
                 continue;
             }
+            let (node_mat, normal_mat) = node_world_matrices(scene, *node_id);
             let tri = mesh.to_triangulated_flat();
             let base = out.positions.len() as u32;
             for v in tri.vertices {
-                out.positions.push([
-                    v.position[0] * scale,
-                    v.position[1] * scale,
-                    v.position[2] * scale,
-                ]);
-                out.normals.push(v.normal);
+                let wp = node_mat.transform_point3(Vec3::from_array(v.position)) * scale;
+                let wn = normal_mat
+                    .transform_vector3(Vec3::from_array(v.normal))
+                    .normalize_or_zero();
+                out.positions.push(wp.to_array());
+                out.normals.push(wn.to_array());
                 out.uvs.push(v.uv);
             }
             out.indices
@@ -474,6 +499,7 @@ pub fn export_glb_bytes(
         if !visible || lp_mesh.faces.is_empty() || !has_custom {
             continue;
         }
+        let (node_mat, normal_mat) = node_world_matrices(scene, *node_id);
         let tri = lp_mesh.to_triangulated_flat();
         if tri.vertices.is_empty() || tri.indices.is_empty() {
             continue;
@@ -484,17 +510,17 @@ pub fn export_glb_bytes(
         let mut t_min = [f32::INFINITY; 3];
         let mut t_max = [f32::NEG_INFINITY; 3];
         for v in &tri.vertices {
-            let p = [
-                v.position[0] * scale,
-                v.position[1] * scale,
-                v.position[2] * scale,
-            ];
+            let wp = node_mat.transform_point3(Vec3::from_array(v.position)) * scale;
+            let wn = normal_mat
+                .transform_vector3(Vec3::from_array(v.normal))
+                .normalize_or_zero();
+            let p = wp.to_array();
             for axis in 0..3 {
                 t_min[axis] = t_min[axis].min(p[axis]);
                 t_max[axis] = t_max[axis].max(p[axis]);
             }
             t_pos.push(p);
-            t_norm.push(v.normal);
+            t_norm.push(wn.to_array());
             if lp_mesh.texture.is_some() {
                 t_uv.push(v.uv);
             } else {
@@ -809,5 +835,45 @@ mod tests {
             let sum: f32 = w.iter().sum();
             assert!((sum - 1.0).abs() < 1e-4, "weights must sum to 1.0: {w:?}");
         }
+    }
+
+    #[test]
+    fn glb_export_applies_node_transform_to_mesh_positions() {
+        let mut scene = SceneState::new();
+        Command::CreatePrimitiveMesh {
+            name: "ShiftedCube".into(),
+            kind: PrimitiveKind::Cube,
+            size: 1.0,
+            material: PaletteIndex::new(1).unwrap(),
+        }
+        .apply(&mut scene)
+        .unwrap();
+        let node_id = scene.active_lowpoly_node().unwrap();
+        Command::SetNodeTransform {
+            node_id,
+            transform: tessel_core::Transform {
+                translation: Vec3::new(5.0, 2.0, -3.0),
+                rotation: glam::Quat::IDENTITY,
+                scale: Vec3::new(2.0, 1.0, 1.0),
+            },
+        }
+        .apply(&mut scene)
+        .unwrap();
+
+        let (glb, _) = export_glb_bytes(&scene, ExportPreset::Godot4).unwrap();
+        let parsed = gltf::Gltf::from_slice(&glb).unwrap();
+        let blob = parsed.blob.as_ref().unwrap();
+        let prim = parsed.meshes().next().unwrap().primitives().next().unwrap();
+        let reader = prim.reader(|_| Some(blob.as_slice()));
+        let positions: Vec<[f32; 3]> = reader.read_positions().unwrap().collect();
+        let min_x = positions.iter().map(|p| p[0]).fold(f32::INFINITY, f32::min);
+        let max_x = positions
+            .iter()
+            .map(|p| p[0])
+            .fold(f32::NEG_INFINITY, f32::max);
+        let min_y = positions.iter().map(|p| p[1]).fold(f32::INFINITY, f32::min);
+        assert!((min_x - 4.0).abs() < 1e-4);
+        assert!((max_x - 6.0).abs() < 1e-4);
+        assert!((min_y - 2.0).abs() < 1e-4);
     }
 }

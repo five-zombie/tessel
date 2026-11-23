@@ -26,6 +26,19 @@ pub fn tool_definitions() -> Vec<Value> {
             }
         }),
         json!({
+            "name": "scene_set_node_transform",
+            "description": "Set a scene node's world position [x,y,z], rotation_deg [pitch,yaw,roll], and/or scale [sx,sy,sz] (omitted fields keep their current values).",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "node_id": { "type": "integer", "minimum": 1 },
+                    "position": { "type": "array", "items": { "type": "number" }, "minItems": 3, "maxItems": 3 },
+                    "rotation_deg": { "type": "array", "items": { "type": "number" }, "minItems": 3, "maxItems": 3 },
+                    "scale": { "type": "array", "items": { "type": "number" }, "minItems": 3, "maxItems": 3 }
+                }
+            }
+        }),
+        json!({
             "name": "voxel_fill_box",
             "description": "Fill an axis-aligned 3D voxel box (solid or hollow) in the active or specified voxel node.",
             "inputSchema": {
@@ -67,14 +80,17 @@ pub fn tool_definitions() -> Vec<Value> {
         }),
         json!({
             "name": "mesh_create_primitive",
-            "description": "Create a low-poly primitive mesh (cube, plane, cylinder, cone).",
+            "description": "Create a low-poly primitive mesh (cube, plane, cylinder, cone) with optional world position, rotation_deg, and scale.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "name": { "type": "string" },
                     "kind": { "type": "string", "enum": ["cube", "plane", "cylinder", "cone"] },
                     "size": { "type": "number" },
-                    "palette_index": { "type": "integer", "minimum": 1, "maximum": 255 }
+                    "palette_index": { "type": "integer", "minimum": 1, "maximum": 255 },
+                    "position": { "type": "array", "items": { "type": "number" }, "minItems": 3, "maxItems": 3 },
+                    "rotation_deg": { "type": "array", "items": { "type": "number" }, "minItems": 3, "maxItems": 3 },
+                    "scale": { "type": "array", "items": { "type": "number" }, "minItems": 3, "maxItems": 3 }
                 },
                 "required": ["kind"]
             }

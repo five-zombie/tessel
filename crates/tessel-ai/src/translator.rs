@@ -50,6 +50,34 @@ fn parse_ivec3(val: &Value, field: &str) -> Result<VoxelCoord, AiError> {
     Ok(c)
 }
 
+fn parse_opt_vec3(val: &Value, field: &str) -> Result<Option<glam::Vec3>, AiError> {
+    let Some(raw) = val.get(field) else {
+        return Ok(None);
+    };
+    let arr = raw.as_array().ok_or_else(|| {
+        AiError::InvalidArguments(format!("'{field}' must be an array of 3 numbers"))
+    })?;
+    if arr.len() != 3 {
+        return Err(AiError::InvalidArguments(format!(
+            "'{field}' must have 3 numbers"
+        )));
+    }
+    let mut out = [0.0f32; 3];
+    for (i, item) in arr.iter().enumerate() {
+        let v = item
+            .as_f64()
+            .ok_or_else(|| AiError::InvalidArguments(format!("'{field}[{i}]' must be number")))?
+            as f32;
+        if !v.is_finite() {
+            return Err(AiError::InvalidArguments(format!(
+                "'{field}[{i}]' must be finite"
+            )));
+        }
+        out[i] = v;
+    }
+    Ok(Some(glam::Vec3::from_array(out)))
+}
+
 fn parse_rotation_deg(val: &Value) -> Result<glam::Quat, AiError> {
     let arr = val
         .get("rotation_deg")
@@ -149,6 +177,37 @@ pub fn execute_tool_call(
             history.execute(scene, Command::DeleteNode(node_id))?;
             Ok(json!({ "ok": true, "deleted_node_id": raw_id }))
         }
+        "scene_set_node_transform" => {
+            let node_id = args
+                .get("node_id")
+                .and_then(Value::as_u64)
+                .map(NodeId)
+                .or(scene.selected_node)
+                .ok_or_else(|| {
+                    AiError::InvalidArguments("missing 'node_id' and no node selected".into())
+                })?;
+            let mut transform = scene
+                .nodes
+                .get(&node_id)
+                .ok_or_else(|| AiError::InvalidArguments(format!("node {} not found", node_id.0)))?
+                .transform;
+            if let Some(pos) = parse_opt_vec3(args, "position")? {
+                transform.translation = pos;
+            }
+            if args.get("rotation_deg").is_some() {
+                transform.rotation = parse_rotation_deg(args)?;
+            }
+            if let Some(sc) = parse_opt_vec3(args, "scale")? {
+                transform.scale = sc;
+            }
+            history.execute(scene, Command::SetNodeTransform { node_id, transform })?;
+            Ok(json!({
+                "ok": true,
+                "node_id": node_id.0,
+                "position": transform.translation.to_array(),
+                "scale": transform.scale.to_array()
+            }))
+        }
         "voxel_fill_box" => {
             let min = parse_ivec3(args, "min")?;
             let max = parse_ivec3(args, "max")?;
@@ -243,6 +302,13 @@ pub fn execute_tool_call(
                 .and_then(Value::as_str)
                 .unwrap_or(kind.label())
                 .to_string();
+            let pos = parse_opt_vec3(args, "position")?;
+            let rot = if args.get("rotation_deg").is_some() {
+                Some(parse_rotation_deg(args)?)
+            } else {
+                None
+            };
+            let sc = parse_opt_vec3(args, "scale")?;
             history.execute(
                 scene,
                 Command::CreatePrimitiveMesh {
@@ -252,7 +318,27 @@ pub fn execute_tool_call(
                     material,
                 },
             )?;
-            Ok(json!({ "ok": true, "node_id": scene.selected_node.map(|n| n.0) }))
+            let created_id = scene.selected_node;
+            if let (Some(node_id), true) =
+                (created_id, pos.is_some() || rot.is_some() || sc.is_some())
+            {
+                let mut transform = scene
+                    .nodes
+                    .get(&node_id)
+                    .map(|n| n.transform)
+                    .unwrap_or_default();
+                if let Some(p) = pos {
+                    transform.translation = p;
+                }
+                if let Some(r) = rot {
+                    transform.rotation = r;
+                }
+                if let Some(s) = sc {
+                    transform.scale = s;
+                }
+                history.execute(scene, Command::SetNodeTransform { node_id, transform })?;
+            }
+            Ok(json!({ "ok": true, "node_id": created_id.map(|n| n.0) }))
         }
         "mesh_import" => {
             let filename = args
@@ -855,5 +941,49 @@ mod tests {
         assert_eq!(scene.lowpoly_meshes.len(), 1);
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn ai_tools_set_node_transform_and_primitive_position() {
+        let mut scene = SceneState::new();
+        let mut history = HistoryStack::new();
+        let dir = std::env::temp_dir();
+
+        let created = execute_tool_call(
+            "mesh_create_primitive",
+            &json!({
+                "kind": "cube",
+                "size": 1.0,
+                "position": [1.5, 2.0, -0.5],
+                "scale": [0.5, 2.0, 0.5]
+            }),
+            &mut scene,
+            &mut history,
+            &dir,
+        )
+        .unwrap();
+        let node_id = NodeId(created["node_id"].as_u64().unwrap());
+        let node = scene.nodes.get(&node_id).unwrap();
+        assert_eq!(node.transform.translation, glam::Vec3::new(1.5, 2.0, -0.5));
+        assert_eq!(node.transform.scale, glam::Vec3::new(0.5, 2.0, 0.5));
+
+        execute_tool_call(
+            "scene_set_node_transform",
+            &json!({
+                "node_id": node_id.0,
+                "position": [-2.0, 0.5, 1.0],
+                "rotation_deg": [0.0, 90.0, 0.0]
+            }),
+            &mut scene,
+            &mut history,
+            &dir,
+        )
+        .unwrap();
+        let updated = scene.nodes.get(&node_id).unwrap();
+        assert_eq!(
+            updated.transform.translation,
+            glam::Vec3::new(-2.0, 0.5, 1.0)
+        );
+        assert_eq!(updated.transform.scale, glam::Vec3::new(0.5, 2.0, 0.5));
     }
 }
