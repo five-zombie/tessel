@@ -140,6 +140,15 @@ pub fn execute_tool_call(
             history.execute(scene, Command::SetMode(mode))?;
             Ok(json!({ "ok": true, "active_mode": mode.label() }))
         }
+        "scene_delete_node" => {
+            let raw_id = args
+                .get("node_id")
+                .and_then(Value::as_u64)
+                .ok_or_else(|| AiError::InvalidArguments("missing 'node_id'".into()))?;
+            let node_id = NodeId(raw_id);
+            history.execute(scene, Command::DeleteNode(node_id))?;
+            Ok(json!({ "ok": true, "deleted_node_id": raw_id }))
+        }
         "voxel_fill_box" => {
             let min = parse_ivec3(args, "min")?;
             let max = parse_ivec3(args, "max")?;
@@ -555,6 +564,18 @@ mod tests {
         assert_eq!(res["ok"], true);
         assert_eq!(res["faces"], 12);
         assert_eq!(scene.lowpoly_meshes.len(), 2);
+
+        let imported_id = res["node_id"].as_u64().unwrap();
+        let del = execute_tool_call(
+            "scene_delete_node",
+            &json!({ "node_id": imported_id }),
+            &mut scene,
+            &mut history,
+            &dir,
+        )
+        .unwrap();
+        assert_eq!(del["ok"], true);
+        assert_eq!(scene.lowpoly_meshes.len(), 1);
 
         let _ = std::fs::remove_dir_all(&dir);
     }

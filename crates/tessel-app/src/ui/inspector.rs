@@ -522,9 +522,20 @@ fn show_outliner_section(ui: &mut egui::Ui, scene: &mut SceneState, history: &mu
     for (id, name, kind) in nodes {
         let selected = scene.selected_node == Some(id);
         let label = format!("{name} ({kind:?})");
-        if ui.selectable_label(selected, label).clicked() && !selected {
-            let _ = history.execute(scene, Command::SelectNode(Some(id)));
-        }
+        ui.horizontal(|ui| {
+            if ui.selectable_label(selected, label).clicked() && !selected {
+                let _ = history.execute(scene, Command::SelectNode(Some(id)));
+            }
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui
+                    .small_button(RichText::new("×").color(tokens::ERROR))
+                    .on_hover_text("Delete node")
+                    .clicked()
+                {
+                    let _ = history.execute(scene, Command::DeleteNode(id));
+                }
+            });
+        });
     }
 }
 

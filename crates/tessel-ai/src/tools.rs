@@ -15,6 +15,17 @@ pub fn tool_definitions() -> Vec<Value> {
             }
         }),
         json!({
+            "name": "scene_delete_node",
+            "description": "Delete a scene node by its node_id (supports Undo/Redo).",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "node_id": { "type": "integer", "minimum": 1 }
+                },
+                "required": ["node_id"]
+            }
+        }),
+        json!({
             "name": "voxel_fill_box",
             "description": "Fill an axis-aligned 3D voxel box (solid or hollow) in the active or specified voxel node.",
             "inputSchema": {

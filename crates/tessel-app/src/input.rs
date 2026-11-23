@@ -13,50 +13,69 @@ pub fn handle_global_shortcuts(
         return;
     }
 
-    let (undo, redo, reset_cam, mode_switch, key_b, key_e, key_g, key_i, key_x, key_y) =
-        ctx.input(|i| {
-            let cmd = i.modifiers.command;
-            let shift = i.modifiers.shift;
+    let (
+        undo,
+        redo,
+        reset_cam,
+        delete_selected,
+        mode_switch,
+        key_b,
+        key_e,
+        key_g,
+        key_i,
+        key_x,
+        key_y,
+    ) = ctx.input(|i| {
+        let cmd = i.modifiers.command;
+        let shift = i.modifiers.shift;
 
-            let undo = cmd && !shift && i.key_pressed(egui::Key::Z);
-            let redo = (cmd && shift && i.key_pressed(egui::Key::Z))
-                || (cmd && i.key_pressed(egui::Key::Y));
-            let reset_cam = !cmd && i.key_pressed(egui::Key::F);
+        let undo = cmd && !shift && i.key_pressed(egui::Key::Z);
+        let redo =
+            (cmd && shift && i.key_pressed(egui::Key::Z)) || (cmd && i.key_pressed(egui::Key::Y));
+        let reset_cam = !cmd && i.key_pressed(egui::Key::F);
+        let delete_selected = !cmd && i.key_pressed(egui::Key::Delete);
 
-            let mode = if !cmd {
-                if i.key_pressed(egui::Key::Num1) {
-                    Some(AppMode::Pixel)
-                } else if i.key_pressed(egui::Key::Num2) {
-                    Some(AppMode::Voxel)
-                } else if i.key_pressed(egui::Key::Num3) {
-                    Some(AppMode::LowPoly)
-                } else if i.key_pressed(egui::Key::Num4) {
-                    Some(AppMode::Character)
-                } else {
-                    None
-                }
+        let mode = if !cmd {
+            if i.key_pressed(egui::Key::Num1) {
+                Some(AppMode::Pixel)
+            } else if i.key_pressed(egui::Key::Num2) {
+                Some(AppMode::Voxel)
+            } else if i.key_pressed(egui::Key::Num3) {
+                Some(AppMode::LowPoly)
+            } else if i.key_pressed(egui::Key::Num4) {
+                Some(AppMode::Character)
             } else {
                 None
-            };
+            }
+        } else {
+            None
+        };
 
-            (
-                undo,
-                redo,
-                reset_cam,
-                mode,
-                !cmd && i.key_pressed(egui::Key::B),
-                !cmd && i.key_pressed(egui::Key::E),
-                !cmd && i.key_pressed(egui::Key::G),
-                !cmd && i.key_pressed(egui::Key::I),
-                !cmd && i.key_pressed(egui::Key::X),
-                !cmd && i.key_pressed(egui::Key::Y),
-            )
-        });
+        (
+            undo,
+            redo,
+            reset_cam,
+            delete_selected,
+            mode,
+            !cmd && i.key_pressed(egui::Key::B),
+            !cmd && i.key_pressed(egui::Key::E),
+            !cmd && i.key_pressed(egui::Key::G),
+            !cmd && i.key_pressed(egui::Key::I),
+            !cmd && i.key_pressed(egui::Key::X),
+            !cmd && i.key_pressed(egui::Key::Y),
+        )
+    });
 
     if undo {
         let _ = history.undo(scene);
     } else if redo {
         let _ = history.redo(scene);
+    }
+
+    if delete_selected {
+        if let Some(id) = scene.selected_node {
+            let _ = history.execute(scene, Command::DeleteNode(id));
+        }
     }
 
     if let Some(target_mode) = mode_switch {
