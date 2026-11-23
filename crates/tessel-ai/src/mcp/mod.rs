@@ -16,10 +16,10 @@ const MCP_SERVER_INSTRUCTIONS: &str = "\
 Tessel is a 3D & 2D asset creation studio (Pixel, Voxel, Low-Poly, Character) using a Right-Handed +Y Up, +Z Front coordinate system (1 voxel = 0.1m).
 Recommended workflow:
 1. Inspect `tessel://scene/summary` and `tessel://palette/current` before editing so you know existing node IDs and palette indices (1..=255).
-2. Remove unwanted starter nodes (such as 'Starter Voxel') with `scene_delete_node` before sculpting a new asset.
+2. Remove unwanted starter nodes (such as 'Starter Voxel') with `scene_delete_node` before sculpting a new asset. Position, rotate, or scale any node with `scene_set_node_transform` (`position`, `rotation_deg`, `scale`).
 3. Voxel mode: use `voxel_fill_box` and `voxel_fill_ellipsoid` (bounds ±256), then optionally `voxel_convert_to_lowpoly`.
-4. Low-Poly mode: create primitives (`mesh_create_primitive`) or import `.obj`/`.glb` (`mesh_import`, preserving UVs). To apply custom `.png`/`.jpg` textures or normal maps (skin, wood, fur, fabric), call `mesh_load_texture` and `mesh_load_normal_map`. To paint patterns/spots, call `mesh_fill_texture` then `mesh_paint_spot` with 3D `point` + `normal` (or `uv`) and `radius_px`. Adjust surface finish (metallic/roughness/emissive glow) with `mesh_set_material`. To round sharp corners, call `mesh_smooth_subdivide` (1-3 iterations) and `mesh_set_shading` (`smooth: true`).
-5. Character mode: call `character_apply_biped_rig`, pose bones with `character_set_bone_pose`, and author custom animations with `character_set_keyframe`.
+4. Low-Poly mode: compose primitives via `mesh_create_primitive` (supports `position`, `rotation_deg`, `scale`), sculpt faces with `mesh_translate_face`, or import `.obj`/`.glb` (`mesh_import`, preserving UVs). Apply custom `.png`/`.jpg` textures or normal maps (skin, wood, fur, fabric) via `mesh_load_texture` and `mesh_load_normal_map`. Paint patterns/spots via `mesh_fill_texture` then `mesh_paint_spot` (`point`+`normal` or `uv`, `radius_px`, optional `mirror_x: true` for X symmetry). Adjust PBR finish (`metallic`, `roughness`, `emissive`) with `mesh_set_material`. Round sharp edges with `mesh_smooth_subdivide` (1-3 iterations) and `mesh_set_shading` (`smooth: true`).
+5. Character mode: call `character_apply_biped_rig`, pose bones with `character_set_bone_pose`, and author custom animations with `character_set_keyframe`. Exporting `.glb` while a rig is active automatically embeds glTF 2.0 auto-weight smooth skinning (`skins`, `JOINTS_0`, `WEIGHTS_0`, `inverseBindMatrices`).
 6. Read `tessel://viewport/preview` (when GUI is running) to visually inspect results, use `history_undo`/`history_redo` if needed, and export via `project_export` (`.glb`, `.obj`, `.stl`, `.vox`, `.png`, `.gif`).";
 
 /// Processes a single JSON-RPC 2.0 MCP request directly against any live `SceneState` & `HistoryStack`.
@@ -145,7 +145,7 @@ pub fn dispatch_mcp_message_with_preview(
                 },
                 {
                     "name": "create-lowpoly-prop",
-                    "description": "Skill: Create a clean game-ready low-poly prop and export .glb.",
+                    "description": "Skill: Compose a game-ready low-poly prop using positioned primitives/sculpting, PBR materials/textures, and export .glb.",
                     "arguments": [
                         { "name": "prop_name", "description": "Prop description", "required": false }
                     ]
@@ -157,9 +157,16 @@ pub fn dispatch_mcp_message_with_preview(
                 },
                 {
                     "name": "paint-and-smooth-lowpoly",
-                    "description": "Skill: Paint custom patterns/spots onto a Low-Poly mesh via auto-UV texture painting, apply smooth subdivision + Shade Smooth, and export .glb.",
+                    "description": "Skill: Paint symmetrical 3D textures or load custom albedo/normal maps, tune PBR material, smooth subdivide + Shade Smooth, and export .glb.",
                     "arguments": [
                         { "name": "pattern_description", "description": "Desired surface pattern or colors", "required": false }
+                    ]
+                },
+                {
+                    "name": "rig-and-animate-character",
+                    "description": "Skill: Attach the biped skeleton, pose bones, author custom keyframe animations, and export a smooth-skinned .glb for Unity/Godot/Unreal/Blender.",
+                    "arguments": [
+                        { "name": "animation_style", "description": "Desired animation (e.g. wave, attack, run, idle)", "required": false }
                     ]
                 }
             ]
@@ -185,8 +192,8 @@ pub fn dispatch_mcp_message_with_preview(
                                      1. Coordinate system is Right-Handed, +Y Up, +Z Front, 1 voxel = 0.1m.\n\
                                      2. Read `tessel://palette/current` first so colors match the active palette.\n\
                                      3. Use `voxel_fill_box` and `voxel_fill_ellipsoid` to build legs (y=0..6), torso (y=7..13), arms, and head (y=14..18) facing +Z.\n\
-                                     4. Call `character_apply_biped_rig` to attach the starter skeleton.\n\
-                                     5. Inspect `tessel://viewport/preview` if running in GUI, then call `project_export` with format `glb`."
+                                     4. Call `character_apply_biped_rig` to attach the starter skeleton, and optionally pose/animate with `character_set_bone_pose` and `character_set_keyframe`.\n\
+                                     5. Inspect `tessel://viewport/preview` if running in GUI, then call `project_export` with format `glb` (auto-weight smooth skinning `skins` + `JOINTS_0`/`WEIGHTS_0` is embedded automatically)."
                                 )
                             }
                         }]
@@ -205,9 +212,10 @@ pub fn dispatch_mcp_message_with_preview(
                                 "type": "text",
                                 "text": format!(
                                     "Build a low-poly '{prop}' in Tessel.\n\
-                                     1. Read `tessel://palette/current`.\n\
-                                     2. Either compose primitives with `mesh_create_primitive` or block out voxels and run `voxel_convert_to_lowpoly`.\n\
-                                     3. Export via `project_export` (.glb)."
+                                     1. Read `tessel://palette/current` and delete unwanted starter nodes with `scene_delete_node`.\n\
+                                     2. Compose multi-part primitives with `mesh_create_primitive` using `position`, `rotation_deg`, and `scale` (or adjust existing nodes with `scene_set_node_transform` and sculpt faces with `mesh_translate_face`), or import `.obj`/`.glb` via `mesh_import`.\n\
+                                     3. Tune PBR finish via `mesh_set_material` (`metallic`, `roughness`, `emissive`) and optionally load `.png`/`.jpg` textures or normal maps via `mesh_load_texture` / `mesh_load_normal_map`.\n\
+                                     4. Export via `project_export` (.glb) — all node transforms are baked cleanly into the exported mesh."
                                 )
                             }
                         }]
@@ -237,10 +245,33 @@ pub fn dispatch_mcp_message_with_preview(
                                 "text": format!(
                                     "Paint and smooth the active Low-Poly mesh with '{pattern}':\n\
                                      1. Read `tessel://scene/summary` and `tessel://palette/current` to get the target `node_id` and palette indices.\n\
-                                     2. Call `mesh_fill_texture` to apply the base coat color.\n\
-                                     3. Call `mesh_paint_spot` with 3D `point` + outward `normal` and `radius_px` to paint markings, stripes, or circular spots.\n\
-                                     4. Call `mesh_smooth_subdivide` (1-2 iterations) and `mesh_set_shading` (`smooth: true`) to round sharp corners.\n\
-                                     5. Call `project_export` with `format: \"glb\"` to embed the painted PNG texture."
+                                     2. Call `mesh_fill_texture` for a base coat (or `mesh_load_texture` / `mesh_load_normal_map` for custom `.png`/`.jpg` PBR maps).\n\
+                                     3. Call `mesh_paint_spot` with 3D `point` + outward `normal`, `radius_px`, and `mirror_x: true` for symmetrical markings, stripes, or eyes.\n\
+                                     4. Tune `mesh_set_material` (`metallic`, `roughness`, `emissive`), then call `mesh_smooth_subdivide` (1-2 iterations) and `mesh_set_shading` (`smooth: true`).\n\
+                                     5. Call `project_export` with `format: \"glb\"` to embed the painted PNG texture and PBR maps."
+                                )
+                            }
+                        }]
+                    }))
+                }
+                "rig-and-animate-character" => {
+                    let style = args
+                        .get("animation_style")
+                        .and_then(Value::as_str)
+                        .unwrap_or("idle and wave");
+                    Ok(json!({
+                        "description": "Tessel Character Rigging & Smooth Skinning Animation Skill",
+                        "messages": [{
+                            "role": "user",
+                            "content": {
+                                "type": "text",
+                                "text": format!(
+                                    "Rig and animate the active character with '{style}' in Tessel:\n\
+                                     1. Read `tessel://scene/summary` to confirm the character mesh stands on y=0 facing +Z (adjust with `scene_set_node_transform` if needed).\n\
+                                     2. Call `character_apply_biped_rig` to attach the 7-bone skeleton (0:Root, 1:Torso, 2:Head, 3:LeftArm, 4:RightArm, 5:LeftLeg, 6:RightLeg).\n\
+                                     3. Use `character_set_bone_pose` to verify joint angles in degrees `[pitch, yaw, roll]`.\n\
+                                     4. Author custom keyframes with `character_set_keyframe` (`clip_name`, `duration_secs`, `bone_id`, `time_secs`, `rotation_deg`).\n\
+                                     5. Inspect `tessel://viewport/preview` and export via `project_export` (`format: \"glb\"`), which automatically embeds smooth auto-weight skinning (`skins`, `JOINTS_0`, `WEIGHTS_0`, `inverseBindMatrices`) and animation clips."
                                 )
                             }
                         }]
@@ -466,11 +497,31 @@ mod tests {
             }))
             .unwrap();
         let instructions = init["result"]["instructions"].as_str().unwrap();
+        assert!(instructions.contains("scene_set_node_transform"));
+        assert!(instructions.contains("mesh_translate_face"));
+        assert!(instructions.contains("mirror_x"));
         assert!(instructions.contains("mesh_paint_spot"));
         assert!(instructions.contains("mesh_smooth_subdivide"));
 
         let prompts = list["result"]["prompts"].as_array().unwrap();
-        assert_eq!(prompts.len(), 4);
+        assert_eq!(prompts.len(), 5);
+
+        let rig_skill = server
+            .handle_message(&json!({
+                "jsonrpc": "2.0",
+                "id": 12,
+                "method": "prompts/get",
+                "params": {
+                    "name": "rig-and-animate-character",
+                    "arguments": { "animation_style": "combat ready" }
+                }
+            }))
+            .unwrap();
+        let rig_text = rig_skill["result"]["messages"][0]["content"]["text"]
+            .as_str()
+            .unwrap();
+        assert!(rig_text.contains("combat ready"));
+        assert!(rig_text.contains("character_set_keyframe"));
 
         let get = server
             .handle_message(&json!({
