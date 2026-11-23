@@ -1,0 +1,99 @@
+name: CD Release
+
+on:
+  push:
+    tags:
+      - "v*-*-release"
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: Build (${{ matrix.name }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-x86_64
+            os: ubuntu-latest
+          - name: windows-x86_64
+            os: windows-latest
+          - name: macos-universal
+            os: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.os == 'macos-latest' && 'aarch64-apple-darwin,x86_64-apple-darwin' || '' }}
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install Linux desktop libs
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y pkg-config libxkbcommon-dev libwayland-dev libx11-dev
+
+      - name: Build Linux binary
+        if: runner.os == 'Linux'
+        run: |
+          cargo build --release -p tessel-app
+          mkdir -p dist/tessel-linux-x86_64
+          cp target/release/tessel dist/tessel-linux-x86_64/tessel
+          cp README.md LICENSE dist/tessel-linux-x86_64/
+          tar -czf dist/tessel-linux-x86_64.tar.gz -C dist tessel-linux-x86_64
+          rm -rf dist/tessel-linux-x86_64
+
+      - name: Build Windows .exe
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          cargo build --release -p tessel-app
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          Copy-Item target/release/tessel.exe dist/tessel-windows-x86_64.exe
+
+      - name: Build macOS Universal binary
+        if: runner.os == 'macOS'
+        run: |
+          cargo build --release -p tessel-app --target aarch64-apple-darwin
+          cargo build --release -p tessel-app --target x86_64-apple-darwin
+          mkdir -p dist/tessel-macos-universal
+          lipo -create \
+            target/aarch64-apple-darwin/release/tessel \
+            target/x86_64-apple-darwin/release/tessel \
+            -output dist/tessel-macos-universal/tessel
+          cp README.md LICENSE dist/tessel-macos-universal/
+          tar -czf dist/tessel-macos-universal.tar.gz -C dist tessel-macos-universal
+          rm -rf dist/tessel-macos-universal
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.name }}
+          path: dist/*
+
+  release:
+    name: Publish GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Generate SHA256SUMS.txt
+        run: |
+          cd artifacts
+          sha256sum * > SHA256SUMS.txt
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          prerelease: ${{ contains(github.ref_name, '-rc-') || contains(github.ref_name, '-beta-') || contains(github.ref_name, '-alpha-') }}
+          files: artifacts/*
