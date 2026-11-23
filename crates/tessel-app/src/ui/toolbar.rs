@@ -158,6 +158,19 @@ pub fn show_toolbar(ctx: &egui::Context, scene: &mut SceneState, history: &mut H
                                 let _ = history
                                     .execute(scene, Command::SmoothSubdivideMesh { node_id });
                             }
+                            let is_smooth = scene
+                                .lowpoly_meshes
+                                .get(&node_id)
+                                .is_some_and(|m| m.smooth_shading);
+                            if tool_button(ui, "Shade Sm", is_smooth) {
+                                let _ = history.execute(
+                                    scene,
+                                    Command::SetMeshSmoothShading {
+                                        node_id,
+                                        smooth: !is_smooth,
+                                    },
+                                );
+                            }
                         }
                     }
                     AppMode::Character => {

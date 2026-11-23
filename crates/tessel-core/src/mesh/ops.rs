@@ -38,6 +38,7 @@ pub fn create_primitive(kind: PrimitiveKind, size: f32, material: PaletteIndex) 
                 vertices,
                 faces,
                 texture: None,
+                smooth_shading: false,
             }
         }
         PrimitiveKind::Plane => {
@@ -52,6 +53,7 @@ pub fn create_primitive(kind: PrimitiveKind, size: f32, material: PaletteIndex) 
                 vertices,
                 faces,
                 texture: None,
+                smooth_shading: false,
             }
         }
         PrimitiveKind::Cylinder => create_cylinder(8, h, s, material),
@@ -94,6 +96,7 @@ fn create_cylinder(
         vertices,
         faces,
         texture: None,
+        smooth_shading: false,
     }
 }
 
@@ -118,6 +121,7 @@ fn create_cone(segments: usize, radius: f32, height: f32, material: PaletteIndex
         vertices,
         faces,
         texture: None,
+        smooth_shading: false,
     }
 }
 
@@ -334,6 +338,7 @@ pub fn smooth_subdivide_mesh(mesh: &LowPolyMesh) -> Result<LowPolyMesh, CoreErro
         vertices: new_vertices,
         faces: new_faces,
         texture: mesh.texture.clone(),
+        smooth_shading: mesh.smooth_shading,
     })
 }
 
@@ -372,6 +377,7 @@ pub fn voxel_to_lowpoly(volume: &VoxelVolume, unit_scale: f32) -> LowPolyMesh {
         vertices,
         faces,
         texture: None,
+        smooth_shading: false,
     }
 }
 
@@ -502,5 +508,17 @@ mod tests {
         let round2 = smooth_subdivide_mesh(&round1).unwrap();
         assert_eq!(round2.faces.len(), 96);
         assert_eq!(round2.to_triangulated_flat().indices.len(), 96 * 6);
+    }
+
+    #[test]
+    fn smooth_shading_averages_vertex_normals_across_shared_corners() {
+        let mat = PaletteIndex::new(4).unwrap();
+        let mut cube = create_primitive(PrimitiveKind::Cube, 1.0, mat);
+        let flat_n = cube.to_triangulated_flat().vertices[0].normal;
+        cube.smooth_shading = true;
+        let smooth_n = cube.to_triangulated_flat().vertices[0].normal;
+        // Flat normal is axis-aligned [0, 0, 1]; smooth corner normal averages all 3 adjacent faces.
+        assert!((flat_n[0]).abs() < 1e-4 && (flat_n[1]).abs() < 1e-4);
+        assert!(smooth_n[0].abs() > 0.3 && smooth_n[1].abs() > 0.3 && smooth_n[2].abs() > 0.3);
     }
 }

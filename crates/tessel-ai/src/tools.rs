@@ -121,6 +121,29 @@ pub fn tool_definitions() -> Vec<Value> {
             }
         }),
         json!({
+            "name": "mesh_smooth_subdivide",
+            "description": "Apply Catmull-Clark smooth subdivision to round sharp edges on a Low-Poly mesh (1-3 iterations).",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "node_id": { "type": "integer" },
+                    "iterations": { "type": "integer", "minimum": 1, "maximum": 3 }
+                }
+            }
+        }),
+        json!({
+            "name": "mesh_set_shading",
+            "description": "Toggle smooth vertex-normal shading (true = Shade Smooth, false = Flat) on a Low-Poly mesh.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "node_id": { "type": "integer" },
+                    "smooth": { "type": "boolean" }
+                },
+                "required": ["smooth"]
+            }
+        }),
+        json!({
             "name": "character_apply_biped_rig",
             "description": "Apply the starter 7-bone biped humanoid skeleton with Idle & Walk animations.",
             "inputSchema": { "type": "object", "properties": {} }

@@ -105,6 +105,10 @@ pub enum Command {
     SmoothSubdivideMesh {
         node_id: NodeId,
     },
+    SetMeshSmoothShading {
+        node_id: NodeId,
+        smooth: bool,
+    },
     PaintMeshTexture {
         node_id: NodeId,
         uv: [f32; 2],
@@ -207,6 +211,10 @@ pub enum UndoDelta {
     RestoreMeshTextureFull {
         node_id: NodeId,
         previous: Option<MeshTexture>,
+    },
+    RestoreMeshSmoothShading {
+        node_id: NodeId,
+        previous: bool,
     },
     RestoreCharacterRig(Option<CharacterRig>),
     RestoreBoneRotation {
@@ -661,6 +669,18 @@ impl Command {
                     previous_mesh: current,
                 }
             }
+            Self::SetMeshSmoothShading { node_id, smooth } => {
+                let mesh = scene
+                    .lowpoly_meshes
+                    .get_mut(node_id)
+                    .ok_or(CoreError::LowPolyMeshNotFound(*node_id))?;
+                let previous = mesh.smooth_shading;
+                mesh.smooth_shading = *smooth;
+                UndoDelta::RestoreMeshSmoothShading {
+                    node_id: *node_id,
+                    previous,
+                }
+            }
             Self::PaintMeshTexture {
                 node_id,
                 uv,
@@ -1022,6 +1042,13 @@ impl UndoDelta {
                     .get_mut(node_id)
                     .ok_or(CoreError::LowPolyMeshNotFound(*node_id))?;
                 mesh.texture = previous.clone();
+            }
+            Self::RestoreMeshSmoothShading { node_id, previous } => {
+                let mesh = scene
+                    .lowpoly_meshes
+                    .get_mut(node_id)
+                    .ok_or(CoreError::LowPolyMeshNotFound(*node_id))?;
+                mesh.smooth_shading = *previous;
             }
             Self::RestoreCharacterRig(prev) => {
                 scene.character_rig = prev.clone();

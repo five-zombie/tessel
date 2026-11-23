@@ -28,6 +28,8 @@ pub struct LowPolyMesh {
     pub faces: Vec<Face>,
     #[serde(default)]
     pub texture: Option<MeshTexture>,
+    #[serde(default)]
+    pub smooth_shading: bool,
 }
 
 impl LowPolyMesh {
@@ -56,10 +58,49 @@ impl LowPolyMesh {
             .sum()
     }
 
-    /// Triangulates all faces into flat-shaded triangles with CCW outward normals and auto-UVs.
+    /// Triangulates all faces into indexed triangles with flat or averaged smooth vertex normals and auto-UVs.
     pub fn to_triangulated_flat(&self) -> TriangulatedMesh {
         let mut out = TriangulatedMesh::default();
         let (min_b, max_b) = self.bounds();
+
+        let smooth_normals: Option<Vec<Vec3>> = if self.smooth_shading {
+            let mut acc = vec![Vec3::ZERO; self.vertices.len()];
+            for face in &self.faces {
+                if face.vertices.len() < 3 {
+                    continue;
+                }
+                let Some(&i0) = face.vertices.first() else {
+                    continue;
+                };
+                let Some(&p0) = self.vertices.get(i0) else {
+                    continue;
+                };
+                for fan in 1..(face.vertices.len() - 1) {
+                    let (Some(&i1), Some(&i2)) =
+                        (face.vertices.get(fan), face.vertices.get(fan + 1))
+                    else {
+                        continue;
+                    };
+                    let (Some(&p1), Some(&p2)) = (self.vertices.get(i1), self.vertices.get(i2))
+                    else {
+                        continue;
+                    };
+                    let cross = (p1 - p0).cross(p2 - p0);
+                    if cross.length_squared() >= 1e-10 {
+                        acc[i0] += cross;
+                        acc[i1] += cross;
+                        acc[i2] += cross;
+                    }
+                }
+            }
+            for n in &mut acc {
+                *n = n.normalize_or_zero();
+            }
+            Some(acc)
+        } else {
+            None
+        };
+
         for face in &self.faces {
             if face.vertices.len() < 3 {
                 continue;
@@ -79,28 +120,45 @@ impl LowPolyMesh {
                 let (Some(&p1), Some(&p2)) = (self.vertices.get(i1), self.vertices.get(i2)) else {
                     continue;
                 };
-                let normal = (p1 - p0).cross(p2 - p0).normalize_or_zero();
-                if normal.length_squared() < 1e-8 {
+                let face_normal = (p1 - p0).cross(p2 - p0).normalize_or_zero();
+                if face_normal.length_squared() < 1e-8 {
                     continue;
                 }
-                let n_arr = normal.to_array();
+                let n0 = smooth_normals
+                    .as_ref()
+                    .and_then(|sn| sn.get(i0).copied())
+                    .filter(|n| n.length_squared() > 1e-6)
+                    .unwrap_or(face_normal)
+                    .to_array();
+                let n1 = smooth_normals
+                    .as_ref()
+                    .and_then(|sn| sn.get(i1).copied())
+                    .filter(|n| n.length_squared() > 1e-6)
+                    .unwrap_or(face_normal)
+                    .to_array();
+                let n2 = smooth_normals
+                    .as_ref()
+                    .and_then(|sn| sn.get(i2).copied())
+                    .filter(|n| n.length_squared() > 1e-6)
+                    .unwrap_or(face_normal)
+                    .to_array();
                 let base = out.vertices.len() as u32;
                 out.vertices.push(TriVertex {
                     position: p0.to_array(),
-                    normal: n_arr,
-                    uv: box_atlas_uv(p0, normal, min_b, max_b),
+                    normal: n0,
+                    uv: box_atlas_uv(p0, face_normal, min_b, max_b),
                     palette_index: face.material,
                 });
                 out.vertices.push(TriVertex {
                     position: p1.to_array(),
-                    normal: n_arr,
-                    uv: box_atlas_uv(p1, normal, min_b, max_b),
+                    normal: n1,
+                    uv: box_atlas_uv(p1, face_normal, min_b, max_b),
                     palette_index: face.material,
                 });
                 out.vertices.push(TriVertex {
                     position: p2.to_array(),
-                    normal: n_arr,
-                    uv: box_atlas_uv(p2, normal, min_b, max_b),
+                    normal: n2,
+                    uv: box_atlas_uv(p2, face_normal, min_b, max_b),
                     palette_index: face.material,
                 });
                 out.indices.extend_from_slice(&[base, base + 1, base + 2]);

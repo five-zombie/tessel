@@ -360,6 +360,40 @@ pub fn execute_tool_call(
             )?;
             Ok(json!({ "ok": true, "node_id": node_id.0, "uv": uv }))
         }
+        "mesh_smooth_subdivide" => {
+            let node_id = args
+                .get("node_id")
+                .and_then(Value::as_u64)
+                .map(NodeId)
+                .or_else(|| scene.active_lowpoly_node())
+                .ok_or_else(|| AiError::InvalidArguments("no low-poly mesh found".into()))?;
+            let iterations = args
+                .get("iterations")
+                .and_then(Value::as_u64)
+                .unwrap_or(1)
+                .clamp(1, 3) as usize;
+            let cmds = vec![Command::SmoothSubdivideMesh { node_id }; iterations];
+            history.execute(scene, Command::Transaction(cmds))?;
+            let faces = scene
+                .lowpoly_meshes
+                .get(&node_id)
+                .map_or(0, |m| m.faces.len());
+            Ok(json!({ "ok": true, "node_id": node_id.0, "faces": faces }))
+        }
+        "mesh_set_shading" => {
+            let node_id = args
+                .get("node_id")
+                .and_then(Value::as_u64)
+                .map(NodeId)
+                .or_else(|| scene.active_lowpoly_node())
+                .ok_or_else(|| AiError::InvalidArguments("no low-poly mesh found".into()))?;
+            let smooth = args
+                .get("smooth")
+                .and_then(Value::as_bool)
+                .ok_or_else(|| AiError::InvalidArguments("missing 'smooth'".into()))?;
+            history.execute(scene, Command::SetMeshSmoothShading { node_id, smooth })?;
+            Ok(json!({ "ok": true, "node_id": node_id.0, "smooth": smooth }))
+        }
         "character_apply_biped_rig" => {
             history.execute(scene, Command::ApplyBipedRig)?;
             Ok(json!({ "ok": true, "bones": 7 }))

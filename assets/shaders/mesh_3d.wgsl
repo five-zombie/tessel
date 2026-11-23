@@ -41,9 +41,10 @@ fn vs_main(in: VertexIn) -> VertexOut {
 }
 
 @fragment
-fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
+fn fs_main(in: VertexOut, @builtin(front_facing) front_facing: bool) -> @location(0) vec4<f32> {
     let base_color = textureSample(palette_tex, palette_sampler, in.palette_uv).rgb;
-    let n = normalize(in.normal);
+    let raw_n = normalize(in.normal);
+    let n = select(-raw_n, raw_n, front_facing);
     let key_dir = normalize(camera.light_dir.xyz);
     let fill_dir = normalize(vec3<f32>(-key_dir.x, 0.35, -key_dir.z));
 
