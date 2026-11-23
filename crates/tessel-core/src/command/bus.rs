@@ -103,6 +103,11 @@ pub enum Command {
         face_id: FaceId,
         factor: f32,
     },
+    TranslateMeshFace {
+        node_id: NodeId,
+        face_id: FaceId,
+        delta: glam::Vec3,
+    },
     SmoothSubdivideMesh {
         node_id: NodeId,
     },
@@ -671,6 +676,23 @@ impl Command {
                     .ok_or(CoreError::LowPolyMeshNotFound(*node_id))?
                     .clone();
                 let next = mesh_ops::inset_face(&current, *face_id, *factor)?;
+                scene.lowpoly_meshes.insert(*node_id, next);
+                UndoDelta::RestoreLowPolyMesh {
+                    node_id: *node_id,
+                    previous_mesh: current,
+                }
+            }
+            Self::TranslateMeshFace {
+                node_id,
+                face_id,
+                delta,
+            } => {
+                let current = scene
+                    .lowpoly_meshes
+                    .get(node_id)
+                    .ok_or(CoreError::LowPolyMeshNotFound(*node_id))?
+                    .clone();
+                let next = mesh_ops::translate_face(&current, *face_id, *delta)?;
                 scene.lowpoly_meshes.insert(*node_id, next);
                 UndoDelta::RestoreLowPolyMesh {
                     node_id: *node_id,

@@ -130,7 +130,7 @@ pub fn tool_definitions() -> Vec<Value> {
         }),
         json!({
             "name": "mesh_paint_spot",
-            "description": "Paint a circular spot onto a Low-Poly mesh's auto-UV texture at a 3D surface point+normal (or direct UV).",
+            "description": "Paint a circular spot onto a Low-Poly mesh's auto-UV texture at a 3D surface point+normal (or direct UV), with optional X mirror symmetry.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -139,9 +139,23 @@ pub fn tool_definitions() -> Vec<Value> {
                     "normal": { "type": "array", "items": { "type": "number" }, "minItems": 3, "maxItems": 3 },
                     "uv": { "type": "array", "items": { "type": "number" }, "minItems": 2, "maxItems": 2 },
                     "radius_px": { "type": "number", "minimum": 1.0, "maximum": 96.0 },
-                    "palette_index": { "type": "integer", "minimum": 1, "maximum": 255 }
+                    "palette_index": { "type": "integer", "minimum": 1, "maximum": 255 },
+                    "mirror_x": { "type": "boolean" }
                 },
                 "required": ["palette_index"]
+            }
+        }),
+        json!({
+            "name": "mesh_translate_face",
+            "description": "Translate all vertices of a selected Low-Poly face by a 3D delta [dx, dy, dz].",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "node_id": { "type": "integer" },
+                    "face_id": { "type": "integer", "minimum": 0 },
+                    "delta": { "type": "array", "items": { "type": "number" }, "minItems": 3, "maxItems": 3 }
+                },
+                "required": ["face_id", "delta"]
             }
         }),
         json!({

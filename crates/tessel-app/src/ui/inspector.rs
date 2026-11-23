@@ -715,6 +715,37 @@ fn show_transform_and_lighting_section(
                         },
                     );
                 }
+                if let Some(face_id) = scene.selected_face {
+                    ui.add_space(6.0);
+                    ui.label(
+                        RichText::new(format!("Move Face #{}", face_id.0))
+                            .strong()
+                            .size(11.5)
+                            .color(tokens::ON_SURFACE),
+                    );
+                    let step = 0.05;
+                    ui.horizontal(|ui| {
+                        for (lbl, d) in [
+                            ("-X", glam::Vec3::new(-step, 0.0, 0.0)),
+                            ("+X", glam::Vec3::new(step, 0.0, 0.0)),
+                            ("-Y", glam::Vec3::new(0.0, -step, 0.0)),
+                            ("+Y", glam::Vec3::new(0.0, step, 0.0)),
+                            ("-Z", glam::Vec3::new(0.0, 0.0, -step)),
+                            ("+Z", glam::Vec3::new(0.0, 0.0, step)),
+                        ] {
+                            if ui.small_button(lbl).clicked() {
+                                let _ = history.execute(
+                                    scene,
+                                    Command::TranslateMeshFace {
+                                        node_id,
+                                        face_id,
+                                        delta: d,
+                                    },
+                                );
+                            }
+                        }
+                    });
+                }
                 ui.add_space(6.0);
             }
         }

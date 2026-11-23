@@ -37,6 +37,8 @@ pub struct SceneState {
     pub voxel_symmetry: Symmetry3D,
     #[serde(default)]
     pub lowpoly_paint_mode: bool,
+    #[serde(default)]
+    pub lowpoly_mirror_x: bool,
     #[serde(default = "default_lowpoly_brush_radius")]
     pub lowpoly_brush_radius: f32,
     pub nodes: BTreeMap<NodeId, SceneNode>,
@@ -85,6 +87,7 @@ impl SceneState {
             voxel_tool: VoxelTool::Place,
             voxel_symmetry: Symmetry3D::default(),
             lowpoly_paint_mode: false,
+            lowpoly_mirror_x: false,
             lowpoly_brush_radius: default_lowpoly_brush_radius(),
             nodes: BTreeMap::new(),
             pixel_canvases: BTreeMap::new(),

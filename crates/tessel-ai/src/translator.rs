@@ -356,6 +356,11 @@ pub fn execute_tool_call(
                 .get("radius_px")
                 .and_then(Value::as_f64)
                 .unwrap_or(10.0) as f32;
+            let mirror_x = args
+                .get("mirror_x")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            let mut mirror_uv: Option<[f32; 2]> = None;
             let uv = if let Some(uv_arr) = args.get("uv").and_then(Value::as_array) {
                 if uv_arr.len() != 2 {
                     return Err(AiError::InvalidArguments("'uv' must have 2 numbers".into()));
@@ -393,18 +398,82 @@ pub fn execute_tool_call(
                     .get(&node_id)
                     .map(|m| m.bounds())
                     .ok_or_else(|| AiError::InvalidArguments("low-poly mesh not found".into()))?;
+                if mirror_x {
+                    mirror_uv = Some(tessel_core::box_atlas_uv(
+                        glam::Vec3::new(-point.x, point.y, point.z),
+                        glam::Vec3::new(-normal.x, normal.y, normal.z),
+                        min_b,
+                        max_b,
+                    ));
+                }
                 tessel_core::box_atlas_uv(point, normal, min_b, max_b)
             };
+            if let Some(muv) = mirror_uv {
+                history.execute(
+                    scene,
+                    Command::Transaction(vec![
+                        Command::PaintMeshTexture {
+                            node_id,
+                            uv,
+                            radius_px,
+                            color,
+                        },
+                        Command::PaintMeshTexture {
+                            node_id,
+                            uv: muv,
+                            radius_px,
+                            color,
+                        },
+                    ]),
+                )?;
+            } else {
+                history.execute(
+                    scene,
+                    Command::PaintMeshTexture {
+                        node_id,
+                        uv,
+                        radius_px,
+                        color,
+                    },
+                )?;
+            }
+            Ok(json!({ "ok": true, "node_id": node_id.0, "uv": uv, "mirror_x": mirror_x }))
+        }
+        "mesh_translate_face" => {
+            let node_id = args
+                .get("node_id")
+                .and_then(Value::as_u64)
+                .map(NodeId)
+                .or_else(|| scene.active_lowpoly_node())
+                .ok_or_else(|| AiError::InvalidArguments("no low-poly mesh found".into()))?;
+            let face_idx = args
+                .get("face_id")
+                .and_then(Value::as_u64)
+                .ok_or_else(|| AiError::InvalidArguments("missing 'face_id'".into()))?
+                as usize;
+            let d_arr = args
+                .get("delta")
+                .and_then(Value::as_array)
+                .ok_or_else(|| AiError::InvalidArguments("missing 'delta'".into()))?;
+            if d_arr.len() != 3 {
+                return Err(AiError::InvalidArguments(
+                    "'delta' must have 3 numbers".into(),
+                ));
+            }
+            let delta = glam::Vec3::new(
+                d_arr[0].as_f64().unwrap_or(0.0) as f32,
+                d_arr[1].as_f64().unwrap_or(0.0) as f32,
+                d_arr[2].as_f64().unwrap_or(0.0) as f32,
+            );
             history.execute(
                 scene,
-                Command::PaintMeshTexture {
+                Command::TranslateMeshFace {
                     node_id,
-                    uv,
-                    radius_px,
-                    color,
+                    face_id: tessel_core::FaceId(face_idx),
+                    delta,
                 },
             )?;
-            Ok(json!({ "ok": true, "node_id": node_id.0, "uv": uv }))
+            Ok(json!({ "ok": true, "node_id": node_id.0, "face_id": face_idx }))
         }
         "mesh_smooth_subdivide" => {
             let node_id = args

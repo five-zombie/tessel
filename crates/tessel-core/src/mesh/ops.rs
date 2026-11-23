@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use glam::Vec3;
 
@@ -131,6 +131,28 @@ fn create_cone(segments: usize, radius: f32, height: f32, material: PaletteIndex
         smooth_shading: false,
         material: Default::default(),
     }
+}
+
+/// Translates all unique vertices belonging to `face_id` by `delta`.
+pub fn translate_face(
+    mesh: &LowPolyMesh,
+    face_id: FaceId,
+    delta: Vec3,
+) -> Result<LowPolyMesh, CoreError> {
+    if !delta.is_finite() {
+        return Err(CoreError::OutOfBounds);
+    }
+    let face = mesh.faces.get(face_id.0).ok_or(CoreError::OutOfBounds)?;
+    if face.vertices.is_empty() {
+        return Err(CoreError::OutOfBounds);
+    }
+    let mut next = mesh.clone();
+    let unique_verts: BTreeSet<usize> = face.vertices.iter().copied().collect();
+    for vi in unique_verts {
+        let v = next.vertices.get_mut(vi).ok_or(CoreError::OutOfBounds)?;
+        *v += delta;
+    }
+    Ok(next)
 }
 
 /// Extrudes `face_id` along its face normal by `distance`.
@@ -532,5 +554,15 @@ mod tests {
         // Flat normal is axis-aligned [0, 0, 1]; smooth corner normal averages all 3 adjacent faces.
         assert!((flat_n[0]).abs() < 1e-4 && (flat_n[1]).abs() < 1e-4);
         assert!(smooth_n[0].abs() > 0.3 && smooth_n[1].abs() > 0.3 && smooth_n[2].abs() > 0.3);
+    }
+
+    #[test]
+    fn translate_face_moves_selected_face_vertices() {
+        let mat = PaletteIndex::new(4).unwrap();
+        let cube = create_primitive(PrimitiveKind::Cube, 1.0, mat);
+        let before_z = cube.vertices[cube.faces[0].vertices[0]].z;
+        let moved = translate_face(&cube, FaceId(0), Vec3::new(0.0, 0.0, 0.5)).unwrap();
+        let after_z = moved.vertices[moved.faces[0].vertices[0]].z;
+        assert!((after_z - before_z - 0.5).abs() < 1e-5);
     }
 }

@@ -164,6 +164,7 @@ pub fn show_toolbar(ctx: &egui::Context, scene: &mut SceneState, history: &mut H
                                     egui::Slider::new(&mut scene.lowpoly_brush_radius, 2.0..=40.0)
                                         .show_value(false),
                                 );
+                                toggle_chip(ui, "Mir X", &mut scene.lowpoly_mirror_x);
                                 if action_button(ui, "Fill Tex") {
                                     let color = scene
                                         .palette

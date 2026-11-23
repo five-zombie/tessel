@@ -129,15 +129,51 @@ pub fn show_viewport(
                                                 .get(scene.active_color)
                                                 .map(|e| e.color)
                                                 .unwrap_or(tessel_core::Rgba8::rgb(225, 226, 235));
-                                            let _ = history.execute(
-                                                scene,
-                                                Command::PaintMeshTexture {
+                                            if scene.lowpoly_mirror_x {
+                                                let mirror_uv = scene
+                                                    .lowpoly_meshes
+                                                    .get(&node_id)
+                                                    .map(|mesh| {
+                                                        let (min_b, max_b) = mesh.bounds();
+                                                        let mp = glam::Vec3::new(
+                                                            -h.point.x, h.point.y, h.point.z,
+                                                        );
+                                                        let mn = glam::Vec3::new(
+                                                            -h.normal.x,
+                                                            h.normal.y,
+                                                            h.normal.z,
+                                                        );
+                                                        tessel_core::box_atlas_uv(
+                                                            mp, mn, min_b, max_b,
+                                                        )
+                                                    });
+                                                let mut cmds = vec![Command::PaintMeshTexture {
                                                     node_id,
                                                     uv: h.uv,
                                                     radius_px: scene.lowpoly_brush_radius,
                                                     color,
-                                                },
-                                            );
+                                                }];
+                                                if let Some(muv) = mirror_uv {
+                                                    cmds.push(Command::PaintMeshTexture {
+                                                        node_id,
+                                                        uv: muv,
+                                                        radius_px: scene.lowpoly_brush_radius,
+                                                        color,
+                                                    });
+                                                }
+                                                let _ = history
+                                                    .execute(scene, Command::Transaction(cmds));
+                                            } else {
+                                                let _ = history.execute(
+                                                    scene,
+                                                    Command::PaintMeshTexture {
+                                                        node_id,
+                                                        uv: h.uv,
+                                                        radius_px: scene.lowpoly_brush_radius,
+                                                        color,
+                                                    },
+                                                );
+                                            }
                                         } else {
                                             scene.selected_face = Some(h.face_id);
                                             scene.mark_modified();
