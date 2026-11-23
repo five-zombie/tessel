@@ -105,6 +105,18 @@ pub fn tool_definitions() -> Vec<Value> {
             }
         }),
         json!({
+            "name": "mesh_load_texture",
+            "description": "Load a custom .png or .jpg/.jpeg image texture (e.g. wood bark, fur, fabric from Blender/Poly Haven) from the allowed export/workspace directory onto a Low-Poly mesh.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "node_id": { "type": "integer" },
+                    "filename": { "type": "string" }
+                },
+                "required": ["filename"]
+            }
+        }),
+        json!({
             "name": "mesh_paint_spot",
             "description": "Paint a circular spot onto a Low-Poly mesh's auto-UV texture at a 3D surface point+normal (or direct UV).",
             "inputSchema": {

@@ -7,8 +7,8 @@ use tessel_core::{
     SceneState, VoxelCoord,
 };
 use tessel_io::{
-    export_scene_to_dir, import_mesh_from_path, resolve_safe_export_path, ExportFormat,
-    ExportPreset,
+    export_scene_to_dir, import_mesh_from_path, import_mesh_texture_from_path,
+    resolve_safe_export_path, ExportFormat, ExportPreset,
 };
 
 use crate::error::AiError;
@@ -292,6 +292,29 @@ pub fn execute_tool_call(
                 .ok_or_else(|| AiError::InvalidArguments("palette index not defined".into()))?;
             history.execute(scene, Command::FillMeshTexture { node_id, color })?;
             Ok(json!({ "ok": true, "node_id": node_id.0 }))
+        }
+        "mesh_load_texture" => {
+            let node_id = args
+                .get("node_id")
+                .and_then(Value::as_u64)
+                .map(NodeId)
+                .or_else(|| scene.active_lowpoly_node())
+                .ok_or_else(|| AiError::InvalidArguments("no low-poly mesh found".into()))?;
+            let filename = args
+                .get("filename")
+                .and_then(Value::as_str)
+                .ok_or_else(|| AiError::InvalidArguments("missing 'filename'".into()))?;
+            let target = resolve_safe_export_path(allowed_export_dir, filename)?;
+            let tex = import_mesh_texture_from_path(&target)?;
+            let (w, h) = (tex.width, tex.height);
+            history.execute(
+                scene,
+                Command::SetMeshTexture {
+                    node_id,
+                    texture: Some(tex),
+                },
+            )?;
+            Ok(json!({ "ok": true, "node_id": node_id.0, "width": w, "height": h }))
         }
         "mesh_paint_spot" => {
             let node_id = args

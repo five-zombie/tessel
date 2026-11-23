@@ -119,6 +119,10 @@ pub enum Command {
         node_id: NodeId,
         color: Rgba8,
     },
+    SetMeshTexture {
+        node_id: NodeId,
+        texture: Option<MeshTexture>,
+    },
     ApplyBipedRig,
     SetBoneRotation {
         bone_id: BoneId,
@@ -725,6 +729,31 @@ impl Command {
                         ));
                     }
                 }
+                UndoDelta::RestoreMeshTextureFull {
+                    node_id: *node_id,
+                    previous,
+                }
+            }
+            Self::SetMeshTexture { node_id, texture } => {
+                if let Some(tex) = texture {
+                    let expected = (tex.width as usize)
+                        .checked_mul(tex.height as usize)
+                        .and_then(|px| px.checked_mul(4));
+                    if tex.width == 0
+                        || tex.height == 0
+                        || tex.width > 1024
+                        || tex.height > 1024
+                        || expected != Some(tex.rgba.len())
+                    {
+                        return Err(CoreError::OutOfBounds);
+                    }
+                }
+                let mesh = scene
+                    .lowpoly_meshes
+                    .get_mut(node_id)
+                    .ok_or(CoreError::LowPolyMeshNotFound(*node_id))?;
+                let previous = mesh.texture.clone();
+                mesh.texture = texture.clone();
                 UndoDelta::RestoreMeshTextureFull {
                     node_id: *node_id,
                     previous,

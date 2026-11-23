@@ -12,6 +12,16 @@ use crate::translator::{execute_tool_call, palette_summary_json, scene_summary_j
 
 pub use http::{LiveMcpRequest, LiveMcpServerHandle};
 
+const MCP_SERVER_INSTRUCTIONS: &str = "\
+Tessel is a 3D & 2D asset creation studio (Pixel, Voxel, Low-Poly, Character) using a Right-Handed +Y Up, +Z Front coordinate system (1 voxel = 0.1m).
+Recommended workflow:
+1. Inspect `tessel://scene/summary` and `tessel://palette/current` before editing so you know existing node IDs and palette indices (1..=255).
+2. Remove unwanted starter nodes (such as 'Starter Voxel') with `scene_delete_node` before sculpting a new asset.
+3. Voxel mode: use `voxel_fill_box` and `voxel_fill_ellipsoid` (bounds ±256), then optionally `voxel_convert_to_lowpoly`.
+4. Low-Poly mode: create primitives (`mesh_create_primitive`) or import `.obj`/`.glb` (`mesh_import`). To apply custom `.png`/`.jpg` textures (wood, fur, fabric), call `mesh_load_texture`. To paint patterns/spots, call `mesh_fill_texture` then `mesh_paint_spot` with 3D `point` + `normal` (or `uv`) and `radius_px`. To round sharp corners, call `mesh_smooth_subdivide` (1-3 iterations) and `mesh_set_shading` (`smooth: true`).
+5. Character mode: call `character_apply_biped_rig`, pose bones with `character_set_bone_pose`, and author custom animations with `character_set_keyframe`.
+6. Read `tessel://viewport/preview` (when GUI is running) to visually inspect results, use `history_undo`/`history_redo` if needed, and export via `project_export` (`.glb`, `.obj`, `.stl`, `.vox`, `.png`, `.gif`).";
+
 /// Processes a single JSON-RPC 2.0 MCP request directly against any live `SceneState` & `HistoryStack`.
 pub fn dispatch_mcp_message(
     request: &Value,
@@ -49,7 +59,8 @@ pub fn dispatch_mcp_message_with_preview(
             "serverInfo": {
                 "name": "tessel-mcp",
                 "version": env!("CARGO_PKG_VERSION")
-            }
+            },
+            "instructions": MCP_SERVER_INSTRUCTIONS
         })),
         "tools/list" => Ok(json!({
             "tools": tool_definitions()
@@ -143,6 +154,13 @@ pub fn dispatch_mcp_message_with_preview(
                     "name": "inspect-and-refine",
                     "description": "Skill: Inspect active scene summary, palette, and viewport PNG before refining.",
                     "arguments": []
+                },
+                {
+                    "name": "paint-and-smooth-lowpoly",
+                    "description": "Skill: Paint custom patterns/spots onto a Low-Poly mesh via auto-UV texture painting, apply smooth subdivision + Shade Smooth, and export .glb.",
+                    "arguments": [
+                        { "name": "pattern_description", "description": "Desired surface pattern or colors", "required": false }
+                    ]
                 }
             ]
         })),
@@ -205,6 +223,29 @@ pub fn dispatch_mcp_message_with_preview(
                         }
                     }]
                 })),
+                "paint-and-smooth-lowpoly" => {
+                    let pattern = args
+                        .get("pattern_description")
+                        .and_then(Value::as_str)
+                        .unwrap_or("custom painted surface pattern");
+                    Ok(json!({
+                        "description": "Tessel Low-Poly 3D Texture Painting & Smoothing Skill",
+                        "messages": [{
+                            "role": "user",
+                            "content": {
+                                "type": "text",
+                                "text": format!(
+                                    "Paint and smooth the active Low-Poly mesh with '{pattern}':\n\
+                                     1. Read `tessel://scene/summary` and `tessel://palette/current` to get the target `node_id` and palette indices.\n\
+                                     2. Call `mesh_fill_texture` to apply the base coat color.\n\
+                                     3. Call `mesh_paint_spot` with 3D `point` + outward `normal` and `radius_px` to paint markings, stripes, or circular spots.\n\
+                                     4. Call `mesh_smooth_subdivide` (1-2 iterations) and `mesh_set_shading` (`smooth: true`) to round sharp corners.\n\
+                                     5. Call `project_export` with `format: \"glb\"` to embed the painted PNG texture."
+                                )
+                            }
+                        }]
+                    }))
+                }
                 other => Err((-32602, format!("unknown prompt '{other}'"))),
             }
         }
@@ -417,8 +458,19 @@ mod tests {
                 "method": "prompts/list"
             }))
             .unwrap();
+        let init = server
+            .handle_message(&json!({
+                "jsonrpc": "2.0",
+                "id": 9,
+                "method": "initialize"
+            }))
+            .unwrap();
+        let instructions = init["result"]["instructions"].as_str().unwrap();
+        assert!(instructions.contains("mesh_paint_spot"));
+        assert!(instructions.contains("mesh_smooth_subdivide"));
+
         let prompts = list["result"]["prompts"].as_array().unwrap();
-        assert_eq!(prompts.len(), 3);
+        assert_eq!(prompts.len(), 4);
 
         let get = server
             .handle_message(&json!({

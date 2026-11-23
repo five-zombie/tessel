@@ -3,7 +3,7 @@ use std::fs;
 use std::path::Path;
 
 use glam::Vec3;
-use tessel_core::{Face, LowPolyMesh, PaletteIndex, SceneState};
+use tessel_core::{Face, LowPolyMesh, MeshTexture, PaletteIndex, SceneState};
 
 use crate::error::IoError;
 use crate::gltf::CollectedMesh;
@@ -230,6 +230,25 @@ pub fn import_mesh_from_path(
     Ok((name, mesh))
 }
 
+/// Loads a custom `.png` or `.jpg`/`.jpeg` texture image (e.g. from Blender, Poly Haven, AmbientCG)
+/// into a `MeshTexture`, downscaling safely if larger than 1024x1024.
+pub fn import_mesh_texture_from_path(path: &Path) -> Result<MeshTexture, IoError> {
+    let mut img = image::open(path)?;
+    if img.width() > 1024 || img.height() > 1024 {
+        img = img.thumbnail(1024, 1024);
+    }
+    let rgba = img.to_rgba8();
+    let (width, height) = rgba.dimensions();
+    if width == 0 || height == 0 {
+        return Err(IoError::InvalidDimensions(width, height));
+    }
+    Ok(MeshTexture {
+        width,
+        height,
+        rgba: rgba.into_raw(),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -278,5 +297,22 @@ mod tests {
         let (glb, _) = export_glb_bytes(&scene, ExportPreset::Godot4).unwrap();
         let imported_glb = import_glb_bytes(&glb, mat).unwrap();
         assert_eq!(imported_glb.faces.len(), 12);
+    }
+
+    #[test]
+    fn custom_png_texture_import_loads_rgba_dimensions() {
+        let dir = std::env::temp_dir().join("tessel_custom_tex_test");
+        let _ = fs::create_dir_all(&dir);
+        let path = dir.join("bark.png");
+        let img = image::RgbaImage::from_pixel(32, 16, image::Rgba([120, 80, 45, 255]));
+        img.save(&path).unwrap();
+
+        let tex = import_mesh_texture_from_path(&path).unwrap();
+        assert_eq!(tex.width, 32);
+        assert_eq!(tex.height, 16);
+        assert_eq!(tex.rgba.len(), 32 * 16 * 4);
+        assert_eq!(&tex.rgba[0..4], &[120, 80, 45, 255]);
+
+        let _ = fs::remove_dir_all(&dir);
     }
 }

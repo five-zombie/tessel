@@ -108,6 +108,30 @@ pub fn show_toolbar(ctx: &egui::Context, scene: &mut SceneState, history: &mut H
                             if tool_button(ui, "Paint", scene.lowpoly_paint_mode) {
                                 scene.lowpoly_paint_mode = !scene.lowpoly_paint_mode;
                             }
+                            if action_button(ui, "Load Tex") {
+                                if let Some(path) = rfd::FileDialog::new()
+                                    .add_filter(
+                                        "Texture Image (.png, .jpg)",
+                                        &["png", "jpg", "jpeg"],
+                                    )
+                                    .pick_file()
+                                {
+                                    match tessel_io::import_mesh_texture_from_path(&path) {
+                                        Ok(tex) => {
+                                            let _ = history.execute(
+                                                scene,
+                                                Command::SetMeshTexture {
+                                                    node_id,
+                                                    texture: Some(tex),
+                                                },
+                                            );
+                                        }
+                                        Err(err) => {
+                                            tracing::error!("Load custom texture failed: {err}");
+                                        }
+                                    }
+                                }
+                            }
                             if scene.lowpoly_paint_mode {
                                 ui.label(
                                     RichText::new(format!("R: {:.0}", scene.lowpoly_brush_radius))
