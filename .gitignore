@@ -1,0 +1,4 @@
+.knowledges/
+knl-config.json
+/target/
+*.tessel.tmp
