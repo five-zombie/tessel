@@ -213,6 +213,15 @@ pub fn show_toolbar(ctx: &egui::Context, scene: &mut SceneState, history: &mut H
                                 let _ = history
                                     .execute(scene, Command::SmoothSubdivideMesh { node_id });
                             }
+                            if action_button(ui, "Decimate") {
+                                let _ = history.execute(
+                                    scene,
+                                    Command::DecimateMesh {
+                                        node_id,
+                                        ratio: 0.5,
+                                    },
+                                );
+                            }
                             let is_smooth = scene
                                 .lowpoly_meshes
                                 .get(&node_id)

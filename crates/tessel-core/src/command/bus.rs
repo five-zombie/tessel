@@ -1,7 +1,7 @@
 use glam::Quat;
 use serde::{Deserialize, Serialize};
 
-use crate::character::{AnimationClip, BoneId, CharacterRig, Keyframe, SkinBinding};
+use crate::character::{AnimationClip, Bone, BoneId, CharacterRig, Keyframe, SkinBinding};
 use crate::error::CoreError;
 use crate::mesh::{
     ops as mesh_ops, FaceId, LowPolyMesh, MeshMaterial, MeshTexture, PrimitiveKind,
@@ -31,6 +31,14 @@ pub enum Command {
     SetNodeTransform {
         node_id: NodeId,
         transform: Transform,
+    },
+    SetNodeParent {
+        node_id: NodeId,
+        parent: Option<NodeId>,
+    },
+    SetLightDirection {
+        azimuth: f32,
+        elevation: f32,
     },
     SetPaletteEntry {
         index: PaletteIndex,
@@ -85,6 +93,13 @@ pub enum Command {
         size: f32,
         material: PaletteIndex,
     },
+    CreateCurveTubeMesh {
+        name: String,
+        points: Vec<glam::Vec3>,
+        radius: f32,
+        flatness: f32,
+        material: PaletteIndex,
+    },
     ImportLowPolyMesh {
         name: String,
         mesh: LowPolyMesh,
@@ -115,6 +130,10 @@ pub enum Command {
         node_id: NodeId,
         amount: f32,
     },
+    DecimateMesh {
+        node_id: NodeId,
+        ratio: f32,
+    },
     SetMeshSmoothShading {
         node_id: NodeId,
         smooth: bool,
@@ -142,6 +161,11 @@ pub enum Command {
         normal_map: Option<MeshTexture>,
     },
     ApplyBipedRig,
+    AddBone {
+        name: String,
+        parent: Option<BoneId>,
+        position: glam::Vec3,
+    },
     SetBoneRotation {
         bone_id: BoneId,
         rotation: Quat,
@@ -186,6 +210,14 @@ pub enum UndoDelta {
     RestoreNodeTransform {
         node_id: NodeId,
         previous: Transform,
+    },
+    RestoreNodeParent {
+        node_id: NodeId,
+        previous: Option<NodeId>,
+    },
+    RestoreLightDirection {
+        azimuth: f32,
+        elevation: f32,
     },
     RestorePaletteEntry {
         index: PaletteIndex,
@@ -288,6 +320,7 @@ impl Command {
                         name: name.clone(),
                         kind: *kind,
                         visible: true,
+                        parent: None,
                         transform: *transform,
                     },
                 );
@@ -318,6 +351,7 @@ impl Command {
                         name: name.clone(),
                         kind: NodeKind::PixelCanvas,
                         visible: true,
+                        parent: None,
                         transform: Transform::default(),
                     },
                 );
@@ -365,6 +399,49 @@ impl Command {
                 UndoDelta::RestoreNodeTransform {
                     node_id: *node_id,
                     previous,
+                }
+            }
+            Self::SetNodeParent { node_id, parent } => {
+                if !scene.nodes.contains_key(node_id) {
+                    return Err(CoreError::NodeNotFound(*node_id));
+                }
+                if let Some(pid) = parent {
+                    if *pid == *node_id || !scene.nodes.contains_key(pid) {
+                        return Err(CoreError::OutOfBounds);
+                    }
+                    // Prevent cycle: walk ancestors of pid
+                    let mut curr = Some(*pid);
+                    let mut hops = 0usize;
+                    while let Some(anc) = curr {
+                        if anc == *node_id || hops >= 16 {
+                            return Err(CoreError::OutOfBounds);
+                        }
+                        curr = scene.nodes.get(&anc).and_then(|n| n.parent);
+                        hops += 1;
+                    }
+                }
+                let node = scene
+                    .nodes
+                    .get_mut(node_id)
+                    .ok_or(CoreError::NodeNotFound(*node_id))?;
+                let previous = node.parent;
+                node.parent = *parent;
+                UndoDelta::RestoreNodeParent {
+                    node_id: *node_id,
+                    previous,
+                }
+            }
+            Self::SetLightDirection { azimuth, elevation } => {
+                if !azimuth.is_finite() || !elevation.is_finite() {
+                    return Err(CoreError::OutOfBounds);
+                }
+                let prev_az = scene.light_azimuth;
+                let prev_el = scene.light_elevation;
+                scene.light_azimuth = *azimuth;
+                scene.light_elevation = elevation.clamp(0.05, 1.52);
+                UndoDelta::RestoreLightDirection {
+                    azimuth: prev_az,
+                    elevation: prev_el,
                 }
             }
             Self::SetPaletteEntry { index, entry } => {
@@ -496,6 +573,7 @@ impl Command {
                         name: name.clone(),
                         kind: NodeKind::VoxelVolume,
                         visible: true,
+                        parent: None,
                         transform: Transform::default(),
                     },
                 );
@@ -568,6 +646,7 @@ impl Command {
                         name: name.clone(),
                         kind: NodeKind::VoxelVolume,
                         visible: true,
+                        parent: None,
                         transform: Transform::default(),
                     },
                 );
@@ -594,6 +673,35 @@ impl Command {
                         name: name.clone(),
                         kind: NodeKind::LowPolyMesh,
                         visible: true,
+                        parent: None,
+                        transform: Transform::default(),
+                    },
+                );
+                scene.lowpoly_meshes.insert(id, mesh);
+                scene.selected_node = Some(id);
+                UndoDelta::RemoveNode {
+                    id,
+                    previous_selection,
+                }
+            }
+            Self::CreateCurveTubeMesh {
+                name,
+                points,
+                radius,
+                flatness,
+                material,
+            } => {
+                let mesh = mesh_ops::create_curve_tube(points, *radius, *flatness, *material)?;
+                let id = scene.allocate_node_id();
+                let previous_selection = scene.selected_node;
+                scene.nodes.insert(
+                    id,
+                    SceneNode {
+                        id,
+                        name: name.clone(),
+                        kind: NodeKind::LowPolyMesh,
+                        visible: true,
+                        parent: None,
                         transform: Transform::default(),
                     },
                 );
@@ -614,6 +722,7 @@ impl Command {
                         name: name.clone(),
                         kind: NodeKind::LowPolyMesh,
                         visible: true,
+                        parent: None,
                         transform: Transform::default(),
                     },
                 );
@@ -642,6 +751,7 @@ impl Command {
                         name: name.clone(),
                         kind: NodeKind::LowPolyMesh,
                         visible: true,
+                        parent: None,
                         transform: Transform::default(),
                     },
                 );
@@ -723,6 +833,19 @@ impl Command {
                     .ok_or(CoreError::LowPolyMeshNotFound(*node_id))?
                     .clone();
                 let next = mesh_ops::bevel_mesh(&current, *amount)?;
+                scene.lowpoly_meshes.insert(*node_id, next);
+                UndoDelta::RestoreLowPolyMesh {
+                    node_id: *node_id,
+                    previous_mesh: current,
+                }
+            }
+            Self::DecimateMesh { node_id, ratio } => {
+                let current = scene
+                    .lowpoly_meshes
+                    .get(node_id)
+                    .ok_or(CoreError::LowPolyMeshNotFound(*node_id))?
+                    .clone();
+                let next = mesh_ops::decimate_mesh(&current, *ratio)?;
                 scene.lowpoly_meshes.insert(*node_id, next);
                 UndoDelta::RestoreLowPolyMesh {
                     node_id: *node_id,
@@ -872,6 +995,42 @@ impl Command {
             }
             Self::ApplyBipedRig => {
                 let prev = scene.character_rig.replace(CharacterRig::biped_template());
+                UndoDelta::RestoreCharacterRig(prev)
+            }
+            Self::AddBone {
+                name,
+                parent,
+                position,
+            } => {
+                if !position.is_finite() {
+                    return Err(CoreError::OutOfBounds);
+                }
+                let prev = scene.character_rig.clone();
+                let rig = scene
+                    .character_rig
+                    .get_or_insert_with(CharacterRig::default);
+                if let Some(pid) = parent {
+                    if rig.bone(*pid).is_none() {
+                        scene.character_rig = prev;
+                        return Err(CoreError::OutOfBounds);
+                    }
+                }
+                let next_id = rig
+                    .bones
+                    .iter()
+                    .map(|b| b.id.0.saturating_add(1))
+                    .max()
+                    .unwrap_or(0);
+                rig.bones.push(Bone::new(
+                    BoneId(next_id),
+                    name.clone(),
+                    *parent,
+                    Transform {
+                        translation: *position,
+                        rotation: Quat::IDENTITY,
+                        scale: glam::Vec3::ONE,
+                    },
+                ));
                 UndoDelta::RestoreCharacterRig(prev)
             }
             Self::SetBoneRotation { bone_id, rotation } => {
@@ -1053,6 +1212,17 @@ impl UndoDelta {
                     .get_mut(node_id)
                     .ok_or(CoreError::NodeNotFound(*node_id))?;
                 node.transform = *previous;
+            }
+            Self::RestoreNodeParent { node_id, previous } => {
+                let node = scene
+                    .nodes
+                    .get_mut(node_id)
+                    .ok_or(CoreError::NodeNotFound(*node_id))?;
+                node.parent = *previous;
+            }
+            Self::RestoreLightDirection { azimuth, elevation } => {
+                scene.light_azimuth = *azimuth;
+                scene.light_elevation = *elevation;
             }
             Self::RestorePaletteEntry { index, previous } => match previous {
                 Some(entry) => {

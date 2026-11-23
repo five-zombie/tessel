@@ -17,6 +17,8 @@ pub struct SceneNode {
     pub name: String,
     pub kind: NodeKind,
     pub visible: bool,
+    #[serde(default)]
+    pub parent: Option<NodeId>,
     pub transform: Transform,
 }
 
@@ -146,6 +148,33 @@ impl SceneState {
             }
         }
         self.lowpoly_meshes.keys().next().copied()
+    }
+
+    /// Computes the world-space transform matrix for `id` by walking its `parent` hierarchy.
+    pub fn node_world_matrix(&self, id: NodeId) -> glam::Mat4 {
+        let mut chain = Vec::new();
+        let mut curr = Some(id);
+        while let Some(nid) = curr {
+            if chain.len() >= 16 || chain.contains(&nid) {
+                break;
+            }
+            let Some(node) = self.nodes.get(&nid) else {
+                break;
+            };
+            chain.push(nid);
+            curr = node.parent;
+        }
+        let mut mat = glam::Mat4::IDENTITY;
+        for nid in chain.into_iter().rev() {
+            if let Some(node) = self.nodes.get(&nid) {
+                mat *= glam::Mat4::from_scale_rotation_translation(
+                    node.transform.scale,
+                    node.transform.rotation,
+                    node.transform.translation,
+                );
+            }
+        }
+        mat
     }
 }
 

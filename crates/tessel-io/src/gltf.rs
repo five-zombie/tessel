@@ -11,17 +11,7 @@ use crate::error::IoError;
 use crate::ExportPreset;
 
 fn node_world_matrices(scene: &SceneState, node_id: tessel_core::NodeId) -> (Mat4, Mat4) {
-    let mat = scene
-        .nodes
-        .get(&node_id)
-        .map(|n| {
-            Mat4::from_scale_rotation_translation(
-                n.transform.scale,
-                n.transform.rotation,
-                n.transform.translation,
-            )
-        })
-        .unwrap_or(Mat4::IDENTITY);
+    let mat = scene.node_world_matrix(node_id);
     let normal_mat = if mat.determinant().abs() > 1e-8 {
         mat.inverse().transpose()
     } else {

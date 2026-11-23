@@ -135,23 +135,11 @@ impl ViewportRenderer {
         let mut vertices = Vec::new();
         let mut indices = Vec::new();
         for (node_id, vol) in &scene.voxel_volumes {
-            let (visible, node_mat) = scene
-                .nodes
-                .get(node_id)
-                .map(|n| {
-                    (
-                        n.visible,
-                        glam::Mat4::from_scale_rotation_translation(
-                            n.transform.scale,
-                            n.transform.rotation,
-                            n.transform.translation,
-                        ),
-                    )
-                })
-                .unwrap_or((true, glam::Mat4::IDENTITY));
+            let visible = scene.nodes.get(node_id).map(|n| n.visible).unwrap_or(true);
             if !visible || vol.is_empty() {
                 continue;
             }
+            let node_mat = scene.node_world_matrix(*node_id);
             let bound_mat = scene
                 .character_rig
                 .as_ref()
@@ -186,23 +174,11 @@ impl ViewportRenderer {
 
         let mut custom_items = Vec::new();
         for (node_id, mesh) in &scene.lowpoly_meshes {
-            let (visible, node_mat) = scene
-                .nodes
-                .get(node_id)
-                .map(|n| {
-                    (
-                        n.visible,
-                        glam::Mat4::from_scale_rotation_translation(
-                            n.transform.scale,
-                            n.transform.rotation,
-                            n.transform.translation,
-                        ),
-                    )
-                })
-                .unwrap_or((true, glam::Mat4::IDENTITY));
+            let visible = scene.nodes.get(node_id).map(|n| n.visible).unwrap_or(true);
             if !visible || mesh.faces.is_empty() {
                 continue;
             }
+            let node_mat = scene.node_world_matrix(*node_id);
             let bound_mat = scene
                 .character_rig
                 .as_ref()

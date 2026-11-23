@@ -303,6 +303,172 @@ fn create_capsule(
     }
 }
 
+/// Generates a curved strap, belt, pipe, or cable mesh along 3D control `points`.
+/// `flatness` in `0.1..=1.0` controls elliptical thickness (`1.0` = round tube, `0.25` = flat strap).
+pub fn create_curve_tube(
+    points: &[Vec3],
+    radius: f32,
+    flatness: f32,
+    material: PaletteIndex,
+) -> Result<LowPolyMesh, CoreError> {
+    if points.len() < 2
+        || points.len() > 128
+        || !radius.is_finite()
+        || radius <= 0.001
+        || !flatness.is_finite()
+        || points.iter().any(|p| !p.is_finite())
+    {
+        return Err(CoreError::OutOfBounds);
+    }
+
+    // Apply 1 pass of Chaikin smoothing when >= 3 control points so straps curve naturally
+    let path: Vec<Vec3> = if points.len() >= 3 {
+        let mut smooth = Vec::with_capacity(points.len() * 2);
+        smooth.push(points[0]);
+        for seg in points.windows(2) {
+            smooth.push(seg[0].lerp(seg[1], 0.25));
+            smooth.push(seg[0].lerp(seg[1], 0.75));
+        }
+        smooth.push(*points.last().unwrap_or(&points[0]));
+        smooth
+    } else {
+        points.to_vec()
+    };
+
+    let sectors = 8usize;
+    let rx = radius.max(0.005);
+    let ry = rx * flatness.clamp(0.1, 1.0);
+    let mut vertices = Vec::with_capacity(path.len() * sectors + 2);
+    let mut prev_right = Vec3::X;
+
+    for i in 0..path.len() {
+        let tangent = if i == 0 {
+            (path[1] - path[0]).normalize_or_zero()
+        } else if i + 1 == path.len() {
+            (path[i] - path[i - 1]).normalize_or_zero()
+        } else {
+            (path[i + 1] - path[i - 1]).normalize_or_zero()
+        };
+        let t = if tangent.length_squared() > 1e-6 {
+            tangent
+        } else {
+            Vec3::Y
+        };
+        let mut right = (prev_right - t * prev_right.dot(t)).normalize_or_zero();
+        if right.length_squared() < 1e-4 {
+            let fallback = if t.y.abs() < 0.9 { Vec3::Y } else { Vec3::X };
+            right = fallback.cross(t).normalize_or_zero();
+        }
+        let up = t.cross(right).normalize_or_zero();
+        prev_right = right;
+
+        for s in 0..sectors {
+            let ang = std::f32::consts::TAU * (s as f32 / sectors as f32);
+            let offset = right * (ang.cos() * rx) + up * (ang.sin() * ry);
+            vertices.push(path[i] + offset);
+        }
+    }
+
+    let mut faces = Vec::with_capacity((path.len() - 1) * sectors + 2);
+    for ring in 0..(path.len() - 1) {
+        let r0 = ring * sectors;
+        let r1 = r0 + sectors;
+        for s in 0..sectors {
+            let next = (s + 1) % sectors;
+            faces.push(Face::new(
+                vec![r0 + s, r0 + next, r1 + next, r1 + s],
+                material,
+            ));
+        }
+    }
+    // Start and end caps
+    let start_cap: Vec<usize> = (0..sectors).rev().collect();
+    faces.push(Face::new(start_cap, material));
+    let last_base = (path.len() - 1) * sectors;
+    let end_cap: Vec<usize> = (0..sectors).map(|s| last_base + s).collect();
+    faces.push(Face::new(end_cap, material));
+
+    Ok(LowPolyMesh {
+        vertices,
+        faces,
+        texture: None,
+        normal_map: None,
+        smooth_shading: true,
+        material: Default::default(),
+    })
+}
+
+/// Simplifies `mesh` by clustering vertices on a 3D grid scaled to `target_ratio` (`0.1..=0.9`).
+pub fn decimate_mesh(mesh: &LowPolyMesh, target_ratio: f32) -> Result<LowPolyMesh, CoreError> {
+    if !target_ratio.is_finite() || mesh.faces.is_empty() {
+        return Err(CoreError::OutOfBounds);
+    }
+    if mesh.vertices.len() <= 8 {
+        return Ok(mesh.clone());
+    }
+    let ratio = target_ratio.clamp(0.1, 0.9);
+    let (bmin, bmax) = mesh.bounds();
+    let extent = (bmax - bmin).max(Vec3::splat(1e-4));
+    let target_verts = ((mesh.vertices.len() as f32) * ratio).max(4.0);
+    let grid_res = (target_verts.cbrt().round() as i32).clamp(2, 48);
+
+    let mut cell_accum: BTreeMap<[i32; 3], (Vec3, usize, usize)> = BTreeMap::new();
+    let mut vert_to_cell: Vec<[i32; 3]> = Vec::with_capacity(mesh.vertices.len());
+    let mut new_vertices: Vec<Vec3> = Vec::new();
+
+    for &p in &mesh.vertices {
+        let norm = (p - bmin) / extent;
+        let cell = [
+            ((norm.x * grid_res as f32).floor() as i32).clamp(0, grid_res),
+            ((norm.y * grid_res as f32).floor() as i32).clamp(0, grid_res),
+            ((norm.z * grid_res as f32).floor() as i32).clamp(0, grid_res),
+        ];
+        vert_to_cell.push(cell);
+        cell_accum
+            .entry(cell)
+            .and_modify(|(sum, count, _)| {
+                *sum += p;
+                *count += 1;
+            })
+            .or_insert_with(|| {
+                let idx = new_vertices.len();
+                new_vertices.push(p);
+                (p, 1, idx)
+            });
+    }
+
+    for (sum, count, idx) in cell_accum.values() {
+        new_vertices[*idx] = *sum / (*count as f32);
+    }
+
+    let mut new_faces = Vec::new();
+    for face in &mesh.faces {
+        let mut loop_verts: Vec<usize> = Vec::new();
+        for &vi in &face.vertices {
+            let idx = cell_accum[&vert_to_cell[vi]].2;
+            if !loop_verts.contains(&idx) {
+                loop_verts.push(idx);
+            }
+        }
+        if loop_verts.len() >= 3 {
+            new_faces.push(Face::new(loop_verts, face.material));
+        }
+    }
+
+    if new_faces.is_empty() {
+        return Ok(mesh.clone());
+    }
+
+    Ok(LowPolyMesh {
+        vertices: new_vertices,
+        faces: new_faces,
+        texture: mesh.texture.clone(),
+        normal_map: mesh.normal_map.clone(),
+        smooth_shading: mesh.smooth_shading,
+        material: mesh.material,
+    })
+}
+
 /// Translates all unique vertices belonging to `face_id` by `delta`.
 pub fn translate_face(
     mesh: &LowPolyMesh,
@@ -873,5 +1039,25 @@ mod tests {
         // 6 main faces + 12 edge chamfer quads + 8 corner triangles = 26 faces
         assert_eq!(beveled.faces.len(), 26);
         assert_eq!(beveled.vertices.len(), 24);
+    }
+
+    #[test]
+    fn curve_tube_and_decimate_produce_valid_lowpoly_meshes() {
+        let mat = PaletteIndex::new(4).unwrap();
+        let strap = create_curve_tube(
+            &[
+                Vec3::new(0.0, 0.2, 0.0),
+                Vec3::new(0.2, 0.6, 0.1),
+                Vec3::new(0.0, 1.0, 0.0),
+            ],
+            0.08,
+            0.3,
+            mat,
+        )
+        .unwrap();
+        assert!(strap.faces.len() > 20);
+        let decimated = decimate_mesh(&strap, 0.5).unwrap();
+        assert!(!decimated.faces.is_empty());
+        assert!(decimated.vertices.len() < strap.vertices.len());
     }
 }

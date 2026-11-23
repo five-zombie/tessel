@@ -263,6 +263,41 @@ pub fn execute_tool_call(
                 "scale": transform.scale.to_array()
             }))
         }
+        "scene_set_parent" => {
+            let raw_id = args
+                .get("node_id")
+                .and_then(Value::as_u64)
+                .ok_or_else(|| AiError::InvalidArguments("missing 'node_id'".into()))?;
+            let node_id = NodeId(raw_id);
+            let parent = args
+                .get("parent_node_id")
+                .and_then(Value::as_u64)
+                .map(NodeId);
+            history.execute(scene, Command::SetNodeParent { node_id, parent })?;
+            Ok(json!({
+                "ok": true,
+                "node_id": node_id.0,
+                "parent_node_id": parent.map(|p| p.0)
+            }))
+        }
+        "scene_set_lighting" => {
+            let azimuth = args
+                .get("azimuth_deg")
+                .and_then(Value::as_f64)
+                .map(|d| (d as f32).to_radians())
+                .unwrap_or(scene.light_azimuth);
+            let elevation = args
+                .get("elevation_deg")
+                .and_then(Value::as_f64)
+                .map(|d| (d as f32).to_radians())
+                .unwrap_or(scene.light_elevation);
+            history.execute(scene, Command::SetLightDirection { azimuth, elevation })?;
+            Ok(json!({
+                "ok": true,
+                "azimuth_deg": scene.light_azimuth.to_degrees(),
+                "elevation_deg": scene.light_elevation.to_degrees()
+            }))
+        }
         "voxel_fill_box" => {
             let min = parse_ivec3(args, "min")?;
             let max = parse_ivec3(args, "max")?;
@@ -397,6 +432,61 @@ pub fn execute_tool_call(
                 history.execute(scene, Command::SetNodeTransform { node_id, transform })?;
             }
             Ok(json!({ "ok": true, "node_id": created_id.map(|n| n.0) }))
+        }
+        "mesh_create_curve_tube" => {
+            let pts_arr = args
+                .get("points")
+                .and_then(Value::as_array)
+                .ok_or_else(|| AiError::InvalidArguments("missing 'points' array".into()))?;
+            if pts_arr.len() < 2 {
+                return Err(AiError::InvalidArguments(
+                    "'points' must have at least 2 [x,y,z] points".into(),
+                ));
+            }
+            let mut points = Vec::with_capacity(pts_arr.len());
+            for (i, item) in pts_arr.iter().enumerate() {
+                let Some(arr) = item.as_array() else {
+                    return Err(AiError::InvalidArguments(format!(
+                        "'points[{i}]' must be [x,y,z]"
+                    )));
+                };
+                if arr.len() != 3 {
+                    return Err(AiError::InvalidArguments(format!(
+                        "'points[{i}]' must have 3 numbers"
+                    )));
+                }
+                let x = arr[0].as_f64().unwrap_or(0.0) as f32;
+                let y = arr[1].as_f64().unwrap_or(0.0) as f32;
+                let z = arr[2].as_f64().unwrap_or(0.0) as f32;
+                points.push(glam::Vec3::new(x, y, z));
+            }
+            let radius = args.get("radius").and_then(Value::as_f64).unwrap_or(0.06) as f32;
+            let flatness = args.get("flatness").and_then(Value::as_f64).unwrap_or(0.3) as f32;
+            let material = parse_palette_index(args, 4)?;
+            let name = args
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or("StrapCurve")
+                .to_string();
+            history.execute(
+                scene,
+                Command::CreateCurveTubeMesh {
+                    name,
+                    points,
+                    radius,
+                    flatness,
+                    material,
+                },
+            )?;
+            let node_id = scene.selected_node;
+            let faces = node_id
+                .and_then(|id| scene.lowpoly_meshes.get(&id))
+                .map_or(0, |m| m.faces.len());
+            Ok(json!({
+                "ok": true,
+                "node_id": node_id.map(|n| n.0),
+                "faces": faces
+            }))
         }
         "mesh_import" => {
             let filename = args
@@ -803,6 +893,30 @@ pub fn execute_tool_call(
                 .map_or(0, |m| m.faces.len());
             Ok(json!({ "ok": true, "node_id": node_id.0, "faces": faces }))
         }
+        "mesh_decimate" => {
+            let node_id = args
+                .get("node_id")
+                .and_then(Value::as_u64)
+                .map(NodeId)
+                .or_else(|| scene.active_lowpoly_node())
+                .ok_or_else(|| AiError::InvalidArguments("no low-poly mesh found".into()))?;
+            let ratio = args
+                .get("ratio")
+                .and_then(Value::as_f64)
+                .unwrap_or(0.5)
+                .clamp(0.1, 0.9) as f32;
+            history.execute(scene, Command::DecimateMesh { node_id, ratio })?;
+            let (verts, faces) = scene
+                .lowpoly_meshes
+                .get(&node_id)
+                .map_or((0, 0), |m| (m.vertices.len(), m.faces.len()));
+            Ok(json!({
+                "ok": true,
+                "node_id": node_id.0,
+                "vertices": verts,
+                "faces": faces
+            }))
+        }
         "mesh_set_shading" => {
             let node_id = args
                 .get("node_id")
@@ -865,6 +979,56 @@ pub fn execute_tool_call(
         "character_apply_biped_rig" => {
             history.execute(scene, Command::ApplyBipedRig)?;
             Ok(json!({ "ok": true, "bones": 7 }))
+        }
+        "character_add_bone" => {
+            let name = args
+                .get("name")
+                .and_then(Value::as_str)
+                .ok_or_else(|| AiError::InvalidArguments("missing 'name'".into()))?
+                .to_string();
+            let parent = match args.get("parent_bone_id").and_then(Value::as_u64) {
+                Some(raw) => Some(BoneId(u32::try_from(raw).map_err(|_| {
+                    AiError::InvalidArguments("parent_bone_id overflow".into())
+                })?)),
+                None => None,
+            };
+            let position = parse_opt_vec3(args, "position")?
+                .ok_or_else(|| AiError::InvalidArguments("missing 'position'".into()))?;
+            history.execute(
+                scene,
+                Command::AddBone {
+                    name: name.clone(),
+                    parent,
+                    position,
+                },
+            )?;
+            let bone_id = scene
+                .character_rig
+                .as_ref()
+                .and_then(|r| r.bones.last())
+                .map_or(0, |b| b.id.0);
+            Ok(json!({ "ok": true, "bone_id": bone_id, "name": name }))
+        }
+        "character_bind_node" => {
+            let raw_node = args
+                .get("node_id")
+                .and_then(Value::as_u64)
+                .ok_or_else(|| AiError::InvalidArguments("missing 'node_id'".into()))?;
+            let node_id = NodeId(raw_node);
+            let bone_id = match args.get("bone_id").and_then(Value::as_u64) {
+                Some(raw) => {
+                    Some(BoneId(u32::try_from(raw).map_err(|_| {
+                        AiError::InvalidArguments("bone_id overflow".into())
+                    })?))
+                }
+                None => None,
+            };
+            history.execute(scene, Command::BindNodeToBone { node_id, bone_id })?;
+            Ok(json!({
+                "ok": true,
+                "node_id": node_id.0,
+                "bone_id": bone_id.map(|b| b.0)
+            }))
         }
         "character_set_bone_pose" => {
             let raw_id = args
@@ -1023,6 +1187,7 @@ pub fn scene_summary_json(scene: &SceneState) -> Value {
                 "name": n.name,
                 "kind": format!("{:?}", n.kind),
                 "visible": n.visible,
+                "parent": n.parent.map(|p| p.0),
                 "position": n.transform.translation.to_array(),
                 "scale": n.transform.scale.to_array(),
                 "stats": detail
@@ -1281,5 +1446,72 @@ mod tests {
         )
         .unwrap();
         assert_eq!(sphere["ok"], true);
+        let sphere_id = sphere["node_id"].as_u64().unwrap();
+
+        let parented = execute_tool_call(
+            "scene_set_parent",
+            &json!({ "node_id": sphere_id, "parent_node_id": node_id.0 }),
+            &mut scene,
+            &mut history,
+            &dir,
+        )
+        .unwrap();
+        assert_eq!(parented["parent_node_id"], node_id.0);
+
+        let strap = execute_tool_call(
+            "mesh_create_curve_tube",
+            &json!({
+                "name": "ShoulderStrap",
+                "points": [[0.0, 0.2, 0.0], [0.2, 0.6, 0.2], [0.0, 1.0, 0.0]],
+                "radius": 0.08,
+                "flatness": 0.25
+            }),
+            &mut scene,
+            &mut history,
+            &dir,
+        )
+        .unwrap();
+        assert_eq!(strap["ok"], true);
+        let strap_id = strap["node_id"].as_u64().unwrap();
+
+        let dec = execute_tool_call(
+            "mesh_decimate",
+            &json!({ "node_id": strap_id, "ratio": 0.5 }),
+            &mut scene,
+            &mut history,
+            &dir,
+        )
+        .unwrap();
+        assert_eq!(dec["ok"], true);
+
+        let bone = execute_tool_call(
+            "character_add_bone",
+            &json!({ "name": "FlapHinge", "position": [0.0, 1.0, 0.0] }),
+            &mut scene,
+            &mut history,
+            &dir,
+        )
+        .unwrap();
+        assert_eq!(bone["bone_id"], 0);
+
+        let bind = execute_tool_call(
+            "character_bind_node",
+            &json!({ "node_id": strap_id, "bone_id": 0 }),
+            &mut scene,
+            &mut history,
+            &dir,
+        )
+        .unwrap();
+        assert_eq!(bind["bone_id"], 0);
+
+        let light = execute_tool_call(
+            "scene_set_lighting",
+            &json!({ "azimuth_deg": 45.0, "elevation_deg": 60.0 }),
+            &mut scene,
+            &mut history,
+            &dir,
+        )
+        .unwrap();
+        assert_eq!(light["ok"], true);
     }
 }

@@ -58,6 +58,29 @@ pub fn tool_definitions() -> Vec<Value> {
             }
         }),
         json!({
+            "name": "scene_set_parent",
+            "description": "Parent or group a child node under a parent_node_id (or null to unparent) so moving/rotating the parent moves all children together.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "node_id": { "type": "integer", "minimum": 1 },
+                    "parent_node_id": { "type": ["integer", "null"] }
+                },
+                "required": ["node_id"]
+            }
+        }),
+        json!({
+            "name": "scene_set_lighting",
+            "description": "Set the studio directional key light azimuth_deg (-180..180) and elevation_deg (5..85) for viewport and Render Preview ground shadows.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "azimuth_deg": { "type": "number" },
+                    "elevation_deg": { "type": "number", "minimum": 5.0, "maximum": 85.0 }
+                }
+            }
+        }),
+        json!({
             "name": "voxel_fill_box",
             "description": "Fill an axis-aligned 3D voxel box (solid or hollow) in the active or specified voxel node.",
             "inputSchema": {
@@ -112,6 +135,25 @@ pub fn tool_definitions() -> Vec<Value> {
                     "scale": { "type": "array", "items": { "type": "number" }, "minItems": 3, "maxItems": 3 }
                 },
                 "required": ["kind"]
+            }
+        }),
+        json!({
+            "name": "mesh_create_curve_tube",
+            "description": "Create a smooth curved strap, shoulder belt, cable, pipe, or handle following 3D control points [[x,y,z], ...]. Set flatness=0.25 for flat backpack straps or flatness=1.0 for round cables/tubes.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "name": { "type": "string" },
+                    "points": {
+                        "type": "array",
+                        "minItems": 2,
+                        "items": { "type": "array", "items": { "type": "number" }, "minItems": 3, "maxItems": 3 }
+                    },
+                    "radius": { "type": "number", "minimum": 0.005 },
+                    "flatness": { "type": "number", "minimum": 0.1, "maximum": 1.0 },
+                    "palette_index": { "type": "integer", "minimum": 1, "maximum": 255 }
+                },
+                "required": ["points"]
             }
         }),
         json!({
@@ -252,6 +294,17 @@ pub fn tool_definitions() -> Vec<Value> {
             }
         }),
         json!({
+            "name": "mesh_decimate",
+            "description": "Simplify/decimate a Low-Poly mesh for LOD reduction by target vertex ratio (0.1..0.9, default 0.5).",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "node_id": { "type": "integer", "minimum": 1 },
+                    "ratio": { "type": "number", "minimum": 0.1, "maximum": 0.9 }
+                }
+            }
+        }),
+        json!({
             "name": "mesh_set_shading",
             "description": "Toggle smooth vertex-normal shading (true = Shade Smooth, false = Flat) on a Low-Poly mesh.",
             "inputSchema": {
@@ -280,6 +333,31 @@ pub fn tool_definitions() -> Vec<Value> {
             "name": "character_apply_biped_rig",
             "description": "Apply the starter 7-bone biped humanoid skeleton with Idle & Walk animations.",
             "inputSchema": { "type": "object", "properties": {} }
+        }),
+        json!({
+            "name": "character_add_bone",
+            "description": "Add a custom bone to the active rig (or initialize a custom prop rig for backpacks, chests, weapons) with optional parent_bone_id and local rest position [x,y,z].",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "name": { "type": "string" },
+                    "parent_bone_id": { "type": ["integer", "null"], "minimum": 0 },
+                    "position": { "type": "array", "items": { "type": "number" }, "minItems": 3, "maxItems": 3 }
+                },
+                "required": ["name", "position"]
+            }
+        }),
+        json!({
+            "name": "character_bind_node",
+            "description": "Bind a scene node (e.g. backpack flap, pouch, weapon part) rigidly to a bone_id (or null to unbind for smooth auto-weight skinning).",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "node_id": { "type": "integer", "minimum": 1 },
+                    "bone_id": { "type": ["integer", "null"], "minimum": 0 }
+                },
+                "required": ["node_id"]
+            }
         }),
         json!({
             "name": "character_set_bone_pose",
