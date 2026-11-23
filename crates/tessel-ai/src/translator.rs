@@ -108,6 +108,23 @@ fn parse_rotation_deg(val: &Value) -> Result<glam::Quat, AiError> {
     ))
 }
 
+/// Parses a `bone_id` u64 argument into a [`BoneId`] (rejects overflow).
+fn parse_bone_id(args: &Value, key: &str) -> Result<BoneId, AiError> {
+    let raw = args
+        .get(key)
+        .and_then(Value::as_u64)
+        .ok_or_else(|| AiError::InvalidArguments(format!("missing '{key}'")))?;
+    Ok(BoneId(u32::try_from(raw).map_err(|_| {
+        AiError::InvalidArguments(format!("'{key}' overflows u32"))
+    })?))
+}
+
+/// Converts a quaternion to XYZ euler degrees (matches `rotation_deg` input order).
+fn quat_to_degrees(q: glam::Quat) -> [f32; 3] {
+    let (x, y, z) = q.to_euler(glam::EulerRot::XYZ);
+    [x.to_degrees(), y.to_degrees(), z.to_degrees()]
+}
+
 fn parse_palette_index(val: &Value, default: u8) -> Result<PaletteIndex, AiError> {
     let raw = val
         .get("palette_index")
@@ -138,6 +155,53 @@ fn resolve_voxel_node(
     scene
         .active_voxel_node()
         .ok_or_else(|| AiError::InvalidArguments("failed to create voxel volume".into()))
+}
+
+/// Resolves `clip_index` or `clip_name` to a clip index. With `auto_create`,
+/// a missing clip name creates a new clip (needs `duration_secs`, default 2.0);
+/// otherwise unknown names are an error. Falls back to the active clip.
+fn resolve_clip_index(
+    args: &Value,
+    scene: &mut SceneState,
+    history: &mut HistoryStack,
+    auto_create: bool,
+) -> Result<usize, AiError> {
+    if let Some(idx) = args.get("clip_index").and_then(Value::as_u64) {
+        return Ok(idx as usize);
+    }
+    if let Some(name) = args.get("clip_name").and_then(Value::as_str) {
+        let existing = scene
+            .character_rig
+            .as_ref()
+            .and_then(|r| r.animations.iter().position(|c| c.name == name));
+        if let Some(i) = existing {
+            return Ok(i);
+        }
+        if !auto_create {
+            return Err(AiError::InvalidArguments(format!(
+                "unknown animation clip '{name}'"
+            )));
+        }
+        let duration_secs = args
+            .get("duration_secs")
+            .and_then(Value::as_f64)
+            .unwrap_or(2.0) as f32;
+        history.execute(
+            scene,
+            Command::AddAnimationClip {
+                name: name.to_string(),
+                duration_secs,
+            },
+        )?;
+        return Ok(scene
+            .character_rig
+            .as_ref()
+            .map_or(0, |r| r.animations.len().saturating_sub(1)));
+    }
+    Ok(scene
+        .character_rig
+        .as_ref()
+        .map_or(0, |r| r.active_animation))
 }
 
 /// Validates and executes a named tool call against `SceneState` & `HistoryStack`.
@@ -1606,6 +1670,229 @@ pub fn execute_tool_call(
             )?;
             Ok(json!({ "ok": true, "clip_index": clip_index }))
         }
+        "character_list_bones" => {
+            let rig = scene
+                .character_rig
+                .as_ref()
+                .ok_or_else(|| AiError::InvalidArguments("no character rig in scene".into()))?;
+            let bones: Vec<Value> = rig
+                .bones
+                .iter()
+                .map(|b| {
+                    json!({
+                        "bone_id": b.id.0,
+                        "name": b.name,
+                        "parent_bone_id": b.parent.map(|p| p.0),
+                        "rest_position": b.rest_local.translation.to_array(),
+                    })
+                })
+                .collect();
+            Ok(json!({ "ok": true, "bone_count": bones.len(), "bones": bones }))
+        }
+        "character_inspect_clip" => {
+            let clip_index = resolve_clip_index(args, scene, history, false)?;
+            let rig = scene
+                .character_rig
+                .as_ref()
+                .ok_or_else(|| AiError::InvalidArguments("no character rig in scene".into()))?;
+            let clip = rig
+                .animations
+                .get(clip_index)
+                .ok_or_else(|| AiError::InvalidArguments("clip_index out of range".into()))?;
+            let channels: Vec<Value> = clip
+                .channels
+                .iter()
+                .map(|ch| {
+                    let keys: Vec<Value> = ch
+                        .keyframes
+                        .iter()
+                        .map(|k| {
+                            json!({
+                                "time_secs": k.time_secs,
+                                "translation": k.translation.to_array(),
+                                "rotation_quat": k.rotation.to_array(),
+                                "rotation_deg": quat_to_degrees(k.rotation),
+                                "scale": k.scale.to_array(),
+                            })
+                        })
+                        .collect();
+                    json!({ "bone_id": ch.bone_id.0, "keyframes": keys })
+                })
+                .collect();
+            let morph_tracks: Vec<Value> = clip
+                .morph_tracks
+                .iter()
+                .map(|t| {
+                    json!({
+                        "node_id": t.node.0,
+                        "target": t.target,
+                        "keys": t.keys.iter().map(|k| json!({ "time_secs": k.time_secs, "weight": k.weight })).collect::<Vec<_>>(),
+                    })
+                })
+                .collect();
+            Ok(json!({
+                "ok": true,
+                "clip_index": clip_index,
+                "name": clip.name,
+                "duration_secs": clip.duration_secs,
+                "is_active": rig.active_animation == clip_index,
+                "channels": channels,
+                "morph_tracks": morph_tracks,
+            }))
+        }
+        "character_sample_pose" => {
+            let clip_index = resolve_clip_index(args, scene, history, false)?;
+            let time_secs = args
+                .get("time_secs")
+                .and_then(Value::as_f64)
+                .ok_or_else(|| AiError::InvalidArguments("missing 'time_secs'".into()))?
+                as f32;
+            if !time_secs.is_finite() || time_secs < 0.0 {
+                return Err(AiError::InvalidArguments(
+                    "'time_secs' must be a finite number >= 0".into(),
+                ));
+            }
+            let rig = scene
+                .character_rig
+                .as_ref()
+                .ok_or_else(|| AiError::InvalidArguments("no character rig in scene".into()))?;
+            let sampled = rig
+                .sample_clip_pose(clip_index, time_secs)
+                .ok_or_else(|| AiError::InvalidArguments("clip_index out of range".into()))?;
+            let bones: Vec<Value> = sampled
+                .iter()
+                .map(|s| {
+                    let name = rig
+                        .bone(s.bone_id)
+                        .map(|b| b.name.clone())
+                        .unwrap_or_default();
+                    json!({
+                        "bone_id": s.bone_id.0,
+                        "name": name,
+                        "world_position": s.world_position.to_array(),
+                        "local_rotation_deg": quat_to_degrees(s.local_rotation),
+                    })
+                })
+                .collect();
+            Ok(json!({ "ok": true, "clip_index": clip_index, "time_secs": time_secs, "bones": bones }))
+        }
+        "character_set_active_clip" => {
+            let clip_index = resolve_clip_index(args, scene, history, false)?;
+            history.execute(scene, Command::SetActiveAnimationClip { clip_index })?;
+            Ok(json!({ "ok": true, "clip_index": clip_index }))
+        }
+        "character_remove_keyframe" => {
+            let clip_index = resolve_clip_index(args, scene, history, false)?;
+            let bone_id = parse_bone_id(args, "bone_id")?;
+            let time_secs = args
+                .get("time_secs")
+                .and_then(Value::as_f64)
+                .ok_or_else(|| AiError::InvalidArguments("missing 'time_secs'".into()))?
+                as f32;
+            history.execute(
+                scene,
+                Command::RemoveAnimationKeyframe {
+                    clip_index,
+                    bone_id,
+                    time_secs,
+                },
+            )?;
+            Ok(json!({ "ok": true, "clip_index": clip_index, "bone_id": bone_id.0 }))
+        }
+        "character_remove_clip" => {
+            let clip_index = resolve_clip_index(args, scene, history, false)?;
+            let removed_name = scene
+                .character_rig
+                .as_ref()
+                .and_then(|r| r.animations.get(clip_index))
+                .map(|c| c.name.clone())
+                .unwrap_or_default();
+            history.execute(scene, Command::RemoveAnimationClip { clip_index })?;
+            let remaining = scene
+                .character_rig
+                .as_ref()
+                .map(|r| r.animations.len())
+                .unwrap_or(0);
+            Ok(json!({ "ok": true, "removed": removed_name, "remaining_clips": remaining }))
+        }
+        "character_remove_bone" => {
+            let bone_id = parse_bone_id(args, "bone_id")?;
+            let before = scene
+                .character_rig
+                .as_ref()
+                .ok_or_else(|| AiError::InvalidArguments("no character rig in scene".into()))?;
+            let before_bones = before.bones.len();
+            let before_bindings = before.bindings.len();
+            let before_channels: usize = before.animations.iter().map(|c| c.channels.len()).sum();
+            history.execute(scene, Command::RemoveBone { bone_id })?;
+            let rig = scene.character_rig.as_ref();
+            let after_bones = rig.map(|r| r.bones.len()).unwrap_or(0);
+            let after_bindings = rig.map(|r| r.bindings.len()).unwrap_or(0);
+            let after_channels: usize = rig
+                .map(|r| r.animations.iter().map(|c| c.channels.len()).sum())
+                .unwrap_or(0);
+            Ok(json!({
+                "ok": true,
+                "removed_bones": before_bones - after_bones,
+                "cleared_bindings": before_bindings - after_bindings,
+                "dropped_channels": before_channels - after_channels,
+            }))
+        }
+        "scene_duplicate_node" => {
+            let node_id = args
+                .get("node_id")
+                .and_then(Value::as_u64)
+                .map(NodeId)
+                .or_else(|| scene.active_lowpoly_node())
+                .ok_or_else(|| AiError::InvalidArguments("no node found".into()))?;
+            let name = args.get("name").and_then(Value::as_str).map(str::to_string);
+            history.execute(scene, Command::DuplicateNode { node_id, name })?;
+            let new_id = scene.selected_node.ok_or_else(|| {
+                AiError::InvalidArguments("duplicate produced no node".into())
+            })?;
+            Ok(json!({ "ok": true, "node_id": new_id.0 }))
+        }
+        "scene_set_node_visibility" => {
+            let node_id = args
+                .get("node_id")
+                .and_then(Value::as_u64)
+                .map(NodeId)
+                .ok_or_else(|| AiError::InvalidArguments("missing 'node_id'".into()))?;
+            let visible = args
+                .get("visible")
+                .and_then(Value::as_bool)
+                .ok_or_else(|| AiError::InvalidArguments("missing boolean 'visible'".into()))?;
+            history.execute(scene, Command::SetNodeVisibility { node_id, visible })?;
+            Ok(json!({ "ok": true, "node_id": node_id.0, "visible": visible }))
+        }
+        "mesh_clear_texture" => {
+            let node_id = args
+                .get("node_id")
+                .and_then(Value::as_u64)
+                .map(NodeId)
+                .or_else(|| scene.active_lowpoly_node())
+                .ok_or_else(|| AiError::InvalidArguments("no low-poly mesh found".into()))?;
+            let target = args.get("target").and_then(Value::as_str).unwrap_or("color");
+            let (clear_color, clear_normal) = match target {
+                "color" => (true, false),
+                "normal" => (false, true),
+                "both" => (true, true),
+                _ => {
+                    return Err(AiError::InvalidArguments(
+                        "target must be 'color', 'normal', or 'both'".into(),
+                    ));
+                }
+            };
+            history.execute(
+                scene,
+                Command::ClearMeshTexture {
+                    node_id,
+                    clear_color,
+                    clear_normal,
+                },
+            )?;
+            Ok(json!({ "ok": true, "node_id": node_id.0, "cleared": target }))
+        }
         "project_export" => {
             let filename = args
                 .get("filename")
@@ -1631,6 +1918,12 @@ pub fn execute_tool_call(
             history.redo(scene)?;
             Ok(json!({ "ok": true, "redo_remaining": history.redo_len() }))
         }
+        other if other.starts_with("camera_") => Err(AiError::InvalidArguments(
+            "camera tools need the live GUI viewport (HTTP bridge); this headless session has no camera".into(),
+        )),
+        "viewport_screenshot" => Err(AiError::InvalidArguments(
+            "viewport_screenshot is served by the MCP server itself (needs its own GPU); the Direct AI path has no renderer".into(),
+        )),
         other => Err(AiError::UnknownTool(other.to_string())),
     }
 }
@@ -2177,6 +2470,33 @@ mod tests {
     }
 
     #[test]
+    fn ai_tool_camera_calls_need_live_viewport() {
+        let mut scene = SceneState::new();
+        let mut history = HistoryStack::new();
+        let dir = std::env::temp_dir();
+
+        // Headless dispatch has no camera: every camera_* tool must fail
+        // closed with a clear message instead of misrouting to UnknownTool.
+        for (name, args) in [
+            ("camera_get", json!({})),
+            ("camera_look_at", json!({ "target": [0.0, 0.5, 0.0] })),
+            ("camera_zoom", json!({ "factor": 0.5 })),
+            ("camera_orbit", json!({ "dx": 10.0, "dy": 0.0 })),
+            ("camera_pan", json!({ "dx": 10.0, "dy": 0.0 })),
+            ("camera_reset", json!({})),
+            ("camera_preset", json!({ "name": "front" })),
+        ] {
+            let err = execute_tool_call(name, &args, &mut scene, &mut history, &dir)
+                .expect_err("camera tools must fail without a live viewport");
+            let msg = format!("{err:?}");
+            assert!(
+                msg.contains("live GUI viewport"),
+                "unexpected error for {name}: {msg}"
+            );
+        }
+    }
+
+    #[test]
     fn ai_tool_solve_ik_reaches_target() {
         let mut scene = SceneState::new();
         let mut history = HistoryStack::new();
@@ -2330,6 +2650,255 @@ mod tests {
             )
             .is_err());
         }
+    }
+
+    #[test]
+    fn ai_tool_rig_introspection_and_small_batch() {
+        let mut scene = SceneState::new();
+        let mut history = HistoryStack::new();
+        let dir = std::env::temp_dir();
+
+        // No rig yet: introspection fails closed.
+        assert!(execute_tool_call(
+            "character_list_bones",
+            &json!({}),
+            &mut scene,
+            &mut history,
+            &dir
+        )
+        .is_err());
+
+        execute_tool_call(
+            "character_apply_biped_rig",
+            &json!({}),
+            &mut scene,
+            &mut history,
+            &dir,
+        )
+        .unwrap();
+
+        // List bones: 7-bone biped with parents.
+        let listed = execute_tool_call(
+            "character_list_bones",
+            &json!({}),
+            &mut scene,
+            &mut history,
+            &dir,
+        )
+        .unwrap();
+        assert_eq!(listed["bone_count"], 7);
+        assert_eq!(listed["bones"][1]["name"], "Torso");
+        assert_eq!(listed["bones"][1]["parent_bone_id"], 0);
+
+        // Inspect the Idle clip (index 0): Torso channel has 3 keys.
+        let insp = execute_tool_call(
+            "character_inspect_clip",
+            &json!({ "clip_name": "Idle" }),
+            &mut scene,
+            &mut history,
+            &dir,
+        )
+        .unwrap();
+        assert_eq!(insp["name"], "Idle");
+        assert!(insp["is_active"].as_bool().unwrap());
+        let torso_ch = insp["channels"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["bone_id"] == 1)
+            .unwrap();
+        assert_eq!(torso_ch["keyframes"].as_array().unwrap().len(), 3);
+
+        // Sample the pose halfway: torso lifted by half the breathing offset.
+        let sampled = execute_tool_call(
+            "character_sample_pose",
+            &json!({ "clip_name": "Idle", "time_secs": 0.5 }),
+            &mut scene,
+            &mut history,
+            &dir,
+        )
+        .unwrap();
+        let torso = sampled["bones"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|b| b["bone_id"] == 1)
+            .unwrap();
+        assert!((torso["world_position"][1].as_f64().unwrap() - 1.115).abs() < 1e-3);
+
+        // Switch active clip to Walk, then remove a keyframe off it.
+        execute_tool_call(
+            "character_set_active_clip",
+            &json!({ "clip_name": "Walk" }),
+            &mut scene,
+            &mut history,
+            &dir,
+        )
+        .unwrap();
+        let rig = scene.character_rig.as_ref().unwrap();
+        assert_eq!(rig.animations[rig.active_animation].name, "Walk");
+        let left_arm_keys = |scene: &SceneState| {
+            scene.character_rig.as_ref().unwrap().animations[1]
+                .channels
+                .iter()
+                .find(|c| c.bone_id == BoneId(3))
+                .map(|c| c.keyframes.len())
+                .unwrap_or(0)
+        };
+        assert_eq!(left_arm_keys(&scene), 3);
+        execute_tool_call(
+            "character_remove_keyframe",
+            &json!({ "clip_index": 1, "bone_id": 3, "time_secs": 0.0 }),
+            &mut scene,
+            &mut history,
+            &dir,
+        )
+        .unwrap();
+        assert_eq!(left_arm_keys(&scene), 2);
+
+        // Duplicate a low-poly node: cube -> copy with offset + inherited name.
+        let created = execute_tool_call(
+            "mesh_create_primitive",
+            &json!({ "kind": "cube", "size": 1.0 }),
+            &mut scene,
+            &mut history,
+            &dir,
+        )
+        .unwrap();
+        let node_id = created["node_id"].as_u64().unwrap();
+        let dup = execute_tool_call(
+            "scene_duplicate_node",
+            &json!({ "node_id": node_id, "name": "Twin" }),
+            &mut scene,
+            &mut history,
+            &dir,
+        )
+        .unwrap();
+        assert_ne!(dup["node_id"], node_id);
+        let twin = scene
+            .lowpoly_meshes
+            .get(&NodeId(dup["node_id"].as_u64().unwrap()))
+            .unwrap();
+        assert_eq!(twin.vertices.len(), 8);
+        // Undo drops the copy.
+        history.undo(&mut scene).unwrap();
+        assert_eq!(scene.lowpoly_meshes.len(), 1);
+
+        // Visibility toggle with undo.
+        execute_tool_call(
+            "scene_set_node_visibility",
+            &json!({ "node_id": node_id, "visible": false }),
+            &mut scene,
+            &mut history,
+            &dir,
+        )
+        .unwrap();
+        assert!(!scene.nodes.get(&NodeId(node_id)).unwrap().visible);
+        history.undo(&mut scene).unwrap();
+        assert!(scene.nodes.get(&NodeId(node_id)).unwrap().visible);
+
+        // Clear texture round-trips through undo.
+        execute_tool_call(
+            "mesh_fill_texture",
+            &json!({ "node_id": node_id, "palette_index": 5 }),
+            &mut scene,
+            &mut history,
+            &dir,
+        )
+        .unwrap();
+        assert!(scene
+            .lowpoly_meshes
+            .get(&NodeId(node_id))
+            .unwrap()
+            .texture
+            .is_some());
+        execute_tool_call(
+            "mesh_clear_texture",
+            &json!({ "node_id": node_id, "target": "color" }),
+            &mut scene,
+            &mut history,
+            &dir,
+        )
+        .unwrap();
+        assert!(scene
+            .lowpoly_meshes
+            .get(&NodeId(node_id))
+            .unwrap()
+            .texture
+            .is_none());
+        history.undo(&mut scene).unwrap();
+        assert!(scene
+            .lowpoly_meshes
+            .get(&NodeId(node_id))
+            .unwrap()
+            .texture
+            .is_some());
+        assert!(execute_tool_call(
+            "mesh_clear_texture",
+            &json!({ "node_id": node_id, "target": "bogus" }),
+            &mut scene,
+            &mut history,
+            &dir,
+        )
+        .is_err());
+
+        // Remove one clip, then one leaf bone (RightArm has no children;
+        // removing Torso would drop the body chain).
+        let clips_before = scene.character_rig.as_ref().unwrap().animations.len();
+        execute_tool_call(
+            "character_remove_clip",
+            &json!({ "clip_name": "Idle" }),
+            &mut scene,
+            &mut history,
+            &dir,
+        )
+        .unwrap();
+        assert_eq!(
+            scene.character_rig.as_ref().unwrap().animations.len(),
+            clips_before - 1
+        );
+        let removed = execute_tool_call(
+            "character_remove_bone",
+            &json!({ "bone_id": 4 }),
+            &mut scene,
+            &mut history,
+            &dir,
+        )
+        .unwrap();
+        assert_eq!(removed["removed_bones"], 1);
+        let listed = execute_tool_call(
+            "character_list_bones",
+            &json!({}),
+            &mut scene,
+            &mut history,
+            &dir,
+        )
+        .unwrap();
+        assert_eq!(listed["bone_count"], 6);
+        assert!(scene
+            .character_rig
+            .as_ref()
+            .unwrap()
+            .bones
+            .iter()
+            .all(|b| b.name != "RightArm"));
+        // Unknown bone / clip fail cleanly.
+        assert!(execute_tool_call(
+            "character_remove_bone",
+            &json!({ "bone_id": 99 }),
+            &mut scene,
+            &mut history,
+            &dir,
+        )
+        .is_err());
+        assert!(execute_tool_call(
+            "character_remove_clip",
+            &json!({ "clip_name": "Nope" }),
+            &mut scene,
+            &mut history,
+            &dir,
+        )
+        .is_err());
     }
 
     #[test]

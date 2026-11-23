@@ -280,13 +280,52 @@ fn show_pixel_layers_section(
                 .size(11.5)
                 .color(tokens::ON_SURFACE_VARIANT),
         );
-        if icons::hud_icon_button(ui, ToolIcon::Add, "New 32x32 Pixel Canvas", false) {
+        ui.add_space(4.0);
+        let size_id = egui::Id::new("new_canvas_size");
+        let (mut w, mut h) = ui
+            .ctx()
+            .data_mut(|data| data.get_temp::<(u32, u32)>(size_id).unwrap_or((32, 32)));
+        ui.horizontal(|ui| {
+            ui.label(
+                RichText::new("W")
+                    .size(11.0)
+                    .color(tokens::ON_SURFACE_VARIANT),
+            );
+            ui.add(
+                egui::DragValue::new(&mut w)
+                    .range(8..=256)
+                    .prefix("")
+                    .suffix("px"),
+            );
+            ui.label(
+                RichText::new("H")
+                    .size(11.0)
+                    .color(tokens::ON_SURFACE_VARIANT),
+            );
+            ui.add(
+                egui::DragValue::new(&mut h)
+                    .range(8..=256)
+                    .prefix("")
+                    .suffix("px"),
+            );
+        });
+        ui.ctx().data_mut(|data| data.insert_temp(size_id, (w, h)));
+        ui.add_space(4.0);
+        let create_btn = egui::Button::new(
+            RichText::new(format!("+ New Canvas ({w}×{h})"))
+                .size(12.0)
+                .color(tokens::ON_PRIMARY),
+        )
+        .fill(tokens::PRIMARY_CONTAINER)
+        .corner_radius(egui::CornerRadius::same(4))
+        .min_size(egui::vec2(ui.available_width(), 28.0));
+        if ui.add(create_btn).clicked() {
             let _ = history.execute(
                 scene,
                 Command::CreatePixelCanvas {
-                    name: "Sprite 32x32".into(),
-                    width: 32,
-                    height: 32,
+                    name: format!("Sprite {w}x{h}"),
+                    width: w,
+                    height: h,
                 },
             );
         }

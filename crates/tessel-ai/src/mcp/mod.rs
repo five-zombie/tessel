@@ -19,8 +19,10 @@ Recommended workflow:
 2. Remove unwanted starter nodes (such as 'Starter Voxel') with `scene_delete_node` before sculpting a new asset. Position, rotate, or scale any node with `scene_set_node_transform` (`position`, `rotation_deg`, `scale`), group/parent parts with `scene_set_parent`, and adjust studio lighting with `scene_set_lighting`.
 3. Voxel mode: use `voxel_fill_box` and `voxel_fill_ellipsoid` (bounds ±256), then optionally `voxel_convert_to_lowpoly`.
 4. Low-Poly mode: compose primitives via `mesh_create_primitive` (`cube`, `plane`, `cylinder`, `cone`, `sphere`, `torus`, `capsule` with `position`, `rotation_deg`, `scale`), generate curved shoulder straps/belts/cables with `mesh_create_curve_tube` (`points`, `radius`, `flatness`), inspect face IDs/normals with `mesh_inspect`, bevel/panel faces with `mesh_inset_face`, extrude pockets/flaps/straps with `mesh_extrude_face`, chamfer hard edges/corners with `mesh_bevel`, sculpt faces with `mesh_translate_face`, edit individual corners with `mesh_move_vertices` / `mesh_set_vertex`, unwrap UVs manually with `mesh_set_face_uvs`, paint skin weights with `mesh_set_vertex_weights` (cleared by bevel/subdivide/decimate), sculpt blend shapes with `mesh_morph_delta` / `mesh_morph_clear`, optimize LOD with `mesh_decimate`, or import `.obj`/`.glb` (`mesh_import`, preserving UVs). Apply custom `.png`/`.jpg` textures or normal maps (skin, wood, fur, fabric, camo, stitching) via `mesh_load_texture` and `mesh_load_normal_map`. Paint patterns/spots via `mesh_fill_texture` then `mesh_paint_spot` (`point`+`normal` or `uv`, `radius_px`, optional `mirror_x: true` for X symmetry). Adjust PBR finish (`metallic`, `roughness`, `emissive`) with `mesh_set_material`. Round organic shapes with `mesh_smooth_subdivide` (1-3 iterations) and `mesh_set_shading` (`smooth: true`).
-5. Character & Prop Rigging mode: call `character_apply_biped_rig` for humanoids or `character_add_bone` + `character_bind_node` for custom prop rigs (backpacks, weapons, chests), pose bones with `character_set_bone_pose`, solve two-bone IK with `character_solve_ik`, author custom TRS animations with `character_set_keyframe`, and animate blend shapes with `character_set_morph_weight`. Exporting `.glb` while a rig is active automatically embeds glTF 2.0 auto-weight smooth skinning (`skins`, `JOINTS_0`, `WEIGHTS_0`, `inverseBindMatrices`).
-6. Read `tessel://viewport/preview` (when GUI is running) to visually inspect results, use `history_undo`/`history_redo` if needed, and export via `project_export` (`.glb`, `.obj`, `.stl`, `.vox`, `.png`, `.gif`).";
+5. Character & Prop Rigging mode: call `character_apply_biped_rig` for humanoids or `character_add_bone` + `character_bind_node` for custom prop rigs (backpacks, weapons, chests), pose bones with `character_set_bone_pose`, solve two-bone IK with `character_solve_ik`, author custom TRS animations with `character_set_keyframe` (remove with `character_remove_keyframe`), manage clips with `character_set_active_clip` / `character_remove_clip`, prune bones with `character_remove_bone`, inspect with `character_list_bones` / `character_inspect_clip` / `character_sample_pose`, and animate blend shapes with `character_set_morph_weight`. Exporting `.glb` while a rig is active automatically embeds glTF 2.0 auto-weight smooth skinning (`skins`, `JOINTS_0`, `WEIGHTS_0`, `inverseBindMatrices`).
+6. Read `tessel://viewport/preview` (when GUI is running) to visually inspect results, use `history_undo`/`history_redo` if needed, and export via `project_export` (`.glb`, `.obj`, `.stl`, `.vox`, `.png`, `.gif`).
+7. Live GUI viewport only: frame subjects with `camera_get`, `camera_look_at`, `camera_zoom` (`factor` or `distance`), `camera_orbit`, `camera_pan`, `camera_preset` (`iso|front|back|right|left|top`), and `camera_reset` before screenshotting.
+8. Verify visually with `viewport_screenshot` (`width`, `height`, `target`, `yaw`, `pitch`, `distance`, `preview`): renders the live scene offscreen to an sRGB PNG (needs a GPU; software GL works).";
 
 /// Processes a single JSON-RPC 2.0 MCP request directly against any live `SceneState` & `HistoryStack`.
 pub fn dispatch_mcp_message(
@@ -304,6 +306,7 @@ pub struct McpServer {
     pub scene: SceneState,
     pub history: HistoryStack,
     pub allowed_export_dir: PathBuf,
+    headless: Option<crate::headless::HeadlessRenderer>,
 }
 
 impl McpServer {
@@ -312,17 +315,84 @@ impl McpServer {
             scene: SceneState::new(),
             history: HistoryStack::new(),
             allowed_export_dir,
+            headless: None,
         }
     }
 
     /// Processes a single JSON-RPC 2.0 request and returns an optional response (`None` for notifications).
     pub fn handle_message(&mut self, request: &Value) -> Option<Value> {
+        if request.get("method").and_then(Value::as_str) == Some("tools/call")
+            && request
+                .get("params")
+                .and_then(|p| p.get("name"))
+                .and_then(Value::as_str)
+                == Some("viewport_screenshot")
+        {
+            return Some(self.call_viewport_screenshot(request));
+        }
         dispatch_mcp_message(
             request,
             &mut self.scene,
             &mut self.history,
             &self.allowed_export_dir,
         )
+    }
+
+    /// Renders the current scene offscreen (headless GPU) and returns the PNG
+    /// as an MCP image content block. The renderer is created lazily so
+    /// machines without a GPU keep working for every other tool.
+    fn call_viewport_screenshot(&mut self, request: &Value) -> Value {
+        use crate::error::AiError;
+        let id = request.get("id").cloned().unwrap_or(Value::Null);
+        let args = request
+            .get("params")
+            .and_then(|p| p.get("arguments"))
+            .cloned()
+            .unwrap_or_else(|| json!({}));
+        let result = (|| -> Result<Value, AiError> {
+            let w = args
+                .get("width")
+                .and_then(Value::as_u64)
+                .unwrap_or(640)
+                .clamp(16, 1024) as u32;
+            let h = args
+                .get("height")
+                .and_then(Value::as_u64)
+                .unwrap_or(480)
+                .clamp(16, 1024) as u32;
+            let preview = args
+                .get("preview")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            let cam = crate::headless::screenshot_camera(&args)?;
+            if self.headless.is_none() {
+                self.headless = Some(crate::headless::HeadlessRenderer::new(640, 480)?);
+            }
+            let png = self
+                .headless
+                .as_mut()
+                .expect("headless renderer just created")
+                .render_png(&self.scene, &cam, w, h, preview)?;
+            Ok(json!([
+                { "type": "text", "text": format!("viewport {w}x{h} sRGB PNG") },
+                { "type": "image", "data": base64::engine::general_purpose::STANDARD.encode(&png), "mimeType": "image/png" },
+            ]))
+        })();
+        match result {
+            Ok(content) => json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "result": { "content": content, "isError": false },
+            }),
+            Err(err) => json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "result": {
+                    "content": [{ "type": "text", "text": err.to_structured_json().to_string() }],
+                    "isError": true,
+                },
+            }),
+        }
     }
 
     /// Runs the line-delimited JSON-RPC stdio transport loop until EOF.
@@ -429,6 +499,62 @@ mod tests {
             .contains("EXPORT_PATH_DENIED"));
 
         let _ = std::fs::remove_dir_all(&export_dir);
+    }
+
+    #[test]
+    fn mcp_viewport_screenshot_needs_gpu_but_validates_args_first() {
+        let export_dir = std::env::temp_dir().join("tessel_mcp_shot_test");
+        let _ = std::fs::remove_dir_all(&export_dir);
+        let mut server = McpServer::new(export_dir);
+
+        // Bad camera args fail before any GPU is touched.
+        let bad = server
+            .handle_message(&json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {
+                    "name": "viewport_screenshot",
+                    "arguments": { "target": [0.0, 0.0] }
+                }
+            }))
+            .unwrap();
+        assert_eq!(bad["result"]["isError"], true);
+        assert!(bad["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("target"));
+
+        // A real render needs a GPU; CI sandboxes without one get a clear
+        // error instead of a hang (run with a GPU, e.g. lavapipe, for pixels).
+        let shot = server
+            .handle_message(&json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "tools/call",
+                "params": {
+                    "name": "viewport_screenshot",
+                    "arguments": { "width": 64, "height": 64 }
+                }
+            }))
+            .unwrap();
+        if shot["result"]["isError"] == true {
+            let msg = shot["result"]["content"][0]["text"].as_str().unwrap();
+            assert!(
+                msg.contains("GPU"),
+                "GPU-less failure must say so, got: {msg}"
+            );
+            eprintln!("SKIP pixels: no GPU adapter in this environment");
+            return;
+        }
+        let content = shot["result"]["content"].as_array().unwrap();
+        assert_eq!(content.len(), 2);
+        let b64 = content[1]["data"].as_str().unwrap();
+        assert_eq!(content[1]["mimeType"], "image/png");
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(b64)
+            .unwrap();
+        assert_eq!(&bytes[1..4], b"PNG", "must be a real PNG file");
     }
 
     #[test]

@@ -71,6 +71,7 @@ pub enum ToolIcon {
     EyeClosed,
     Reset,
     Stop,
+    NewProject,
 }
 
 impl ToolIcon {
@@ -142,13 +143,14 @@ impl ToolIcon {
             Self::EyeClosed => r::EYE_SLASH,
             Self::Reset => r::ARROW_COUNTER_CLOCKWISE,
             Self::Stop => r::STOP,
+            Self::NewProject => r::FILE_PLUS,
         }
     }
 }
 
 /// Every icon, for the headless paint smoke test below.
 #[cfg(test)]
-pub const ALL: [ToolIcon; 63] = [
+pub const ALL: [ToolIcon; 64] = [
     ToolIcon::Pencil,
     ToolIcon::Eraser,
     ToolIcon::Fill,
@@ -212,6 +214,7 @@ pub const ALL: [ToolIcon; 63] = [
     ToolIcon::EyeClosed,
     ToolIcon::Reset,
     ToolIcon::Stop,
+    ToolIcon::NewProject,
 ];
 
 /// One clickable toolbar cell. To add a button, push one of these into a

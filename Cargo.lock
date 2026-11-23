@@ -3273,14 +3273,17 @@ version = "0.1.0"
 dependencies = [
  "base64 0.22.1",
  "glam",
+ "pollster",
  "reqwest",
  "serde",
  "serde_json",
  "tessel-core",
  "tessel-io",
+ "tessel-render",
  "thiserror 2.0.21",
  "tokio",
  "tracing",
+ "wgpu",
 ]
 
 [[package]]

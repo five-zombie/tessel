@@ -1,5 +1,6 @@
 pub mod direct;
 pub mod error;
+pub mod headless;
 pub mod mcp;
 pub mod tools;
 pub mod translator;

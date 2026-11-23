@@ -540,6 +540,116 @@ pub fn tool_definitions() -> Vec<Value> {
             }
         }),
         json!({
+            "name": "character_list_bones",
+            "description": "List all bones of the character rig (id, name, parent, rest position). Fails when the scene has no rig.",
+            "inputSchema": { "type": "object", "properties": {} }
+        }),
+        json!({
+            "name": "character_inspect_clip",
+            "description": "Inspect an animation clip in full: keyframes per bone channel (time, translation, rotation quat + degrees, scale) and morph weight tracks.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "clip_index": { "type": "integer", "minimum": 0 },
+                    "clip_name": { "type": "string" }
+                }
+            }
+        }),
+        json!({
+            "name": "character_sample_pose",
+            "description": "Sample an animation clip at time_secs without touching live pose. Returns per-bone world positions and local XYZ-euler degrees.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "clip_index": { "type": "integer", "minimum": 0 },
+                    "clip_name": { "type": "string" },
+                    "time_secs": { "type": "number", "minimum": 0.0 }
+                },
+                "required": ["time_secs"]
+            }
+        }),
+        json!({
+            "name": "character_set_active_clip",
+            "description": "Set the active animation clip (viewport playback target).",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "clip_index": { "type": "integer", "minimum": 0 },
+                    "clip_name": { "type": "string" }
+                }
+            }
+        }),
+        json!({
+            "name": "character_remove_keyframe",
+            "description": "Remove a bone keyframe matching time_secs (within 1ms) from an animation clip.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "clip_index": { "type": "integer", "minimum": 0 },
+                    "clip_name": { "type": "string" },
+                    "bone_id": { "type": "integer", "minimum": 0 },
+                    "time_secs": { "type": "number", "minimum": 0.0 }
+                },
+                "required": ["bone_id", "time_secs"]
+            }
+        }),
+        json!({
+            "name": "character_remove_clip",
+            "description": "Remove an animation clip by index or name (active clip index is repaired when needed).",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "clip_index": { "type": "integer", "minimum": 0 },
+                    "clip_name": { "type": "string" }
+                }
+            }
+        }),
+        json!({
+            "name": "character_remove_bone",
+            "description": "Remove a bone and its whole subtree (children, bindings, and bone channels referencing it). Reports counts of removed items.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "bone_id": { "type": "integer", "minimum": 0 }
+                },
+                "required": ["bone_id"]
+            }
+        }),
+        json!({
+            "name": "scene_duplicate_node",
+            "description": "Duplicate a scene node (mesh/voxel/pixel payload plus material, inheriting rig bindings) with a +0.5 x offset. Selects the copy.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "node_id": { "type": "integer", "minimum": 1 },
+                    "name": { "type": "string" }
+                }
+            }
+        }),
+        json!({
+            "name": "scene_set_node_visibility",
+            "description": "Show or hide a scene node (undoable).",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "node_id": { "type": "integer", "minimum": 1 },
+                    "visible": { "type": "boolean" }
+                },
+                "required": ["node_id", "visible"]
+            }
+        }),
+        json!({
+            "name": "mesh_clear_texture",
+            "description": "Clear a low-poly mesh's color texture, normal map, or both (undoable).",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "node_id": { "type": "integer" },
+                    "target": { "type": "string", "enum": ["color", "normal", "both"] }
+                }
+            }
+        }),
+        json!({
             "name": "project_export",
             "description": "Export the current scene to .glb, .obj, .stl, .vox, .png, or .gif inside the allowed export directory.",
             "inputSchema": {
@@ -561,6 +671,89 @@ pub fn tool_definitions() -> Vec<Value> {
             "name": "history_redo",
             "description": "Redo the most recently undone command.",
             "inputSchema": { "type": "object", "properties": {} }
+        }),
+        json!({
+            "name": "camera_get",
+            "description": "Read the live viewport camera state (target, yaw, pitch, distance). Requires the live GUI viewport; unavailable headless.",
+            "inputSchema": { "type": "object", "properties": {} }
+        }),
+        json!({
+            "name": "camera_look_at",
+            "description": "Point the live viewport camera at an absolute world position [x, y, z]. Requires the live GUI viewport.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "target": { "type": "array", "items": { "type": "number" }, "minItems": 3, "maxItems": 3 }
+                },
+                "required": ["target"]
+            }
+        }),
+        json!({
+            "name": "camera_zoom",
+            "description": "Zoom the live viewport camera. Pass factor (> 0, < 1 zooms in) or an absolute distance (> 0). Requires the live GUI viewport.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "factor": { "type": "number" },
+                    "distance": { "type": "number", "minimum": 0 }
+                }
+            }
+        }),
+        json!({
+            "name": "camera_orbit",
+            "description": "Orbit the live viewport camera by pixel deltas (dx turns yaw, dy turns pitch). Requires the live GUI viewport.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "dx": { "type": "number" },
+                    "dy": { "type": "number" }
+                },
+                "required": ["dx", "dy"]
+            }
+        }),
+        json!({
+            "name": "camera_pan",
+            "description": "Pan the live viewport camera target by pixel deltas. Requires the live GUI viewport.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "dx": { "type": "number" },
+                    "dy": { "type": "number" }
+                },
+                "required": ["dx", "dy"]
+            }
+        }),
+        json!({
+            "name": "camera_reset",
+            "description": "Reset the live viewport camera to its default view. Requires the live GUI viewport.",
+            "inputSchema": { "type": "object", "properties": {} }
+        }),
+        json!({
+            "name": "camera_preset",
+            "description": "Move the live viewport camera to a named preset view. Requires the live GUI viewport.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "name": { "type": "string", "enum": ["iso", "front", "back", "right", "left", "top"] }
+                },
+                "required": ["name"]
+            }
+        }),
+        json!({
+            "name": "viewport_screenshot",
+            "description": "Render the current scene offscreen (headless GPU) and return an sRGB PNG image. Fully args-driven (width, height, target, yaw, pitch, distance, preview); needs a GPU (software GL works). Use it to visually verify assets.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "width": { "type": "integer", "minimum": 16, "maximum": 1024 },
+                    "height": { "type": "integer", "minimum": 16, "maximum": 1024 },
+                    "target": { "type": "array", "items": { "type": "number" }, "minItems": 3, "maxItems": 3 },
+                    "yaw": { "type": "number" },
+                    "pitch": { "type": "number" },
+                    "distance": { "type": "number", "minimum": 0 },
+                    "preview": { "type": "boolean" }
+                }
+            }
         }),
     ]
 }

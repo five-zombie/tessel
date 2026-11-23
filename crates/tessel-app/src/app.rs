@@ -9,7 +9,7 @@ use winit::window::{Window, WindowId};
 
 use tessel_ai::{dispatch_mcp_message_with_preview, LiveMcpServerHandle};
 use tessel_core::{Command, HistoryStack, PixelCoord, SceneState};
-use tessel_render::{OrbitCamera, PixelCamera2D, RenderError, ViewportRenderer};
+use tessel_render::{CameraPreset, OrbitCamera, PixelCamera2D, RenderError, ViewportRenderer};
 
 use crate::input::handle_global_shortcuts;
 use crate::project_files::ProjectFileManager;
@@ -59,6 +59,129 @@ struct StudioState {
     live_mcp: Option<LiveMcpServerHandle>,
 }
 
+/// Live-viewport camera tools for MCP agents (orbit/zoom/pan/preset/look-at).
+/// Only the GUI app hosts a camera, so these are intercepted in
+/// [`StudioState::poll_live_mcp`] instead of going through the shared
+/// [`tessel_ai::translator::execute_tool_call`] path (which correctly rejects
+/// them as needing a live viewport).
+fn camera_state_json(cam: &OrbitCamera) -> serde_json::Value {
+    serde_json::json!({
+        "target": cam.target.to_array(),
+        "yaw": cam.yaw,
+        "pitch": cam.pitch,
+        "distance": cam.distance,
+    })
+}
+
+fn read_vec3(args: &serde_json::Value, key: &str) -> Result<glam::Vec3, tessel_ai::AiError> {
+    use tessel_ai::AiError;
+    let arr = args
+        .get(key)
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| AiError::InvalidArguments(format!("missing '{key}' [x, y, z]")))?;
+    if arr.len() != 3 {
+        return Err(AiError::InvalidArguments(format!(
+            "'{key}' must have 3 numbers"
+        )));
+    }
+    let mut out = [0.0f32; 3];
+    for (i, v) in arr.iter().enumerate() {
+        out[i] = v
+            .as_f64()
+            .ok_or_else(|| AiError::InvalidArguments(format!("'{key}[{i}]' must be a number")))?
+            as f32;
+    }
+    let vec = glam::Vec3::from_array(out);
+    if !vec.is_finite() {
+        return Err(AiError::InvalidArguments(format!("'{key}' must be finite")));
+    }
+    Ok(vec)
+}
+
+fn read_finite(args: &serde_json::Value, key: &str) -> Result<f32, tessel_ai::AiError> {
+    use tessel_ai::AiError;
+    args.get(key)
+        .and_then(serde_json::Value::as_f64)
+        .map(|v| v as f32)
+        .filter(|v| v.is_finite())
+        .ok_or_else(|| AiError::InvalidArguments(format!("missing finite number '{key}'")))
+}
+
+fn handle_camera_tool_call(
+    tool_name: &str,
+    args: &serde_json::Value,
+    cam: &mut OrbitCamera,
+) -> Result<serde_json::Value, tessel_ai::AiError> {
+    use tessel_ai::AiError;
+    match tool_name {
+        "camera_get" => Ok(serde_json::json!({ "ok": true, "camera": camera_state_json(cam) })),
+        "camera_look_at" => {
+            cam.target = read_vec3(args, "target")?;
+            Ok(serde_json::json!({ "ok": true, "camera": camera_state_json(cam) }))
+        }
+        "camera_zoom" => {
+            if let Some(f) = args.get("factor").and_then(serde_json::Value::as_f64) {
+                let f = f as f32;
+                if !f.is_finite() || f <= 0.0 {
+                    return Err(AiError::InvalidArguments(
+                        "'factor' must be a finite number > 0".into(),
+                    ));
+                }
+                cam.zoom_step(f.clamp(0.001, 1000.0));
+            } else if let Some(d) = args.get("distance").and_then(serde_json::Value::as_f64) {
+                let d = d as f32;
+                if !d.is_finite() || d <= 0.0 {
+                    return Err(AiError::InvalidArguments(
+                        "'distance' must be a finite number > 0".into(),
+                    ));
+                }
+                cam.zoom_step((d / cam.distance.max(1e-6)).clamp(0.001, 1000.0));
+            } else {
+                return Err(AiError::InvalidArguments(
+                    "camera_zoom needs 'factor' or 'distance'".into(),
+                ));
+            }
+            Ok(serde_json::json!({ "ok": true, "camera": camera_state_json(cam) }))
+        }
+        "camera_orbit" => {
+            let (dx, dy) = (read_finite(args, "dx")?, read_finite(args, "dy")?);
+            cam.orbit(dx, dy);
+            Ok(serde_json::json!({ "ok": true, "camera": camera_state_json(cam) }))
+        }
+        "camera_pan" => {
+            let (dx, dy) = (read_finite(args, "dx")?, read_finite(args, "dy")?);
+            cam.pan(dx, dy);
+            Ok(serde_json::json!({ "ok": true, "camera": camera_state_json(cam) }))
+        }
+        "camera_reset" => {
+            cam.reset();
+            Ok(serde_json::json!({ "ok": true, "camera": camera_state_json(cam) }))
+        }
+        "camera_preset" => {
+            let name = args
+                .get("name")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("");
+            let preset = match name {
+                "iso" => CameraPreset::Iso,
+                "front" => CameraPreset::Front,
+                "back" => CameraPreset::Back,
+                "right" => CameraPreset::Right,
+                "left" => CameraPreset::Left,
+                "top" => CameraPreset::Top,
+                _ => {
+                    return Err(AiError::InvalidArguments(
+                        "unknown preset; use iso|front|back|right|left|top".into(),
+                    ));
+                }
+            };
+            cam.set_preset(preset);
+            Ok(serde_json::json!({ "ok": true, "camera": camera_state_json(cam) }))
+        }
+        other => Err(AiError::UnknownTool(other.to_string())),
+    }
+}
+
 impl StudioState {
     fn poll_live_mcp(&mut self, mut capture_preview: impl FnMut() -> Option<Vec<u8>>) {
         let Some(handle) = &self.live_mcp else {
@@ -79,13 +202,60 @@ impl StudioState {
             } else {
                 None
             };
-            let reply = dispatch_mcp_message_with_preview(
-                &req.payload,
-                &mut self.scene,
-                &mut self.history,
-                &self.export_dialog.output_dir,
-                preview_bytes,
-            );
+            let is_camera_tool = req
+                .payload
+                .get("method")
+                .and_then(serde_json::Value::as_str)
+                == Some("tools/call")
+                && req
+                    .payload
+                    .get("params")
+                    .and_then(|p| p.get("name"))
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|n| n.starts_with("camera_"));
+            let reply = if is_camera_tool {
+                let params = req
+                    .payload
+                    .get("params")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null);
+                let id = req
+                    .payload
+                    .get("id")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null);
+                let tool_name = params
+                    .get("name")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("");
+                let args = params
+                    .get("arguments")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null);
+                let result = match handle_camera_tool_call(tool_name, &args, &mut self.camera_3d) {
+                    Ok(val) => serde_json::json!({
+                        "content": [{ "type": "text", "text": val.to_string() }],
+                        "isError": false
+                    }),
+                    Err(err) => serde_json::json!({
+                        "content": [{ "type": "text", "text": err.to_structured_json().to_string() }],
+                        "isError": true
+                    }),
+                };
+                Some(serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "result": result,
+                }))
+            } else {
+                dispatch_mcp_message_with_preview(
+                    &req.payload,
+                    &mut self.scene,
+                    &mut self.history,
+                    &self.export_dialog.output_dir,
+                    preview_bytes,
+                )
+            };
             let _ = req.reply_tx.send(reply);
         }
     }
@@ -327,6 +497,7 @@ impl GpuState {
             open_mcp: false,
             save_project: false,
             open_project: false,
+            new_project: false,
             import_mesh: false,
             open_settings: false,
         };
@@ -545,6 +716,16 @@ impl GpuState {
                 Err(err) => tracing::error!("Open project failed: {err}"),
             }
         }
+        if top_actions.new_project {
+            studio.scene = SceneState::new();
+            studio.history = HistoryStack::new();
+            studio.camera_3d.reset();
+            studio.camera_2d.reset();
+            studio.project_files.current_path = None;
+            studio
+                .project_files
+                .mark_baseline_revision(studio.scene.revision);
+        }
 
         self.egui_state
             .handle_platform_output(&self.window, full_output.platform_output);
@@ -721,5 +902,99 @@ impl ApplicationHandler for TesselApp {
             }
             _ => {}
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn camera_tools_drive_viewport_state() {
+        let mut cam = OrbitCamera::new();
+        assert!((cam.distance - 9.0).abs() < 1e-6);
+
+        // Absolute zoom + readback.
+        let res = handle_camera_tool_call(
+            "camera_zoom",
+            &serde_json::json!({ "distance": 3.0 }),
+            &mut cam,
+        )
+        .unwrap();
+        assert!((res["camera"]["distance"].as_f64().unwrap() - 3.0).abs() < 1e-4);
+
+        // Factor zoom in halves the distance.
+        handle_camera_tool_call(
+            "camera_zoom",
+            &serde_json::json!({ "factor": 0.5 }),
+            &mut cam,
+        )
+        .unwrap();
+        assert!((cam.distance - 1.5).abs() < 1e-4);
+
+        // Look-at + orbit + pan move state observably.
+        handle_camera_tool_call(
+            "camera_look_at",
+            &serde_json::json!({ "target": [1.0, 0.5, -2.0] }),
+            &mut cam,
+        )
+        .unwrap();
+        assert_eq!(cam.target, glam::Vec3::new(1.0, 0.5, -2.0));
+        let before = (cam.yaw, cam.pitch);
+        handle_camera_tool_call(
+            "camera_orbit",
+            &serde_json::json!({ "dx": 40.0, "dy": -15.0 }),
+            &mut cam,
+        )
+        .unwrap();
+        assert!((cam.yaw - before.0).abs() > 1e-6);
+        assert!((cam.pitch - before.1).abs() > 1e-6);
+        let target_before = cam.target;
+        handle_camera_tool_call(
+            "camera_pan",
+            &serde_json::json!({ "dx": 30.0, "dy": 10.0 }),
+            &mut cam,
+        )
+        .unwrap();
+        assert!((cam.target - target_before).length() > 1e-6);
+
+        // Preset + reset restore defaults.
+        handle_camera_tool_call(
+            "camera_preset",
+            &serde_json::json!({ "name": "front" }),
+            &mut cam,
+        )
+        .unwrap();
+        assert!(cam.yaw.abs() < 1e-6);
+        handle_camera_tool_call("camera_reset", &serde_json::json!({}), &mut cam).unwrap();
+        assert!((cam.distance - 9.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn camera_tools_reject_bad_input() {
+        let mut cam = OrbitCamera::new();
+        for (name, v) in [
+            ("camera_zoom", serde_json::json!({})),
+            ("camera_zoom", serde_json::json!({ "factor": -1.0 })),
+            ("camera_zoom", serde_json::json!({ "distance": 0.0 })),
+            ("camera_orbit", serde_json::json!({ "dx": 1.0 })),
+            (
+                "camera_look_at",
+                serde_json::json!({ "target": [0.0, 0.0] }),
+            ),
+            (
+                "camera_preset",
+                serde_json::json!({ "name": "upside-down" }),
+            ),
+            ("camera_preset", serde_json::json!({})),
+            ("camera_nope", serde_json::json!({})),
+        ] {
+            assert!(
+                handle_camera_tool_call(name, &v, &mut cam).is_err(),
+                "{name} should be rejected"
+            );
+        }
+        // Failed calls leave the camera untouched.
+        assert!((cam.distance - 9.0).abs() < 1e-6);
     }
 }

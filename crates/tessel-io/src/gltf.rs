@@ -1368,6 +1368,37 @@ mod tests {
     }
 
     #[test]
+    fn glb_export_survives_bone_and_clip_removal() {
+        let mut scene = SceneState::new();
+        Command::CreatePrimitiveMesh {
+            name: "Hero".into(),
+            kind: PrimitiveKind::Cube,
+            size: 1.0,
+            material: PaletteIndex::new(1).unwrap(),
+        }
+        .apply(&mut scene)
+        .unwrap();
+        Command::ApplyBipedRig.apply(&mut scene).unwrap();
+        // Drop RightArm (leaf) and the Walk clip, then export must parse.
+        Command::RemoveBone {
+            bone_id: tessel_core::BoneId(4),
+        }
+        .apply(&mut scene)
+        .unwrap();
+        let rig = scene.character_rig.as_ref().unwrap();
+        assert_eq!(rig.bones.len(), 6);
+        Command::RemoveAnimationClip { clip_index: 1 }
+            .apply(&mut scene)
+            .unwrap();
+        assert_eq!(scene.character_rig.as_ref().unwrap().animations.len(), 1);
+
+        let (glb, _) = export_glb_bytes(&scene, ExportPreset::Godot4).unwrap();
+        let parsed = gltf::Gltf::from_slice(&glb).unwrap();
+        assert_eq!(parsed.animations().count(), 1);
+        assert_eq!(parsed.skins().count(), 1);
+    }
+
+    #[test]
     fn glb_export_applies_node_transform_to_mesh_positions() {
         let mut scene = SceneState::new();
         Command::CreatePrimitiveMesh {

@@ -8,6 +8,7 @@ pub struct TopBarActions {
     pub open_mcp: bool,
     pub save_project: bool,
     pub open_project: bool,
+    pub new_project: bool,
     pub import_mesh: bool,
     pub open_settings: bool,
 }
@@ -24,6 +25,7 @@ pub fn show_top_bar(
         open_mcp: false,
         save_project: false,
         open_project: false,
+        new_project: false,
         import_mesh: false,
         open_settings: false,
     };
@@ -43,6 +45,9 @@ pub fn show_top_bar(
                         .size(13.5)
                         .color(tokens::ON_SURFACE),
                 );
+                if icons::hud_icon_button(ui, ToolIcon::NewProject, "New project", false) {
+                    actions.new_project = true;
+                }
                 if icons::hud_icon_button(ui, ToolIcon::Open, "Open project", false) {
                     actions.open_project = true;
                 }

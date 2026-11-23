@@ -243,6 +243,28 @@ pub enum Command {
         target: String,
         time_secs: f32,
     },
+    SetActiveAnimationClip {
+        clip_index: usize,
+    },
+    RemoveAnimationClip {
+        clip_index: usize,
+    },
+    RemoveBone {
+        bone_id: BoneId,
+    },
+    DuplicateNode {
+        node_id: NodeId,
+        name: Option<String>,
+    },
+    SetNodeVisibility {
+        node_id: NodeId,
+        visible: bool,
+    },
+    ClearMeshTexture {
+        node_id: NodeId,
+        clear_color: bool,
+        clear_normal: bool,
+    },
     Transaction(Vec<Command>),
 }
 
@@ -349,6 +371,10 @@ pub enum UndoDelta {
     RestoreAnimationClip {
         clip_index: usize,
         previous: AnimationClip,
+    },
+    RestoreNodeVisibility {
+        node_id: NodeId,
+        previous: bool,
     },
     Transaction(Vec<UndoDelta>),
 }
@@ -1401,6 +1427,159 @@ impl Command {
                     previous,
                 }
             }
+            Self::SetActiveAnimationClip { clip_index } => {
+                let previous = scene.character_rig.clone();
+                let rig = scene
+                    .character_rig
+                    .as_mut()
+                    .ok_or(CoreError::CharacterRigNotFound)?;
+                if *clip_index >= rig.animations.len() {
+                    return Err(CoreError::OutOfBounds);
+                }
+                rig.active_animation = *clip_index;
+                rig.playback_time = 0.0;
+                UndoDelta::RestoreCharacterRig(previous)
+            }
+            Self::RemoveAnimationClip { clip_index } => {
+                let previous = scene.character_rig.clone();
+                let rig = scene
+                    .character_rig
+                    .as_mut()
+                    .ok_or(CoreError::CharacterRigNotFound)?;
+                if *clip_index >= rig.animations.len() {
+                    return Err(CoreError::OutOfBounds);
+                }
+                rig.animations.remove(*clip_index);
+                if rig.animations.is_empty() {
+                    rig.active_animation = 0;
+                } else if rig.active_animation >= rig.animations.len() {
+                    rig.active_animation = rig.animations.len() - 1;
+                }
+                UndoDelta::RestoreCharacterRig(previous)
+            }
+            Self::RemoveBone { bone_id } => {
+                let previous = scene.character_rig.clone();
+                let rig = scene
+                    .character_rig
+                    .as_mut()
+                    .ok_or(CoreError::CharacterRigNotFound)?;
+                if rig.bone(*bone_id).is_none() {
+                    return Err(CoreError::OutOfBounds);
+                }
+                // Collect the whole subtree: any bone whose parent chain
+                // reaches `bone_id` goes too.
+                let mut removed = vec![*bone_id];
+                loop {
+                    let mut added = false;
+                    for bone in rig.bones.iter() {
+                        if !removed.contains(&bone.id)
+                            && bone.parent.is_some_and(|p| removed.contains(&p))
+                        {
+                            removed.push(bone.id);
+                            added = true;
+                        }
+                    }
+                    if !added {
+                        break;
+                    }
+                }
+                rig.bones.retain(|b| !removed.contains(&b.id));
+                rig.bindings.retain(|b| !removed.contains(&b.bone_id));
+                for clip in rig.animations.iter_mut() {
+                    clip.channels.retain(|c| !removed.contains(&c.bone_id));
+                }
+                UndoDelta::RestoreCharacterRig(previous)
+            }
+            Self::DuplicateNode { node_id, name } => {
+                let source = scene
+                    .nodes
+                    .get(node_id)
+                    .ok_or(CoreError::NodeNotFound(*node_id))?
+                    .clone();
+                let id = scene.allocate_node_id();
+                let previous_selection = scene.selected_node;
+                let mut node = source.clone();
+                node.id = id;
+                node.name = name
+                    .clone()
+                    .unwrap_or_else(|| format!("{} Copy", source.name));
+                node.transform.translation += glam::Vec3::new(0.5, 0.0, 0.0);
+                scene.nodes.insert(id, node);
+                if let Some(mesh) = scene.lowpoly_meshes.get(node_id).cloned() {
+                    scene.lowpoly_meshes.insert(id, mesh);
+                }
+                if let Some(volume) = scene.voxel_volumes.get(node_id).cloned() {
+                    scene.voxel_volumes.insert(id, volume);
+                }
+                if let Some(canvas) = scene.pixel_canvases.get(node_id).cloned() {
+                    scene.pixel_canvases.insert(id, canvas);
+                }
+                if let Some(rig) = scene.character_rig.as_mut() {
+                    let inherited: Vec<BoneId> = rig
+                        .bindings
+                        .iter()
+                        .filter(|b| b.node_id == *node_id)
+                        .map(|b| b.bone_id)
+                        .collect();
+                    for bone_id in inherited {
+                        rig.bindings.push(SkinBinding {
+                            node_id: id,
+                            bone_id,
+                        });
+                    }
+                }
+                scene.selected_node = Some(id);
+                UndoDelta::RemoveNode {
+                    id,
+                    previous_selection,
+                }
+            }
+            Self::SetNodeVisibility { node_id, visible } => {
+                let node = scene
+                    .nodes
+                    .get_mut(node_id)
+                    .ok_or(CoreError::NodeNotFound(*node_id))?;
+                let previous = node.visible;
+                node.visible = *visible;
+                UndoDelta::RestoreNodeVisibility {
+                    node_id: *node_id,
+                    previous,
+                }
+            }
+            Self::ClearMeshTexture {
+                node_id,
+                clear_color,
+                clear_normal,
+            } => {
+                if !clear_color && !clear_normal {
+                    return Err(CoreError::OutOfBounds);
+                }
+                let mesh = scene
+                    .lowpoly_meshes
+                    .get_mut(node_id)
+                    .ok_or(CoreError::LowPolyMeshNotFound(*node_id))?;
+                let mut deltas = Vec::with_capacity(2);
+                if *clear_color {
+                    let previous = mesh.texture.clone();
+                    mesh.texture = None;
+                    deltas.push(UndoDelta::RestoreMeshTextureFull {
+                        node_id: *node_id,
+                        previous,
+                    });
+                }
+                if *clear_normal {
+                    let previous = mesh.normal_map.clone();
+                    mesh.normal_map = None;
+                    deltas.push(UndoDelta::RestoreMeshNormalMap {
+                        node_id: *node_id,
+                        previous,
+                    });
+                }
+                match deltas.len() {
+                    1 => deltas.into_iter().next().expect("exactly one"),
+                    _ => UndoDelta::Transaction(deltas),
+                }
+            }
             Self::Transaction(commands) => {
                 if commands.is_empty() {
                     return Err(CoreError::EmptyTransaction);
@@ -1687,6 +1866,13 @@ impl UndoDelta {
                 if rig.active_animation == *clip_index {
                     rig.apply_active_animation();
                 }
+            }
+            Self::RestoreNodeVisibility { node_id, previous } => {
+                let node = scene
+                    .nodes
+                    .get_mut(node_id)
+                    .ok_or(CoreError::NodeNotFound(*node_id))?;
+                node.visible = *previous;
             }
             Self::Transaction(deltas) => {
                 for delta in deltas.iter().rev() {

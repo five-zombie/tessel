@@ -16,6 +16,15 @@ pub struct SkinBinding {
     pub bone_id: BoneId,
 }
 
+/// A single bone's sampled pose: world-space joint position plus the
+/// local rotation that produces it (matches `SetBoneRotation` space).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SampledBonePose {
+    pub bone_id: BoneId,
+    pub world_position: Vec3,
+    pub local_rotation: Quat,
+}
+
 /// Unit Anchor: Hierarchical humanoid/custom character rig with starter animations.
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 pub struct CharacterRig {
@@ -96,6 +105,46 @@ impl CharacterRig {
     }
 
     /// Evaluates the active `AnimationClip` at `playback_time` into bone poses.
+    /// Samples `clip_index` at `time_secs` (wrapping within the clip
+    /// duration) without touching live poses. Returns one entry per bone in
+    /// hierarchy order, mirroring `apply_active_animation` math. `None` for
+    /// a missing clip.
+    pub fn sample_clip_pose(
+        &self,
+        clip_index: usize,
+        time_secs: f32,
+    ) -> Option<Vec<SampledBonePose>> {
+        let clip = self.animations.get(clip_index)?;
+        let t = if clip.duration_secs > 0.0 {
+            time_secs.max(0.0) % clip.duration_secs
+        } else {
+            0.0
+        };
+        let mut world_mats: BTreeMap<BoneId, Mat4> = BTreeMap::new();
+        let mut out = Vec::with_capacity(self.bones.len());
+        for bone in &self.bones {
+            let sampled = clip.sample_bone(bone.id, t);
+            let local_t =
+                bone.rest_local.translation + sampled.map(|k| k.translation).unwrap_or(Vec3::ZERO);
+            let local_r =
+                bone.rest_local.rotation * sampled.map(|k| k.rotation).unwrap_or(Quat::IDENTITY);
+            let local_s = bone.rest_local.scale * sampled.map(|k| k.scale).unwrap_or(Vec3::ONE);
+            let local = Mat4::from_scale_rotation_translation(local_s, local_r, local_t);
+            let world = match bone.parent.and_then(|p| world_mats.get(&p)) {
+                Some(parent_world) => *parent_world * local,
+                None => local,
+            };
+            let (_, _, world_pos) = world.to_scale_rotation_translation();
+            world_mats.insert(bone.id, world);
+            out.push(SampledBonePose {
+                bone_id: bone.id,
+                world_position: world_pos,
+                local_rotation: local_r,
+            });
+        }
+        Some(out)
+    }
+
     pub fn apply_active_animation(&mut self) {
         let Some(clip) = self.animations.get(self.active_animation).cloned() else {
             return;
@@ -168,5 +217,22 @@ mod tests {
         rig.apply_active_animation();
         let w = rig.morph_weights.get(&(node, "Smile".to_string())).copied();
         assert!((w.unwrap_or(-1.0) - 0.25).abs() < 1e-6);
+    }
+
+    #[test]
+    fn sample_clip_pose_matches_rest_and_keyframes() {
+        let rig = CharacterRig::biped_template();
+        // Idle (clip 0) has Torso translation keys [0, .03, 0]; LeftArm is static.
+        let at_half = rig.sample_clip_pose(0, 0.5).unwrap();
+        assert_eq!(at_half.len(), rig.bones.len());
+        let torso = at_half.iter().find(|s| s.bone_id == BoneId(1)).unwrap();
+        // Rest torso world pos is (0, 1.1, 0); +0.015 breathing offset at t=0.5.
+        assert!((torso.world_position.y - 1.115).abs() < 1e-4);
+        assert!(torso.local_rotation.angle_between(Quat::IDENTITY) < 1e-6);
+        // Unknown clip returns None.
+        assert!(rig.sample_clip_pose(99, 0.0).is_none());
+        // Empty rig samples fine (zero bones).
+        let empty = CharacterRig::default();
+        assert_eq!(empty.sample_clip_pose(0, 0.0), None);
     }
 }
