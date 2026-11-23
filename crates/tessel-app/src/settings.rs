@@ -149,3 +149,81 @@ pub fn save_api_key_to_keyring(provider: AiProviderKind, key: &str) -> Result<()
         entry.set_password(key.trim()).map_err(|e| e.to_string())
     }
 }
+
+fn mcp_token_file(paths: &AppPaths) -> PathBuf {
+    paths.config_dir.join("mcp_token")
+}
+
+/// Loads the persistent Live MCP bearer token (OS Keyring or `<config_dir>/mcp_token`),
+/// creating and saving one only on first use so the token stays stable across restarts.
+pub fn load_or_create_mcp_token(paths: &AppPaths) -> String {
+    if let Ok(entry) = keyring::Entry::new("tessel", "mcp_live_token") {
+        if let Ok(tok) = entry.get_password() {
+            let trimmed = tok.trim();
+            if !trimmed.is_empty() {
+                return trimmed.to_string();
+            }
+        }
+    }
+    if let Ok(raw) = fs::read_to_string(mcp_token_file(paths)) {
+        let trimmed = raw.trim();
+        if !trimmed.is_empty() {
+            return trimmed.to_string();
+        }
+    }
+    let token = tessel_ai::mcp::http::generate_local_token();
+    save_mcp_token(paths, &token);
+    token
+}
+
+/// Rotates the persistent Live MCP bearer token on explicit user request.
+pub fn rotate_mcp_token(paths: &AppPaths) -> String {
+    let token = tessel_ai::mcp::http::generate_local_token();
+    save_mcp_token(paths, &token);
+    token
+}
+
+fn save_mcp_token(paths: &AppPaths, token: &str) {
+    if let Ok(entry) = keyring::Entry::new("tessel", "mcp_live_token") {
+        let _ = entry.set_password(token);
+    }
+    let token_path = mcp_token_file(paths);
+    if let Some(parent) = token_path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    if fs::write(&token_path, token).is_ok() {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = fs::set_permissions(&token_path, fs::Permissions::from_mode(0o600));
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mcp_token_persists_until_explicitly_rotated() {
+        let dir = std::env::temp_dir().join("tessel_mcp_token_persist_test");
+        let _ = fs::remove_dir_all(&dir);
+        let paths = AppPaths {
+            config_dir: dir.clone(),
+            settings_file: dir.join("settings.json"),
+            recovery_file: dir.join("autosave.tessel"),
+            log_file: dir.join("tessel.log"),
+        };
+
+        let first = load_or_create_mcp_token(&paths);
+        assert!(first.starts_with("tsl_"));
+        let second = load_or_create_mcp_token(&paths);
+        assert_eq!(first, second);
+
+        let rotated = rotate_mcp_token(&paths);
+        assert_ne!(first, rotated);
+        assert_eq!(load_or_create_mcp_token(&paths), rotated);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+}

@@ -64,6 +64,7 @@ pub struct McpDialogState {
 
 pub struct McpDialogAction {
     pub toggle_server: bool,
+    pub rotate_token: bool,
 }
 
 /// Copies text to both egui's clipboard and the OS native clipboard tool for reliable Wayland/X11/macOS/Windows support.
@@ -129,6 +130,7 @@ pub fn build_mcp_config_snippet(
     client: McpClientTarget,
     transport: McpTransportMode,
     live_mcp: Option<&LiveMcpServerHandle>,
+    mcp_token: &str,
     export_dir: &Path,
 ) -> String {
     let export_dir_escaped = export_dir
@@ -138,7 +140,7 @@ pub fn build_mcp_config_snippet(
         .replace('"', "\\\"");
     let (port, token) = match live_mcp {
         Some(mcp) => (mcp.port, mcp.token.as_str()),
-        None => (38421, "<START_LIVE_MCP_FOR_TOKEN>"),
+        None => (38421, mcp_token),
     };
     let url = format!("http://127.0.0.1:{port}/mcp");
 
@@ -168,10 +170,12 @@ pub fn show_mcp_dialog(
     ctx: &egui::Context,
     state: &mut McpDialogState,
     live_mcp: Option<&LiveMcpServerHandle>,
+    mcp_token: &str,
     export_dir: &Path,
 ) -> McpDialogAction {
     let mut action = McpDialogAction {
         toggle_server: false,
+        rotate_token: false,
     };
     if !state.open {
         return action;
@@ -217,26 +221,32 @@ pub fn show_mcp_dialog(
                 });
             });
 
-            if let Some(mcp) = live_mcp {
-                ui.add_space(4.0);
-                let mut token_display = mcp.token.clone();
-                ui.horizontal(|ui| {
-                    ui.label(
-                        RichText::new("Bearer Token:")
-                            .size(11.0)
-                            .color(tokens::ON_SURFACE_VARIANT),
-                    );
-                    ui.add(
-                        egui::TextEdit::singleline(&mut token_display)
-                            .desired_width(290.0)
-                            .code_editor(),
-                    );
-                    if ui.small_button("Copy Token").clicked() {
-                        copy_text_reliable(ui.ctx(), &mcp.token);
-                        state.status_message = Some("Copied Bearer Token to clipboard.".into());
-                    }
-                });
-            }
+            ui.add_space(4.0);
+            let active_token = live_mcp.map_or(mcp_token, |m| m.token.as_str());
+            let mut token_display = active_token.to_string();
+            ui.horizontal(|ui| {
+                ui.label(
+                    RichText::new("Bearer Token:")
+                        .size(11.0)
+                        .color(tokens::ON_SURFACE_VARIANT),
+                );
+                ui.add(
+                    egui::TextEdit::singleline(&mut token_display)
+                        .desired_width(235.0)
+                        .code_editor(),
+                );
+                if ui.small_button("Copy").clicked() {
+                    copy_text_reliable(ui.ctx(), active_token);
+                    state.status_message = Some("Copied Bearer Token to clipboard.".into());
+                }
+                if ui
+                    .small_button("Rotate")
+                    .on_hover_text("Generate a new persistent MCP token")
+                    .clicked()
+                {
+                    action.rotate_token = true;
+                }
+            });
 
             ui.add_space(8.0);
             ui.separator();
@@ -281,8 +291,13 @@ pub fn show_mcp_dialog(
             );
 
             ui.add_space(6.0);
-            let snippet =
-                build_mcp_config_snippet(state.client, state.transport, live_mcp, export_dir);
+            let snippet = build_mcp_config_snippet(
+                state.client,
+                state.transport,
+                live_mcp,
+                mcp_token,
+                export_dir,
+            );
             let mut snippet_display = snippet.clone();
 
             egui::ScrollArea::vertical()
@@ -337,13 +352,14 @@ mod tests {
     #[test]
     fn mcp_config_snippets_match_client_schemas() {
         let dir = Path::new("/tmp/tessel_exports");
+        let tok = "tsl_testtoken1234";
         for client in [
             McpClientTarget::OpenCode,
             McpClientTarget::Agy,
             McpClientTarget::Claude,
         ] {
             for mode in [McpTransportMode::LiveHttp, McpTransportMode::Stdio] {
-                let snippet = build_mcp_config_snippet(client, mode, None, dir);
+                let snippet = build_mcp_config_snippet(client, mode, None, tok, dir);
                 let parsed: serde_json::Value = serde_json::from_str(&snippet).unwrap();
                 assert!(parsed.is_object());
             }
@@ -353,13 +369,20 @@ mod tests {
             McpClientTarget::Codex,
             McpTransportMode::LiveHttp,
             None,
+            tok,
             dir,
         );
         assert!(codex_http.contains("[mcp_servers.tessel]"));
         assert!(codex_http.contains("[mcp_servers.tessel.http_headers]"));
+        assert!(codex_http.contains(tok));
 
-        let codex_stdio =
-            build_mcp_config_snippet(McpClientTarget::Codex, McpTransportMode::Stdio, None, dir);
+        let codex_stdio = build_mcp_config_snippet(
+            McpClientTarget::Codex,
+            McpTransportMode::Stdio,
+            None,
+            tok,
+            dir,
+        );
         assert!(codex_stdio.contains("command = \"tessel\""));
     }
 }

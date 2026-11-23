@@ -1,7 +1,7 @@
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpListener;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{mpsc, Arc};
+use std::sync::{mpsc, Arc, RwLock};
 use std::time::Duration;
 
 use serde_json::{json, Value};
@@ -17,17 +17,22 @@ pub struct LiveMcpServerHandle {
     pub port: u16,
     pub token: String,
     pub rx: mpsc::Receiver<LiveMcpRequest>,
+    expected_auth: Arc<RwLock<String>>,
     stop: Arc<AtomicBool>,
 }
 
 impl LiveMcpServerHandle {
     pub fn start(port: u16) -> std::io::Result<Self> {
+        Self::start_with_token(port, generate_local_token())
+    }
+
+    pub fn start_with_token(port: u16, token: String) -> std::io::Result<Self> {
         let listener = TcpListener::bind(("127.0.0.1", port))?;
         let bound_port = listener.local_addr()?.port();
         listener.set_nonblocking(true)?;
 
-        let token = generate_local_token();
-        let expected_auth = format!("Bearer {token}");
+        let expected_auth = Arc::new(RwLock::new(format!("Bearer {token}")));
+        let auth_ref = Arc::clone(&expected_auth);
         let (tx, rx) = mpsc::channel::<LiveMcpRequest>();
         let stop = Arc::new(AtomicBool::new(false));
         let stop_flag = Arc::clone(&stop);
@@ -38,7 +43,8 @@ impl LiveMcpServerHandle {
                     Ok((mut stream, _)) => {
                         let _ = stream.set_nonblocking(false);
                         let _ = stream.set_read_timeout(Some(Duration::from_secs(3)));
-                        handle_http_connection(&mut stream, &expected_auth, &tx);
+                        let current_auth = auth_ref.read().map(|g| g.clone()).unwrap_or_default();
+                        handle_http_connection(&mut stream, &current_auth, &tx);
                     }
                     Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                         std::thread::sleep(Duration::from_millis(25));
@@ -52,8 +58,17 @@ impl LiveMcpServerHandle {
             port: bound_port,
             token,
             rx,
+            expected_auth,
             stop,
         })
+    }
+
+    /// Rotates the active bearer token in place without restarting the listening socket.
+    pub fn set_token(&mut self, new_token: String) {
+        if let Ok(mut guard) = self.expected_auth.write() {
+            *guard = format!("Bearer {new_token}");
+        }
+        self.token = new_token;
     }
 
     pub fn stop(&self) {
@@ -67,7 +82,21 @@ impl Drop for LiveMcpServerHandle {
     }
 }
 
-fn generate_local_token() -> String {
+pub fn generate_local_token() -> String {
+    #[cfg(unix)]
+    {
+        if let Ok(mut f) = std::fs::File::open("/dev/urandom") {
+            let mut bytes = [0u8; 16];
+            if f.read_exact(&mut bytes).is_ok() {
+                let mut hex = String::with_capacity(36);
+                hex.push_str("tsl_");
+                for b in bytes {
+                    let _ = std::fmt::Write::write_fmt(&mut hex, format_args!("{b:02x}"));
+                }
+                return hex;
+            }
+        }
+    }
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_nanos());

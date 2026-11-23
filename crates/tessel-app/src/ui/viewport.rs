@@ -32,6 +32,7 @@ pub fn show_viewport(
     camera_2d: &mut PixelCamera2D,
     pixel_drag_start: &mut Option<PixelCoord>,
     gizmo_drag: &mut Option<GizmoDragState>,
+    free_view: &mut bool,
 ) -> ((u32, u32), Option<VoxelCoord>, Option<GizmoAxis>) {
     let mut desired_size = (1, 1);
     let mut hover_voxel = None;
@@ -66,7 +67,6 @@ pub fn show_viewport(
                 pixel_drag_start,
             );
         } else {
-            handle_3d_viewport_input(ui, &response, camera_3d);
             let gizmo_consumed = handle_gizmo_drag_input(
                 rect,
                 &response,
@@ -76,6 +76,7 @@ pub fn show_viewport(
                 gizmo_drag,
                 &mut active_gizmo_axis,
             );
+            handle_3d_viewport_input(ui, &response, camera_3d, *free_view && !gizmo_consumed);
 
             if !gizmo_consumed {
                 match scene.active_mode {
@@ -125,7 +126,7 @@ pub fn show_viewport(
             }
         }
 
-        show_viewport_hud(ui, rect, scene.active_mode, camera_3d, camera_2d);
+        show_viewport_hud(ui, rect, scene.active_mode, camera_3d, camera_2d, free_view);
         if scene.active_mode != AppMode::Pixel {
             draw_camera_compass(ui, rect, camera_3d);
         }
@@ -278,6 +279,7 @@ fn show_viewport_hud(
     mode: AppMode,
     camera_3d: &mut OrbitCamera,
     camera_2d: &mut PixelCamera2D,
+    free_view: &mut bool,
 ) {
     let hud_pos = rect.right_top() + egui::vec2(-10.0, 10.0);
     egui::Area::new(egui::Id::new("tessel_viewport_hud"))
@@ -318,6 +320,25 @@ fn show_viewport_hud(
 
                         if mode != AppMode::Pixel {
                             ui.separator();
+                            let (free_fill, free_text) = if *free_view {
+                                (tokens::PRIMARY_CONTAINER, tokens::ON_PRIMARY)
+                            } else {
+                                (tokens::SURFACE_HIGH, tokens::ON_SURFACE)
+                            };
+                            if ui
+                                .add(
+                                    egui::Button::new(
+                                        RichText::new("Free").size(11.0).color(free_text),
+                                    )
+                                    .fill(free_fill),
+                                )
+                                .on_hover_text(
+                                    "Free View: Left-drag to orbit 360°, Shift+Left-drag to pan",
+                                )
+                                .clicked()
+                            {
+                                *free_view = !*free_view;
+                            }
                             let presets = [
                                 ("Iso", CameraPreset::Iso),
                                 ("Front", CameraPreset::Front),
@@ -367,9 +388,17 @@ fn compute_hover_voxel(
     }
 }
 
-fn handle_3d_viewport_input(ui: &egui::Ui, response: &egui::Response, camera: &mut OrbitCamera) {
+fn handle_3d_viewport_input(
+    ui: &egui::Ui,
+    response: &egui::Response,
+    camera: &mut OrbitCamera,
+    allow_primary_orbit: bool,
+) {
+    let primary_drag = response.dragged_by(egui::PointerButton::Primary)
+        && (allow_primary_orbit || ui.input(|i| i.modifiers.alt));
     if response.dragged_by(egui::PointerButton::Secondary)
         || response.dragged_by(egui::PointerButton::Middle)
+        || primary_drag
     {
         let delta = response.drag_delta();
         let shift = ui.input(|i| i.modifiers.shift);
@@ -378,9 +407,6 @@ fn handle_3d_viewport_input(ui: &egui::Ui, response: &egui::Response, camera: &m
         } else {
             camera.orbit(delta.x, delta.y);
         }
-    } else if response.dragged_by(egui::PointerButton::Primary) && ui.input(|i| i.modifiers.alt) {
-        let delta = response.drag_delta();
-        camera.orbit(delta.x, delta.y);
     }
 
     if response.hovered() {

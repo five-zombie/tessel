@@ -13,7 +13,9 @@ use tessel_render::{OrbitCamera, PixelCamera2D, RenderError, ViewportRenderer};
 
 use crate::input::handle_global_shortcuts;
 use crate::project_files::ProjectFileManager;
-use crate::settings::{load_api_key_from_keyring, AppPaths, AppSettings};
+use crate::settings::{
+    load_api_key_from_keyring, load_or_create_mcp_token, rotate_mcp_token, AppPaths, AppSettings,
+};
 use crate::ui;
 
 #[derive(Debug, Error)]
@@ -42,6 +44,7 @@ struct StudioState {
     camera_2d: PixelCamera2D,
     pixel_drag_start: Option<PixelCoord>,
     gizmo_drag: Option<ui::viewport::GizmoDragState>,
+    free_view: bool,
     export_dialog: ui::export_dialog::ExportDialogState,
     settings_dialog: ui::settings_dialog::SettingsDialogState,
     mcp_dialog: ui::mcp_dialog::McpDialogState,
@@ -51,6 +54,7 @@ struct StudioState {
     project_files: ProjectFileManager,
     paths: AppPaths,
     settings: AppSettings,
+    mcp_token: String,
     live_mcp: Option<LiveMcpServerHandle>,
 }
 
@@ -90,7 +94,7 @@ impl StudioState {
             handle.stop();
             tracing::info!("Live MCP HTTP server stopped");
         } else {
-            match LiveMcpServerHandle::start(38421) {
+            match LiveMcpServerHandle::start_with_token(38421, self.mcp_token.clone()) {
                 Ok(handle) => {
                     tracing::info!(
                         "Live MCP HTTP server listening on http://127.0.0.1:{}/mcp",
@@ -110,6 +114,7 @@ impl Default for StudioState {
     fn default() -> Self {
         let paths = AppPaths::resolve();
         let settings = AppSettings::load(&paths);
+        let mcp_token = load_or_create_mcp_token(&paths);
         let mut project_files = ProjectFileManager::with_recovery_path(paths.recovery_file.clone());
         let has_recovery = project_files.has_recovery_snapshot();
 
@@ -156,6 +161,7 @@ impl Default for StudioState {
             camera_2d: PixelCamera2D::new(),
             pixel_drag_start: None,
             gizmo_drag: None,
+            free_view: true,
             export_dialog,
             settings_dialog,
             mcp_dialog: ui::mcp_dialog::McpDialogState::default(),
@@ -169,6 +175,7 @@ impl Default for StudioState {
             project_files,
             paths,
             settings,
+            mcp_token,
             live_mcp: None,
         }
     }
@@ -319,6 +326,7 @@ impl GpuState {
             open_settings: false,
         };
         let mut toggle_mcp_server = false;
+        let mut rotate_mcp = false;
 
         let full_output = self.egui_ctx.run(raw_input, |ctx| {
             handle_global_shortcuts(
@@ -385,6 +393,7 @@ impl GpuState {
                 &mut studio.camera_2d,
                 &mut studio.pixel_drag_start,
                 &mut studio.gizmo_drag,
+                &mut studio.free_view,
             );
             desired_viewport = vp_size;
             hover_voxel = hv;
@@ -404,9 +413,11 @@ impl GpuState {
                 ctx,
                 &mut studio.mcp_dialog,
                 studio.live_mcp.as_ref(),
+                &studio.mcp_token,
                 &studio.export_dialog.output_dir,
             );
             toggle_mcp_server |= mcp_action.toggle_server;
+            rotate_mcp |= mcp_action.rotate_token;
             quick_action = ui::quick_start::show_quick_start(
                 ctx,
                 &mut studio.quick_start,
@@ -487,6 +498,15 @@ impl GpuState {
         }
         if toggle_mcp_server {
             studio.toggle_live_mcp();
+        }
+        if rotate_mcp {
+            let next = rotate_mcp_token(&studio.paths);
+            studio.mcp_token = next.clone();
+            if let Some(handle) = studio.live_mcp.as_mut() {
+                handle.set_token(next);
+            }
+            studio.mcp_dialog.status_message =
+                Some("Rotated MCP token. Update your client config.".into());
         }
         if top_actions.save_project {
             let thumb = self
