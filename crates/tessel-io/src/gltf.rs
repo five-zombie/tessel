@@ -43,8 +43,9 @@ impl CollectedMesh {
 
         for (node_id, mesh) in &scene.lowpoly_meshes {
             let visible = scene.nodes.get(node_id).map(|n| n.visible).unwrap_or(true);
-            let is_custom =
-                mesh.texture.is_some() || mesh.material != tessel_core::MeshMaterial::default();
+            let is_custom = mesh.texture.is_some()
+                || mesh.normal_map.is_some()
+                || mesh.material != tessel_core::MeshMaterial::default();
             if !visible || mesh.faces.is_empty() || is_custom {
                 continue;
             }
@@ -75,8 +76,9 @@ impl CollectedMesh {
         let mut out = Self::from_scene_untextured(scene, preset);
         for (node_id, mesh) in &scene.lowpoly_meshes {
             let visible = scene.nodes.get(node_id).map(|n| n.visible).unwrap_or(true);
-            let is_custom =
-                mesh.texture.is_some() || mesh.material != tessel_core::MeshMaterial::default();
+            let is_custom = mesh.texture.is_some()
+                || mesh.normal_map.is_some()
+                || mesh.material != tessel_core::MeshMaterial::default();
             if !visible || mesh.faces.is_empty() || !is_custom {
                 continue;
             }
@@ -372,8 +374,9 @@ pub fn export_glb_bytes(
     let mut palette_tex_index: Option<usize> = if has_palette_prim { Some(0) } else { None };
     for (node_id, lp_mesh) in &scene.lowpoly_meshes {
         let visible = scene.nodes.get(node_id).map(|n| n.visible).unwrap_or(true);
-        let has_custom =
-            lp_mesh.texture.is_some() || lp_mesh.material != tessel_core::MeshMaterial::default();
+        let has_custom = lp_mesh.texture.is_some()
+            || lp_mesh.normal_map.is_some()
+            || lp_mesh.material != tessel_core::MeshMaterial::default();
         if !visible || lp_mesh.faces.is_empty() || !has_custom {
             continue;
         }
@@ -478,6 +481,15 @@ pub fn export_glb_bytes(
         });
         if lp_mesh.material.emissive.iter().any(|&c| c > 0.0) {
             mat_json["emissiveFactor"] = json!(lp_mesh.material.emissive);
+        }
+        if let Some(nmap) = &lp_mesh.normal_map {
+            let norm_png = encode_rgba_png(nmap.width, nmap.height, &nmap.rgba)?;
+            let n_img_bv = push_view(&mut bin, &mut buffer_views, &norm_png, None);
+            let n_img_idx = images.len();
+            images.push(json!({ "bufferView": n_img_bv, "mimeType": "image/png" }));
+            let n_tex_idx = textures.len();
+            textures.push(json!({ "sampler": 0, "source": n_img_idx }));
+            mat_json["normalTexture"] = json!({ "index": n_tex_idx });
         }
         materials.push(mat_json);
         primitives.push(json!({
@@ -595,6 +607,26 @@ mod tests {
         assert!((mat.pbr_metallic_roughness().metallic_factor() - 0.9).abs() < 1e-4);
         assert!((mat.pbr_metallic_roughness().roughness_factor() - 0.2).abs() < 1e-4);
         assert!((mat.emissive_factor()[2] - 0.8).abs() < 1e-4);
+
+        // Verify Normal Map embeds as glTF normalTexture
+        Command::SetMeshNormalMap {
+            node_id,
+            normal_map: Some(tessel_core::MeshTexture::solid(
+                16,
+                16,
+                Rgba8::rgb(128, 128, 255),
+            )),
+        }
+        .apply(&mut scene)
+        .unwrap();
+        let (glb_norm, _) = export_glb_bytes(&scene, ExportPreset::Godot4).unwrap();
+        let parsed_norm = gltf::Gltf::from_slice(&glb_norm).unwrap();
+        assert!(parsed_norm
+            .materials()
+            .next()
+            .unwrap()
+            .normal_texture()
+            .is_some());
     }
 
     #[test]

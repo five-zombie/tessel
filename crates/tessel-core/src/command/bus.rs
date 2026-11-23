@@ -128,6 +128,10 @@ pub enum Command {
         node_id: NodeId,
         texture: Option<MeshTexture>,
     },
+    SetMeshNormalMap {
+        node_id: NodeId,
+        normal_map: Option<MeshTexture>,
+    },
     ApplyBipedRig,
     SetBoneRotation {
         bone_id: BoneId,
@@ -218,6 +222,10 @@ pub enum UndoDelta {
         previous_pixels: Vec<(usize, [u8; 4])>,
     },
     RestoreMeshTextureFull {
+        node_id: NodeId,
+        previous: Option<MeshTexture>,
+    },
+    RestoreMeshNormalMap {
         node_id: NodeId,
         previous: Option<MeshTexture>,
     },
@@ -795,6 +803,34 @@ impl Command {
                     previous,
                 }
             }
+            Self::SetMeshNormalMap {
+                node_id,
+                normal_map,
+            } => {
+                if let Some(tex) = normal_map {
+                    let expected = (tex.width as usize)
+                        .checked_mul(tex.height as usize)
+                        .and_then(|px| px.checked_mul(4));
+                    if tex.width == 0
+                        || tex.height == 0
+                        || tex.width > 1024
+                        || tex.height > 1024
+                        || expected != Some(tex.rgba.len())
+                    {
+                        return Err(CoreError::OutOfBounds);
+                    }
+                }
+                let mesh = scene
+                    .lowpoly_meshes
+                    .get_mut(node_id)
+                    .ok_or(CoreError::LowPolyMeshNotFound(*node_id))?;
+                let previous = mesh.normal_map.clone();
+                mesh.normal_map = normal_map.clone();
+                UndoDelta::RestoreMeshNormalMap {
+                    node_id: *node_id,
+                    previous,
+                }
+            }
             Self::ApplyBipedRig => {
                 let prev = scene.character_rig.replace(CharacterRig::biped_template());
                 UndoDelta::RestoreCharacterRig(prev)
@@ -1107,6 +1143,13 @@ impl UndoDelta {
                     .get_mut(node_id)
                     .ok_or(CoreError::LowPolyMeshNotFound(*node_id))?;
                 mesh.texture = previous.clone();
+            }
+            Self::RestoreMeshNormalMap { node_id, previous } => {
+                let mesh = scene
+                    .lowpoly_meshes
+                    .get_mut(node_id)
+                    .ok_or(CoreError::LowPolyMeshNotFound(*node_id))?;
+                mesh.normal_map = previous.clone();
             }
             Self::RestoreMeshSmoothShading { node_id, previous } => {
                 let mesh = scene

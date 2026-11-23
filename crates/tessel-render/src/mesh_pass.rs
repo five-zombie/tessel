@@ -7,6 +7,7 @@ const MESH_SHADER_WGSL: &str = include_str!("../../../assets/shaders/mesh_3d.wgs
 
 pub struct CustomMeshUpload<'a> {
     pub texture: Option<&'a MeshTexture>,
+    pub normal_map: Option<&'a MeshTexture>,
     pub material: MeshMaterial,
     pub vertices: Vec<StudioVertex3D>,
     pub indices: Vec<u32>,
@@ -14,6 +15,7 @@ pub struct CustomMeshUpload<'a> {
 
 struct TexturedMeshDraw {
     _texture: Option<wgpu::Texture>,
+    _normal_texture: Option<wgpu::Texture>,
     _material_buffer: wgpu::Buffer,
     bind_group: wgpu::BindGroup,
     vertex_buffer: wgpu::Buffer,
@@ -22,7 +24,7 @@ struct TexturedMeshDraw {
 }
 
 /// Renders shaded 3D Voxel & Low-Poly meshes using a 256x1 palette texture (or per-mesh RGBA texture)
-/// with per-mesh PBR material properties and depth testing.
+/// with per-mesh PBR material properties, tangent-space normal mapping, and depth testing.
 pub struct MeshPass {
     pipeline: wgpu::RenderPipeline,
     bgl: wgpu::BindGroupLayout,
@@ -30,6 +32,8 @@ pub struct MeshPass {
     _default_material_buffer: wgpu::Buffer,
     palette_texture: wgpu::Texture,
     palette_view: wgpu::TextureView,
+    _default_normal_texture: wgpu::Texture,
+    default_normal_view: wgpu::TextureView,
     sampler: wgpu::Sampler,
     bind_group: wgpu::BindGroup,
     vertex_buffer: Option<wgpu::Buffer>,
@@ -83,6 +87,23 @@ impl MeshPass {
             ..Default::default()
         });
 
+        let default_normal_texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("tessel-default-flat-normal-1x1"),
+            size: wgpu::Extent3d {
+                width: 1,
+                height: 1,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        let default_normal_view =
+            default_normal_texture.create_view(&wgpu::TextureViewDescriptor::default());
+
         let default_material = MaterialUniform::default();
         let default_material_buffer =
             device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -130,6 +151,16 @@ impl MeshPass {
                     },
                     count: None,
                 },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 4,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
             ],
         });
 
@@ -152,6 +183,10 @@ impl MeshPass {
                 wgpu::BindGroupEntry {
                     binding: 3,
                     resource: default_material_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: wgpu::BindingResource::TextureView(&default_normal_view),
                 },
             ],
         });
@@ -185,6 +220,11 @@ impl MeshPass {
                     offset: 32,
                     shader_location: 3,
                     format: wgpu::VertexFormat::Float32,
+                },
+                wgpu::VertexAttribute {
+                    offset: 36,
+                    shader_location: 4,
+                    format: wgpu::VertexFormat::Float32x4,
                 },
             ],
         };
@@ -232,6 +272,8 @@ impl MeshPass {
             _default_material_buffer: default_material_buffer,
             palette_texture,
             palette_view,
+            _default_normal_texture: default_normal_texture,
+            default_normal_view,
             sampler,
             bind_group,
             vertex_buffer: None,
@@ -242,6 +284,26 @@ impl MeshPass {
     }
 
     pub fn upload_palette(&self, queue: &wgpu::Queue, palette: &Palette) {
+        // Initialize 1x1 flat tangent-space normal map (0, 0, 1) -> [128, 128, 255, 255].
+        queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &self._default_normal_texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            &[128u8, 128, 255, 255],
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(4),
+                rows_per_image: Some(1),
+            },
+            wgpu::Extent3d {
+                width: 1,
+                height: 1,
+                depth_or_array_layers: 1,
+            },
+        );
         let mut rgba = vec![255u8; 256 * 4];
         for raw in 1u8..=255 {
             if let Ok(idx) = PaletteIndex::new(raw) {
@@ -374,7 +436,57 @@ impl MeshPass {
                 (None, None)
             };
 
+            let (gpu_norm_tex, custom_norm_view) = if let Some(nmap) = item.normal_map {
+                let expected = (nmap.width as usize)
+                    .saturating_mul(nmap.height as usize)
+                    .saturating_mul(4);
+                if nmap.width == 0 || nmap.height == 0 || nmap.rgba.len() < expected {
+                    (None, None)
+                } else {
+                    let t = device.create_texture(&wgpu::TextureDescriptor {
+                        label: Some("tessel-lowpoly-normal-tex"),
+                        size: wgpu::Extent3d {
+                            width: nmap.width,
+                            height: nmap.height,
+                            depth_or_array_layers: 1,
+                        },
+                        mip_level_count: 1,
+                        sample_count: 1,
+                        dimension: wgpu::TextureDimension::D2,
+                        format: wgpu::TextureFormat::Rgba8Unorm,
+                        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+                        view_formats: &[],
+                    });
+                    queue.write_texture(
+                        wgpu::TexelCopyTextureInfo {
+                            texture: &t,
+                            mip_level: 0,
+                            origin: wgpu::Origin3d::ZERO,
+                            aspect: wgpu::TextureAspect::All,
+                        },
+                        &nmap.rgba[..expected],
+                        wgpu::TexelCopyBufferLayout {
+                            offset: 0,
+                            bytes_per_row: Some(nmap.width * 4),
+                            rows_per_image: Some(nmap.height),
+                        },
+                        wgpu::Extent3d {
+                            width: nmap.width,
+                            height: nmap.height,
+                            depth_or_array_layers: 1,
+                        },
+                    );
+                    let v = t.create_view(&wgpu::TextureViewDescriptor::default());
+                    (Some(t), Some(v))
+                }
+            } else {
+                (None, None)
+            };
+
             let tex_view_ref = custom_view.as_ref().unwrap_or(&self.palette_view);
+            let norm_view_ref = custom_norm_view
+                .as_ref()
+                .unwrap_or(&self.default_normal_view);
             let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("tessel-lowpoly-custom-bg"),
                 layout: &self.bgl,
@@ -395,6 +507,10 @@ impl MeshPass {
                         binding: 3,
                         resource: material_buffer.as_entire_binding(),
                     },
+                    wgpu::BindGroupEntry {
+                        binding: 4,
+                        resource: wgpu::BindingResource::TextureView(norm_view_ref),
+                    },
                 ],
             });
             let vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -409,6 +525,7 @@ impl MeshPass {
             });
             self.textured_draws.push(TexturedMeshDraw {
                 _texture: gpu_tex,
+                _normal_texture: gpu_norm_tex,
                 _material_buffer: material_buffer,
                 bind_group,
                 vertex_buffer,

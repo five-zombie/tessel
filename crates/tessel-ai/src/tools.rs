@@ -117,6 +117,18 @@ pub fn tool_definitions() -> Vec<Value> {
             }
         }),
         json!({
+            "name": "mesh_load_normal_map",
+            "description": "Load a tangent-space Normal Map (.png or .jpg) from the allowed export/workspace directory onto a Low-Poly mesh for micro surface detail (skin pores, fabric weave, metal scratches).",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "node_id": { "type": "integer" },
+                    "filename": { "type": "string" }
+                },
+                "required": ["filename"]
+            }
+        }),
+        json!({
             "name": "mesh_paint_spot",
             "description": "Paint a circular spot onto a Low-Poly mesh's auto-UV texture at a 3D surface point+normal (or direct UV).",
             "inputSchema": {

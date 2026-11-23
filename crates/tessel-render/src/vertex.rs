@@ -1,6 +1,6 @@
 use bytemuck::{Pod, Zeroable};
 
-/// GPU vertex layout for static 3D Voxel & Low-Poly geometry (36 bytes, Right-Handed Y-Up).
+/// GPU vertex layout for static 3D Voxel & Low-Poly geometry (52 bytes, Right-Handed Y-Up).
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Pod, Zeroable)]
 pub struct StudioVertex3D {
@@ -8,6 +8,7 @@ pub struct StudioVertex3D {
     pub normal: [f32; 3],
     pub palette_uv: [f32; 2],
     pub ao: f32,
+    pub tangent: [f32; 4],
 }
 
 /// Shared per-frame camera & lighting uniform matching 3D WGSL shaders.

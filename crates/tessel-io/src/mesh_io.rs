@@ -68,9 +68,10 @@ pub fn export_stl_bytes(
     Ok((out, tri_count))
 }
 
-/// Imports a Wavefront `.obj` text document into a `LowPolyMesh`.
+/// Imports a Wavefront `.obj` text document into a `LowPolyMesh`, preserving `vt` UVs when present.
 pub fn import_obj_str(obj_text: &str, material: PaletteIndex) -> Result<LowPolyMesh, IoError> {
     let mut vertices = Vec::new();
+    let mut tex_coords: Vec<[f32; 2]> = Vec::new();
     let mut faces = Vec::new();
 
     for raw_line in obj_text.lines() {
@@ -98,10 +99,20 @@ pub fn import_obj_str(obj_text: &str, material: PaletteIndex) -> Result<LowPolyM
                     .ok_or_else(|| IoError::InvalidFormat("invalid OBJ vertex z".into()))?;
                 vertices.push(Vec3::new(x, y, z));
             }
+            "vt" => {
+                if let (Some(u), Some(v)) = (
+                    parts.next().and_then(|s| s.parse::<f32>().ok()),
+                    parts.next().and_then(|s| s.parse::<f32>().ok()),
+                ) {
+                    tex_coords.push([u, 1.0 - v]);
+                }
+            }
             "f" => {
                 let mut indices = Vec::new();
+                let mut face_uvs = Vec::new();
                 for token in parts {
-                    let v_str = token.split('/').next().unwrap_or("");
+                    let mut segs = token.split('/');
+                    let v_str = segs.next().unwrap_or("");
                     let raw_idx: isize = v_str
                         .parse()
                         .map_err(|_| IoError::InvalidFormat("invalid OBJ face index".into()))?;
@@ -122,9 +133,27 @@ pub fn import_obj_str(obj_text: &str, material: PaletteIndex) -> Result<LowPolyM
                         ));
                     }
                     indices.push(resolved);
+                    if let Some(vt_str) = segs.next().filter(|s| !s.is_empty()) {
+                        if let Ok(vt_raw) = vt_str.parse::<isize>() {
+                            let vt_idx = if vt_raw > 0 {
+                                Some((vt_raw - 1) as usize)
+                            } else if vt_raw < 0 {
+                                tex_coords.len().checked_sub(vt_raw.unsigned_abs())
+                            } else {
+                                None
+                            };
+                            if let Some(uv) = vt_idx.and_then(|i| tex_coords.get(i).copied()) {
+                                face_uvs.push(uv);
+                            }
+                        }
+                    }
                 }
                 if indices.len() >= 3 {
-                    faces.push(Face::new(indices, material));
+                    if face_uvs.len() == indices.len() {
+                        faces.push(Face::with_uvs(indices, material, face_uvs));
+                    } else {
+                        faces.push(Face::new(indices, material));
+                    }
                 }
             }
             _ => {}
@@ -140,12 +169,13 @@ pub fn import_obj_str(obj_text: &str, material: PaletteIndex) -> Result<LowPolyM
         vertices,
         faces,
         texture: None,
+        normal_map: None,
         smooth_shading: false,
         material: Default::default(),
     })
 }
 
-/// Imports a binary glTF 2.0 (`.glb`) buffer into a `LowPolyMesh`.
+/// Imports a binary glTF 2.0 (`.glb`) buffer into a `LowPolyMesh`, preserving `TEXCOORD_0` UVs.
 pub fn import_glb_bytes(bytes: &[u8], material: PaletteIndex) -> Result<LowPolyMesh, IoError> {
     let gltf = gltf::Gltf::from_slice(bytes)
         .map_err(|e| IoError::InvalidFormat(format!("invalid GLB: {e}")))?;
@@ -171,13 +201,26 @@ pub fn import_glb_bytes(bytes: &[u8], material: PaletteIndex) -> Result<LowPolyM
             if added < 3 {
                 continue;
             }
+            let prim_uvs: Vec<[f32; 2]> = reader
+                .read_tex_coords(0)
+                .map(|tc| tc.into_f32().collect())
+                .unwrap_or_default();
             let indices: Vec<usize> = match reader.read_indices() {
                 Some(iter) => iter.into_u32().map(|i| base + i as usize).collect(),
                 None => (base..base + added).collect(),
             };
             for tri in indices.as_chunks::<3>().0 {
                 if tri[0] < vertices.len() && tri[1] < vertices.len() && tri[2] < vertices.len() {
-                    faces.push(Face::new(vec![tri[0], tri[1], tri[2]], material));
+                    let (l0, l1, l2) = (tri[0] - base, tri[1] - base, tri[2] - base);
+                    if l0 < prim_uvs.len() && l1 < prim_uvs.len() && l2 < prim_uvs.len() {
+                        faces.push(Face::with_uvs(
+                            vec![tri[0], tri[1], tri[2]],
+                            material,
+                            vec![prim_uvs[l0], prim_uvs[l1], prim_uvs[l2]],
+                        ));
+                    } else {
+                        faces.push(Face::new(vec![tri[0], tri[1], tri[2]], material));
+                    }
                 }
             }
         }
@@ -192,6 +235,7 @@ pub fn import_glb_bytes(bytes: &[u8], material: PaletteIndex) -> Result<LowPolyM
         vertices,
         faces,
         texture: None,
+        normal_map: None,
         smooth_shading: false,
         material: Default::default(),
     })

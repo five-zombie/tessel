@@ -38,6 +38,7 @@ pub fn create_primitive(kind: PrimitiveKind, size: f32, material: PaletteIndex) 
                 vertices,
                 faces,
                 texture: None,
+                normal_map: None,
                 smooth_shading: false,
                 material: Default::default(),
             }
@@ -54,6 +55,7 @@ pub fn create_primitive(kind: PrimitiveKind, size: f32, material: PaletteIndex) 
                 vertices,
                 faces,
                 texture: None,
+                normal_map: None,
                 smooth_shading: false,
                 material: Default::default(),
             }
@@ -98,6 +100,7 @@ fn create_cylinder(
         vertices,
         faces,
         texture: None,
+        normal_map: None,
         smooth_shading: false,
         material: Default::default(),
     }
@@ -124,6 +127,7 @@ fn create_cone(segments: usize, radius: f32, height: f32, material: PaletteIndex
         vertices,
         faces,
         texture: None,
+        normal_map: None,
         smooth_shading: false,
         material: Default::default(),
     }
@@ -342,6 +346,7 @@ pub fn smooth_subdivide_mesh(mesh: &LowPolyMesh) -> Result<LowPolyMesh, CoreErro
         vertices: new_vertices,
         faces: new_faces,
         texture: mesh.texture.clone(),
+        normal_map: mesh.normal_map.clone(),
         smooth_shading: mesh.smooth_shading,
         material: mesh.material,
     })
@@ -382,6 +387,7 @@ pub fn voxel_to_lowpoly(volume: &VoxelVolume, unit_scale: f32) -> LowPolyMesh {
         vertices,
         faces,
         texture: None,
+        normal_map: None,
         smooth_shading: false,
         material: Default::default(),
     }

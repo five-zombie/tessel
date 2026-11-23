@@ -11,6 +11,7 @@ pub struct TriVertex {
     pub position: [f32; 3],
     pub normal: [f32; 3],
     pub uv: [f32; 2],
+    pub tangent: [f32; 4],
     pub palette_index: PaletteIndex,
 }
 
@@ -46,6 +47,8 @@ pub struct LowPolyMesh {
     pub faces: Vec<Face>,
     #[serde(default)]
     pub texture: Option<MeshTexture>,
+    #[serde(default)]
+    pub normal_map: Option<MeshTexture>,
     #[serde(default)]
     pub smooth_shading: bool,
     #[serde(default)]
@@ -162,23 +165,44 @@ impl LowPolyMesh {
                     .filter(|n| n.length_squared() > 1e-6)
                     .unwrap_or(face_normal)
                     .to_array();
+                let has_face_uvs = face.uvs.len() == face.vertices.len();
+                let uv0 = if has_face_uvs {
+                    face.uvs[0]
+                } else {
+                    box_atlas_uv(p0, face_normal, min_b, max_b)
+                };
+                let uv1 = if has_face_uvs {
+                    face.uvs[fan]
+                } else {
+                    box_atlas_uv(p1, face_normal, min_b, max_b)
+                };
+                let uv2 = if has_face_uvs {
+                    face.uvs[fan + 1]
+                } else {
+                    box_atlas_uv(p2, face_normal, min_b, max_b)
+                };
+                let tangent = compute_triangle_tangent(p0, p1, p2, uv0, uv1, uv2, face_normal);
+
                 let base = out.vertices.len() as u32;
                 out.vertices.push(TriVertex {
                     position: p0.to_array(),
                     normal: n0,
-                    uv: box_atlas_uv(p0, face_normal, min_b, max_b),
+                    uv: uv0,
+                    tangent,
                     palette_index: face.material,
                 });
                 out.vertices.push(TriVertex {
                     position: p1.to_array(),
                     normal: n1,
-                    uv: box_atlas_uv(p1, face_normal, min_b, max_b),
+                    uv: uv1,
+                    tangent,
                     palette_index: face.material,
                 });
                 out.vertices.push(TriVertex {
                     position: p2.to_array(),
                     normal: n2,
-                    uv: box_atlas_uv(p2, face_normal, min_b, max_b),
+                    uv: uv2,
+                    tangent,
                     palette_index: face.material,
                 });
                 out.indices.extend_from_slice(&[base, base + 1, base + 2]);
@@ -186,4 +210,49 @@ impl LowPolyMesh {
         }
         out
     }
+}
+
+fn compute_triangle_tangent(
+    p0: Vec3,
+    p1: Vec3,
+    p2: Vec3,
+    uv0: [f32; 2],
+    uv1: [f32; 2],
+    uv2: [f32; 2],
+    normal: Vec3,
+) -> [f32; 4] {
+    let e1 = p1 - p0;
+    let e2 = p2 - p0;
+    let du1 = uv1[0] - uv0[0];
+    let dv1 = uv1[1] - uv0[1];
+    let du2 = uv2[0] - uv0[0];
+    let dv2 = uv2[1] - uv0[1];
+    let det = du1 * dv2 - du2 * dv1;
+    let (t, b) = if det.abs() > 1e-8 {
+        let inv = 1.0 / det;
+        (
+            ((e1 * dv2 - e2 * dv1) * inv).normalize_or_zero(),
+            ((e2 * du1 - e1 * du2) * inv).normalize_or_zero(),
+        )
+    } else {
+        let fallback_axis = if normal.y.abs() < 0.9 {
+            Vec3::Y
+        } else {
+            Vec3::X
+        };
+        let t = fallback_axis.cross(normal).normalize_or_zero();
+        (t, normal.cross(t).normalize_or_zero())
+    };
+    let ortho_t = (t - normal * normal.dot(t)).normalize_or_zero();
+    let ortho_t = if ortho_t.length_squared() < 1e-6 {
+        Vec3::X
+    } else {
+        ortho_t
+    };
+    let w = if normal.cross(ortho_t).dot(b) < 0.0 {
+        -1.0
+    } else {
+        1.0
+    };
+    [ortho_t.x, ortho_t.y, ortho_t.z, w]
 }

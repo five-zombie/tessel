@@ -174,6 +174,7 @@ impl ViewportRenderer {
                     normal: norm,
                     palette_uv: [u, 0.5],
                     ao: v.ao,
+                    tangent: [1.0, 0.0, 0.0, 1.0],
                 });
             }
             indices.extend(mesh.indices.into_iter().map(|idx| idx + base));
@@ -210,8 +211,9 @@ impl ViewportRenderer {
             };
 
             let tri = mesh.to_triangulated_flat();
-            let has_custom =
-                mesh.texture.is_some() || mesh.material != tessel_core::MeshMaterial::default();
+            let has_custom = mesh.texture.is_some()
+                || mesh.normal_map.is_some()
+                || mesh.material != tessel_core::MeshMaterial::default();
             if has_custom {
                 let mut t_verts = Vec::with_capacity(tri.vertices.len());
                 for v in tri.vertices {
@@ -222,7 +224,14 @@ impl ViewportRenderer {
                         .transform_vector3(glam::Vec3::from_array(v.normal))
                         .normalize_or_zero()
                         .to_array();
-                    let uv = if mesh.texture.is_some() {
+                    let tang = combined_mat
+                        .transform_vector3(glam::Vec3::new(
+                            v.tangent[0],
+                            v.tangent[1],
+                            v.tangent[2],
+                        ))
+                        .normalize_or_zero();
+                    let uv = if mesh.texture.is_some() || mesh.normal_map.is_some() {
                         v.uv
                     } else {
                         [(f32::from(v.palette_index.get()) + 0.5) / 256.0, 0.5]
@@ -232,10 +241,12 @@ impl ViewportRenderer {
                         normal: norm,
                         palette_uv: uv,
                         ao: 1.0,
+                        tangent: [tang.x, tang.y, tang.z, v.tangent[3]],
                     });
                 }
                 custom_items.push(crate::mesh_pass::CustomMeshUpload {
                     texture: mesh.texture.as_ref(),
+                    normal_map: mesh.normal_map.as_ref(),
                     material: mesh.material,
                     vertices: t_verts,
                     indices: tri.indices,
@@ -256,6 +267,7 @@ impl ViewportRenderer {
                         normal: norm,
                         palette_uv: [u, 0.5],
                         ao: 1.0,
+                        tangent: [1.0, 0.0, 0.0, 1.0],
                     });
                 }
                 indices.extend(tri.indices.into_iter().map(|idx| idx + base));

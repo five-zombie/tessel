@@ -22,11 +22,15 @@ var palette_sampler: sampler;
 @group(0) @binding(3)
 var<uniform> material: MaterialUniform;
 
+@group(0) @binding(4)
+var normal_tex: texture_2d<f32>;
+
 struct VertexIn {
     @location(0) position: vec3<f32>,
     @location(1) normal: vec3<f32>,
     @location(2) palette_uv: vec2<f32>,
     @location(3) ao: f32,
+    @location(4) tangent: vec4<f32>,
 };
 
 struct VertexOut {
@@ -35,6 +39,7 @@ struct VertexOut {
     @location(1) normal: vec3<f32>,
     @location(2) palette_uv: vec2<f32>,
     @location(3) ao: f32,
+    @location(4) tangent: vec4<f32>,
 };
 
 @vertex
@@ -45,6 +50,7 @@ fn vs_main(in: VertexIn) -> VertexOut {
     out.normal = in.normal;
     out.palette_uv = in.palette_uv;
     out.ao = in.ao;
+    out.tangent = in.tangent;
     return out;
 }
 
@@ -52,7 +58,11 @@ fn vs_main(in: VertexIn) -> VertexOut {
 fn fs_main(in: VertexOut, @builtin(front_facing) front_facing: bool) -> @location(0) vec4<f32> {
     let base_color = textureSample(palette_tex, palette_sampler, in.palette_uv).rgb;
     let raw_n = normalize(in.normal);
-    let n = select(-raw_n, raw_n, front_facing);
+    let geom_n = select(-raw_n, raw_n, front_facing);
+    let t_dir = normalize(in.tangent.xyz - geom_n * dot(geom_n, in.tangent.xyz));
+    let b_dir = normalize(cross(geom_n, t_dir)) * in.tangent.w;
+    let sampled_n = textureSample(normal_tex, palette_sampler, in.palette_uv).xyz * 2.0 - vec3<f32>(1.0);
+    let n = normalize(t_dir * sampled_n.x + b_dir * sampled_n.y + geom_n * sampled_n.z);
     let key_dir = normalize(camera.light_dir.xyz);
     let fill_dir = normalize(vec3<f32>(-key_dir.x, 0.35, -key_dir.z));
 
