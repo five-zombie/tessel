@@ -3,8 +3,8 @@ use std::path::Path;
 use serde_json::{json, Value};
 use tessel_core::voxel::ops as voxel_ops;
 use tessel_core::{
-    AppMode, BoneId, Command, HistoryStack, Keyframe, NodeId, PaletteIndex, PrimitiveKind,
-    SceneState, VoxelCoord,
+    AppMode, BoneId, Command, HistoryStack, Keyframe, NodeId, PaletteEntry, PaletteIndex,
+    PrimitiveKind, Rgba8, SceneState, VoxelCoord,
 };
 use tessel_io::{
     export_scene_to_dir, import_mesh_from_path, import_mesh_texture_from_path,
@@ -168,6 +168,61 @@ pub fn execute_tool_call(
             history.execute(scene, Command::SetMode(mode))?;
             Ok(json!({ "ok": true, "active_mode": mode.label() }))
         }
+        "scene_inspect" | "scene_list_nodes" => Ok(json!({
+            "ok": true,
+            "scene": scene_summary_json(scene),
+            "palette": palette_summary_json(scene)["colors"]
+        })),
+        "palette_set_color" => {
+            let index = parse_palette_index(args, 0)?;
+            let color = if let Some(arr) = args.get("rgb").and_then(Value::as_array) {
+                if arr.len() != 3 {
+                    return Err(AiError::InvalidArguments(
+                        "'rgb' must have 3 integers [r, g, b]".into(),
+                    ));
+                }
+                let r = arr[0].as_u64().unwrap_or(0).min(255) as u8;
+                let g = arr[1].as_u64().unwrap_or(0).min(255) as u8;
+                let b = arr[2].as_u64().unwrap_or(0).min(255) as u8;
+                Rgba8::rgb(r, g, b)
+            } else if let Some(hex_raw) = args.get("hex").and_then(Value::as_str) {
+                let hex = hex_raw.trim().trim_start_matches('#');
+                if hex.len() != 6 {
+                    return Err(AiError::InvalidArguments(
+                        "'hex' must be 6 hex digits '#RRGGBB'".into(),
+                    ));
+                }
+                let r = u8::from_str_radix(&hex[0..2], 16)
+                    .map_err(|_| AiError::InvalidArguments("invalid hex red".into()))?;
+                let g = u8::from_str_radix(&hex[2..4], 16)
+                    .map_err(|_| AiError::InvalidArguments("invalid hex green".into()))?;
+                let b = u8::from_str_radix(&hex[4..6], 16)
+                    .map_err(|_| AiError::InvalidArguments("invalid hex blue".into()))?;
+                Rgba8::rgb(r, g, b)
+            } else {
+                return Err(AiError::InvalidArguments(
+                    "provide either 'rgb': [r,g,b] or 'hex': '#RRGGBB'".into(),
+                ));
+            };
+            let name = args
+                .get("name")
+                .and_then(Value::as_str)
+                .map(ToString::to_string)
+                .unwrap_or_else(|| format!("Color {}", index.get()));
+            history.execute(
+                scene,
+                Command::SetPaletteEntry {
+                    index,
+                    entry: PaletteEntry::matte(name.clone(), color),
+                },
+            )?;
+            Ok(json!({
+                "ok": true,
+                "palette_index": index.get(),
+                "name": name,
+                "hex": format!("#{:02X}{:02X}{:02X}", color.r, color.g, color.b)
+            }))
+        }
         "scene_delete_node" => {
             let raw_id = args
                 .get("node_id")
@@ -289,6 +344,9 @@ pub fn execute_tool_call(
                 "plane" => PrimitiveKind::Plane,
                 "cylinder" => PrimitiveKind::Cylinder,
                 "cone" => PrimitiveKind::Cone,
+                "sphere" => PrimitiveKind::Sphere,
+                "torus" => PrimitiveKind::Torus,
+                "capsule" => PrimitiveKind::Capsule,
                 other => {
                     return Err(AiError::InvalidArguments(format!(
                         "unknown primitive '{other}'"
@@ -525,6 +583,151 @@ pub fn execute_tool_call(
             }
             Ok(json!({ "ok": true, "node_id": node_id.0, "uv": uv, "mirror_x": mirror_x }))
         }
+        "mesh_inspect" => {
+            let node_id = args
+                .get("node_id")
+                .and_then(Value::as_u64)
+                .map(NodeId)
+                .or_else(|| scene.active_lowpoly_node())
+                .ok_or_else(|| AiError::InvalidArguments("no low-poly mesh found".into()))?;
+            let mesh = scene
+                .lowpoly_meshes
+                .get(&node_id)
+                .ok_or_else(|| AiError::InvalidArguments("low-poly mesh not found".into()))?;
+            let (min_b, max_b) = mesh.bounds();
+            let faces: Vec<Value> = mesh
+                .faces
+                .iter()
+                .enumerate()
+                .take(64)
+                .map(|(fi, f)| {
+                    let mut center = glam::Vec3::ZERO;
+                    for &vi in &f.vertices {
+                        if let Some(&p) = mesh.vertices.get(vi) {
+                            center += p;
+                        }
+                    }
+                    if !f.vertices.is_empty() {
+                        center /= f.vertices.len() as f32;
+                    }
+                    let normal = if f.vertices.len() >= 3 {
+                        let p0 = mesh
+                            .vertices
+                            .get(f.vertices[0])
+                            .copied()
+                            .unwrap_or_default();
+                        let p1 = mesh
+                            .vertices
+                            .get(f.vertices[1])
+                            .copied()
+                            .unwrap_or_default();
+                        let p2 = mesh
+                            .vertices
+                            .get(f.vertices[2])
+                            .copied()
+                            .unwrap_or_default();
+                        (p1 - p0).cross(p2 - p0).normalize_or_zero()
+                    } else {
+                        glam::Vec3::Y
+                    };
+                    json!({
+                        "face_id": fi,
+                        "center": center.to_array(),
+                        "normal": normal.to_array(),
+                        "vertices": f.vertices.len(),
+                        "palette_index": f.material.get()
+                    })
+                })
+                .collect();
+            Ok(json!({
+                "ok": true,
+                "node_id": node_id.0,
+                "vertex_count": mesh.vertices.len(),
+                "face_count": mesh.faces.len(),
+                "bounds": { "min": min_b.to_array(), "max": max_b.to_array() },
+                "faces_preview": faces
+            }))
+        }
+        "mesh_extrude_face" => {
+            let node_id = args
+                .get("node_id")
+                .and_then(Value::as_u64)
+                .map(NodeId)
+                .or_else(|| scene.active_lowpoly_node())
+                .ok_or_else(|| AiError::InvalidArguments("no low-poly mesh found".into()))?;
+            let face_idx = args
+                .get("face_id")
+                .and_then(Value::as_u64)
+                .ok_or_else(|| AiError::InvalidArguments("missing 'face_id'".into()))?
+                as usize;
+            let distance = args
+                .get("distance")
+                .and_then(Value::as_f64)
+                .ok_or_else(|| AiError::InvalidArguments("missing 'distance'".into()))?
+                as f32;
+            if !distance.is_finite() {
+                return Err(AiError::InvalidArguments(
+                    "'distance' must be finite".into(),
+                ));
+            }
+            history.execute(
+                scene,
+                Command::ExtrudeMeshFace {
+                    node_id,
+                    face_id: tessel_core::FaceId(face_idx),
+                    distance,
+                },
+            )?;
+            let face_count = scene
+                .lowpoly_meshes
+                .get(&node_id)
+                .map_or(0, |m| m.faces.len());
+            Ok(json!({
+                "ok": true,
+                "node_id": node_id.0,
+                "face_id": face_idx,
+                "total_faces": face_count
+            }))
+        }
+        "mesh_inset_face" => {
+            let node_id = args
+                .get("node_id")
+                .and_then(Value::as_u64)
+                .map(NodeId)
+                .or_else(|| scene.active_lowpoly_node())
+                .ok_or_else(|| AiError::InvalidArguments("no low-poly mesh found".into()))?;
+            let face_idx = args
+                .get("face_id")
+                .and_then(Value::as_u64)
+                .ok_or_else(|| AiError::InvalidArguments("missing 'face_id'".into()))?
+                as usize;
+            let factor = args
+                .get("factor")
+                .and_then(Value::as_f64)
+                .ok_or_else(|| AiError::InvalidArguments("missing 'factor'".into()))?
+                as f32;
+            if !factor.is_finite() {
+                return Err(AiError::InvalidArguments("'factor' must be finite".into()));
+            }
+            history.execute(
+                scene,
+                Command::InsetMeshFace {
+                    node_id,
+                    face_id: tessel_core::FaceId(face_idx),
+                    factor,
+                },
+            )?;
+            let face_count = scene
+                .lowpoly_meshes
+                .get(&node_id)
+                .map_or(0, |m| m.faces.len());
+            Ok(json!({
+                "ok": true,
+                "node_id": node_id.0,
+                "face_id": face_idx,
+                "total_faces": face_count
+            }))
+        }
         "mesh_translate_face" => {
             let node_id = args
                 .get("node_id")
@@ -560,6 +763,25 @@ pub fn execute_tool_call(
                 },
             )?;
             Ok(json!({ "ok": true, "node_id": node_id.0, "face_id": face_idx }))
+        }
+        "mesh_bevel" => {
+            let node_id = args
+                .get("node_id")
+                .and_then(Value::as_u64)
+                .map(NodeId)
+                .or_else(|| scene.active_lowpoly_node())
+                .ok_or_else(|| AiError::InvalidArguments("no low-poly mesh found".into()))?;
+            let amount = args
+                .get("amount")
+                .and_then(Value::as_f64)
+                .unwrap_or(0.18)
+                .clamp(0.05, 0.45) as f32;
+            history.execute(scene, Command::BevelMesh { node_id, amount })?;
+            let faces = scene
+                .lowpoly_meshes
+                .get(&node_id)
+                .map_or(0, |m| m.faces.len());
+            Ok(json!({ "ok": true, "node_id": node_id.0, "faces": faces, "amount": amount }))
         }
         "mesh_smooth_subdivide" => {
             let node_id = args
@@ -776,11 +998,16 @@ pub fn scene_summary_json(scene: &SceneState) -> Value {
                     json!({ "voxels": count })
                 }
                 tessel_core::NodeKind::LowPolyMesh => {
-                    let tris = scene
-                        .lowpoly_meshes
-                        .get(&n.id)
-                        .map_or(0, |m| m.triangle_count());
-                    json!({ "triangles": tris })
+                    if let Some(m) = scene.lowpoly_meshes.get(&n.id) {
+                        let (bmin, bmax) = m.bounds();
+                        json!({
+                            "triangles": m.triangle_count(),
+                            "faces": m.faces.len(),
+                            "bounds": { "min": bmin.to_array(), "max": bmax.to_array() }
+                        })
+                    } else {
+                        json!({ "triangles": 0, "faces": 0 })
+                    }
                 }
                 tessel_core::NodeKind::PixelCanvas => {
                     let frames = scene
@@ -989,5 +1216,70 @@ mod tests {
         assert_eq!(updated.transform.scale, glam::Vec3::new(0.5, 2.0, 0.5));
         let summary = scene_summary_json(&scene);
         assert_eq!(summary["nodes"][0]["position"], json!([-2.0, 0.5, 1.0]));
+
+        // Verify palette_set_color, mesh_inspect, mesh_inset_face, mesh_extrude_face, scene_inspect
+        let pal_res = execute_tool_call(
+            "palette_set_color",
+            &json!({ "palette_index": 12, "name": "CamoOlive", "hex": "#4B5320" }),
+            &mut scene,
+            &mut history,
+            &dir,
+        )
+        .unwrap();
+        assert_eq!(pal_res["palette_index"], 12);
+
+        let minspect = execute_tool_call(
+            "mesh_inspect",
+            &json!({ "node_id": node_id.0 }),
+            &mut scene,
+            &mut history,
+            &dir,
+        )
+        .unwrap();
+        assert_eq!(minspect["face_count"], 6);
+
+        let inset = execute_tool_call(
+            "mesh_inset_face",
+            &json!({ "node_id": node_id.0, "face_id": 0, "factor": 0.25 }),
+            &mut scene,
+            &mut history,
+            &dir,
+        )
+        .unwrap();
+        assert_eq!(inset["total_faces"], 10);
+
+        let extrude = execute_tool_call(
+            "mesh_extrude_face",
+            &json!({ "node_id": node_id.0, "face_id": 0, "distance": 0.2 }),
+            &mut scene,
+            &mut history,
+            &dir,
+        )
+        .unwrap();
+        assert_eq!(extrude["total_faces"], 14);
+
+        let sinspect =
+            execute_tool_call("scene_inspect", &json!({}), &mut scene, &mut history, &dir).unwrap();
+        assert_eq!(sinspect["ok"], true);
+
+        let beveled = execute_tool_call(
+            "mesh_bevel",
+            &json!({ "node_id": node_id.0, "amount": 0.15 }),
+            &mut scene,
+            &mut history,
+            &dir,
+        )
+        .unwrap();
+        assert_eq!(beveled["ok"], true);
+
+        let sphere = execute_tool_call(
+            "mesh_create_primitive",
+            &json!({ "kind": "sphere", "size": 1.0, "position": [0.0, 2.0, 0.0] }),
+            &mut scene,
+            &mut history,
+            &dir,
+        )
+        .unwrap();
+        assert_eq!(sphere["ok"], true);
     }
 }

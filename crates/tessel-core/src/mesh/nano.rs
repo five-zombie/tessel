@@ -15,10 +15,21 @@ pub enum PrimitiveKind {
     Plane,
     Cylinder,
     Cone,
+    Sphere,
+    Torus,
+    Capsule,
 }
 
 impl PrimitiveKind {
-    pub const ALL: [Self; 4] = [Self::Cube, Self::Plane, Self::Cylinder, Self::Cone];
+    pub const ALL: [Self; 7] = [
+        Self::Cube,
+        Self::Plane,
+        Self::Cylinder,
+        Self::Cone,
+        Self::Sphere,
+        Self::Torus,
+        Self::Capsule,
+    ];
 
     pub const fn label(self) -> &'static str {
         match self {
@@ -26,6 +37,9 @@ impl PrimitiveKind {
             Self::Plane => "Plane",
             Self::Cylinder => "Cylinder",
             Self::Cone => "Cone",
+            Self::Sphere => "Sphere",
+            Self::Torus => "Torus",
+            Self::Capsule => "Capsule",
         }
     }
 }

@@ -200,6 +200,15 @@ pub fn show_toolbar(ctx: &egui::Context, scene: &mut SceneState, history: &mut H
                                     },
                                 );
                             }
+                            if action_button(ui, "Bevel") {
+                                let _ = history.execute(
+                                    scene,
+                                    Command::BevelMesh {
+                                        node_id,
+                                        amount: 0.18,
+                                    },
+                                );
+                            }
                             if action_button(ui, "Smooth") {
                                 let _ = history
                                     .execute(scene, Command::SmoothSubdivideMesh { node_id });

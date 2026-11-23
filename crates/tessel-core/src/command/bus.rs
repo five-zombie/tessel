@@ -111,6 +111,10 @@ pub enum Command {
     SmoothSubdivideMesh {
         node_id: NodeId,
     },
+    BevelMesh {
+        node_id: NodeId,
+        amount: f32,
+    },
     SetMeshSmoothShading {
         node_id: NodeId,
         smooth: bool,
@@ -706,6 +710,19 @@ impl Command {
                     .ok_or(CoreError::LowPolyMeshNotFound(*node_id))?
                     .clone();
                 let next = mesh_ops::smooth_subdivide_mesh(&current)?;
+                scene.lowpoly_meshes.insert(*node_id, next);
+                UndoDelta::RestoreLowPolyMesh {
+                    node_id: *node_id,
+                    previous_mesh: current,
+                }
+            }
+            Self::BevelMesh { node_id, amount } => {
+                let current = scene
+                    .lowpoly_meshes
+                    .get(node_id)
+                    .ok_or(CoreError::LowPolyMeshNotFound(*node_id))?
+                    .clone();
+                let next = mesh_ops::bevel_mesh(&current, *amount)?;
                 scene.lowpoly_meshes.insert(*node_id, next);
                 UndoDelta::RestoreLowPolyMesh {
                     node_id: *node_id,

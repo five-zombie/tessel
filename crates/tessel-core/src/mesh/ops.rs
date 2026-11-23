@@ -62,6 +62,9 @@ pub fn create_primitive(kind: PrimitiveKind, size: f32, material: PaletteIndex) 
         }
         PrimitiveKind::Cylinder => create_cylinder(8, h, s, material),
         PrimitiveKind::Cone => create_cone(8, h, s, material),
+        PrimitiveKind::Sphere => create_uv_sphere(8, 12, h, material),
+        PrimitiveKind::Torus => create_torus(12, 8, s * 0.36, s * 0.14, material),
+        PrimitiveKind::Capsule => create_capsule(4, 12, s * 0.25, s, material),
     }
 }
 
@@ -129,6 +132,173 @@ fn create_cone(segments: usize, radius: f32, height: f32, material: PaletteIndex
         texture: None,
         normal_map: None,
         smooth_shading: false,
+        material: Default::default(),
+    }
+}
+
+fn create_uv_sphere(
+    rings: usize,
+    sectors: usize,
+    radius: f32,
+    material: PaletteIndex,
+) -> LowPolyMesh {
+    let mut vertices = Vec::with_capacity(2 + (rings - 1) * sectors);
+    vertices.push(Vec3::new(0.0, 0.0, 0.0)); // 0: bottom pole
+    for r in 1..rings {
+        let phi = std::f32::consts::PI * (r as f32 / rings as f32);
+        let y = radius - radius * phi.cos();
+        let ring_r = radius * phi.sin();
+        for s in 0..sectors {
+            let theta = std::f32::consts::TAU * (s as f32 / sectors as f32);
+            vertices.push(Vec3::new(ring_r * theta.cos(), y, -ring_r * theta.sin()));
+        }
+    }
+    let top_pole = vertices.len();
+    vertices.push(Vec3::new(0.0, radius * 2.0, 0.0));
+
+    let mut faces = Vec::with_capacity(rings * sectors);
+    for s in 0..sectors {
+        let next = (s + 1) % sectors;
+        faces.push(Face::new(vec![0, 1 + next, 1 + s], material));
+    }
+    for r in 0..(rings - 2) {
+        let row0 = 1 + r * sectors;
+        let row1 = row0 + sectors;
+        for s in 0..sectors {
+            let next = (s + 1) % sectors;
+            faces.push(Face::new(
+                vec![row0 + s, row0 + next, row1 + next, row1 + s],
+                material,
+            ));
+        }
+    }
+    let last_row = 1 + (rings - 2) * sectors;
+    for s in 0..sectors {
+        let next = (s + 1) % sectors;
+        faces.push(Face::new(
+            vec![last_row + s, last_row + next, top_pole],
+            material,
+        ));
+    }
+
+    LowPolyMesh {
+        vertices,
+        faces,
+        texture: None,
+        normal_map: None,
+        smooth_shading: true,
+        material: Default::default(),
+    }
+}
+
+fn create_torus(
+    major_seg: usize,
+    minor_seg: usize,
+    major_r: f32,
+    minor_r: f32,
+    material: PaletteIndex,
+) -> LowPolyMesh {
+    let mut vertices = Vec::with_capacity(major_seg * minor_seg);
+    for i in 0..major_seg {
+        let theta = std::f32::consts::TAU * (i as f32 / major_seg as f32);
+        let dir = Vec3::new(theta.cos(), 0.0, -theta.sin());
+        for j in 0..minor_seg {
+            let phi = std::f32::consts::TAU * (j as f32 / minor_seg as f32);
+            let radial = major_r + minor_r * phi.cos();
+            let y = minor_r + minor_r * phi.sin();
+            vertices.push(dir * radial + Vec3::Y * y);
+        }
+    }
+    let mut faces = Vec::with_capacity(major_seg * minor_seg);
+    for i in 0..major_seg {
+        let i_next = (i + 1) % major_seg;
+        for j in 0..minor_seg {
+            let j_next = (j + 1) % minor_seg;
+            let v00 = i * minor_seg + j;
+            let v10 = i_next * minor_seg + j;
+            let v11 = i_next * minor_seg + j_next;
+            let v01 = i * minor_seg + j_next;
+            faces.push(Face::new(vec![v00, v10, v11, v01], material));
+        }
+    }
+    LowPolyMesh {
+        vertices,
+        faces,
+        texture: None,
+        normal_map: None,
+        smooth_shading: true,
+        material: Default::default(),
+    }
+}
+
+fn create_capsule(
+    hemi_rings: usize,
+    sectors: usize,
+    radius: f32,
+    total_height: f32,
+    material: PaletteIndex,
+) -> LowPolyMesh {
+    let r = radius.min(total_height * 0.45);
+    let cyl_h = (total_height - 2.0 * r).max(0.05);
+    let mut vertices = Vec::new();
+    vertices.push(Vec3::new(0.0, 0.0, 0.0)); // 0: bottom pole
+
+    // Bottom hemisphere (1..=hemi_rings)
+    for ring in 1..=hemi_rings {
+        let phi = std::f32::consts::FRAC_PI_2 * (ring as f32 / hemi_rings as f32);
+        let y = r - r * phi.cos();
+        let ring_r = r * phi.sin();
+        for s in 0..sectors {
+            let theta = std::f32::consts::TAU * (s as f32 / sectors as f32);
+            vertices.push(Vec3::new(ring_r * theta.cos(), y, -ring_r * theta.sin()));
+        }
+    }
+    // Top hemisphere (0..hemi_rings) shifted by cyl_h
+    for ring in 0..hemi_rings {
+        let phi = std::f32::consts::FRAC_PI_2
+            + std::f32::consts::FRAC_PI_2 * (ring as f32 / hemi_rings as f32);
+        let y = r + cyl_h - r * phi.cos();
+        let ring_r = r * phi.sin();
+        for s in 0..sectors {
+            let theta = std::f32::consts::TAU * (s as f32 / sectors as f32);
+            vertices.push(Vec3::new(ring_r * theta.cos(), y, -ring_r * theta.sin()));
+        }
+    }
+    let top_pole = vertices.len();
+    vertices.push(Vec3::new(0.0, 2.0 * r + cyl_h, 0.0));
+
+    let total_rings = hemi_rings * 2;
+    let mut faces = Vec::new();
+    for s in 0..sectors {
+        let next = (s + 1) % sectors;
+        faces.push(Face::new(vec![0, 1 + next, 1 + s], material));
+    }
+    for ring in 0..(total_rings - 1) {
+        let row0 = 1 + ring * sectors;
+        let row1 = row0 + sectors;
+        for s in 0..sectors {
+            let next = (s + 1) % sectors;
+            faces.push(Face::new(
+                vec![row0 + s, row0 + next, row1 + next, row1 + s],
+                material,
+            ));
+        }
+    }
+    let last_row = 1 + (total_rings - 1) * sectors;
+    for s in 0..sectors {
+        let next = (s + 1) % sectors;
+        faces.push(Face::new(
+            vec![last_row + s, last_row + next, top_pole],
+            material,
+        ));
+    }
+
+    LowPolyMesh {
+        vertices,
+        faces,
+        texture: None,
+        normal_map: None,
+        smooth_shading: true,
         material: Default::default(),
     }
 }
@@ -238,6 +408,119 @@ pub fn inset_face(
     }
 
     Ok(next)
+}
+
+/// Chamfers/bevels all shared edges and corners of `mesh` by `amount` (`0.05..=0.45`)
+/// while keeping main face centers flat (Doo-Sabin edge/corner bevel).
+pub fn bevel_mesh(mesh: &LowPolyMesh, amount: f32) -> Result<LowPolyMesh, CoreError> {
+    if !amount.is_finite() || mesh.faces.is_empty() || mesh.faces.len() > 8_000 {
+        return Err(CoreError::OutOfBounds);
+    }
+    let t = amount.clamp(0.05, 0.45);
+    let mut new_vertices = Vec::new();
+    let mut face_corner_verts: Vec<Vec<usize>> = Vec::with_capacity(mesh.faces.len());
+    let mut face_normals: Vec<Vec3> = Vec::with_capacity(mesh.faces.len());
+    let mut face_materials: Vec<PaletteIndex> = Vec::with_capacity(mesh.faces.len());
+
+    // Map directed edge (a, b) -> (face_idx, inset_a, inset_b)
+    let mut half_edges: BTreeMap<(usize, usize), (usize, usize, usize)> = BTreeMap::new();
+    // Map original vertex vi -> Vec<(face_idx, inset_vi)>
+    let mut vert_corners: BTreeMap<usize, Vec<(usize, usize)>> = BTreeMap::new();
+
+    for (fi, face) in mesh.faces.iter().enumerate() {
+        let n = face.vertices.len();
+        if n < 3 {
+            return Err(CoreError::OutOfBounds);
+        }
+        let mut centroid = Vec3::ZERO;
+        for &vi in &face.vertices {
+            centroid += *mesh.vertices.get(vi).ok_or(CoreError::OutOfBounds)?;
+        }
+        centroid /= n as f32;
+
+        let p0 = mesh.vertices[face.vertices[0]];
+        let p1 = mesh.vertices[face.vertices[1]];
+        let p2 = mesh.vertices[face.vertices[2]];
+        let normal = (p1 - p0).cross(p2 - p0).normalize_or_zero();
+        face_normals.push(normal);
+        face_materials.push(face.material);
+
+        let mut corners = Vec::with_capacity(n);
+        for &vi in &face.vertices {
+            let idx = new_vertices.len();
+            new_vertices.push(mesh.vertices[vi].lerp(centroid, t));
+            corners.push(idx);
+            vert_corners.entry(vi).or_default().push((fi, idx));
+        }
+        for i in 0..n {
+            let a = face.vertices[i];
+            let b = face.vertices[(i + 1) % n];
+            half_edges.insert((a, b), (fi, corners[i], corners[(i + 1) % n]));
+        }
+        face_corner_verts.push(corners);
+    }
+
+    let mut new_faces = Vec::new();
+    // 1. Shrunk main faces
+    for (fi, corners) in face_corner_verts.iter().enumerate() {
+        new_faces.push(Face::new(corners.clone(), face_materials[fi]));
+    }
+
+    // 2. Bevel quads along shared edges
+    for (&(a, b), &(f1, u1_a, u1_b)) in &half_edges {
+        if a < b {
+            if let Some(&(_f2, u2_b, u2_a)) = half_edges.get(&(b, a)) {
+                new_faces.push(Face::new(vec![u1_b, u1_a, u2_a, u2_b], face_materials[f1]));
+            }
+        }
+    }
+
+    // 3. Corner polygons at vertices shared by >= 3 faces
+    for (vi, items) in vert_corners {
+        if items.len() < 3 {
+            continue;
+        }
+        let mut avg_n = Vec3::ZERO;
+        let mut center = Vec3::ZERO;
+        for &(fi, u_idx) in &items {
+            avg_n += face_normals[fi];
+            center += new_vertices[u_idx];
+        }
+        center /= items.len() as f32;
+        let n_dir = if avg_n.length_squared() > 1e-6 {
+            avg_n.normalize()
+        } else {
+            (mesh.vertices[vi] - center).normalize_or_zero()
+        };
+        let up = if n_dir.y.abs() < 0.9 {
+            Vec3::Y
+        } else {
+            Vec3::X
+        };
+        let t_axis = up.cross(n_dir).normalize_or_zero();
+        let b_axis = n_dir.cross(t_axis).normalize_or_zero();
+
+        let mut sorted = items.clone();
+        sorted.sort_by(|&(_, idx_a), &(_, idx_b)| {
+            let da = new_vertices[idx_a] - center;
+            let db = new_vertices[idx_b] - center;
+            let ang_a = da.dot(b_axis).atan2(da.dot(t_axis));
+            let ang_b = db.dot(b_axis).atan2(db.dot(t_axis));
+            ang_a.total_cmp(&ang_b)
+        });
+        let mat = face_materials[sorted[0].0];
+        let loop_verts: Vec<usize> = sorted.into_iter().map(|(_, idx)| idx).collect();
+        new_faces.push(Face::new(loop_verts, mat));
+    }
+
+    Ok(LowPolyMesh {
+        vertices: new_vertices,
+        faces: new_faces,
+        texture: mesh.texture.clone(),
+        normal_map: mesh.normal_map.clone(),
+        smooth_shading: mesh.smooth_shading,
+        material: mesh.material,
+    })
 }
 
 /// Applies one iteration of Catmull-Clark smooth subdivision to `mesh`.
@@ -564,5 +847,31 @@ mod tests {
         let moved = translate_face(&cube, FaceId(0), Vec3::new(0.0, 0.0, 0.5)).unwrap();
         let after_z = moved.vertices[moved.faces[0].vertices[0]].z;
         assert!((after_z - before_z - 0.5).abs() < 1e-5);
+    }
+
+    #[test]
+    fn primitives_sphere_torus_capsule_have_valid_geometry() {
+        let mat = PaletteIndex::new(4).unwrap();
+        for kind in [
+            PrimitiveKind::Sphere,
+            PrimitiveKind::Torus,
+            PrimitiveKind::Capsule,
+        ] {
+            let mesh = create_primitive(kind, 1.0, mat);
+            assert!(!mesh.vertices.is_empty());
+            assert!(!mesh.faces.is_empty());
+            assert!(mesh.smooth_shading);
+            assert!(mesh.triangle_count() > 20);
+        }
+    }
+
+    #[test]
+    fn bevel_mesh_chamfers_cube_edges_and_corners() {
+        let mat = PaletteIndex::new(4).unwrap();
+        let cube = create_primitive(PrimitiveKind::Cube, 1.0, mat);
+        let beveled = bevel_mesh(&cube, 0.2).unwrap();
+        // 6 main faces + 12 edge chamfer quads + 8 corner triangles = 26 faces
+        assert_eq!(beveled.faces.len(), 26);
+        assert_eq!(beveled.vertices.len(), 24);
     }
 }

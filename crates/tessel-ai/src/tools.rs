@@ -15,6 +15,25 @@ pub fn tool_definitions() -> Vec<Value> {
             }
         }),
         json!({
+            "name": "scene_inspect",
+            "description": "List and inspect all scene nodes (id, name, kind, position, scale, bounds, face/voxel counts) and active palette colors (1..=255).",
+            "inputSchema": { "type": "object", "properties": {} }
+        }),
+        json!({
+            "name": "palette_set_color",
+            "description": "Add or update a color in the 255-slot palette (1..=255) using either rgb [r,g,b] (0..255) or hex '#RRGGBB'.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "palette_index": { "type": "integer", "minimum": 1, "maximum": 255 },
+                    "name": { "type": "string" },
+                    "rgb": { "type": "array", "items": { "type": "integer", "minimum": 0, "maximum": 255 }, "minItems": 3, "maxItems": 3 },
+                    "hex": { "type": "string" }
+                },
+                "required": ["palette_index"]
+            }
+        }),
+        json!({
             "name": "scene_delete_node",
             "description": "Delete a scene node by its node_id (supports Undo/Redo).",
             "inputSchema": {
@@ -80,12 +99,12 @@ pub fn tool_definitions() -> Vec<Value> {
         }),
         json!({
             "name": "mesh_create_primitive",
-            "description": "Create a low-poly primitive mesh (cube, plane, cylinder, cone) with optional world position, rotation_deg, and scale.",
+            "description": "Create a low-poly primitive mesh (cube, plane, cylinder, cone, sphere, torus, capsule) with optional world position, rotation_deg, and scale.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "name": { "type": "string" },
-                    "kind": { "type": "string", "enum": ["cube", "plane", "cylinder", "cone"] },
+                    "kind": { "type": "string", "enum": ["cube", "plane", "cylinder", "cone", "sphere", "torus", "capsule"] },
                     "size": { "type": "number" },
                     "palette_index": { "type": "integer", "minimum": 1, "maximum": 255 },
                     "position": { "type": "array", "items": { "type": "number" }, "minItems": 3, "maxItems": 3 },
@@ -162,6 +181,42 @@ pub fn tool_definitions() -> Vec<Value> {
             }
         }),
         json!({
+            "name": "mesh_inspect",
+            "description": "Inspect a Low-Poly mesh's bounding box and list its faces (face_id, center [x,y,z], outward normal [nx,ny,nz]) for targeted extrude, inset, translate_face, or paint_spot.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "node_id": { "type": "integer", "minimum": 1 }
+                }
+            }
+        }),
+        json!({
+            "name": "mesh_extrude_face",
+            "description": "Extrude a Low-Poly face outward (distance > 0) or inward (distance < 0) along its face normal, creating side quads (ideal for pockets, flaps, straps, details).",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "node_id": { "type": "integer", "minimum": 1 },
+                    "face_id": { "type": "integer", "minimum": 0 },
+                    "distance": { "type": "number" }
+                },
+                "required": ["face_id", "distance"]
+            }
+        }),
+        json!({
+            "name": "mesh_inset_face",
+            "description": "Inset a Low-Poly face toward its center by factor (0.05..0.9) and create border quads (ideal for bevels, seams, zippers, panels before extruding).",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "node_id": { "type": "integer", "minimum": 1 },
+                    "face_id": { "type": "integer", "minimum": 0 },
+                    "factor": { "type": "number", "minimum": 0.05, "maximum": 0.9 }
+                },
+                "required": ["face_id", "factor"]
+            }
+        }),
+        json!({
             "name": "mesh_translate_face",
             "description": "Translate all vertices of a selected Low-Poly face by a 3D delta [dx, dy, dz].",
             "inputSchema": {
@@ -172,6 +227,17 @@ pub fn tool_definitions() -> Vec<Value> {
                     "delta": { "type": "array", "items": { "type": "number" }, "minItems": 3, "maxItems": 3 }
                 },
                 "required": ["face_id", "delta"]
+            }
+        }),
+        json!({
+            "name": "mesh_bevel",
+            "description": "Chamfer/bevel all shared edges and corners of a Low-Poly mesh by amount (0.05..0.45, default 0.18) while keeping main surfaces flat (ideal for backpacks, pouches, weapons, hard-surface props).",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "node_id": { "type": "integer", "minimum": 1 },
+                    "amount": { "type": "number", "minimum": 0.05, "maximum": 0.45 }
+                }
             }
         }),
         json!({
