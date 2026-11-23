@@ -417,6 +417,51 @@ pub fn execute_tool_call(
             history.execute(scene, Command::SetMeshSmoothShading { node_id, smooth })?;
             Ok(json!({ "ok": true, "node_id": node_id.0, "smooth": smooth }))
         }
+        "mesh_set_material" => {
+            let node_id = args
+                .get("node_id")
+                .and_then(Value::as_u64)
+                .map(NodeId)
+                .or_else(|| scene.active_lowpoly_node())
+                .ok_or_else(|| AiError::InvalidArguments("no low-poly mesh found".into()))?;
+            let mut mat = scene
+                .lowpoly_meshes
+                .get(&node_id)
+                .map(|m| m.material)
+                .ok_or_else(|| AiError::InvalidArguments("low-poly mesh not found".into()))?;
+            if let Some(m) = args.get("metallic").and_then(Value::as_f64) {
+                mat.metallic = m as f32;
+            }
+            if let Some(r) = args.get("roughness").and_then(Value::as_f64) {
+                mat.roughness = r as f32;
+            }
+            if let Some(arr) = args.get("emissive").and_then(Value::as_array) {
+                if arr.len() != 3 {
+                    return Err(AiError::InvalidArguments(
+                        "'emissive' must have 3 numbers [r, g, b]".into(),
+                    ));
+                }
+                mat.emissive = [
+                    arr[0].as_f64().unwrap_or(0.0) as f32,
+                    arr[1].as_f64().unwrap_or(0.0) as f32,
+                    arr[2].as_f64().unwrap_or(0.0) as f32,
+                ];
+            }
+            history.execute(
+                scene,
+                Command::SetMeshMaterial {
+                    node_id,
+                    material: mat,
+                },
+            )?;
+            Ok(json!({
+                "ok": true,
+                "node_id": node_id.0,
+                "metallic": mat.metallic,
+                "roughness": mat.roughness,
+                "emissive": mat.emissive
+            }))
+        }
         "character_apply_biped_rig" => {
             history.execute(scene, Command::ApplyBipedRig)?;
             Ok(json!({ "ok": true, "bones": 7 }))

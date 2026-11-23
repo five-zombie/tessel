@@ -13,7 +13,7 @@ pub use character::{
 pub use command::{Command, HistoryStack, UndoDelta};
 pub use error::CoreError;
 pub use mesh::{
-    box_atlas_uv, Face, FaceId, LowPolyMesh, MeshTexture, PrimitiveKind, TriVertex,
+    box_atlas_uv, Face, FaceId, LowPolyMesh, MeshMaterial, MeshTexture, PrimitiveKind, TriVertex,
     TriangulatedMesh, VertexId, DEFAULT_MESH_TEX_SIZE,
 };
 pub use palette::{Palette, PaletteEntry, PaletteIndex, Rgba8};

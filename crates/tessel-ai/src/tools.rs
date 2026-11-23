@@ -156,6 +156,19 @@ pub fn tool_definitions() -> Vec<Value> {
             }
         }),
         json!({
+            "name": "mesh_set_material",
+            "description": "Set PBR material properties (metallic 0..1, roughness 0.05..1, emissive [r,g,b] 0..1) on a Low-Poly mesh.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "node_id": { "type": "integer" },
+                    "metallic": { "type": "number", "minimum": 0.0, "maximum": 1.0 },
+                    "roughness": { "type": "number", "minimum": 0.05, "maximum": 1.0 },
+                    "emissive": { "type": "array", "items": { "type": "number" }, "minItems": 3, "maxItems": 3 }
+                }
+            }
+        }),
+        json!({
             "name": "character_apply_biped_rig",
             "description": "Apply the starter 7-bone biped humanoid skeleton with Idle & Walk animations.",
             "inputSchema": { "type": "object", "properties": {} }

@@ -20,8 +20,26 @@ pub struct TriangulatedMesh {
     pub indices: Vec<u32>,
 }
 
-/// Unit Anchor: Editable indexed low-poly mesh supporting triangles & quads with flat shading
-/// and optional auto-UV RGBA texture painting.
+/// Sub-Unit: PBR surface material properties for a `LowPolyMesh` (rendered live & exported to `.glb`).
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct MeshMaterial {
+    pub metallic: f32,
+    pub roughness: f32,
+    pub emissive: [f32; 3],
+}
+
+impl Default for MeshMaterial {
+    fn default() -> Self {
+        Self {
+            metallic: 0.0,
+            roughness: 0.85,
+            emissive: [0.0, 0.0, 0.0],
+        }
+    }
+}
+
+/// Unit Anchor: Editable indexed low-poly mesh supporting triangles & quads with flat/smooth shading,
+/// PBR material properties, and optional auto-UV RGBA texture painting.
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 pub struct LowPolyMesh {
     pub vertices: Vec<Vec3>,
@@ -30,6 +48,8 @@ pub struct LowPolyMesh {
     pub texture: Option<MeshTexture>,
     #[serde(default)]
     pub smooth_shading: bool,
+    #[serde(default)]
+    pub material: MeshMaterial,
 }
 
 impl LowPolyMesh {

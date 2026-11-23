@@ -4,7 +4,8 @@ use serde::{Deserialize, Serialize};
 use crate::character::{AnimationClip, BoneId, CharacterRig, Keyframe, SkinBinding};
 use crate::error::CoreError;
 use crate::mesh::{
-    ops as mesh_ops, FaceId, LowPolyMesh, MeshTexture, PrimitiveKind, DEFAULT_MESH_TEX_SIZE,
+    ops as mesh_ops, FaceId, LowPolyMesh, MeshMaterial, MeshTexture, PrimitiveKind,
+    DEFAULT_MESH_TEX_SIZE,
 };
 use crate::palette::{PaletteEntry, PaletteIndex, Rgba8};
 use crate::pixel::{FrameIndex, LayerId, PixelCanvas, PixelEdit, PixelFrame, PixelLayer};
@@ -108,6 +109,10 @@ pub enum Command {
     SetMeshSmoothShading {
         node_id: NodeId,
         smooth: bool,
+    },
+    SetMeshMaterial {
+        node_id: NodeId,
+        material: MeshMaterial,
     },
     PaintMeshTexture {
         node_id: NodeId,
@@ -219,6 +224,10 @@ pub enum UndoDelta {
     RestoreMeshSmoothShading {
         node_id: NodeId,
         previous: bool,
+    },
+    RestoreMeshMaterial {
+        node_id: NodeId,
+        previous: MeshMaterial,
     },
     RestoreCharacterRig(Option<CharacterRig>),
     RestoreBoneRotation {
@@ -685,6 +694,33 @@ impl Command {
                     previous,
                 }
             }
+            Self::SetMeshMaterial { node_id, material } => {
+                if !material.metallic.is_finite()
+                    || !material.roughness.is_finite()
+                    || material.emissive.iter().any(|c| !c.is_finite())
+                {
+                    return Err(CoreError::OutOfBounds);
+                }
+                let sanitized = MeshMaterial {
+                    metallic: material.metallic.clamp(0.0, 1.0),
+                    roughness: material.roughness.clamp(0.05, 1.0),
+                    emissive: [
+                        material.emissive[0].clamp(0.0, 1.0),
+                        material.emissive[1].clamp(0.0, 1.0),
+                        material.emissive[2].clamp(0.0, 1.0),
+                    ],
+                };
+                let mesh = scene
+                    .lowpoly_meshes
+                    .get_mut(node_id)
+                    .ok_or(CoreError::LowPolyMeshNotFound(*node_id))?;
+                let previous = mesh.material;
+                mesh.material = sanitized;
+                UndoDelta::RestoreMeshMaterial {
+                    node_id: *node_id,
+                    previous,
+                }
+            }
             Self::PaintMeshTexture {
                 node_id,
                 uv,
@@ -1078,6 +1114,13 @@ impl UndoDelta {
                     .get_mut(node_id)
                     .ok_or(CoreError::LowPolyMeshNotFound(*node_id))?;
                 mesh.smooth_shading = *previous;
+            }
+            Self::RestoreMeshMaterial { node_id, previous } => {
+                let mesh = scene
+                    .lowpoly_meshes
+                    .get_mut(node_id)
+                    .ok_or(CoreError::LowPolyMeshNotFound(*node_id))?;
+                mesh.material = *previous;
             }
             Self::RestoreCharacterRig(prev) => {
                 scene.character_rig = prev.clone();

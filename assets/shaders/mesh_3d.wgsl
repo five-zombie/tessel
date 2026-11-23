@@ -5,6 +5,11 @@ struct CameraUniform {
     light_dir: vec4<f32>,
 };
 
+struct MaterialUniform {
+    pbr: vec4<f32>,
+    emissive: vec4<f32>,
+};
+
 @group(0) @binding(0)
 var<uniform> camera: CameraUniform;
 
@@ -13,6 +18,9 @@ var palette_tex: texture_2d<f32>;
 
 @group(0) @binding(2)
 var palette_sampler: sampler;
+
+@group(0) @binding(3)
+var<uniform> material: MaterialUniform;
 
 struct VertexIn {
     @location(0) position: vec3<f32>,
@@ -55,6 +63,15 @@ fn fs_main(in: VertexOut, @builtin(front_facing) front_facing: bool) -> @locatio
     let view_dir = normalize(camera.camera_pos.xyz - in.world_pos);
     let rim = pow(1.0 - max(dot(n, view_dir), 0.0), 3.0) * 0.12;
 
-    let lit = base_color * (hemi + ndl * 0.68 + fill) * in.ao + vec3<f32>(rim);
+    let metallic = clamp(material.pbr.x, 0.0, 1.0);
+    let roughness = clamp(material.pbr.y, 0.05, 1.0);
+    let half_vec = normalize(key_dir + view_dir);
+    let spec_pow = mix(128.0, 4.0, roughness * roughness);
+    let spec_strength = mix(0.04, 1.0, metallic) + (1.0 - roughness) * 0.45;
+    let spec_color = mix(vec3<f32>(1.0), base_color, metallic);
+    let specular = spec_color * pow(max(dot(n, half_vec), 0.0), spec_pow) * spec_strength;
+
+    let diffuse = base_color * (1.0 - metallic * 0.65) * (hemi + ndl * 0.68 + fill);
+    let lit = (diffuse + specular) * in.ao + vec3<f32>(rim) + material.emissive.rgb;
     return vec4<f32>(lit, 1.0);
 }

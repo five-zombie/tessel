@@ -1,24 +1,35 @@
-use tessel_core::{MeshTexture, Palette, PaletteIndex};
+use tessel_core::{MeshMaterial, MeshTexture, Palette, PaletteIndex};
 use wgpu::util::DeviceExt;
 
-use crate::vertex::{CameraUniform, StudioVertex3D};
+use crate::vertex::{CameraUniform, MaterialUniform, StudioVertex3D};
 
 const MESH_SHADER_WGSL: &str = include_str!("../../../assets/shaders/mesh_3d.wgsl");
 
+pub struct CustomMeshUpload<'a> {
+    pub texture: Option<&'a MeshTexture>,
+    pub material: MeshMaterial,
+    pub vertices: Vec<StudioVertex3D>,
+    pub indices: Vec<u32>,
+}
+
 struct TexturedMeshDraw {
-    _texture: wgpu::Texture,
+    _texture: Option<wgpu::Texture>,
+    _material_buffer: wgpu::Buffer,
     bind_group: wgpu::BindGroup,
     vertex_buffer: wgpu::Buffer,
     index_buffer: wgpu::Buffer,
     index_count: u32,
 }
 
-/// Renders shaded 3D Voxel & Low-Poly meshes using a 256x1 palette texture (or per-mesh RGBA texture) and depth testing.
+/// Renders shaded 3D Voxel & Low-Poly meshes using a 256x1 palette texture (or per-mesh RGBA texture)
+/// with per-mesh PBR material properties and depth testing.
 pub struct MeshPass {
     pipeline: wgpu::RenderPipeline,
     bgl: wgpu::BindGroupLayout,
     camera_buffer: wgpu::Buffer,
+    _default_material_buffer: wgpu::Buffer,
     palette_texture: wgpu::Texture,
+    palette_view: wgpu::TextureView,
     sampler: wgpu::Sampler,
     bind_group: wgpu::BindGroup,
     vertex_buffer: Option<wgpu::Buffer>,
@@ -72,6 +83,14 @@ impl MeshPass {
             ..Default::default()
         });
 
+        let default_material = MaterialUniform::default();
+        let default_material_buffer =
+            device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("tessel-default-material-uniform"),
+                contents: bytemuck::bytes_of(&default_material),
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            });
+
         let bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("tessel-mesh-bgl"),
             entries: &[
@@ -101,6 +120,16 @@ impl MeshPass {
                     ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::NonFiltering),
                     count: None,
                 },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 3,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
             ],
         });
 
@@ -119,6 +148,10 @@ impl MeshPass {
                 wgpu::BindGroupEntry {
                     binding: 2,
                     resource: wgpu::BindingResource::Sampler(&sampler),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: default_material_buffer.as_entire_binding(),
                 },
             ],
         });
@@ -196,7 +229,9 @@ impl MeshPass {
             pipeline,
             bgl,
             camera_buffer,
+            _default_material_buffer: default_material_buffer,
             palette_texture,
+            palette_view,
             sampler,
             bind_group,
             vertex_buffer: None,
@@ -269,59 +304,79 @@ impl MeshPass {
         self.index_count = indices.len() as u32;
     }
 
-    pub fn upload_textured_meshes(
+    pub fn upload_custom_meshes(
         &mut self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
-        items: &[(&MeshTexture, Vec<StudioVertex3D>, Vec<u32>)],
+        items: &[CustomMeshUpload<'_>],
     ) {
         self.textured_draws.clear();
-        for (tex, vertices, indices) in items {
-            if vertices.is_empty() || indices.is_empty() || tex.width == 0 || tex.height == 0 {
+        for item in items {
+            let (opt_tex, mat, vertices, indices) =
+                (item.texture, item.material, &item.vertices, &item.indices);
+            if vertices.is_empty() || indices.is_empty() {
                 continue;
             }
-            let expected = (tex.width as usize)
-                .saturating_mul(tex.height as usize)
-                .saturating_mul(4);
-            if tex.rgba.len() < expected {
-                continue;
-            }
-            let gpu_tex = device.create_texture(&wgpu::TextureDescriptor {
-                label: Some("tessel-lowpoly-rgba-tex"),
-                size: wgpu::Extent3d {
-                    width: tex.width,
-                    height: tex.height,
-                    depth_or_array_layers: 1,
-                },
-                mip_level_count: 1,
-                sample_count: 1,
-                dimension: wgpu::TextureDimension::D2,
-                format: wgpu::TextureFormat::Rgba8UnormSrgb,
-                usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-                view_formats: &[],
+            let mat_uniform = MaterialUniform {
+                pbr: [mat.metallic, mat.roughness, 0.0, 0.0],
+                emissive: [mat.emissive[0], mat.emissive[1], mat.emissive[2], 0.0],
+            };
+            let material_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("tessel-custom-material-uniform"),
+                contents: bytemuck::bytes_of(&mat_uniform),
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             });
-            queue.write_texture(
-                wgpu::TexelCopyTextureInfo {
-                    texture: &gpu_tex,
-                    mip_level: 0,
-                    origin: wgpu::Origin3d::ZERO,
-                    aspect: wgpu::TextureAspect::All,
-                },
-                &tex.rgba[..expected],
-                wgpu::TexelCopyBufferLayout {
-                    offset: 0,
-                    bytes_per_row: Some(tex.width * 4),
-                    rows_per_image: Some(tex.height),
-                },
-                wgpu::Extent3d {
-                    width: tex.width,
-                    height: tex.height,
-                    depth_or_array_layers: 1,
-                },
-            );
-            let view = gpu_tex.create_view(&wgpu::TextureViewDescriptor::default());
+
+            let (gpu_tex, custom_view) = if let Some(tex) = opt_tex {
+                let expected = (tex.width as usize)
+                    .saturating_mul(tex.height as usize)
+                    .saturating_mul(4);
+                if tex.width == 0 || tex.height == 0 || tex.rgba.len() < expected {
+                    (None, None)
+                } else {
+                    let t = device.create_texture(&wgpu::TextureDescriptor {
+                        label: Some("tessel-lowpoly-rgba-tex"),
+                        size: wgpu::Extent3d {
+                            width: tex.width,
+                            height: tex.height,
+                            depth_or_array_layers: 1,
+                        },
+                        mip_level_count: 1,
+                        sample_count: 1,
+                        dimension: wgpu::TextureDimension::D2,
+                        format: wgpu::TextureFormat::Rgba8UnormSrgb,
+                        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+                        view_formats: &[],
+                    });
+                    queue.write_texture(
+                        wgpu::TexelCopyTextureInfo {
+                            texture: &t,
+                            mip_level: 0,
+                            origin: wgpu::Origin3d::ZERO,
+                            aspect: wgpu::TextureAspect::All,
+                        },
+                        &tex.rgba[..expected],
+                        wgpu::TexelCopyBufferLayout {
+                            offset: 0,
+                            bytes_per_row: Some(tex.width * 4),
+                            rows_per_image: Some(tex.height),
+                        },
+                        wgpu::Extent3d {
+                            width: tex.width,
+                            height: tex.height,
+                            depth_or_array_layers: 1,
+                        },
+                    );
+                    let v = t.create_view(&wgpu::TextureViewDescriptor::default());
+                    (Some(t), Some(v))
+                }
+            } else {
+                (None, None)
+            };
+
+            let tex_view_ref = custom_view.as_ref().unwrap_or(&self.palette_view);
             let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("tessel-lowpoly-tex-bg"),
+                label: Some("tessel-lowpoly-custom-bg"),
                 layout: &self.bgl,
                 entries: &[
                     wgpu::BindGroupEntry {
@@ -330,26 +385,31 @@ impl MeshPass {
                     },
                     wgpu::BindGroupEntry {
                         binding: 1,
-                        resource: wgpu::BindingResource::TextureView(&view),
+                        resource: wgpu::BindingResource::TextureView(tex_view_ref),
                     },
                     wgpu::BindGroupEntry {
                         binding: 2,
                         resource: wgpu::BindingResource::Sampler(&self.sampler),
                     },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: material_buffer.as_entire_binding(),
+                    },
                 ],
             });
             let vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("tessel-textured-mesh-vb"),
+                label: Some("tessel-custom-mesh-vb"),
                 contents: bytemuck::cast_slice(vertices),
                 usage: wgpu::BufferUsages::VERTEX,
             });
             let index_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("tessel-textured-mesh-ib"),
+                label: Some("tessel-custom-mesh-ib"),
                 contents: bytemuck::cast_slice(indices),
                 usage: wgpu::BufferUsages::INDEX,
             });
             self.textured_draws.push(TexturedMeshDraw {
                 _texture: gpu_tex,
+                _material_buffer: material_buffer,
                 bind_group,
                 vertex_buffer,
                 index_buffer,

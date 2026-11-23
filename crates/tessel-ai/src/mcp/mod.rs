@@ -18,7 +18,7 @@ Recommended workflow:
 1. Inspect `tessel://scene/summary` and `tessel://palette/current` before editing so you know existing node IDs and palette indices (1..=255).
 2. Remove unwanted starter nodes (such as 'Starter Voxel') with `scene_delete_node` before sculpting a new asset.
 3. Voxel mode: use `voxel_fill_box` and `voxel_fill_ellipsoid` (bounds ±256), then optionally `voxel_convert_to_lowpoly`.
-4. Low-Poly mode: create primitives (`mesh_create_primitive`) or import `.obj`/`.glb` (`mesh_import`). To apply custom `.png`/`.jpg` textures (wood, fur, fabric), call `mesh_load_texture`. To paint patterns/spots, call `mesh_fill_texture` then `mesh_paint_spot` with 3D `point` + `normal` (or `uv`) and `radius_px`. To round sharp corners, call `mesh_smooth_subdivide` (1-3 iterations) and `mesh_set_shading` (`smooth: true`).
+4. Low-Poly mode: create primitives (`mesh_create_primitive`) or import `.obj`/`.glb` (`mesh_import`). To apply custom `.png`/`.jpg` textures (wood, fur, fabric), call `mesh_load_texture`. To paint patterns/spots, call `mesh_fill_texture` then `mesh_paint_spot` with 3D `point` + `normal` (or `uv`) and `radius_px`. Adjust surface finish (metallic/roughness/emissive glow) with `mesh_set_material`. To round sharp corners, call `mesh_smooth_subdivide` (1-3 iterations) and `mesh_set_shading` (`smooth: true`).
 5. Character mode: call `character_apply_biped_rig`, pose bones with `character_set_bone_pose`, and author custom animations with `character_set_keyframe`.
 6. Read `tessel://viewport/preview` (when GUI is running) to visually inspect results, use `history_undo`/`history_redo` if needed, and export via `project_export` (`.glb`, `.obj`, `.stl`, `.vox`, `.png`, `.gif`).";
 

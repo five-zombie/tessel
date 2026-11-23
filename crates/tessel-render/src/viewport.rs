@@ -179,7 +179,7 @@ impl ViewportRenderer {
             indices.extend(mesh.indices.into_iter().map(|idx| idx + base));
         }
 
-        let mut textured_items = Vec::new();
+        let mut custom_items = Vec::new();
         for (node_id, mesh) in &scene.lowpoly_meshes {
             let (visible, node_mat) = scene
                 .nodes
@@ -210,7 +210,9 @@ impl ViewportRenderer {
             };
 
             let tri = mesh.to_triangulated_flat();
-            if let Some(tex) = &mesh.texture {
+            let has_custom =
+                mesh.texture.is_some() || mesh.material != tessel_core::MeshMaterial::default();
+            if has_custom {
                 let mut t_verts = Vec::with_capacity(tri.vertices.len());
                 for v in tri.vertices {
                     let pos = combined_mat
@@ -220,14 +222,24 @@ impl ViewportRenderer {
                         .transform_vector3(glam::Vec3::from_array(v.normal))
                         .normalize_or_zero()
                         .to_array();
+                    let uv = if mesh.texture.is_some() {
+                        v.uv
+                    } else {
+                        [(f32::from(v.palette_index.get()) + 0.5) / 256.0, 0.5]
+                    };
                     t_verts.push(StudioVertex3D {
                         position: pos,
                         normal: norm,
-                        palette_uv: v.uv,
+                        palette_uv: uv,
                         ao: 1.0,
                     });
                 }
-                textured_items.push((tex, t_verts, tri.indices));
+                custom_items.push(crate::mesh_pass::CustomMeshUpload {
+                    texture: mesh.texture.as_ref(),
+                    material: mesh.material,
+                    vertices: t_verts,
+                    indices: tri.indices,
+                });
             } else {
                 let base = vertices.len() as u32;
                 for v in tri.vertices {
@@ -251,7 +263,7 @@ impl ViewportRenderer {
         }
         self.mesh_pass.upload_mesh(device, &vertices, &indices);
         self.mesh_pass
-            .upload_textured_meshes(device, queue, &textured_items);
+            .upload_custom_meshes(device, queue, &custom_items);
         self.last_uploaded_revision = scene.revision;
     }
 

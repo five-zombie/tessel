@@ -39,6 +39,7 @@ pub fn create_primitive(kind: PrimitiveKind, size: f32, material: PaletteIndex) 
                 faces,
                 texture: None,
                 smooth_shading: false,
+                material: Default::default(),
             }
         }
         PrimitiveKind::Plane => {
@@ -54,6 +55,7 @@ pub fn create_primitive(kind: PrimitiveKind, size: f32, material: PaletteIndex) 
                 faces,
                 texture: None,
                 smooth_shading: false,
+                material: Default::default(),
             }
         }
         PrimitiveKind::Cylinder => create_cylinder(8, h, s, material),
@@ -97,6 +99,7 @@ fn create_cylinder(
         faces,
         texture: None,
         smooth_shading: false,
+        material: Default::default(),
     }
 }
 
@@ -122,6 +125,7 @@ fn create_cone(segments: usize, radius: f32, height: f32, material: PaletteIndex
         faces,
         texture: None,
         smooth_shading: false,
+        material: Default::default(),
     }
 }
 
@@ -339,6 +343,7 @@ pub fn smooth_subdivide_mesh(mesh: &LowPolyMesh) -> Result<LowPolyMesh, CoreErro
         faces: new_faces,
         texture: mesh.texture.clone(),
         smooth_shading: mesh.smooth_shading,
+        material: mesh.material,
     })
 }
 
@@ -378,6 +383,7 @@ pub fn voxel_to_lowpoly(volume: &VoxelVolume, unit_scale: f32) -> LowPolyMesh {
         faces,
         texture: None,
         smooth_shading: false,
+        material: Default::default(),
     }
 }
 

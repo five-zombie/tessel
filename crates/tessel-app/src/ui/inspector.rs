@@ -669,6 +669,57 @@ fn show_transform_and_lighting_section(
         }
     }
 
+    if scene.active_mode == AppMode::LowPoly {
+        if let Some(node_id) = scene.active_lowpoly_node() {
+            if let Some(mut mat) = scene.lowpoly_meshes.get(&node_id).map(|m| m.material) {
+                ui.horizontal(|ui| {
+                    ui.label(
+                        RichText::new("PBR Material")
+                            .strong()
+                            .size(12.5)
+                            .color(tokens::ON_SURFACE),
+                    );
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.small_button("Reset").clicked() {
+                            let _ = history.execute(
+                                scene,
+                                Command::SetMeshMaterial {
+                                    node_id,
+                                    material: tessel_core::MeshMaterial::default(),
+                                },
+                            );
+                        }
+                    });
+                });
+                let mut changed = false;
+                changed |= ui
+                    .add(egui::Slider::new(&mut mat.metallic, 0.0..=1.0).text("Metallic"))
+                    .changed();
+                changed |= ui
+                    .add(egui::Slider::new(&mut mat.roughness, 0.05..=1.0).text("Roughness"))
+                    .changed();
+                ui.horizontal(|ui| {
+                    ui.label(
+                        RichText::new("Emissive Glow")
+                            .size(11.0)
+                            .color(tokens::ON_SURFACE_VARIANT),
+                    );
+                    changed |= ui.color_edit_button_rgb(&mut mat.emissive).changed();
+                });
+                if changed {
+                    let _ = history.execute(
+                        scene,
+                        Command::SetMeshMaterial {
+                            node_id,
+                            material: mat,
+                        },
+                    );
+                }
+                ui.add_space(6.0);
+            }
+        }
+    }
+
     if scene.active_mode != AppMode::Pixel {
         ui.label(
             RichText::new("Studio Lighting")

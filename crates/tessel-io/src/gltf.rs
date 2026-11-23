@@ -43,7 +43,9 @@ impl CollectedMesh {
 
         for (node_id, mesh) in &scene.lowpoly_meshes {
             let visible = scene.nodes.get(node_id).map(|n| n.visible).unwrap_or(true);
-            if !visible || mesh.faces.is_empty() || mesh.texture.is_some() {
+            let is_custom =
+                mesh.texture.is_some() || mesh.material != tessel_core::MeshMaterial::default();
+            if !visible || mesh.faces.is_empty() || is_custom {
                 continue;
             }
             let tri = mesh.to_triangulated_flat();
@@ -73,7 +75,9 @@ impl CollectedMesh {
         let mut out = Self::from_scene_untextured(scene, preset);
         for (node_id, mesh) in &scene.lowpoly_meshes {
             let visible = scene.nodes.get(node_id).map(|n| n.visible).unwrap_or(true);
-            if !visible || mesh.faces.is_empty() || mesh.texture.is_none() {
+            let is_custom =
+                mesh.texture.is_some() || mesh.material != tessel_core::MeshMaterial::default();
+            if !visible || mesh.faces.is_empty() || !is_custom {
                 continue;
             }
             let tri = mesh.to_triangulated_flat();
@@ -364,13 +368,13 @@ pub fn export_glb_bytes(
         }
     }
 
-    // Export any textured Low-Poly meshes as separate primitives with embedded RGBA PNG textures.
+    // Export any Low-Poly meshes with custom RGBA texture or PBR material as dedicated primitives.
+    let mut palette_tex_index: Option<usize> = if has_palette_prim { Some(0) } else { None };
     for (node_id, lp_mesh) in &scene.lowpoly_meshes {
         let visible = scene.nodes.get(node_id).map(|n| n.visible).unwrap_or(true);
-        let Some(tex) = &lp_mesh.texture else {
-            continue;
-        };
-        if !visible || lp_mesh.faces.is_empty() {
+        let has_custom =
+            lp_mesh.texture.is_some() || lp_mesh.material != tessel_core::MeshMaterial::default();
+        if !visible || lp_mesh.faces.is_empty() || !has_custom {
             continue;
         }
         let tri = lp_mesh.to_triangulated_flat();
@@ -394,9 +398,12 @@ pub fn export_glb_bytes(
             }
             t_pos.push(p);
             t_norm.push(v.normal);
-            t_uv.push(v.uv);
+            if lp_mesh.texture.is_some() {
+                t_uv.push(v.uv);
+            } else {
+                t_uv.push([(f32::from(v.palette_index.get()) + 0.5) / 256.0, 0.5]);
+            }
         }
-        let tex_png = encode_rgba_png(tex.width, tex.height, &tex.rgba)?;
         let p_bv = push_view(
             &mut bin,
             &mut buffer_views,
@@ -421,7 +428,26 @@ pub fn export_glb_bytes(
             bytemuck::cast_slice(&tri.indices),
             Some(34963),
         );
-        let t_img_bv = push_view(&mut bin, &mut buffer_views, &tex_png, None);
+
+        let tex_idx = if let Some(tex) = &lp_mesh.texture {
+            let tex_png = encode_rgba_png(tex.width, tex.height, &tex.rgba)?;
+            let t_img_bv = push_view(&mut bin, &mut buffer_views, &tex_png, None);
+            let img_idx = images.len();
+            images.push(json!({ "bufferView": t_img_bv, "mimeType": "image/png" }));
+            let idx = textures.len();
+            textures.push(json!({ "sampler": 0, "source": img_idx }));
+            idx
+        } else if let Some(idx) = palette_tex_index {
+            idx
+        } else {
+            let pal_bv = push_view(&mut bin, &mut buffer_views, &palette_png, None);
+            let img_idx = images.len();
+            images.push(json!({ "bufferView": pal_bv, "mimeType": "image/png" }));
+            let idx = textures.len();
+            textures.push(json!({ "sampler": 0, "source": img_idx }));
+            palette_tex_index = Some(idx);
+            idx
+        };
 
         let p_acc = accessors.len();
         accessors.push(json!({
@@ -441,19 +467,19 @@ pub fn export_glb_bytes(
             "bufferView": i_bv, "componentType": 5125, "count": tri.indices.len(), "type": "SCALAR"
         }));
 
-        let img_idx = images.len();
-        images.push(json!({ "bufferView": t_img_bv, "mimeType": "image/png" }));
-        let tex_idx = textures.len();
-        textures.push(json!({ "sampler": 0, "source": img_idx }));
         let mat_idx = materials.len();
-        materials.push(json!({
-            "name": format!("TesselMeshTexture_{}", node_id.0),
+        let mut mat_json = json!({
+            "name": format!("TesselMeshMaterial_{}", node_id.0),
             "pbrMetallicRoughness": {
                 "baseColorTexture": { "index": tex_idx },
-                "metallicFactor": 0.0,
-                "roughnessFactor": 0.85
+                "metallicFactor": lp_mesh.material.metallic,
+                "roughnessFactor": lp_mesh.material.roughness
             }
-        }));
+        });
+        if lp_mesh.material.emissive.iter().any(|&c| c > 0.0) {
+            mat_json["emissiveFactor"] = json!(lp_mesh.material.emissive);
+        }
+        materials.push(mat_json);
         primitives.push(json!({
             "attributes": {
                 "POSITION": p_acc,
@@ -551,6 +577,24 @@ mod tests {
         let parsed = gltf::Gltf::from_slice(&glb).unwrap();
         assert_eq!(parsed.images().count(), 1);
         assert_eq!(parsed.materials().count(), 1);
+
+        // Verify PBR metallic, roughness, and emissive factors export cleanly into glTF 2.0
+        Command::SetMeshMaterial {
+            node_id,
+            material: tessel_core::MeshMaterial {
+                metallic: 0.9,
+                roughness: 0.2,
+                emissive: [0.1, 0.5, 0.8],
+            },
+        }
+        .apply(&mut scene)
+        .unwrap();
+        let (glb_pbr, _) = export_glb_bytes(&scene, ExportPreset::Godot4).unwrap();
+        let parsed_pbr = gltf::Gltf::from_slice(&glb_pbr).unwrap();
+        let mat = parsed_pbr.materials().next().unwrap();
+        assert!((mat.pbr_metallic_roughness().metallic_factor() - 0.9).abs() < 1e-4);
+        assert!((mat.pbr_metallic_roughness().roughness_factor() - 0.2).abs() < 1e-4);
+        assert!((mat.emissive_factor()[2] - 0.8).abs() < 1e-4);
     }
 
     #[test]
