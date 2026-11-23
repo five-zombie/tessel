@@ -10,6 +10,7 @@ use crate::grid_pass::GridPass;
 use crate::mesh_pass::MeshPass;
 use crate::overlay_pass::OverlayPass;
 use crate::pixel_pass::{PixelCamera2D, PixelPass};
+use crate::shadow_pass::{ShadowPass, ShadowUniform};
 use crate::vertex::StudioVertex3D;
 
 /// Clear color matching `surface-container-lowest` (`#0B0E14` in linear sRGB).
@@ -31,6 +32,7 @@ pub struct ViewportRenderer {
     depth_texture: wgpu::Texture,
     depth_view: wgpu::TextureView,
     grid_pass: GridPass,
+    shadow_pass: ShadowPass,
     mesh_pass: MeshPass,
     overlay_pass: OverlayPass,
     pixel_pass: PixelPass,
@@ -46,6 +48,7 @@ impl ViewportRenderer {
         let (color_texture, color_view) = create_color_target(device, safe_size.0, safe_size.1);
         let (depth_texture, depth_view) = create_depth_target(device, safe_size.0, safe_size.1);
         let grid_pass = GridPass::new(device, VIEWPORT_FORMAT, DEPTH_FORMAT);
+        let shadow_pass = ShadowPass::new(device, VIEWPORT_FORMAT, DEPTH_FORMAT);
         let mesh_pass = MeshPass::new(device, VIEWPORT_FORMAT, DEPTH_FORMAT);
         let overlay_pass = OverlayPass::new(device, VIEWPORT_FORMAT, DEPTH_FORMAT);
         let pixel_pass = PixelPass::new(device, VIEWPORT_FORMAT);
@@ -56,6 +59,7 @@ impl ViewportRenderer {
             depth_texture,
             depth_view,
             grid_pass,
+            shadow_pass,
             mesh_pass,
             overlay_pass,
             pixel_pass,
@@ -276,6 +280,20 @@ impl ViewportRenderer {
         self.mesh_pass.upload_mesh(device, &vertices, &indices);
         self.mesh_pass
             .upload_custom_meshes(device, queue, &custom_items);
+
+        let mut bmin = [f32::INFINITY; 3];
+        let mut bmax = [f32::NEG_INFINITY; 3];
+        for v in vertices
+            .iter()
+            .chain(custom_items.iter().flat_map(|item| item.vertices.iter()))
+        {
+            for axis in 0..3 {
+                bmin[axis] = bmin[axis].min(v.position[axis]);
+                bmax[axis] = bmax[axis].max(v.position[axis]);
+            }
+        }
+        self.shadow_pass
+            .update_bounds(queue, &ShadowUniform::from_bounds(bmin, bmax));
         self.last_uploaded_revision = scene.revision;
     }
 
@@ -315,6 +333,7 @@ impl ViewportRenderer {
                 let uniform =
                     camera_3d.to_uniform(aspect, scene.light_azimuth, scene.light_elevation);
                 self.grid_pass.update_camera(queue, &uniform);
+                self.shadow_pass.update_camera(queue, &uniform);
                 self.mesh_pass.update_camera(queue, &uniform);
                 self.overlay_pass.update_camera(queue, &uniform);
 
@@ -339,7 +358,9 @@ impl ViewportRenderer {
                     occlusion_query_set: None,
                     timestamp_writes: None,
                 });
-                if !render_preview {
+                if render_preview {
+                    self.shadow_pass.draw(&mut pass);
+                } else {
                     self.grid_pass.draw(&mut pass);
                 }
                 self.mesh_pass.draw(&mut pass);
