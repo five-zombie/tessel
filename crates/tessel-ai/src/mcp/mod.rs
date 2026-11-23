@@ -52,7 +52,7 @@ pub fn dispatch_mcp_message_with_preview(
         "initialize" => Ok(json!({
             "protocolVersion": "2024-11-05",
             "capabilities": {
-                "tools": {},
+                "tools": { "listChanged": true },
                 "resources": {},
                 "prompts": {}
             },

@@ -177,7 +177,7 @@ pub fn execute_tool_call(
             history.execute(scene, Command::DeleteNode(node_id))?;
             Ok(json!({ "ok": true, "deleted_node_id": raw_id }))
         }
-        "scene_set_node_transform" => {
+        "scene_set_node_transform" | "set_node_transform" => {
             let node_id = args
                 .get("node_id")
                 .and_then(Value::as_u64)
@@ -796,6 +796,8 @@ pub fn scene_summary_json(scene: &SceneState) -> Value {
                 "name": n.name,
                 "kind": format!("{:?}", n.kind),
                 "visible": n.visible,
+                "position": n.transform.translation.to_array(),
+                "scale": n.transform.scale.to_array(),
                 "stats": detail
             })
         })
@@ -968,7 +970,7 @@ mod tests {
         assert_eq!(node.transform.scale, glam::Vec3::new(0.5, 2.0, 0.5));
 
         execute_tool_call(
-            "scene_set_node_transform",
+            "set_node_transform",
             &json!({
                 "node_id": node_id.0,
                 "position": [-2.0, 0.5, 1.0],
@@ -985,5 +987,7 @@ mod tests {
             glam::Vec3::new(-2.0, 0.5, 1.0)
         );
         assert_eq!(updated.transform.scale, glam::Vec3::new(0.5, 2.0, 0.5));
+        let summary = scene_summary_json(&scene);
+        assert_eq!(summary["nodes"][0]["position"], json!([-2.0, 0.5, 1.0]));
     }
 }
