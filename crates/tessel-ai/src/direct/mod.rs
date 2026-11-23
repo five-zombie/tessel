@@ -8,7 +8,7 @@ use crate::translator::{palette_summary_json, scene_summary_json};
 
 pub const MAX_TOOL_TURNS: usize = 8;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default, Serialize, Deserialize)]
 pub enum AiProviderKind {
     #[default]
     OpenAi,
@@ -35,6 +35,15 @@ impl AiProviderKind {
             Self::Ollama => "llama3.2",
             Self::Gemini => "gemini-2.5-flash",
             Self::Anthropic => "claude-3-5-sonnet-latest",
+        }
+    }
+
+    pub const fn default_base_url(self) -> &'static str {
+        match self {
+            Self::OpenAi => "https://api.openai.com/v1/chat/completions",
+            Self::Ollama => "http://127.0.0.1:11434/v1/chat/completions",
+            Self::Gemini => "https://generativelanguage.googleapis.com/v1beta",
+            Self::Anthropic => "https://api.anthropic.com/v1/messages",
         }
     }
 }
@@ -127,6 +136,27 @@ pub fn parse_openai_tool_calls(message: &Value) -> Vec<PlannedToolCall> {
     out
 }
 
+/// Resolves the final HTTP endpoint URL for any provider, honoring custom `base_url`.
+pub fn resolve_endpoint(config: &DirectAiConfig) -> String {
+    let base = if config.base_url.trim().is_empty() {
+        config.provider.default_base_url()
+    } else {
+        config.base_url.trim().trim_end_matches('/')
+    };
+
+    match config.provider {
+        AiProviderKind::OpenAi | AiProviderKind::Ollama | AiProviderKind::Anthropic => {
+            base.to_string()
+        }
+        AiProviderKind::Gemini => {
+            format!(
+                "{base}/models/{}:generateContent?key={}",
+                config.model, config.api_key
+            )
+        }
+    }
+}
+
 /// Sends a real HTTP chat completion request with Tessel tool definitions attached.
 /// Surfaces real network/auth errors with zero mocking.
 pub async fn send_prompt(
@@ -138,21 +168,7 @@ pub async fn send_prompt(
         return Err(AiError::MissingApiKey);
     }
 
-    let endpoint = match config.provider {
-        AiProviderKind::OpenAi => "https://api.openai.com/v1/chat/completions".to_string(),
-        AiProviderKind::Ollama => {
-            if config.base_url.trim().is_empty() {
-                "http://127.0.0.1:11434/v1/chat/completions".to_string()
-            } else {
-                config.base_url.clone()
-            }
-        }
-        AiProviderKind::Gemini => format!(
-            "https://generativelanguage.googleapis.com/v1beta/models/{}:generateContent?key={}",
-            config.model, config.api_key
-        ),
-        AiProviderKind::Anthropic => "https://api.anthropic.com/v1/messages".to_string(),
-    };
+    let endpoint = resolve_endpoint(config);
 
     let system_prompt = build_system_prompt(scene);
     let client = reqwest::Client::new();
@@ -257,5 +273,30 @@ mod tests {
         assert_eq!(parsed.len(), MAX_TOOL_TURNS);
         assert_eq!(parsed[0].name, "voxel_fill_box");
         assert_eq!(parsed[0].arguments["palette_index"], 4);
+    }
+
+    #[test]
+    fn resolve_endpoint_honors_custom_base_urls_for_all_providers() {
+        let openai_custom = DirectAiConfig {
+            provider: AiProviderKind::OpenAi,
+            model: "llama-3.3-70b".into(),
+            base_url: "https://openrouter.ai/api/v1/chat/completions/".into(),
+            api_key: "sk-test".into(),
+        };
+        assert_eq!(
+            resolve_endpoint(&openai_custom),
+            "https://openrouter.ai/api/v1/chat/completions"
+        );
+
+        let gemini_default = DirectAiConfig {
+            provider: AiProviderKind::Gemini,
+            model: "gemini-2.5-flash".into(),
+            base_url: String::new(),
+            api_key: "gk".into(),
+        };
+        assert_eq!(
+            resolve_endpoint(&gemini_default),
+            "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=gk"
+        );
     }
 }

@@ -631,6 +631,7 @@ fn show_direct_ai_section(ui: &mut egui::Ui, scene: &SceneState, ai_state: &mut 
             {
                 ai_state.config.provider = provider;
                 ai_state.config.model = provider.default_model().into();
+                ai_state.config.base_url = provider.default_base_url().into();
                 ai_state.config.api_key = crate::settings::load_api_key_from_keyring(provider);
             }
         }

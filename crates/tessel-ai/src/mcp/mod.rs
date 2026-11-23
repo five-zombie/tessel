@@ -43,7 +43,8 @@ pub fn dispatch_mcp_message_with_preview(
             "protocolVersion": "2024-11-05",
             "capabilities": {
                 "tools": {},
-                "resources": {}
+                "resources": {},
+                "prompts": {}
             },
             "serverInfo": {
                 "name": "tessel-mcp",
@@ -120,6 +121,91 @@ pub fn dispatch_mcp_message_with_preview(
                     )),
                 },
                 _ => Err((-32602, format!("unknown resource URI '{uri}'"))),
+            }
+        }
+        "prompts/list" => Ok(json!({
+            "prompts": [
+                {
+                    "name": "create-voxel-character",
+                    "description": "Skill: Build a proportional voxel humanoid character, apply biped rig, inspect preview, and export .glb.",
+                    "arguments": [
+                        { "name": "character_concept", "description": "Character theme (e.g. knight, robot, mage)", "required": false }
+                    ]
+                },
+                {
+                    "name": "create-lowpoly-prop",
+                    "description": "Skill: Create a clean game-ready low-poly prop and export .glb.",
+                    "arguments": [
+                        { "name": "prop_name", "description": "Prop description", "required": false }
+                    ]
+                },
+                {
+                    "name": "inspect-and-refine",
+                    "description": "Skill: Inspect active scene summary, palette, and viewport PNG before refining.",
+                    "arguments": []
+                }
+            ]
+        })),
+        "prompts/get" => {
+            let prompt_name = params.get("name").and_then(Value::as_str).unwrap_or("");
+            let args = params.get("arguments").cloned().unwrap_or(Value::Null);
+            match prompt_name {
+                "create-voxel-character" => {
+                    let concept = args
+                        .get("character_concept")
+                        .and_then(Value::as_str)
+                        .unwrap_or("stylized voxel adventurer");
+                    Ok(json!({
+                        "description": "Tessel Voxel Character Creation Skill",
+                        "messages": [{
+                            "role": "user",
+                            "content": {
+                                "type": "text",
+                                "text": format!(
+                                    "Create a '{concept}' in Tessel.\n\
+                                     Rules:\n\
+                                     1. Coordinate system is Right-Handed, +Y Up, +Z Front, 1 voxel = 0.1m.\n\
+                                     2. Read `tessel://palette/current` first so colors match the active palette.\n\
+                                     3. Use `voxel_fill_box` and `voxel_fill_ellipsoid` to build legs (y=0..6), torso (y=7..13), arms, and head (y=14..18) facing +Z.\n\
+                                     4. Call `character_apply_biped_rig` to attach the starter skeleton.\n\
+                                     5. Inspect `tessel://viewport/preview` if running in GUI, then call `project_export` with format `glb`."
+                                )
+                            }
+                        }]
+                    }))
+                }
+                "create-lowpoly-prop" => {
+                    let prop = args
+                        .get("prop_name")
+                        .and_then(Value::as_str)
+                        .unwrap_or("game prop");
+                    Ok(json!({
+                        "description": "Tessel Low-Poly Prop Skill",
+                        "messages": [{
+                            "role": "user",
+                            "content": {
+                                "type": "text",
+                                "text": format!(
+                                    "Build a low-poly '{prop}' in Tessel.\n\
+                                     1. Read `tessel://palette/current`.\n\
+                                     2. Either compose primitives with `mesh_create_primitive` or block out voxels and run `voxel_convert_to_lowpoly`.\n\
+                                     3. Export via `project_export` (.glb)."
+                                )
+                            }
+                        }]
+                    }))
+                }
+                "inspect-and-refine" => Ok(json!({
+                    "description": "Tessel Scene Inspection Skill",
+                    "messages": [{
+                        "role": "user",
+                        "content": {
+                            "type": "text",
+                            "text": "Read `tessel://scene/summary`, `tessel://palette/current`, and `tessel://viewport/preview`. Summarize proportions and suggest or apply targeted voxel/mesh refinements."
+                        }
+                    }]
+                })),
+                other => Err((-32602, format!("unknown prompt '{other}'"))),
             }
         }
         other => Err((-32601, format!("method not found: '{other}'"))),
@@ -319,5 +405,36 @@ mod tests {
         .unwrap();
         assert_eq!(resp["result"]["contents"][0]["mimeType"], "image/png");
         assert_eq!(resp["result"]["contents"][0]["blob"], "iVBORw==");
+    }
+
+    #[test]
+    fn mcp_prompts_list_and_get_return_skills() {
+        let mut server = McpServer::new(std::env::temp_dir());
+        let list = server
+            .handle_message(&json!({
+                "jsonrpc": "2.0",
+                "id": 10,
+                "method": "prompts/list"
+            }))
+            .unwrap();
+        let prompts = list["result"]["prompts"].as_array().unwrap();
+        assert_eq!(prompts.len(), 3);
+
+        let get = server
+            .handle_message(&json!({
+                "jsonrpc": "2.0",
+                "id": 11,
+                "method": "prompts/get",
+                "params": {
+                    "name": "create-voxel-character",
+                    "arguments": { "character_concept": "cyber knight" }
+                }
+            }))
+            .unwrap();
+        let text = get["result"]["messages"][0]["content"]["text"]
+            .as_str()
+            .unwrap();
+        assert!(text.contains("cyber knight"));
+        assert!(text.contains("voxel_fill_box"));
     }
 }

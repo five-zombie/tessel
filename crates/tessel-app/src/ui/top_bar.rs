@@ -7,6 +7,7 @@ pub struct TopBarActions {
     pub toggle_mcp: bool,
     pub save_project: bool,
     pub open_project: bool,
+    pub open_settings: bool,
 }
 
 pub fn show_top_bar(
@@ -21,6 +22,7 @@ pub fn show_top_bar(
         toggle_mcp: false,
         save_project: false,
         open_project: false,
+        open_settings: false,
     };
     let frame = Frame::NONE
         .fill(tokens::SURFACE_LOW)
@@ -95,6 +97,9 @@ pub fn show_top_bar(
                     .corner_radius(CornerRadius::same(4));
                     if ui.add(export_btn).clicked() {
                         *export_open = true;
+                    }
+                    if ui.small_button("Settings").clicked() {
+                        actions.open_settings = true;
                     }
                     ui.separator();
                     let mcp_label = match mcp_port {

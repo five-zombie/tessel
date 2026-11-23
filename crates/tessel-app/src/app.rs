@@ -43,6 +43,7 @@ struct StudioState {
     pixel_drag_start: Option<PixelCoord>,
     gizmo_drag: Option<ui::viewport::GizmoDragState>,
     export_dialog: ui::export_dialog::ExportDialogState,
+    settings_dialog: ui::settings_dialog::SettingsDialogState,
     ai_state: ui::inspector::DirectAiUiState,
     command_palette: ui::command_palette::CommandPaletteState,
     quick_start: ui::quick_start::QuickStartState,
@@ -124,6 +125,7 @@ impl Default for StudioState {
             output_dir: settings.allowed_export_dir.clone(),
             ..Default::default()
         };
+        let settings_dialog = ui::settings_dialog::SettingsDialogState::from_settings(&settings);
 
         let mut ai_state = ui::inspector::DirectAiUiState::default();
         ai_state.config.provider = settings.ai_provider;
@@ -139,6 +141,7 @@ impl Default for StudioState {
             pixel_drag_start: None,
             gizmo_drag: None,
             export_dialog,
+            settings_dialog,
             ai_state,
             command_palette: ui::command_palette::CommandPaletteState::default(),
             quick_start: ui::quick_start::QuickStartState {
@@ -295,6 +298,7 @@ impl GpuState {
             toggle_mcp: false,
             save_project: false,
             open_project: false,
+            open_settings: false,
         };
 
         let full_output = self.egui_ctx.run(raw_input, |ctx| {
@@ -331,6 +335,7 @@ impl GpuState {
             top_actions.toggle_mcp |= bar.toggle_mcp;
             top_actions.save_project |= bar.save_project;
             top_actions.open_project |= bar.open_project;
+            top_actions.open_settings |= bar.open_settings;
 
             ui::status_bar::show_status_bar(
                 ctx,
@@ -362,6 +367,15 @@ impl GpuState {
             hover_voxel = hv;
             active_gizmo_axis = g_axis;
             ui::export_dialog::show_export_dialog(ctx, &studio.scene, &mut studio.export_dialog);
+            ui::settings_dialog::show_settings_dialog(
+                ctx,
+                &mut studio.settings_dialog,
+                &mut studio.settings,
+                &studio.paths,
+                &mut studio.ai_state.config,
+                &mut studio.export_dialog.output_dir,
+                studio.live_mcp.as_ref(),
+            );
             quick_action = ui::quick_start::show_quick_start(
                 ctx,
                 &mut studio.quick_start,
@@ -414,6 +428,9 @@ impl GpuState {
             }
         }
 
+        if top_actions.open_settings {
+            studio.settings_dialog.open = true;
+        }
         if top_actions.toggle_mcp {
             studio.toggle_live_mcp();
         }
