@@ -6,7 +6,10 @@ use tessel_core::{
     AppMode, BoneId, Command, HistoryStack, Keyframe, NodeId, PaletteIndex, PrimitiveKind,
     SceneState, VoxelCoord,
 };
-use tessel_io::{export_scene_to_dir, ExportFormat, ExportPreset};
+use tessel_io::{
+    export_scene_to_dir, import_mesh_from_path, resolve_safe_export_path, ExportFormat,
+    ExportPreset,
+};
 
 use crate::error::AiError;
 
@@ -241,6 +244,29 @@ pub fn execute_tool_call(
                 },
             )?;
             Ok(json!({ "ok": true, "node_id": scene.selected_node.map(|n| n.0) }))
+        }
+        "mesh_import" => {
+            let filename = args
+                .get("filename")
+                .and_then(Value::as_str)
+                .ok_or_else(|| AiError::InvalidArguments("missing 'filename'".into()))?;
+            let target = resolve_safe_export_path(allowed_export_dir, filename)?;
+            let material = parse_palette_index(args, 4)?;
+            let (default_name, mesh) = import_mesh_from_path(&target, material)?;
+            let verts = mesh.vertices.len();
+            let faces = mesh.faces.len();
+            let name = args
+                .get("name")
+                .and_then(Value::as_str)
+                .map(ToString::to_string)
+                .unwrap_or(default_name);
+            history.execute(scene, Command::ImportLowPolyMesh { name, mesh })?;
+            Ok(json!({
+                "ok": true,
+                "node_id": scene.selected_node.map(|n| n.0),
+                "vertices": verts,
+                "faces": faces
+            }))
         }
         "character_apply_biped_rig" => {
             history.execute(scene, Command::ApplyBipedRig)?;
@@ -492,5 +518,44 @@ mod tests {
         assert_eq!(rig.animations.len(), 3);
         assert_eq!(rig.animations[2].name, "Wave");
         assert_eq!(rig.animations[2].keyframe_times(Some(BoneId(4))), vec![0.5]);
+    }
+
+    #[test]
+    fn ai_tool_mesh_import_loads_exported_obj_and_glb() {
+        let mut scene = SceneState::new();
+        let mut history = HistoryStack::new();
+        let dir = std::env::temp_dir().join("tessel_ai_mesh_import_test");
+        let _ = std::fs::create_dir_all(&dir);
+
+        execute_tool_call(
+            "mesh_create_primitive",
+            &json!({ "kind": "cube", "size": 1.0 }),
+            &mut scene,
+            &mut history,
+            &dir,
+        )
+        .unwrap();
+        execute_tool_call(
+            "project_export",
+            &json!({ "filename": "cube_test.glb", "format": "glb" }),
+            &mut scene,
+            &mut history,
+            &dir,
+        )
+        .unwrap();
+
+        let res = execute_tool_call(
+            "mesh_import",
+            &json!({ "filename": "cube_test.glb", "name": "Imported Cube" }),
+            &mut scene,
+            &mut history,
+            &dir,
+        )
+        .unwrap();
+        assert_eq!(res["ok"], true);
+        assert_eq!(res["faces"], 12);
+        assert_eq!(scene.lowpoly_meshes.len(), 2);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

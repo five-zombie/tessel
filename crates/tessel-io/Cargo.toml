@@ -8,12 +8,10 @@ license.workspace = true
 bytemuck.workspace = true
 gif.workspace = true
 glam.workspace = true
+gltf.workspace = true
 image.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tessel-core = { path = "../tessel-core" }
 thiserror.workspace = true
 zip.workspace = true
-
-[dev-dependencies]
-gltf.workspace = true

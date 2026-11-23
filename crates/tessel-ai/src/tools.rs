@@ -69,6 +69,19 @@ pub fn tool_definitions() -> Vec<Value> {
             }
         }),
         json!({
+            "name": "mesh_import",
+            "description": "Import a .obj or .glb 3D mesh from the allowed workspace/export directory into Low-Poly mode.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "filename": { "type": "string" },
+                    "name": { "type": "string" },
+                    "palette_index": { "type": "integer", "minimum": 1, "maximum": 255 }
+                },
+                "required": ["filename"]
+            }
+        }),
+        json!({
             "name": "character_apply_biped_rig",
             "description": "Apply the starter 7-bone biped humanoid skeleton with Idle & Walk animations.",
             "inputSchema": { "type": "object", "properties": {} }

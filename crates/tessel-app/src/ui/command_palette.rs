@@ -16,6 +16,7 @@ pub struct CommandPaletteState {
 enum PaletteAction {
     Mode(AppMode),
     OpenExport,
+    ImportMesh,
     Undo,
     Redo,
     ResetCamera,
@@ -56,6 +57,11 @@ const ACTIONS: &[ActionEntry] = &[
         label: "Export Asset (.glb / .obj / .stl / .vox / .png / .gif)",
         shortcut: "Ctrl+E",
         action: PaletteAction::OpenExport,
+    },
+    ActionEntry {
+        label: "Import 3D Mesh (.obj / .glb)",
+        shortcut: "Ctrl+I",
+        action: PaletteAction::ImportMesh,
     },
     ActionEntry {
         label: "Starter Template: Spawn Biped Voxel Character",
@@ -103,6 +109,7 @@ pub fn show_command_palette(
     camera_3d: &mut OrbitCamera,
     camera_2d: &mut PixelCamera2D,
     export_open: &mut bool,
+    import_mesh: &mut bool,
 ) {
     if !state.open {
         return;
@@ -176,7 +183,15 @@ pub fn show_command_palette(
         });
 
     if let Some(action) = triggered {
-        execute_action(action, scene, history, camera_3d, camera_2d, export_open);
+        execute_action(
+            action,
+            scene,
+            history,
+            camera_3d,
+            camera_2d,
+            export_open,
+            import_mesh,
+        );
         state.open = false;
         state.query.clear();
     } else {
@@ -191,6 +206,7 @@ fn execute_action(
     camera_3d: &mut OrbitCamera,
     camera_2d: &mut PixelCamera2D,
     export_open: &mut bool,
+    import_mesh: &mut bool,
 ) {
     match action {
         PaletteAction::Mode(mode) => {
@@ -200,6 +216,9 @@ fn execute_action(
         }
         PaletteAction::OpenExport => {
             *export_open = true;
+        }
+        PaletteAction::ImportMesh => {
+            *import_mesh = true;
         }
         PaletteAction::Undo => {
             let _ = history.undo(scene);

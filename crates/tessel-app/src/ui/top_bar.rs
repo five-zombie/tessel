@@ -7,6 +7,7 @@ pub struct TopBarActions {
     pub toggle_mcp: bool,
     pub save_project: bool,
     pub open_project: bool,
+    pub import_mesh: bool,
     pub open_settings: bool,
 }
 
@@ -22,6 +23,7 @@ pub fn show_top_bar(
         toggle_mcp: false,
         save_project: false,
         open_project: false,
+        import_mesh: false,
         open_settings: false,
     };
     let frame = Frame::NONE
@@ -45,6 +47,13 @@ pub fn show_top_bar(
                 }
                 if ui.small_button("Save").clicked() {
                     actions.save_project = true;
+                }
+                if ui
+                    .small_button("Import")
+                    .on_hover_text("Import 3D Mesh (.obj / .glb)")
+                    .clicked()
+                {
+                    actions.import_mesh = true;
                 }
                 ui.separator();
 

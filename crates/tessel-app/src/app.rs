@@ -298,6 +298,7 @@ impl GpuState {
             toggle_mcp: false,
             save_project: false,
             open_project: false,
+            import_mesh: false,
             open_settings: false,
         };
 
@@ -322,6 +323,9 @@ impl GpuState {
                 if ctx.input(|i| i.modifiers.command && i.key_pressed(egui::Key::O)) {
                     top_actions.open_project = true;
                 }
+                if ctx.input(|i| i.modifiers.command && i.key_pressed(egui::Key::I)) {
+                    top_actions.import_mesh = true;
+                }
             }
             let mcp_port = studio.live_mcp.as_ref().map(|h| h.port);
             let bar = ui::top_bar::show_top_bar(
@@ -335,6 +339,7 @@ impl GpuState {
             top_actions.toggle_mcp |= bar.toggle_mcp;
             top_actions.save_project |= bar.save_project;
             top_actions.open_project |= bar.open_project;
+            top_actions.import_mesh |= bar.import_mesh;
             top_actions.open_settings |= bar.open_settings;
 
             ui::status_bar::show_status_bar(
@@ -389,6 +394,7 @@ impl GpuState {
                 &mut studio.camera_3d,
                 &mut studio.camera_2d,
                 &mut studio.export_dialog.open,
+                &mut top_actions.import_mesh,
             );
         });
 
@@ -430,6 +436,25 @@ impl GpuState {
 
         if top_actions.open_settings {
             studio.settings_dialog.open = true;
+        }
+        if top_actions.import_mesh {
+            if let Some(path) = rfd::FileDialog::new()
+                .add_filter("3D Mesh (.obj, .glb)", &["obj", "glb"])
+                .pick_file()
+            {
+                match tessel_io::import_mesh_from_path(&path, studio.scene.active_color) {
+                    Ok((name, mesh)) => {
+                        let _ = studio.history.execute(
+                            &mut studio.scene,
+                            Command::Transaction(vec![
+                                Command::ImportLowPolyMesh { name, mesh },
+                                Command::SetMode(tessel_core::AppMode::LowPoly),
+                            ]),
+                        );
+                    }
+                    Err(err) => tracing::error!("Import 3D mesh failed: {err}"),
+                }
+            }
         }
         if top_actions.toggle_mcp {
             studio.toggle_live_mcp();

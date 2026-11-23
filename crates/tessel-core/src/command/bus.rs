@@ -82,6 +82,10 @@ pub enum Command {
         size: f32,
         material: PaletteIndex,
     },
+    ImportLowPolyMesh {
+        name: String,
+        mesh: LowPolyMesh,
+    },
     ConvertVoxelToLowPoly {
         voxel_node_id: NodeId,
         name: String,
@@ -535,6 +539,26 @@ impl Command {
                     },
                 );
                 scene.lowpoly_meshes.insert(id, mesh);
+                scene.selected_node = Some(id);
+                UndoDelta::RemoveNode {
+                    id,
+                    previous_selection,
+                }
+            }
+            Self::ImportLowPolyMesh { name, mesh } => {
+                let id = scene.allocate_node_id();
+                let previous_selection = scene.selected_node;
+                scene.nodes.insert(
+                    id,
+                    SceneNode {
+                        id,
+                        name: name.clone(),
+                        kind: NodeKind::LowPolyMesh,
+                        visible: true,
+                        transform: Transform::default(),
+                    },
+                );
+                scene.lowpoly_meshes.insert(id, mesh.clone());
                 scene.selected_node = Some(id);
                 UndoDelta::RemoveNode {
                     id,
