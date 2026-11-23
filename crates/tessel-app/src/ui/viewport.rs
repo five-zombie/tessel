@@ -1,4 +1,4 @@
-use egui::{CornerRadius, Frame, Margin, RichText, Sense, Stroke};
+use egui::{CornerRadius, Frame, Margin, Sense, Stroke};
 use tessel_core::pixel::ops as pixel_ops;
 use tessel_core::voxel::ops as voxel_ops;
 use tessel_core::{
@@ -10,6 +10,7 @@ use tessel_render::{
     closest_point_on_axis, pick_move_gizmo, CameraPreset, GizmoAxis, OrbitCamera, PixelCamera2D,
 };
 
+use super::icons::{self, ToolIcon};
 use super::theme::tokens;
 
 #[derive(Debug, Clone, Copy)]
@@ -385,23 +386,24 @@ fn show_viewport_hud(
                 .inner_margin(Margin::symmetric(6, 4))
                 .show(ui, |ui| {
                     ui.horizontal(|ui| {
-                        if ui.small_button("-").on_hover_text("Zoom Out").clicked() {
+                        if icons::hud_icon_button(ui, ToolIcon::ZoomOut, "Zoom Out", false) {
                             match mode {
                                 AppMode::Pixel => camera_2d.zoom_step(0.8),
                                 _ => camera_3d.zoom_step(1.2),
                             }
                         }
-                        if ui
-                            .small_button("Reset")
-                            .on_hover_text("Reset Camera (F)")
-                            .clicked()
-                        {
+                        if icons::hud_icon_button(
+                            ui,
+                            ToolIcon::ResetCamera,
+                            "Reset Camera (F)",
+                            false,
+                        ) {
                             match mode {
                                 AppMode::Pixel => camera_2d.reset(),
                                 _ => camera_3d.reset(),
                             }
                         }
-                        if ui.small_button("+").on_hover_text("Zoom In").clicked() {
+                        if icons::hud_icon_button(ui, ToolIcon::ZoomIn, "Zoom In", false) {
                             match mode {
                                 AppMode::Pixel => camera_2d.zoom_step(1.25),
                                 _ => camera_3d.zoom_step(0.82),
@@ -410,62 +412,30 @@ fn show_viewport_hud(
 
                         if mode != AppMode::Pixel {
                             ui.separator();
-                            let (free_fill, free_text) = if *free_view {
-                                (tokens::PRIMARY_CONTAINER, tokens::ON_PRIMARY)
-                            } else {
-                                (tokens::SURFACE_HIGH, tokens::ON_SURFACE)
-                            };
-                            if ui
-                                .add(
-                                    egui::Button::new(
-                                        RichText::new("Free").size(11.0).color(free_text),
-                                    )
-                                    .fill(free_fill),
-                                )
-                                .on_hover_text(
-                                    "Free View: Left-drag to orbit 360°, Shift+Left-drag to pan",
-                                )
-                                .clicked()
-                            {
+                            if icons::hud_icon_button(
+                                ui,
+                                ToolIcon::FreeView,
+                                "Free View: Left-drag to orbit 360°, Shift+Left-drag to pan",
+                                *free_view,
+                            ) {
                                 *free_view = !*free_view;
                             }
-                            let (prev_fill, prev_text) = if *render_preview {
-                                (tokens::PRIMARY_CONTAINER, tokens::ON_PRIMARY)
-                            } else {
-                                (tokens::SURFACE_HIGH, tokens::ON_SURFACE)
-                            };
-                            if ui
-                                .add(
-                                    egui::Button::new(
-                                        RichText::new("Preview").size(11.0).color(prev_text),
-                                    )
-                                    .fill(prev_fill),
-                                )
-                                .on_hover_text(
-                                    "Render Preview: hide grid, wireframe, gizmo, and compass",
-                                )
-                                .clicked()
-                            {
+                            if icons::hud_icon_button(
+                                ui,
+                                ToolIcon::Preview,
+                                "Render Preview: hide grid, wireframe, gizmo, and compass",
+                                *render_preview,
+                            ) {
                                 *render_preview = !*render_preview;
                             }
                             let presets = [
-                                ("Iso", CameraPreset::Iso),
-                                ("Front", CameraPreset::Front),
-                                ("Right", CameraPreset::Right),
-                                ("Top", CameraPreset::Top),
+                                (ToolIcon::ViewIso, "Iso view", CameraPreset::Iso),
+                                (ToolIcon::ViewFront, "Front view", CameraPreset::Front),
+                                (ToolIcon::ViewRight, "Right view", CameraPreset::Right),
+                                (ToolIcon::ViewTop, "Top view", CameraPreset::Top),
                             ];
-                            for (label, preset) in presets {
-                                if ui
-                                    .add(
-                                        egui::Button::new(
-                                            RichText::new(label)
-                                                .size(11.0)
-                                                .color(tokens::ON_SURFACE),
-                                        )
-                                        .fill(tokens::SURFACE_HIGH),
-                                    )
-                                    .clicked()
-                                {
+                            for (icon, tip, preset) in presets {
+                                if icons::hud_icon_button(ui, icon, tip, false) {
                                     camera_3d.set_preset(preset);
                                 }
                             }

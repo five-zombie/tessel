@@ -261,6 +261,9 @@ impl GpuState {
 
         let egui_ctx = egui::Context::default();
         ui::theme::apply_tactile_precision_theme(&egui_ctx);
+        let mut fonts = egui::FontDefinitions::default();
+        egui_phosphor::add_to_fonts(&mut fonts, egui_phosphor::Variant::Regular);
+        egui_ctx.set_fonts(fonts);
 
         let egui_state = egui_winit::State::new(
             egui_ctx.clone(),

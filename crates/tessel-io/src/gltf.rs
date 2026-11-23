@@ -74,14 +74,15 @@ impl CollectedMesh {
             let visible = scene.nodes.get(node_id).map(|n| n.visible).unwrap_or(true);
             let is_custom = mesh.texture.is_some()
                 || mesh.normal_map.is_some()
-                || mesh.material != tessel_core::MeshMaterial::default();
+                || mesh.material != tessel_core::MeshMaterial::default()
+                || !mesh.morphs.is_empty();
             if !visible || mesh.faces.is_empty() || is_custom {
                 continue;
             }
             let (node_mat, normal_mat) = node_world_matrices(scene, *node_id);
             let tri = mesh.to_triangulated_flat();
             let base = positions.len() as u32;
-            for v in tri.vertices {
+            for (corner, v) in tri.vertices.iter().enumerate() {
                 let wp = node_mat.transform_point3(Vec3::from_array(v.position)) * scale;
                 let wn = normal_mat
                     .transform_vector3(Vec3::from_array(v.normal))
@@ -90,7 +91,13 @@ impl CollectedMesh {
                 normals.push(wn.to_array());
                 uvs.push([(f32::from(v.palette_index.get()) + 0.5) / 256.0, 0.5]);
                 if let Some(solver) = skin {
-                    let sw = solver.weights_for_vertex(Some(*node_id), wp);
+                    // Manual weight-paint overrides win over the auto solver.
+                    let sw = tri
+                        .source_indices
+                        .get(corner)
+                        .and_then(|src| mesh.skin_weights.get(src))
+                        .copied()
+                        .unwrap_or_else(|| solver.weights_for_vertex(Some(*node_id), wp));
                     joints.push(sw.joints);
                     weights.push(sw.weights);
                 }
@@ -169,6 +176,29 @@ fn pad4(buf: &mut Vec<u8>, pad_byte: u8) {
     while !buf.len().is_multiple_of(4) {
         buf.push(pad_byte);
     }
+}
+
+/// Linear-interpolates morph weight keys at `time_secs` (clamped ends),
+/// mirroring `AnimationClip::sample_morph_weights` for export baking.
+fn sample_morph_keys(keys: &[tessel_core::MorphWeightKey], time_secs: f32) -> f32 {
+    if keys.is_empty() {
+        return 0.0;
+    }
+    if keys.len() == 1 || time_secs <= keys[0].time_secs {
+        return keys[0].weight;
+    }
+    if time_secs >= keys.last().map(|k| k.time_secs).unwrap_or(0.0) {
+        return keys.last().map(|k| k.weight).unwrap_or(0.0);
+    }
+    for pair in keys.windows(2) {
+        let (a, b) = (pair[0], pair[1]);
+        if time_secs >= a.time_secs && time_secs <= b.time_secs {
+            let span = (b.time_secs - a.time_secs).max(1e-5);
+            let alpha = ((time_secs - a.time_secs) / span).clamp(0.0, 1.0);
+            return a.weight + (b.weight - a.weight) * alpha;
+        }
+    }
+    keys.last().map(|k| k.weight).unwrap_or(0.0)
 }
 
 /// Builds a valid glTF 2.0 Binary (`.glb`) with an embedded 256x1 nearest-neighbor palette PNG,
@@ -342,6 +372,27 @@ pub fn export_glb_bytes(
     let mut animations: Vec<Value> = Vec::new();
     let mut skins: Vec<Value> = Vec::new();
 
+    // Morphed meshes get dedicated export nodes appended after the bone
+    // nodes by the custom-primitive pass below. Precompute their order
+    // here (same BTreeMap order and same skip filters) so morph weight
+    // channels and node indices agree.
+    let morphed_order: Vec<tessel_core::NodeId> = scene
+        .lowpoly_meshes
+        .iter()
+        .filter(|(id, m)| {
+            scene.nodes.get(id).map(|n| n.visible).unwrap_or(true)
+                && !m.faces.is_empty()
+                && !m.morphs.is_empty()
+                && !m.to_triangulated_flat().vertices.is_empty()
+        })
+        .map(|(id, _)| *id)
+        .collect();
+    let morph_base_node = 1 + scene
+        .character_rig
+        .as_ref()
+        .map(|r| r.bones.len())
+        .unwrap_or(0);
+
     if let Some(rig) = &scene.character_rig {
         let mut bone_to_node: BTreeMap<tessel_core::BoneId, usize> = BTreeMap::new();
         for bone in &rig.bones {
@@ -467,6 +518,158 @@ pub fn export_glb_bytes(
                     "sampler": sampler_idx,
                     "target": { "node": target_node, "path": "rotation" }
                 }));
+
+                // Keyframe translation is an offset added to the rest pose
+                // (rig.rs pose composition); export absolute local values so
+                // external players match the viewport. Skipped when all zero
+                // to keep rotation-only clips byte-identical.
+                let rest = rig.bones.iter().find(|b| b.id == ch.bone_id);
+                let rest_t = rest.map(|b| b.rest_local.translation).unwrap_or(Vec3::ZERO);
+                if ch.keyframes.iter().any(|k| k.translation != Vec3::ZERO) {
+                    let trans: Vec<[f32; 3]> = ch
+                        .keyframes
+                        .iter()
+                        .map(|k| ((rest_t + k.translation) * scale).to_array())
+                        .collect();
+                    let trans_bv = push_view(
+                        &mut bin,
+                        &mut buffer_views,
+                        bytemuck::cast_slice(&trans),
+                        None,
+                    );
+                    let trans_acc = accessors.len();
+                    accessors.push(json!({
+                        "bufferView": trans_bv,
+                        "componentType": 5126,
+                        "count": trans.len(),
+                        "type": "VEC3"
+                    }));
+                    let sampler_idx = samplers.len();
+                    samplers.push(json!({
+                        "input": time_acc,
+                        "interpolation": "LINEAR",
+                        "output": trans_acc
+                    }));
+                    channels.push(json!({
+                        "sampler": sampler_idx,
+                        "target": { "node": target_node, "path": "translation" }
+                    }));
+                }
+
+                // Keyframe scale multiplies the rest scale; same skip rule.
+                let rest_s = rest.map(|b| b.rest_local.scale).unwrap_or(Vec3::ONE);
+                if ch.keyframes.iter().any(|k| k.scale != Vec3::ONE) {
+                    let scales: Vec<[f32; 3]> = ch
+                        .keyframes
+                        .iter()
+                        .map(|k| (rest_s * k.scale).to_array())
+                        .collect();
+                    let scale_bv = push_view(
+                        &mut bin,
+                        &mut buffer_views,
+                        bytemuck::cast_slice(&scales),
+                        None,
+                    );
+                    let scale_acc = accessors.len();
+                    accessors.push(json!({
+                        "bufferView": scale_bv,
+                        "componentType": 5126,
+                        "count": scales.len(),
+                        "type": "VEC3"
+                    }));
+                    let sampler_idx = samplers.len();
+                    samplers.push(json!({
+                        "input": time_acc,
+                        "interpolation": "LINEAR",
+                        "output": scale_acc
+                    }));
+                    channels.push(json!({
+                        "sampler": sampler_idx,
+                        "target": { "node": target_node, "path": "scale" }
+                    }));
+                }
+            }
+
+            // Morph weight tracks: one channel per animated mesh node. The
+            // output holds the FULL weight array per keyframe (all targets,
+            // missing tracks read as their sampled value or 0.0), matching
+            // the glTF "weights" path layout.
+            let mut tracks_by_node: BTreeMap<
+                tessel_core::NodeId,
+                Vec<&tessel_core::MorphWeightTrack>,
+            > = BTreeMap::new();
+            for track in &clip.morph_tracks {
+                if !track.keys.is_empty() {
+                    tracks_by_node.entry(track.node).or_default().push(track);
+                }
+            }
+            for (mnode, tracks) in &tracks_by_node {
+                let Some(pos) = morphed_order.iter().position(|id| id == mnode) else {
+                    continue;
+                };
+                let Some(mesh) = scene.lowpoly_meshes.get(mnode) else {
+                    continue;
+                };
+                if mesh.morphs.is_empty() {
+                    continue;
+                }
+                let mut times: Vec<f32> = tracks
+                    .iter()
+                    .flat_map(|t| t.keys.iter().map(|k| k.time_secs))
+                    .collect();
+                times.sort_by(f32::total_cmp);
+                times.dedup_by(|a, b| (*a - *b).abs() <= 1e-3);
+                let mut out: Vec<f32> = Vec::with_capacity(times.len() * mesh.morphs.len());
+                for t in &times {
+                    for morph in &mesh.morphs {
+                        let w = tracks
+                            .iter()
+                            .find(|tr| tr.target == morph.name)
+                            .map(|tr| sample_morph_keys(&tr.keys, *t))
+                            .unwrap_or(0.0);
+                        out.push(if w.is_finite() { w } else { 0.0 });
+                    }
+                }
+                let min_t = times.iter().copied().fold(f32::INFINITY, f32::min);
+                let max_t = times.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+                let time_bv = push_view(
+                    &mut bin,
+                    &mut buffer_views,
+                    bytemuck::cast_slice(&times),
+                    None,
+                );
+                let time_acc = accessors.len();
+                accessors.push(json!({
+                    "bufferView": time_bv,
+                    "componentType": 5126,
+                    "count": times.len(),
+                    "type": "SCALAR",
+                    "min": [min_t],
+                    "max": [max_t]
+                }));
+                let out_bv = push_view(
+                    &mut bin,
+                    &mut buffer_views,
+                    bytemuck::cast_slice(&out),
+                    None,
+                );
+                let out_acc = accessors.len();
+                accessors.push(json!({
+                    "bufferView": out_bv,
+                    "componentType": 5126,
+                    "count": out.len(),
+                    "type": "SCALAR"
+                }));
+                let sampler_idx = samplers.len();
+                samplers.push(json!({
+                    "input": time_acc,
+                    "interpolation": "LINEAR",
+                    "output": out_acc
+                }));
+                channels.push(json!({
+                    "sampler": sampler_idx,
+                    "target": { "node": morph_base_node + pos, "path": "weights" }
+                }));
             }
 
             if !channels.is_empty() {
@@ -479,13 +682,17 @@ pub fn export_glb_bytes(
         }
     }
 
-    // Export any Low-Poly meshes with custom RGBA texture or PBR material as dedicated primitives.
+    // Export any Low-Poly meshes with custom RGBA texture, PBR material, or
+    // morph targets as dedicated primitives (morphs need per-mesh targets,
+    // which the merged palette mesh cannot carry).
     let mut palette_tex_index: Option<usize> = if has_palette_prim { Some(0) } else { None };
+    let mut morphed: Vec<(tessel_core::NodeId, Value, Vec<f64>)> = Vec::new();
     for (node_id, lp_mesh) in &scene.lowpoly_meshes {
         let visible = scene.nodes.get(node_id).map(|n| n.visible).unwrap_or(true);
         let has_custom = lp_mesh.texture.is_some()
             || lp_mesh.normal_map.is_some()
-            || lp_mesh.material != tessel_core::MeshMaterial::default();
+            || lp_mesh.material != tessel_core::MeshMaterial::default()
+            || !lp_mesh.morphs.is_empty();
         if !visible || lp_mesh.faces.is_empty() || !has_custom {
             continue;
         }
@@ -610,8 +817,16 @@ pub fn export_glb_bytes(
         if let Some(solver) = &skin_solver {
             let mut t_joints = Vec::with_capacity(t_pos.len());
             let mut t_weights = Vec::with_capacity(t_pos.len());
-            for &p in &t_pos {
-                let sw = solver.weights_for_vertex(Some(*node_id), Vec3::from_array(p));
+            for (corner, &p) in t_pos.iter().enumerate() {
+                // Manual weight-paint overrides win over the auto solver.
+                let sw = tri
+                    .source_indices
+                    .get(corner)
+                    .and_then(|src| lp_mesh.skin_weights.get(src))
+                    .copied()
+                    .unwrap_or_else(|| {
+                        solver.weights_for_vertex(Some(*node_id), Vec3::from_array(p))
+                    });
                 t_joints.push(sw.joints);
                 t_weights.push(sw.weights);
             }
@@ -644,16 +859,90 @@ pub fn export_glb_bytes(
             custom_attrs["JOINTS_0"] = json!(j_acc);
             custom_attrs["WEIGHTS_0"] = json!(w_acc);
         }
-        primitives.push(json!({
-            "attributes": custom_attrs,
-            "indices": i_acc,
-            "material": mat_idx
-        }));
+        if !lp_mesh.morphs.is_empty() {
+            let mut targets = Vec::with_capacity(lp_mesh.morphs.len());
+            let mut morph_weights = Vec::with_capacity(lp_mesh.morphs.len());
+            for morph in &lp_mesh.morphs {
+                let mut deltas = vec![[0.0f32; 3]; tri.vertices.len()];
+                for (corner, src) in tri.source_indices.iter().enumerate() {
+                    if let Some(d) = morph.deltas.get(src) {
+                        deltas[corner] = (d * scale).to_array();
+                    }
+                }
+                let d_bv = push_view(
+                    &mut bin,
+                    &mut buffer_views,
+                    bytemuck::cast_slice(&deltas),
+                    Some(34962),
+                );
+                let d_acc = accessors.len();
+                accessors.push(json!({
+                    "bufferView": d_bv, "componentType": 5126, "count": deltas.len(),
+                    "type": "VEC3"
+                }));
+                targets.push(json!({ "POSITION": d_acc }));
+                morph_weights.push(0.0);
+            }
+            // Targets are siblings of "attributes", not entries: morph
+            // target dictionaries map attribute -> accessor index.
+            let mut prim_json = json!({
+                "attributes": custom_attrs,
+                "indices": i_acc,
+                "material": mat_idx
+            });
+            prim_json["targets"] = Value::Array(targets);
+            morphed.push((*node_id, prim_json, morph_weights));
+        } else {
+            primitives.push(json!({
+                "attributes": custom_attrs,
+                "indices": i_acc,
+                "material": mat_idx
+            }));
+        }
         total_triangles += tri.indices.len() / 3;
     }
 
-    if primitives.is_empty() {
+    if primitives.is_empty() && morphed.is_empty() {
         return Err(IoError::EmptyCanvas);
+    }
+
+    // Morphed meshes get dedicated mesh objects (with exact default
+    // weights) plus dedicated identity nodes, since morph targets cannot
+    // ride the merged palette mesh. Vertex data is already baked, so the
+    // nodes carry no transform.
+    let mut meshes = vec![json!({
+        "name": "TesselMesh",
+        "primitives": primitives
+    })];
+    let has_skin = !skins.is_empty();
+    // Node indices must match the precomputed `morphed_order` used by the
+    // morph weight channels above (same BTreeMap order, same filters).
+    debug_assert!(morphed
+        .iter()
+        .map(|(id, _, _)| *id)
+        .eq(morphed_order.iter().copied()));
+    for (mnode, prim, weights) in morphed {
+        let mesh_idx = meshes.len();
+        meshes.push(json!({
+            "name": format!("TesselMesh_{}", mnode.0),
+            "primitives": [prim],
+            "weights": weights
+        }));
+        let node_idx = nodes.len();
+        let node_name = scene
+            .nodes
+            .get(&mnode)
+            .map(|n| n.name.clone())
+            .unwrap_or_else(|| format!("TesselAsset_{}", mnode.0));
+        let mut mnode_json = json!({
+            "name": node_name,
+            "mesh": mesh_idx
+        });
+        if has_skin {
+            mnode_json["skin"] = json!(0);
+        }
+        nodes.push(mnode_json);
+        root_nodes.push(node_idx);
     }
 
     let mut gltf_json = json!({
@@ -673,10 +962,7 @@ pub fn export_glb_bytes(
         "images": images,
         "textures": textures,
         "materials": materials,
-        "meshes": [{
-            "name": "TesselMesh",
-            "primitives": primitives
-        }],
+        "meshes": meshes,
         "buffers": [{ "byteLength": bin.len() }],
         "bufferViews": buffer_views,
         "accessors": accessors
@@ -825,6 +1111,260 @@ mod tests {
             let sum: f32 = w.iter().sum();
             assert!((sum - 1.0).abs() < 1e-4, "weights must sum to 1.0: {w:?}");
         }
+    }
+
+    #[test]
+    fn glb_export_writes_translation_and_scale_channels_for_trs_keyframes() {
+        use tessel_core::{BoneId, Keyframe};
+
+        let mut scene = SceneState::new();
+        Command::CreateVoxelVolume {
+            name: "Hero".into(),
+        }
+        .apply(&mut scene)
+        .unwrap();
+        let id = scene.active_voxel_node().unwrap();
+        Command::FillVoxelBox {
+            node_id: id,
+            min: tessel_core::VoxelCoord::new(0, 0, 0),
+            max: tessel_core::VoxelCoord::new(0, 0, 0),
+            color: Some(PaletteIndex::new(4).unwrap()),
+            hollow: false,
+        }
+        .apply(&mut scene)
+        .unwrap();
+        Command::ApplyBipedRig.apply(&mut scene).unwrap();
+        Command::AddAnimationClip {
+            name: "Bounce".into(),
+            duration_secs: 1.0,
+        }
+        .apply(&mut scene)
+        .unwrap();
+        Command::SetAnimationKeyframe {
+            clip_index: 2, // Idle + Walk ship with the rig
+            bone_id: BoneId(1),
+            keyframe: Keyframe {
+                time_secs: 0.5,
+                translation: Vec3::new(0.0, 0.1, 0.0),
+                rotation: glam::Quat::IDENTITY,
+                scale: Vec3::new(1.0, 1.0, 2.0),
+            },
+        }
+        .apply(&mut scene)
+        .unwrap();
+
+        let (glb, _) = export_glb_bytes(&scene, ExportPreset::Godot4).unwrap();
+        let json_len = u32::from_le_bytes(glb[12..16].try_into().unwrap()) as usize;
+        let json: serde_json::Value = serde_json::from_slice(&glb[20..20 + json_len]).unwrap();
+        let animations = json["animations"].as_array().unwrap();
+        let bounce = animations
+            .iter()
+            .find(|a| a["name"] == "Bounce")
+            .expect("Bounce clip must export");
+        let mut paths: Vec<&str> = bounce["channels"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| c["target"]["path"].as_str().unwrap())
+            .collect();
+        paths.sort_unstable();
+        assert_eq!(paths, vec!["rotation", "scale", "translation"]);
+
+        // The built-in Idle clip breathes via translation offsets: those were
+        // silently dropped before and must now export as absolute values.
+        let idle = animations
+            .iter()
+            .find(|a| a["name"] == "Idle")
+            .expect("Idle clip must export");
+        let idle_paths: Vec<&str> = idle["channels"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| c["target"]["path"].as_str().unwrap())
+            .collect();
+        assert!(idle_paths.contains(&"translation"));
+        // No scale keyframes exist anywhere in the starter clips.
+        assert!(!idle_paths.contains(&"scale"));
+
+        // Rotation-only Walk stays rotation-only (skip rule).
+        let walk = animations
+            .iter()
+            .find(|a| a["name"] == "Walk")
+            .expect("Walk clip must export");
+        let walk_paths: Vec<&str> = walk["channels"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| c["target"]["path"].as_str().unwrap())
+            .collect();
+        assert!(walk_paths.iter().all(|p| *p == "rotation"));
+    }
+
+    #[test]
+    fn glb_export_prefers_manual_weights_over_auto_solver() {
+        let mut scene = SceneState::new();
+        Command::CreatePrimitiveMesh {
+            name: "PaintedCube".into(),
+            kind: PrimitiveKind::Cube,
+            size: 1.0,
+            material: PaletteIndex::new(1).unwrap(),
+        }
+        .apply(&mut scene)
+        .unwrap();
+        let node_id = scene.active_lowpoly_node().unwrap();
+        Command::SetMeshVertexWeights {
+            node_id,
+            vertex_ids: (0..8).collect(),
+            joints: [3, 0, 0, 0],
+            weights: [1.0, 0.0, 0.0, 0.0],
+        }
+        .apply(&mut scene)
+        .unwrap();
+        Command::ApplyBipedRig.apply(&mut scene).unwrap();
+
+        let (glb, _) = export_glb_bytes(&scene, ExportPreset::Godot4).unwrap();
+        let parsed = gltf::Gltf::from_slice(&glb).unwrap();
+        let blob = parsed.blob.as_ref().unwrap();
+        let prim = parsed.meshes().next().unwrap().primitives().next().unwrap();
+        let reader = prim.reader(|_| Some(blob.as_slice()));
+        let joints: Vec<[u16; 4]> = reader.read_joints(0).unwrap().into_u16().collect();
+        let weights: Vec<[f32; 4]> = reader.read_weights(0).unwrap().into_f32().collect();
+        assert!(!joints.is_empty());
+        assert_eq!(joints.len(), weights.len());
+        for (j, w) in joints.iter().zip(weights.iter()) {
+            assert_eq!(*j, [3, 0, 0, 0]);
+            assert_eq!(*w, [1.0, 0.0, 0.0, 0.0]);
+        }
+    }
+
+    #[test]
+    fn glb_export_writes_morph_targets_for_morphed_mesh() {
+        let mut scene = SceneState::new();
+        Command::CreatePrimitiveMesh {
+            name: "Smiler".into(),
+            kind: PrimitiveKind::Cube,
+            size: 1.0,
+            material: PaletteIndex::new(1).unwrap(),
+        }
+        .apply(&mut scene)
+        .unwrap();
+        let node_id = scene.active_lowpoly_node().unwrap();
+        Command::AddMorphDelta {
+            node_id,
+            name: "Smile".into(),
+            vertex_ids: vec![0],
+            delta: Vec3::new(0.0, 0.5, 0.0),
+        }
+        .apply(&mut scene)
+        .unwrap();
+
+        let (glb, _) = export_glb_bytes(&scene, ExportPreset::Godot4).unwrap();
+        // The binary must stay parseable with morphs present.
+        gltf::Gltf::from_slice(&glb).unwrap();
+        let json_len = u32::from_le_bytes(glb[12..16].try_into().unwrap()) as usize;
+        let json: serde_json::Value = serde_json::from_slice(&glb[20..20 + json_len]).unwrap();
+        let mesh_json = json["meshes"].as_array().unwrap().last().unwrap();
+        let prim = mesh_json["primitives"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|p| p.get("targets").is_some())
+            .expect("a primitive with morph targets must export");
+        let targets = prim["targets"].as_array().unwrap();
+        assert_eq!(targets.len(), 1);
+        assert_eq!(mesh_json["weights"], serde_json::json!([0.0]));
+
+        // Target deltas land on the triangulated corners of source vertex 0.
+        let mesh = scene.lowpoly_meshes.get(&node_id).unwrap();
+        let tri = mesh.to_triangulated_flat();
+        let expected: usize = tri.source_indices.iter().filter(|s| **s == 0).count();
+        assert!(expected > 0);
+        let acc_idx = targets[0]["POSITION"].as_u64().unwrap() as usize;
+        let acc = json["accessors"].as_array().unwrap()[acc_idx].clone();
+        assert_eq!(acc["count"], tri.vertices.len());
+        assert_eq!(acc["type"], "VEC3");
+        // Sum of absolute y deltas equals |delta.y| * corners sharing vertex 0.
+        // BIN data starts right after the 12-byte header + 8-byte JSON chunk
+        // header + padded JSON (BIN chunk header is 8 bytes).
+        let bv = acc["bufferView"].as_u64().unwrap() as usize;
+        let bvs = json["bufferViews"].as_array().unwrap();
+        let byte_offset: usize = bvs[bv]["byteOffset"].as_u64().unwrap_or(0) as usize;
+        let bin_start = 12 + 8 + json_len + 8;
+        let mut sum = 0.0f32;
+        for i in 0..tri.vertices.len() {
+            let off = bin_start + byte_offset + i * 12 + 4; // y component
+            let y = f32::from_le_bytes(glb[off..off + 4].try_into().unwrap()).abs();
+            sum += y;
+        }
+        assert!((sum - 0.5 * expected as f32).abs() < 1e-3, "sum {sum}");
+    }
+
+    #[test]
+    fn glb_export_writes_morph_weight_channels() {
+        let mut scene = SceneState::new();
+        Command::CreatePrimitiveMesh {
+            name: "Talker".into(),
+            kind: PrimitiveKind::Cube,
+            size: 1.0,
+            material: PaletteIndex::new(1).unwrap(),
+        }
+        .apply(&mut scene)
+        .unwrap();
+        let node_id = scene.active_lowpoly_node().unwrap();
+        Command::AddMorphDelta {
+            node_id,
+            name: "Smile".into(),
+            vertex_ids: vec![0],
+            delta: Vec3::new(0.0, 0.5, 0.0),
+        }
+        .apply(&mut scene)
+        .unwrap();
+        Command::ApplyBipedRig.apply(&mut scene).unwrap();
+        Command::AddAnimationClip {
+            name: "Talk".into(),
+            duration_secs: 1.0,
+        }
+        .apply(&mut scene)
+        .unwrap();
+        Command::SetMorphWeightKeyframe {
+            clip_index: 2,
+            node_id,
+            target: "Smile".into(),
+            time_secs: 0.0,
+            weight: 0.0,
+        }
+        .apply(&mut scene)
+        .unwrap();
+        Command::SetMorphWeightKeyframe {
+            clip_index: 2,
+            node_id,
+            target: "Smile".into(),
+            time_secs: 1.0,
+            weight: 1.0,
+        }
+        .apply(&mut scene)
+        .unwrap();
+
+        let (glb, _) = export_glb_bytes(&scene, ExportPreset::Godot4).unwrap();
+        let parsed = gltf::Gltf::from_slice(&glb).unwrap();
+        // Clips export in order: Idle, Walk, Talk.
+        let anim = parsed.animations().nth(2).expect("Talk clip must export");
+        let mut found_weights = false;
+        for ch in anim.channels() {
+            use gltf::animation::{util::ReadOutputs, Property};
+            if ch.target().property() == Property::MorphTargetWeights {
+                found_weights = true;
+                let reader = ch.reader(|_| parsed.blob.as_deref());
+                let inputs: Vec<f32> = reader.read_inputs().unwrap().collect();
+                assert_eq!(inputs, vec![0.0, 1.0]);
+                let Some(ReadOutputs::MorphTargetWeights(out)) = reader.read_outputs() else {
+                    panic!("weights output must be morph weights");
+                };
+                let outputs: Vec<f32> = out.into_f32().collect();
+                assert_eq!(outputs, vec![0.0, 1.0]);
+            }
+        }
+        assert!(found_weights, "weights channel must export");
     }
 
     #[test]

@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 
 use glam::{Mat4, Vec3};
+use serde::{Deserialize, Serialize};
 
 use crate::scene::NodeId;
 
@@ -8,7 +9,7 @@ use super::nano::BoneId;
 use super::rig::CharacterRig;
 
 /// Normalized 4-bone skinning influence for a single vertex (glTF `JOINTS_0` / `WEIGHTS_0`).
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct VertexSkinWeights {
     pub joints: [u16; 4],
     pub weights: [f32; 4],

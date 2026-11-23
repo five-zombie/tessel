@@ -1,6 +1,7 @@
 use egui::{CornerRadius, Frame, Margin, RichText, Stroke};
 use tessel_core::{AppMode, Command, FrameIndex, HistoryStack, Keyframe, SceneState};
 
+use super::icons::{self, ToolIcon};
 use super::theme::tokens;
 
 pub fn show_timeline(ctx: &egui::Context, scene: &mut SceneState, history: &mut HistoryStack) {
@@ -69,7 +70,7 @@ fn show_pixel_timeline(ctx: &egui::Context, scene: &mut SceneState, history: &mu
                     }
                 }
 
-                if ui.small_button("+ Frame").clicked() {
+                if icons::hud_icon_button(ui, ToolIcon::Add, "+ Frame", false) {
                     let _ = history.execute(scene, Command::AddPixelFrame { node_id });
                 }
 
@@ -119,8 +120,12 @@ fn show_character_timeline(
             };
             let selected_bone = scene.selected_bone;
             ui.horizontal_centered(|ui| {
-                let play_label = if rig.playing { "Pause" } else { "Play" };
-                if ui.small_button(play_label).clicked() {
+                let (play_icon, play_tip) = if rig.playing {
+                    (ToolIcon::Pause, "Pause")
+                } else {
+                    (ToolIcon::Play, "Play")
+                };
+                if icons::hud_icon_button(ui, play_icon, play_tip, false) {
                     rig.playing = !rig.playing;
                 }
                 ui.separator();
@@ -138,7 +143,7 @@ fn show_character_timeline(
                         modified = true;
                     }
                 }
-                if ui.small_button("+ Clip").clicked() {
+                if icons::hud_icon_button(ui, ToolIcon::Add, "+ Clip", false) {
                     pending_cmd = Some(Command::AddAnimationClip {
                         name: format!("Clip {}", rig.animations.len() + 1),
                         duration_secs: 2.0,
@@ -160,7 +165,7 @@ fn show_character_timeline(
                 }
                 ui.separator();
 
-                if ui.small_button("+ Key").clicked() {
+                if icons::hud_icon_button(ui, ToolIcon::Keyframe, "+ Key", false) {
                     let clip_index = rig.active_animation;
                     let t = rig.playback_time;
                     let targets: Vec<_> = match selected_bone {
@@ -205,7 +210,7 @@ fn show_character_timeline(
                     }
                 }
 
-                if ui.small_button("- Key").clicked() {
+                if icons::hud_icon_button(ui, ToolIcon::Remove, "- Key", false) {
                     let clip_index = rig.active_animation;
                     let t = rig.playback_time;
                     if let Some(bone_id) = selected_bone {

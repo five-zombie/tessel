@@ -62,6 +62,12 @@ cargo test --workspace
 
 ---
 
+## Third-Party Notices
+
+- **Phosphor Icons** (toolbar glyphs, via the `egui-phosphor` crate) — Copyright Helena Zhang and Tobias Fried, [MIT License](https://github.com/phosphor-icons/home/blob/main/LICENSE). Glyph names and codepoints © their authors.
+
+---
+
 ## License
 
 Copyright 2026 **The Five Zombie Org**

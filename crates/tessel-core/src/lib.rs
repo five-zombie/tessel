@@ -8,14 +8,14 @@ pub mod scene;
 pub mod voxel;
 
 pub use character::{
-    AnimationClip, AutoSkinSolver, Bone, BoneChannel, BoneId, CharacterRig, Keyframe, SkinBinding,
-    VertexSkinWeights,
+    solve_for_rig, solve_two_bone_ik, AnimationClip, AutoSkinSolver, Bone, BoneChannel, BoneId,
+    CharacterRig, Keyframe, MorphWeightKey, MorphWeightTrack, SkinBinding, VertexSkinWeights,
 };
 pub use command::{Command, HistoryStack, UndoDelta};
 pub use error::CoreError;
 pub use mesh::{
-    box_atlas_uv, Face, FaceId, LowPolyMesh, MeshMaterial, MeshTexture, PrimitiveKind, TriVertex,
-    TriangulatedMesh, VertexId, DEFAULT_MESH_TEX_SIZE,
+    box_atlas_uv, Face, FaceId, LowPolyMesh, MeshMaterial, MeshTexture, MorphTarget, PrimitiveKind,
+    TriVertex, TriangulatedMesh, VertexId, DEFAULT_MESH_TEX_SIZE,
 };
 pub use palette::{Palette, PaletteEntry, PaletteIndex, Rgba8};
 pub use pixel::{

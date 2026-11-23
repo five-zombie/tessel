@@ -1,8 +1,7 @@
-use egui::{CornerRadius, Frame, Margin, RichText, Stroke};
-use tessel_core::{
-    AppMode, Command, FaceId, HistoryStack, PixelTool, PrimitiveKind, SceneState, VoxelTool,
-};
+use egui::{Frame, Margin, RichText, Stroke};
+use tessel_core::{AppMode, Command, FaceId, HistoryStack, SceneState};
 
+use super::icons::{self, IconItem, ToolbarAction};
 use super::theme::tokens;
 
 pub fn show_toolbar(ctx: &egui::Context, scene: &mut SceneState, history: &mut HistoryStack) {
@@ -12,283 +11,426 @@ pub fn show_toolbar(ctx: &egui::Context, scene: &mut SceneState, history: &mut H
         .stroke(Stroke::new(1.0, tokens::OUTLINE_VARIANT));
 
     egui::SidePanel::left("tessel_toolbar")
-        .exact_width(72.0)
+        .exact_width(112.0)
         .resizable(false)
         .frame(frame)
         .show(ctx, |ui| {
-            ui.vertical_centered(|ui| {
-                ui.label(
-                    RichText::new("TOOLS")
-                        .size(10.0)
-                        .color(tokens::ON_SURFACE_VARIANT),
-                );
-                ui.add_space(6.0);
-
-                match scene.active_mode {
-                    AppMode::Pixel => {
-                        for tool in PixelTool::ALL {
-                            if tool_button(ui, tool.label(), scene.pixel_tool == tool) {
-                                scene.pixel_tool = tool;
+            ui.vertical_centered(|ui| match scene.active_mode {
+                AppMode::Pixel => {
+                    let items: Vec<IconItem> = tessel_core::PixelTool::ALL
+                        .iter()
+                        .map(|tool| {
+                            let (icon, tip) = icons::pixel_tool_icon(*tool);
+                            IconItem {
+                                icon,
+                                tip,
+                                active: scene.pixel_tool == *tool,
+                                action: ToolbarAction::PixelTool(*tool),
                             }
-                        }
-                        ui.add_space(6.0);
-                        ui.separator();
-                        ui.label(
-                            RichText::new("SYM")
-                                .size(10.0)
-                                .color(tokens::ON_SURFACE_VARIANT),
-                        );
-                        toggle_chip(ui, "X", &mut scene.pixel_symmetry.x);
-                        toggle_chip(ui, "Y", &mut scene.pixel_symmetry.y);
-                        ui.separator();
-                        if let Some(pixel_node_id) = scene.active_pixel_node() {
-                            if action_button(ui, "To Voxel") {
-                                let _ = history.execute(
-                                    scene,
-                                    Command::Transaction(vec![
-                                        Command::ConvertPixelToVoxel {
-                                            pixel_node_id,
-                                            depth: 3,
-                                            name: "Voxelized Sprite".into(),
-                                        },
-                                        Command::SetMode(AppMode::Voxel),
-                                    ]),
-                                );
-                            }
+                        })
+                        .collect();
+                    if let Some(action) = icons::icon_group(ui, "pixel_tools", "TOOLS", &items) {
+                        fire_toolbar_action(action, scene, history);
+                    }
+                    ui.separator();
+                    let sym = [
+                        IconItem {
+                            icon: icons::ToolIcon::AxisX,
+                            tip: "Mirror X",
+                            active: scene.pixel_symmetry.x,
+                            action: ToolbarAction::TogglePixelSymX,
+                        },
+                        IconItem {
+                            icon: icons::ToolIcon::AxisY,
+                            tip: "Mirror Y",
+                            active: scene.pixel_symmetry.y,
+                            action: ToolbarAction::TogglePixelSymY,
+                        },
+                    ];
+                    if let Some(action) = icons::icon_group(ui, "pixel_sym", "SYM", &sym) {
+                        fire_toolbar_action(action, scene, history);
+                    }
+                    ui.separator();
+                    if scene.active_pixel_node().is_some() {
+                        let convert = [IconItem {
+                            icon: icons::ToolIcon::ToVoxel,
+                            tip: "To Voxel",
+                            active: false,
+                            action: ToolbarAction::ConvertToVoxel,
+                        }];
+                        if let Some(action) =
+                            icons::icon_group(ui, "pixel_convert", "CONVERT", &convert)
+                        {
+                            fire_toolbar_action(action, scene, history);
                         }
                     }
-                    AppMode::Voxel => {
-                        for tool in VoxelTool::ALL {
-                            if tool_button(ui, tool.label(), scene.voxel_tool == tool) {
-                                scene.voxel_tool = tool;
+                }
+                AppMode::Voxel => {
+                    let items: Vec<IconItem> = tessel_core::VoxelTool::ALL
+                        .iter()
+                        .map(|tool| {
+                            let (icon, tip) = icons::voxel_tool_icon(*tool);
+                            IconItem {
+                                icon,
+                                tip,
+                                active: scene.voxel_tool == *tool,
+                                action: ToolbarAction::VoxelTool(*tool),
                             }
-                        }
-                        ui.add_space(6.0);
-                        ui.separator();
-                        ui.label(
-                            RichText::new("MIRROR")
-                                .size(10.0)
-                                .color(tokens::ON_SURFACE_VARIANT),
-                        );
-                        toggle_chip(ui, "X", &mut scene.voxel_symmetry.x);
-                        toggle_chip(ui, "Y", &mut scene.voxel_symmetry.y);
-                        toggle_chip(ui, "Z", &mut scene.voxel_symmetry.z);
-                        ui.separator();
-                        if let Some(voxel_node_id) = scene.active_voxel_node() {
-                            if action_button(ui, "To Mesh") {
-                                let _ = history.execute(
-                                    scene,
-                                    Command::Transaction(vec![
-                                        Command::ConvertVoxelToLowPoly {
-                                            voxel_node_id,
-                                            name: "LowPoly Mesh".into(),
-                                        },
-                                        Command::SetMode(AppMode::LowPoly),
-                                    ]),
-                                );
-                            }
+                        })
+                        .collect();
+                    if let Some(action) = icons::icon_group(ui, "voxel_tools", "TOOLS", &items) {
+                        fire_toolbar_action(action, scene, history);
+                    }
+                    ui.separator();
+                    let mirror = [
+                        IconItem {
+                            icon: icons::ToolIcon::AxisX,
+                            tip: "Mirror X",
+                            active: scene.voxel_symmetry.x,
+                            action: ToolbarAction::ToggleVoxelSymX,
+                        },
+                        IconItem {
+                            icon: icons::ToolIcon::AxisY,
+                            tip: "Mirror Y",
+                            active: scene.voxel_symmetry.y,
+                            action: ToolbarAction::ToggleVoxelSymY,
+                        },
+                        IconItem {
+                            icon: icons::ToolIcon::AxisZ,
+                            tip: "Mirror Z",
+                            active: scene.voxel_symmetry.z,
+                            action: ToolbarAction::ToggleVoxelSymZ,
+                        },
+                    ];
+                    if let Some(action) = icons::icon_group(ui, "voxel_mirror", "MIRROR", &mirror) {
+                        fire_toolbar_action(action, scene, history);
+                    }
+                    ui.separator();
+                    if scene.active_voxel_node().is_some() {
+                        let convert = [IconItem {
+                            icon: icons::ToolIcon::ToMesh,
+                            tip: "To Mesh",
+                            active: false,
+                            action: ToolbarAction::ConvertToMesh,
+                        }];
+                        if let Some(action) =
+                            icons::icon_group(ui, "voxel_convert", "CONVERT", &convert)
+                        {
+                            fire_toolbar_action(action, scene, history);
                         }
                     }
-                    AppMode::LowPoly => {
-                        for kind in PrimitiveKind::ALL {
-                            if action_button(ui, kind.label()) {
-                                let _ = history.execute(
-                                    scene,
-                                    Command::CreatePrimitiveMesh {
-                                        name: kind.label().into(),
-                                        kind,
-                                        size: 0.8,
-                                        material: scene.active_color,
-                                    },
-                                );
+                }
+                AppMode::LowPoly => {
+                    let shapes: Vec<IconItem> = tessel_core::PrimitiveKind::ALL
+                        .iter()
+                        .map(|kind| {
+                            let (icon, tip) = icons::primitive_icon(*kind);
+                            IconItem {
+                                icon,
+                                tip,
+                                active: false,
+                                action: ToolbarAction::Primitive(*kind),
                             }
+                        })
+                        .collect();
+                    if let Some(action) = icons::icon_group(ui, "prim_shapes", "SHAPE", &shapes) {
+                        fire_toolbar_action(action, scene, history);
+                    }
+                    ui.separator();
+                    if scene.active_lowpoly_node().is_some() {
+                        let mut paint: Vec<IconItem> = vec![
+                            IconItem {
+                                icon: icons::ToolIcon::Brush,
+                                tip: "Paint",
+                                active: scene.lowpoly_paint_mode,
+                                action: ToolbarAction::TogglePaint,
+                            },
+                            IconItem {
+                                icon: icons::ToolIcon::Picture,
+                                tip: "Load Tex",
+                                active: false,
+                                action: ToolbarAction::LoadTexture { normal: false },
+                            },
+                            IconItem {
+                                icon: icons::ToolIcon::PictureWave,
+                                tip: "Load Norm",
+                                active: false,
+                                action: ToolbarAction::LoadTexture { normal: true },
+                            },
+                        ];
+                        if scene.lowpoly_paint_mode {
+                            paint.push(IconItem {
+                                icon: icons::ToolIcon::PaintBucket,
+                                tip: "Fill Tex",
+                                active: false,
+                                action: ToolbarAction::FillTexture,
+                            });
+                            paint.push(IconItem {
+                                icon: icons::ToolIcon::AxisX,
+                                tip: "Mirror X",
+                                active: scene.lowpoly_mirror_x,
+                                action: ToolbarAction::ToggleMirrorX,
+                            });
+                        }
+                        if let Some(action) = icons::icon_group(ui, "mesh_paint", "PAINT", &paint) {
+                            fire_toolbar_action(action, scene, history);
                         }
                         ui.separator();
-                        if let Some(node_id) = scene.active_lowpoly_node() {
-                            if tool_button(ui, "Paint", scene.lowpoly_paint_mode) {
-                                scene.lowpoly_paint_mode = !scene.lowpoly_paint_mode;
-                            }
-                            if action_button(ui, "Load Tex") {
-                                if let Some(path) = rfd::FileDialog::new()
-                                    .add_filter(
-                                        "Texture Image (.png, .jpg)",
-                                        &["png", "jpg", "jpeg"],
-                                    )
-                                    .pick_file()
-                                {
-                                    match tessel_io::import_mesh_texture_from_path(&path) {
-                                        Ok(tex) => {
-                                            let _ = history.execute(
-                                                scene,
-                                                Command::SetMeshTexture {
-                                                    node_id,
-                                                    texture: Some(tex),
-                                                },
-                                            );
-                                        }
-                                        Err(err) => {
-                                            tracing::error!("Load custom texture failed: {err}");
-                                        }
-                                    }
-                                }
-                            }
-                            if action_button(ui, "Load Norm") {
-                                if let Some(path) = rfd::FileDialog::new()
-                                    .add_filter("Normal Map (.png, .jpg)", &["png", "jpg", "jpeg"])
-                                    .pick_file()
-                                {
-                                    match tessel_io::import_mesh_texture_from_path(&path) {
-                                        Ok(tex) => {
-                                            let _ = history.execute(
-                                                scene,
-                                                Command::SetMeshNormalMap {
-                                                    node_id,
-                                                    normal_map: Some(tex),
-                                                },
-                                            );
-                                        }
-                                        Err(err) => {
-                                            tracing::error!("Load normal map failed: {err}");
-                                        }
-                                    }
-                                }
-                            }
-                            if scene.lowpoly_paint_mode {
-                                ui.label(
-                                    RichText::new(format!("R: {:.0}", scene.lowpoly_brush_radius))
-                                        .monospace()
-                                        .size(10.0)
-                                        .color(tokens::ON_SURFACE_VARIANT),
-                                );
-                                ui.add(
-                                    egui::Slider::new(&mut scene.lowpoly_brush_radius, 2.0..=40.0)
-                                        .show_value(false),
-                                );
-                                toggle_chip(ui, "Mir X", &mut scene.lowpoly_mirror_x);
-                                if action_button(ui, "Fill Tex") {
-                                    let color = scene
-                                        .palette
-                                        .get(scene.active_color)
-                                        .map(|e| e.color)
-                                        .unwrap_or(tessel_core::Rgba8::rgb(225, 226, 235));
-                                    let _ = history.execute(
-                                        scene,
-                                        Command::FillMeshTexture { node_id, color },
-                                    );
-                                }
-                            }
-                            ui.separator();
-                            if action_button(ui, "Extrude") {
-                                let face_id = scene.selected_face.unwrap_or(FaceId(0));
-                                let _ = history.execute(
-                                    scene,
-                                    Command::ExtrudeMeshFace {
-                                        node_id,
-                                        face_id,
-                                        distance: 0.25,
-                                    },
-                                );
-                            }
-                            if action_button(ui, "Inset") {
-                                let face_id = scene.selected_face.unwrap_or(FaceId(0));
-                                let _ = history.execute(
-                                    scene,
-                                    Command::InsetMeshFace {
-                                        node_id,
-                                        face_id,
-                                        factor: 0.3,
-                                    },
-                                );
-                            }
-                            if action_button(ui, "Bevel") {
-                                let _ = history.execute(
-                                    scene,
-                                    Command::BevelMesh {
-                                        node_id,
-                                        amount: 0.18,
-                                    },
-                                );
-                            }
-                            if action_button(ui, "Smooth") {
-                                let _ = history
-                                    .execute(scene, Command::SmoothSubdivideMesh { node_id });
-                            }
-                            if action_button(ui, "Decimate") {
-                                let _ = history.execute(
-                                    scene,
-                                    Command::DecimateMesh {
-                                        node_id,
-                                        ratio: 0.5,
-                                    },
-                                );
-                            }
-                            let is_smooth = scene
-                                .lowpoly_meshes
-                                .get(&node_id)
-                                .is_some_and(|m| m.smooth_shading);
-                            if tool_button(ui, "Shade Sm", is_smooth) {
-                                let _ = history.execute(
-                                    scene,
-                                    Command::SetMeshSmoothShading {
-                                        node_id,
-                                        smooth: !is_smooth,
-                                    },
-                                );
-                            }
+                        let is_smooth = scene
+                            .lowpoly_meshes
+                            .get(&scene.active_lowpoly_node().unwrap())
+                            .is_some_and(|m| m.smooth_shading);
+                        let edit = [
+                            IconItem {
+                                icon: icons::ToolIcon::Extrude,
+                                tip: "Extrude",
+                                active: false,
+                                action: ToolbarAction::Extrude,
+                            },
+                            IconItem {
+                                icon: icons::ToolIcon::Inset,
+                                tip: "Inset",
+                                active: false,
+                                action: ToolbarAction::Inset,
+                            },
+                            IconItem {
+                                icon: icons::ToolIcon::Bevel,
+                                tip: "Bevel",
+                                active: false,
+                                action: ToolbarAction::Bevel,
+                            },
+                            IconItem {
+                                icon: icons::ToolIcon::Smooth,
+                                tip: "Smooth",
+                                active: false,
+                                action: ToolbarAction::Smooth,
+                            },
+                            IconItem {
+                                icon: icons::ToolIcon::Decimate,
+                                tip: "Decimate",
+                                active: false,
+                                action: ToolbarAction::Decimate,
+                            },
+                            IconItem {
+                                icon: icons::ToolIcon::ShadeSmooth,
+                                tip: "Shade Smooth",
+                                active: is_smooth,
+                                action: ToolbarAction::ToggleShade,
+                            },
+                        ];
+                        if let Some(action) = icons::icon_group(ui, "mesh_edit", "EDIT", &edit) {
+                            fire_toolbar_action(action, scene, history);
+                        }
+                        if scene.lowpoly_paint_mode {
+                            ui.label(
+                                RichText::new(format!("R: {:.0}", scene.lowpoly_brush_radius))
+                                    .monospace()
+                                    .size(10.0)
+                                    .color(tokens::ON_SURFACE_VARIANT),
+                            );
+                            ui.add(
+                                egui::Slider::new(&mut scene.lowpoly_brush_radius, 2.0..=40.0)
+                                    .show_value(false),
+                            );
                         }
                     }
-                    AppMode::Character => {
-                        if action_button(ui, "Biped Rig") {
-                            let _ = history.execute(scene, Command::ApplyBipedRig);
-                        }
+                }
+                AppMode::Character => {
+                    let rig = [IconItem {
+                        icon: icons::ToolIcon::BipedRig,
+                        tip: "Biped Rig",
+                        active: false,
+                        action: ToolbarAction::ApplyBipedRig,
+                    }];
+                    if let Some(action) = icons::icon_group(ui, "char_rig", "RIG", &rig) {
+                        fire_toolbar_action(action, scene, history);
                     }
                 }
             });
         });
 }
 
-fn tool_button(ui: &mut egui::Ui, label: &str, active: bool) -> bool {
-    let fill = if active {
-        tokens::PRIMARY_CONTAINER
-    } else {
-        tokens::SURFACE_HIGH
-    };
-    let text_color = if active {
-        tokens::ON_PRIMARY
-    } else {
-        tokens::ON_SURFACE
-    };
-    let btn = egui::Button::new(RichText::new(label).size(11.0).color(text_color))
-        .min_size(egui::vec2(58.0, 26.0))
-        .fill(fill)
-        .corner_radius(CornerRadius::same(4));
-    ui.add(btn).clicked()
-}
-
-fn action_button(ui: &mut egui::Ui, label: &str) -> bool {
-    let btn = egui::Button::new(RichText::new(label).size(10.5).color(tokens::ON_SURFACE))
-        .min_size(egui::vec2(58.0, 24.0))
-        .fill(tokens::SURFACE_HIGH)
-        .corner_radius(CornerRadius::same(4));
-    ui.add(btn).clicked()
-}
-
-fn toggle_chip(ui: &mut egui::Ui, label: &str, value: &mut bool) {
-    let fill = if *value {
-        tokens::PRIMARY_CONTAINER
-    } else {
-        tokens::SURFACE_HIGH
-    };
-    let text_color = if *value {
-        tokens::ON_PRIMARY
-    } else {
-        tokens::ON_SURFACE
-    };
-    let btn = egui::Button::new(RichText::new(label).size(11.0).color(text_color))
-        .min_size(egui::vec2(58.0, 22.0))
-        .fill(fill)
-        .corner_radius(CornerRadius::same(4));
-    if ui.add(btn).clicked() {
-        *value = !*value;
+/// Executes a toolbar action. To add a button, add one [`IconItem`] line to a
+/// group above with either an existing action or a new [`ToolbarAction`]
+/// variant handled here.
+fn fire_toolbar_action(action: ToolbarAction, scene: &mut SceneState, history: &mut HistoryStack) {
+    match action {
+        ToolbarAction::PixelTool(tool) => scene.pixel_tool = tool,
+        ToolbarAction::VoxelTool(tool) => scene.voxel_tool = tool,
+        ToolbarAction::Primitive(kind) => {
+            let _ = history.execute(
+                scene,
+                Command::CreatePrimitiveMesh {
+                    name: kind.label().into(),
+                    kind,
+                    size: 0.8,
+                    material: scene.active_color,
+                },
+            );
+        }
+        ToolbarAction::ConvertToVoxel => {
+            if let Some(pixel_node_id) = scene.active_pixel_node() {
+                let _ = history.execute(
+                    scene,
+                    Command::Transaction(vec![
+                        Command::ConvertPixelToVoxel {
+                            pixel_node_id,
+                            depth: 3,
+                            name: "Voxelized Sprite".into(),
+                        },
+                        Command::SetMode(AppMode::Voxel),
+                    ]),
+                );
+            }
+        }
+        ToolbarAction::ConvertToMesh => {
+            if let Some(voxel_node_id) = scene.active_voxel_node() {
+                let _ = history.execute(
+                    scene,
+                    Command::Transaction(vec![
+                        Command::ConvertVoxelToLowPoly {
+                            voxel_node_id,
+                            name: "LowPoly Mesh".into(),
+                        },
+                        Command::SetMode(AppMode::LowPoly),
+                    ]),
+                );
+            }
+        }
+        ToolbarAction::TogglePaint => {
+            scene.lowpoly_paint_mode = !scene.lowpoly_paint_mode;
+        }
+        ToolbarAction::LoadTexture { normal } => {
+            let Some(node_id) = scene.active_lowpoly_node() else {
+                return;
+            };
+            let (kind, exts) = if normal {
+                ("Normal Map (.png, .jpg)", &["png", "jpg", "jpeg"][..])
+            } else {
+                ("Texture Image (.png, .jpg)", &["png", "jpg", "jpeg"][..])
+            };
+            if let Some(path) = rfd::FileDialog::new().add_filter(kind, exts).pick_file() {
+                match tessel_io::import_mesh_texture_from_path(&path) {
+                    Ok(tex) => {
+                        let _ = history.execute(
+                            scene,
+                            if normal {
+                                Command::SetMeshNormalMap {
+                                    node_id,
+                                    normal_map: Some(tex),
+                                }
+                            } else {
+                                Command::SetMeshTexture {
+                                    node_id,
+                                    texture: Some(tex),
+                                }
+                            },
+                        );
+                    }
+                    Err(err) => {
+                        tracing::error!("Load custom texture failed: {err}");
+                    }
+                }
+            }
+        }
+        ToolbarAction::FillTexture => {
+            if let Some(node_id) = scene.active_lowpoly_node() {
+                let color = scene
+                    .palette
+                    .get(scene.active_color)
+                    .map(|e| e.color)
+                    .unwrap_or(tessel_core::Rgba8::rgb(225, 226, 235));
+                let _ = history.execute(scene, Command::FillMeshTexture { node_id, color });
+            }
+        }
+        ToolbarAction::Extrude => {
+            if let Some(node_id) = scene.active_lowpoly_node() {
+                let face_id = scene.selected_face.unwrap_or(FaceId(0));
+                let _ = history.execute(
+                    scene,
+                    Command::ExtrudeMeshFace {
+                        node_id,
+                        face_id,
+                        distance: 0.25,
+                    },
+                );
+            }
+        }
+        ToolbarAction::Inset => {
+            if let Some(node_id) = scene.active_lowpoly_node() {
+                let face_id = scene.selected_face.unwrap_or(FaceId(0));
+                let _ = history.execute(
+                    scene,
+                    Command::InsetMeshFace {
+                        node_id,
+                        face_id,
+                        factor: 0.3,
+                    },
+                );
+            }
+        }
+        ToolbarAction::Bevel => {
+            if let Some(node_id) = scene.active_lowpoly_node() {
+                let _ = history.execute(
+                    scene,
+                    Command::BevelMesh {
+                        node_id,
+                        amount: 0.18,
+                    },
+                );
+            }
+        }
+        ToolbarAction::Smooth => {
+            if let Some(node_id) = scene.active_lowpoly_node() {
+                let _ = history.execute(scene, Command::SmoothSubdivideMesh { node_id });
+            }
+        }
+        ToolbarAction::Decimate => {
+            if let Some(node_id) = scene.active_lowpoly_node() {
+                let _ = history.execute(
+                    scene,
+                    Command::DecimateMesh {
+                        node_id,
+                        ratio: 0.5,
+                    },
+                );
+            }
+        }
+        ToolbarAction::ToggleShade => {
+            if let Some(node_id) = scene.active_lowpoly_node() {
+                let smooth = scene
+                    .lowpoly_meshes
+                    .get(&node_id)
+                    .is_some_and(|m| m.smooth_shading);
+                let _ = history.execute(
+                    scene,
+                    Command::SetMeshSmoothShading {
+                        node_id,
+                        smooth: !smooth,
+                    },
+                );
+            }
+        }
+        ToolbarAction::ApplyBipedRig => {
+            let _ = history.execute(scene, Command::ApplyBipedRig);
+        }
+        ToolbarAction::TogglePixelSymX => {
+            scene.pixel_symmetry.x = !scene.pixel_symmetry.x;
+        }
+        ToolbarAction::TogglePixelSymY => {
+            scene.pixel_symmetry.y = !scene.pixel_symmetry.y;
+        }
+        ToolbarAction::ToggleVoxelSymX => {
+            scene.voxel_symmetry.x = !scene.voxel_symmetry.x;
+        }
+        ToolbarAction::ToggleVoxelSymY => {
+            scene.voxel_symmetry.y = !scene.voxel_symmetry.y;
+        }
+        ToolbarAction::ToggleVoxelSymZ => {
+            scene.voxel_symmetry.z = !scene.voxel_symmetry.z;
+        }
+        ToolbarAction::ToggleMirrorX => {
+            scene.lowpoly_mirror_x = !scene.lowpoly_mirror_x;
+        }
     }
 }

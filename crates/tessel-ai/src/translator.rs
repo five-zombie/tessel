@@ -734,8 +734,43 @@ pub fn execute_tool_call(
                 "node_id": node_id.0,
                 "vertex_count": mesh.vertices.len(),
                 "face_count": mesh.faces.len(),
+                "manual_weights": mesh.skin_weights.len(),
+                "morphs": mesh.morphs.iter().map(|m| &m.name).collect::<Vec<_>>(),
                 "bounds": { "min": min_b.to_array(), "max": max_b.to_array() },
                 "faces_preview": faces
+            }))
+        }
+        "mesh_list_vertices" => {
+            let node_id = args
+                .get("node_id")
+                .and_then(Value::as_u64)
+                .map(NodeId)
+                .or_else(|| scene.active_lowpoly_node())
+                .ok_or_else(|| AiError::InvalidArguments("no low-poly mesh found".into()))?;
+            let mesh = scene
+                .lowpoly_meshes
+                .get(&node_id)
+                .ok_or_else(|| AiError::InvalidArguments("low-poly mesh not found".into()))?;
+            let offset = args.get("offset").and_then(Value::as_u64).unwrap_or(0) as usize;
+            let limit = args
+                .get("limit")
+                .and_then(Value::as_u64)
+                .unwrap_or(64)
+                .clamp(1, 512) as usize;
+            let vertices: Vec<Value> = mesh
+                .vertices
+                .iter()
+                .enumerate()
+                .skip(offset)
+                .take(limit)
+                .map(|(vi, p)| json!({ "vertex_id": vi, "position": p.to_array() }))
+                .collect();
+            Ok(json!({
+                "ok": true,
+                "node_id": node_id.0,
+                "vertex_count": mesh.vertices.len(),
+                "offset": offset,
+                "vertices": vertices
             }))
         }
         "mesh_extrude_face" => {
@@ -853,6 +888,303 @@ pub fn execute_tool_call(
                 },
             )?;
             Ok(json!({ "ok": true, "node_id": node_id.0, "face_id": face_idx }))
+        }
+        "mesh_move_vertices" => {
+            let node_id = args
+                .get("node_id")
+                .and_then(Value::as_u64)
+                .map(NodeId)
+                .or_else(|| scene.active_lowpoly_node())
+                .ok_or_else(|| AiError::InvalidArguments("no low-poly mesh found".into()))?;
+            let ids_arr = args
+                .get("vertex_ids")
+                .and_then(Value::as_array)
+                .ok_or_else(|| AiError::InvalidArguments("missing 'vertex_ids'".into()))?;
+            if ids_arr.is_empty() {
+                return Err(AiError::InvalidArguments(
+                    "'vertex_ids' must not be empty".into(),
+                ));
+            }
+            let mut vertex_ids = Vec::with_capacity(ids_arr.len());
+            for id in ids_arr {
+                vertex_ids.push(id.as_u64().ok_or_else(|| {
+                    AiError::InvalidArguments("'vertex_ids' must be integers".into())
+                })? as usize);
+            }
+            let d_arr = args
+                .get("delta")
+                .and_then(Value::as_array)
+                .ok_or_else(|| AiError::InvalidArguments("missing 'delta'".into()))?;
+            if d_arr.len() != 3 {
+                return Err(AiError::InvalidArguments(
+                    "'delta' must have 3 numbers".into(),
+                ));
+            }
+            let delta = glam::Vec3::new(
+                d_arr[0].as_f64().unwrap_or(0.0) as f32,
+                d_arr[1].as_f64().unwrap_or(0.0) as f32,
+                d_arr[2].as_f64().unwrap_or(0.0) as f32,
+            );
+            history.execute(
+                scene,
+                Command::MoveMeshVertices {
+                    node_id,
+                    vertex_ids: vertex_ids.clone(),
+                    delta,
+                },
+            )?;
+            Ok(json!({ "ok": true, "node_id": node_id.0, "vertex_ids": vertex_ids }))
+        }
+        "mesh_set_vertex" => {
+            let node_id = args
+                .get("node_id")
+                .and_then(Value::as_u64)
+                .map(NodeId)
+                .or_else(|| scene.active_lowpoly_node())
+                .ok_or_else(|| AiError::InvalidArguments("no low-poly mesh found".into()))?;
+            let vertex_idx = args
+                .get("vertex_id")
+                .and_then(Value::as_u64)
+                .ok_or_else(|| AiError::InvalidArguments("missing 'vertex_id'".into()))?
+                as usize;
+            let p_arr = args
+                .get("position")
+                .and_then(Value::as_array)
+                .ok_or_else(|| AiError::InvalidArguments("missing 'position'".into()))?;
+            if p_arr.len() != 3 {
+                return Err(AiError::InvalidArguments(
+                    "'position' must have 3 numbers".into(),
+                ));
+            }
+            let position = glam::Vec3::new(
+                p_arr[0].as_f64().unwrap_or(0.0) as f32,
+                p_arr[1].as_f64().unwrap_or(0.0) as f32,
+                p_arr[2].as_f64().unwrap_or(0.0) as f32,
+            );
+            history.execute(
+                scene,
+                Command::SetMeshVertex {
+                    node_id,
+                    vertex_id: vertex_idx,
+                    position,
+                },
+            )?;
+            Ok(json!({ "ok": true, "node_id": node_id.0, "vertex_id": vertex_idx }))
+        }
+        "mesh_set_face_uvs" => {
+            let node_id = args
+                .get("node_id")
+                .and_then(Value::as_u64)
+                .map(NodeId)
+                .or_else(|| scene.active_lowpoly_node())
+                .ok_or_else(|| AiError::InvalidArguments("no low-poly mesh found".into()))?;
+            let face_idx = args
+                .get("face_id")
+                .and_then(Value::as_u64)
+                .ok_or_else(|| AiError::InvalidArguments("missing 'face_id'".into()))?
+                as usize;
+            let uvs_arr = args
+                .get("uvs")
+                .and_then(Value::as_array)
+                .ok_or_else(|| AiError::InvalidArguments("missing 'uvs'".into()))?;
+            if uvs_arr.len() < 3 {
+                return Err(AiError::InvalidArguments(
+                    "'uvs' must carry one [u, v] pair per face corner".into(),
+                ));
+            }
+            let mut uvs = Vec::with_capacity(uvs_arr.len());
+            for pair in uvs_arr {
+                let pair = pair.as_array().ok_or_else(|| {
+                    AiError::InvalidArguments("'uvs' entries must be [u, v] pairs".into())
+                })?;
+                if pair.len() != 2 {
+                    return Err(AiError::InvalidArguments(
+                        "'uvs' entries must be [u, v] pairs".into(),
+                    ));
+                }
+                uvs.push([
+                    pair[0].as_f64().unwrap_or(0.0) as f32,
+                    pair[1].as_f64().unwrap_or(0.0) as f32,
+                ]);
+            }
+            history.execute(
+                scene,
+                Command::SetMeshFaceUvs {
+                    node_id,
+                    face_id: tessel_core::FaceId(face_idx),
+                    uvs: uvs.clone(),
+                },
+            )?;
+            Ok(json!({ "ok": true, "node_id": node_id.0, "face_id": face_idx }))
+        }
+        "mesh_set_vertex_weights" => {
+            let node_id = args
+                .get("node_id")
+                .and_then(Value::as_u64)
+                .map(NodeId)
+                .or_else(|| scene.active_lowpoly_node())
+                .ok_or_else(|| AiError::InvalidArguments("no low-poly mesh found".into()))?;
+            let ids_arr = args
+                .get("vertex_ids")
+                .and_then(Value::as_array)
+                .ok_or_else(|| AiError::InvalidArguments("missing 'vertex_ids'".into()))?;
+            if ids_arr.is_empty() {
+                return Err(AiError::InvalidArguments(
+                    "'vertex_ids' must not be empty".into(),
+                ));
+            }
+            let mut vertex_ids = Vec::with_capacity(ids_arr.len());
+            for id in ids_arr {
+                vertex_ids.push(id.as_u64().ok_or_else(|| {
+                    AiError::InvalidArguments("'vertex_ids' must be integers".into())
+                })? as usize);
+            }
+            let parse_quad = |key: &str, ints: bool| -> Result<[f32; 4], AiError> {
+                let arr = args
+                    .get(key)
+                    .and_then(Value::as_array)
+                    .ok_or_else(|| AiError::InvalidArguments(format!("missing '{key}'")))?;
+                if arr.len() != 4 {
+                    return Err(AiError::InvalidArguments(format!(
+                        "'{key}' must have exactly 4 numbers"
+                    )));
+                }
+                let mut out = [0.0f32; 4];
+                for (i, v) in arr.iter().enumerate() {
+                    let n = v.as_f64().ok_or_else(|| {
+                        AiError::InvalidArguments(format!("'{key}[{i}]' must be number"))
+                    })? as f32;
+                    if !n.is_finite() || n < 0.0 {
+                        return Err(AiError::InvalidArguments(format!(
+                            "'{key}[{i}]' must be a finite non-negative number"
+                        )));
+                    }
+                    if ints && n.fract() != 0.0 {
+                        return Err(AiError::InvalidArguments(format!(
+                            "'{key}[{i}]' must be an integer"
+                        )));
+                    }
+                    out[i] = n;
+                }
+                Ok(out)
+            };
+            let joints_f = parse_quad("joints", true)?;
+            let weights = parse_quad("weights", false)?;
+            let mut joints = [0u16; 4];
+            for (i, j) in joints_f.iter().enumerate() {
+                joints[i] = u16::try_from(*j as u64).map_err(|_| {
+                    AiError::InvalidArguments(format!("'joints[{i}]' overflows u16"))
+                })?;
+            }
+            history.execute(
+                scene,
+                Command::SetMeshVertexWeights {
+                    node_id,
+                    vertex_ids: vertex_ids.clone(),
+                    joints,
+                    weights,
+                },
+            )?;
+            Ok(json!({ "ok": true, "node_id": node_id.0, "painted": vertex_ids.len() }))
+        }
+        "mesh_clear_vertex_weights" => {
+            let node_id = args
+                .get("node_id")
+                .and_then(Value::as_u64)
+                .map(NodeId)
+                .or_else(|| scene.active_lowpoly_node())
+                .ok_or_else(|| AiError::InvalidArguments("no low-poly mesh found".into()))?;
+            let vertex_ids = match args.get("vertex_ids") {
+                None => None,
+                Some(arr) => {
+                    let arr = arr.as_array().ok_or_else(|| {
+                        AiError::InvalidArguments("'vertex_ids' must be an array".into())
+                    })?;
+                    let mut ids = Vec::with_capacity(arr.len());
+                    for id in arr {
+                        ids.push(id.as_u64().ok_or_else(|| {
+                            AiError::InvalidArguments("'vertex_ids' must be integers".into())
+                        })? as usize);
+                    }
+                    Some(ids)
+                }
+            };
+            history.execute(
+                scene,
+                Command::ClearMeshVertexWeights {
+                    node_id,
+                    vertex_ids,
+                },
+            )?;
+            Ok(json!({ "ok": true, "node_id": node_id.0 }))
+        }
+        "mesh_morph_delta" => {
+            let node_id = args
+                .get("node_id")
+                .and_then(Value::as_u64)
+                .map(NodeId)
+                .or_else(|| scene.active_lowpoly_node())
+                .ok_or_else(|| AiError::InvalidArguments("no low-poly mesh found".into()))?;
+            let name = args
+                .get("name")
+                .and_then(Value::as_str)
+                .ok_or_else(|| AiError::InvalidArguments("missing 'name'".into()))?;
+            if name.is_empty() {
+                return Err(AiError::InvalidArguments("'name' must not be empty".into()));
+            }
+            let ids_arr = args
+                .get("vertex_ids")
+                .and_then(Value::as_array)
+                .ok_or_else(|| AiError::InvalidArguments("missing 'vertex_ids'".into()))?;
+            if ids_arr.is_empty() {
+                return Err(AiError::InvalidArguments(
+                    "'vertex_ids' must not be empty".into(),
+                ));
+            }
+            let mut vertex_ids = Vec::with_capacity(ids_arr.len());
+            for id in ids_arr {
+                vertex_ids.push(id.as_u64().ok_or_else(|| {
+                    AiError::InvalidArguments("'vertex_ids' must be integers".into())
+                })? as usize);
+            }
+            let d_arr = args
+                .get("delta")
+                .and_then(Value::as_array)
+                .ok_or_else(|| AiError::InvalidArguments("missing 'delta'".into()))?;
+            if d_arr.len() != 3 {
+                return Err(AiError::InvalidArguments(
+                    "'delta' must have 3 numbers".into(),
+                ));
+            }
+            let delta = glam::Vec3::new(
+                d_arr[0].as_f64().unwrap_or(0.0) as f32,
+                d_arr[1].as_f64().unwrap_or(0.0) as f32,
+                d_arr[2].as_f64().unwrap_or(0.0) as f32,
+            );
+            if !delta.is_finite() {
+                return Err(AiError::InvalidArguments("'delta' must be finite".into()));
+            }
+            history.execute(
+                scene,
+                Command::AddMorphDelta {
+                    node_id,
+                    name: name.to_string(),
+                    vertex_ids,
+                    delta,
+                },
+            )?;
+            Ok(json!({ "ok": true, "node_id": node_id.0, "morph": name }))
+        }
+        "mesh_morph_clear" => {
+            let node_id = args
+                .get("node_id")
+                .and_then(Value::as_u64)
+                .map(NodeId)
+                .or_else(|| scene.active_lowpoly_node())
+                .ok_or_else(|| AiError::InvalidArguments("no low-poly mesh found".into()))?;
+            let name = args.get("name").and_then(Value::as_str).map(str::to_string);
+            history.execute(scene, Command::ClearMorphs { node_id, name })?;
+            Ok(json!({ "ok": true, "node_id": node_id.0 }))
         }
         "mesh_bevel" => {
             let node_id = args
@@ -1070,6 +1402,8 @@ pub fn execute_tool_call(
                 .ok_or_else(|| AiError::InvalidArguments("missing 'time_secs'".into()))?
                 as f32;
             let rotation = parse_rotation_deg(args)?;
+            let translation = parse_opt_vec3(args, "translation")?.unwrap_or(glam::Vec3::ZERO);
+            let scale = parse_opt_vec3(args, "scale")?.unwrap_or(glam::Vec3::ONE);
             let clip_index = if let Some(idx) = args.get("clip_index").and_then(Value::as_u64) {
                 idx as usize
             } else if let Some(name) = args.get("clip_name").and_then(Value::as_str) {
@@ -1108,15 +1442,169 @@ pub fn execute_tool_call(
                 Command::SetAnimationKeyframe {
                     clip_index,
                     bone_id,
-                    keyframe: Keyframe::rotation_only(time_secs, rotation),
+                    keyframe: Keyframe {
+                        time_secs,
+                        translation,
+                        rotation,
+                        scale,
+                    },
                 },
             )?;
             Ok(json!({
                 "ok": true,
                 "clip_index": clip_index,
                 "bone_id": bone_id.0,
-                "time_secs": time_secs
+                "time_secs": time_secs,
+                "translation": translation.to_array(),
+                "scale": scale.to_array()
             }))
+        }
+        "character_solve_ik" => {
+            let parse_bone = |key: &str| -> Result<BoneId, AiError> {
+                let raw = args
+                    .get(key)
+                    .and_then(Value::as_u64)
+                    .ok_or_else(|| AiError::InvalidArguments(format!("missing '{key}'")))?;
+                Ok(BoneId(u32::try_from(raw).map_err(|_| {
+                    AiError::InvalidArguments(format!("'{key}' overflow"))
+                })?))
+            };
+            let root = parse_bone("root_bone_id")?;
+            let mid = parse_bone("mid_bone_id")?;
+            let end = parse_bone("end_bone_id")?;
+            let target = parse_opt_vec3(args, "target")?
+                .ok_or_else(|| AiError::InvalidArguments("missing 'target'".into()))?;
+            let pole = parse_opt_vec3(args, "pole_vector")?.unwrap_or(glam::Vec3::Z);
+            history.execute(
+                scene,
+                Command::SolveTwoBoneIk {
+                    root_bone: root,
+                    mid_bone: mid,
+                    end_bone: end,
+                    target,
+                    pole,
+                },
+            )?;
+            let reached = scene
+                .character_rig
+                .as_ref()
+                .and_then(|rig| rig.world_pose_matrices().get(&end).copied())
+                .map(|m| m.transform_point3(glam::Vec3::ZERO).to_array())
+                .unwrap_or([f32::NAN; 3]);
+            Ok(json!({
+                "ok": true,
+                "root_bone_id": root.0,
+                "mid_bone_id": mid.0,
+                "end_bone_id": end.0,
+                "reached": reached
+            }))
+        }
+        "character_set_morph_weight" => {
+            let node_id = args
+                .get("node_id")
+                .and_then(Value::as_u64)
+                .map(NodeId)
+                .ok_or_else(|| AiError::InvalidArguments("missing 'node_id'".into()))?;
+            let target = args
+                .get("target")
+                .and_then(Value::as_str)
+                .ok_or_else(|| AiError::InvalidArguments("missing 'target'".into()))?;
+            if target.is_empty() {
+                return Err(AiError::InvalidArguments(
+                    "'target' must not be empty".into(),
+                ));
+            }
+            let time_secs = args
+                .get("time_secs")
+                .and_then(Value::as_f64)
+                .ok_or_else(|| AiError::InvalidArguments("missing 'time_secs'".into()))?
+                as f32;
+            let weight = args
+                .get("weight")
+                .and_then(Value::as_f64)
+                .ok_or_else(|| AiError::InvalidArguments("missing 'weight'".into()))?
+                as f32;
+            let clip_index = if let Some(idx) = args.get("clip_index").and_then(Value::as_u64) {
+                idx as usize
+            } else if let Some(name) = args.get("clip_name").and_then(Value::as_str) {
+                let existing = scene
+                    .character_rig
+                    .as_ref()
+                    .and_then(|r| r.animations.iter().position(|c| c.name == name));
+                if let Some(i) = existing {
+                    i
+                } else {
+                    let duration_secs = args
+                        .get("duration_secs")
+                        .and_then(Value::as_f64)
+                        .unwrap_or(2.0) as f32;
+                    history.execute(
+                        scene,
+                        Command::AddAnimationClip {
+                            name: name.to_string(),
+                            duration_secs,
+                        },
+                    )?;
+                    scene
+                        .character_rig
+                        .as_ref()
+                        .map_or(0, |r| r.animations.len().saturating_sub(1))
+                }
+            } else {
+                scene
+                    .character_rig
+                    .as_ref()
+                    .map_or(0, |r| r.active_animation)
+            };
+            history.execute(
+                scene,
+                Command::SetMorphWeightKeyframe {
+                    clip_index,
+                    node_id,
+                    target: target.to_string(),
+                    time_secs,
+                    weight,
+                },
+            )?;
+            Ok(json!({
+                "ok": true,
+                "clip_index": clip_index,
+                "node_id": node_id.0,
+                "target": target,
+                "time_secs": time_secs,
+                "weight": weight
+            }))
+        }
+        "character_remove_morph_weight" => {
+            let node_id = args
+                .get("node_id")
+                .and_then(Value::as_u64)
+                .map(NodeId)
+                .ok_or_else(|| AiError::InvalidArguments("missing 'node_id'".into()))?;
+            let target = args
+                .get("target")
+                .and_then(Value::as_str)
+                .ok_or_else(|| AiError::InvalidArguments("missing 'target'".into()))?;
+            let clip_index = args
+                .get("clip_index")
+                .and_then(Value::as_u64)
+                .ok_or_else(|| AiError::InvalidArguments("missing 'clip_index'".into()))?
+                as usize;
+            let time_secs = args
+                .get("time_secs")
+                .and_then(Value::as_f64)
+                .ok_or_else(|| AiError::InvalidArguments("missing 'time_secs'".into()))?
+                as f32;
+            history.execute(
+                scene,
+                Command::RemoveMorphWeightKeyframe {
+                    clip_index,
+                    node_id,
+                    target: target.to_string(),
+                    time_secs,
+                },
+            )?;
+            Ok(json!({ "ok": true, "clip_index": clip_index }))
         }
         "project_export" => {
             let filename = args
@@ -1513,5 +2001,528 @@ mod tests {
         )
         .unwrap();
         assert_eq!(light["ok"], true);
+    }
+
+    #[test]
+    fn ai_tools_move_vertices_set_vertex_and_face_uvs() {
+        let mut scene = SceneState::new();
+        let mut history = HistoryStack::new();
+        let dir = std::env::temp_dir();
+
+        let created = execute_tool_call(
+            "mesh_create_primitive",
+            &json!({ "kind": "cube", "size": 1.0 }),
+            &mut scene,
+            &mut history,
+            &dir,
+        )
+        .unwrap();
+        let node_id = created["node_id"].as_u64().unwrap();
+        let mesh = scene.lowpoly_meshes.get(&NodeId(node_id)).unwrap();
+        let before_v0 = mesh.vertices[0];
+        let before_v1 = mesh.vertices[1];
+
+        let moved = execute_tool_call(
+            "mesh_move_vertices",
+            &json!({ "node_id": node_id, "vertex_ids": [0], "delta": [0.25, 0.0, 0.0] }),
+            &mut scene,
+            &mut history,
+            &dir,
+        )
+        .unwrap();
+        assert_eq!(moved["ok"], true);
+        let mesh = scene.lowpoly_meshes.get(&NodeId(node_id)).unwrap();
+        assert!((mesh.vertices[0].x - (before_v0.x + 0.25)).abs() < 1e-6);
+        assert_eq!(mesh.vertices[1], before_v1);
+
+        let placed = execute_tool_call(
+            "mesh_set_vertex",
+            &json!({ "node_id": node_id, "vertex_id": 1, "position": [0.1, 0.2, 0.3] }),
+            &mut scene,
+            &mut history,
+            &dir,
+        )
+        .unwrap();
+        assert_eq!(placed["ok"], true);
+        let mesh = scene.lowpoly_meshes.get(&NodeId(node_id)).unwrap();
+        assert_eq!(mesh.vertices[1], glam::Vec3::new(0.1, 0.2, 0.3));
+
+        let uvs = [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]];
+        let unwrapped = execute_tool_call(
+            "mesh_set_face_uvs",
+            &json!({ "node_id": node_id, "face_id": 0, "uvs": uvs }),
+            &mut scene,
+            &mut history,
+            &dir,
+        )
+        .unwrap();
+        assert_eq!(unwrapped["ok"], true);
+        let mesh = scene.lowpoly_meshes.get(&NodeId(node_id)).unwrap();
+        assert_eq!(mesh.faces[0].uvs, uvs);
+
+        // Rejected inputs surface as errors, not silent no-ops.
+        assert!(execute_tool_call(
+            "mesh_move_vertices",
+            &json!({ "node_id": node_id, "vertex_ids": [], "delta": [0.0, 0.0, 0.0] }),
+            &mut scene,
+            &mut history,
+            &dir,
+        )
+        .is_err());
+        assert!(execute_tool_call(
+            "mesh_set_face_uvs",
+            &json!({ "node_id": node_id, "face_id": 0, "uvs": [[0.0, 0.0]] }),
+            &mut scene,
+            &mut history,
+            &dir,
+        )
+        .is_err());
+
+        // Undo restores the mesh snapshot taken before the last command.
+        history.undo(&mut scene).unwrap();
+        let mesh = scene.lowpoly_meshes.get(&NodeId(node_id)).unwrap();
+        assert!(mesh.faces[0].uvs.is_empty());
+    }
+
+    #[test]
+    fn ai_tool_set_keyframe_stores_trs() {
+        let mut scene = SceneState::new();
+        let mut history = HistoryStack::new();
+        let dir = std::env::temp_dir();
+
+        execute_tool_call(
+            "character_apply_biped_rig",
+            &json!({}),
+            &mut scene,
+            &mut history,
+            &dir,
+        )
+        .unwrap();
+        let res = execute_tool_call(
+            "character_set_keyframe",
+            &json!({
+                "clip_name": "Bounce",
+                "duration_secs": 2.0,
+                "bone_id": 1,
+                "time_secs": 0.5,
+                "rotation_deg": [0.0, 0.0, 45.0],
+                "translation": [0.0, 0.1, 0.0],
+                "scale": [1.0, 1.0, 2.0]
+            }),
+            &mut scene,
+            &mut history,
+            &dir,
+        )
+        .unwrap();
+        assert_eq!(res["ok"], true);
+        // f32 JSON round-trip is approximate: compare with tolerance.
+        let got_t: Vec<f32> = serde_json::from_value(res["translation"].clone()).unwrap();
+        let got_s: Vec<f32> = serde_json::from_value(res["scale"].clone()).unwrap();
+        for (got, want) in got_t.iter().zip([0.0f32, 0.1, 0.0]) {
+            assert!((got - want).abs() < 1e-6);
+        }
+        for (got, want) in got_s.iter().zip([1.0f32, 1.0, 2.0]) {
+            assert!((got - want).abs() < 1e-6);
+        }
+
+        let rig = scene.character_rig.as_ref().unwrap();
+        let clip = rig.animations.iter().find(|c| c.name == "Bounce").unwrap();
+        let ch = clip
+            .channels
+            .iter()
+            .find(|c| c.bone_id == BoneId(1))
+            .unwrap();
+        assert_eq!(ch.keyframes.len(), 1);
+        assert_eq!(ch.keyframes[0].translation, glam::Vec3::new(0.0, 0.1, 0.0));
+        assert_eq!(ch.keyframes[0].scale, glam::Vec3::new(1.0, 1.0, 2.0));
+
+        // Rotation-only callers keep working with TRS defaults.
+        execute_tool_call(
+            "character_set_keyframe",
+            &json!({
+                "clip_name": "Bounce",
+                "bone_id": 1,
+                "time_secs": 1.0,
+                "rotation_deg": [0.0, 0.0, 0.0]
+            }),
+            &mut scene,
+            &mut history,
+            &dir,
+        )
+        .unwrap();
+        let rig = scene.character_rig.as_ref().unwrap();
+        let clip = rig.animations.iter().find(|c| c.name == "Bounce").unwrap();
+        let ch = clip
+            .channels
+            .iter()
+            .find(|c| c.bone_id == BoneId(1))
+            .unwrap();
+        assert_eq!(ch.keyframes.len(), 2);
+
+        // Malformed TRS arrays are rejected, not stored.
+        assert!(execute_tool_call(
+            "character_set_keyframe",
+            &json!({
+                "clip_name": "Bounce",
+                "bone_id": 1,
+                "time_secs": 1.5,
+                "rotation_deg": [0.0, 0.0, 0.0],
+                "translation": [0.0, 0.0]
+            }),
+            &mut scene,
+            &mut history,
+            &dir,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn ai_tool_solve_ik_reaches_target() {
+        let mut scene = SceneState::new();
+        let mut history = HistoryStack::new();
+        let dir = std::env::temp_dir();
+
+        // Straight 3-bone leg: hip(0,1,0) -> knee(0,0.5,0) -> ankle(0,0,0).
+        for (name, parent, pos) in [
+            ("Hip", None, [0.0, 1.0, 0.0]),
+            ("Knee", Some(0), [0.0, -0.5, 0.0]),
+            ("Ankle", Some(1), [0.0, -0.5, 0.0]),
+        ] {
+            let mut args = serde_json::Map::new();
+            args.insert("name".into(), json!(name));
+            args.insert("position".into(), json!(pos));
+            if let Some(pid) = parent {
+                args.insert("parent_bone_id".into(), json!(pid));
+            }
+            execute_tool_call(
+                "character_add_bone",
+                &Value::Object(args),
+                &mut scene,
+                &mut history,
+                &dir,
+            )
+            .unwrap();
+        }
+
+        let solved = execute_tool_call(
+            "character_solve_ik",
+            &json!({
+                "root_bone_id": 0,
+                "mid_bone_id": 1,
+                "end_bone_id": 2,
+                "target": [0.0, 0.5, 0.5]
+            }),
+            &mut scene,
+            &mut history,
+            &dir,
+        )
+        .unwrap();
+        assert_eq!(solved["ok"], true);
+        let reached: Vec<f32> = serde_json::from_value(solved["reached"].clone()).unwrap();
+        let target = glam::Vec3::new(0.0, 0.5, 0.5);
+        assert!(
+            (glam::Vec3::from_array([reached[0], reached[1], reached[2]]) - target).length() < 1e-3,
+            "reached {reached:?}"
+        );
+
+        // Undo restores the straight pose.
+        history.undo(&mut scene).unwrap();
+        let rig = scene.character_rig.as_ref().unwrap();
+        let world = rig.world_pose_matrices();
+        let ankle = world
+            .get(&BoneId(2))
+            .unwrap()
+            .transform_point3(glam::Vec3::ZERO);
+        assert!((ankle - glam::Vec3::new(0.0, 0.0, 0.0)).length() < 1e-5);
+
+        // Non-linked triple is rejected, not solved.
+        assert!(execute_tool_call(
+            "character_solve_ik",
+            &json!({
+                "root_bone_id": 0,
+                "mid_bone_id": 2,
+                "end_bone_id": 1,
+                "target": [0.0, 0.5, 0.5]
+            }),
+            &mut scene,
+            &mut history,
+            &dir,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn ai_tool_vertex_weights_paint_and_clear() {
+        let mut scene = SceneState::new();
+        let mut history = HistoryStack::new();
+        let dir = std::env::temp_dir();
+
+        let created = execute_tool_call(
+            "mesh_create_primitive",
+            &json!({ "kind": "cube", "size": 1.0 }),
+            &mut scene,
+            &mut history,
+            &dir,
+        )
+        .unwrap();
+        let node_id = created["node_id"].as_u64().unwrap();
+
+        let painted = execute_tool_call(
+            "mesh_set_vertex_weights",
+            &json!({ "node_id": node_id, "vertex_ids": [0, 1], "joints": [2, 0, 0, 0], "weights": [3.0, 1.0, 0.0, 0.0] }),
+            &mut scene,
+            &mut history,
+            &dir,
+        )
+        .unwrap();
+        assert_eq!(painted["ok"], true);
+        assert_eq!(painted["painted"], 2);
+        let mesh = scene.lowpoly_meshes.get(&NodeId(node_id)).unwrap();
+        assert!((mesh.skin_weights[&0].weights[0] - 0.75).abs() < 1e-6);
+
+        let inspect = execute_tool_call(
+            "mesh_inspect",
+            &json!({ "node_id": node_id }),
+            &mut scene,
+            &mut history,
+            &dir,
+        )
+        .unwrap();
+        assert_eq!(inspect["manual_weights"], 2);
+
+        // Undo restores the unpainted mesh.
+        history.undo(&mut scene).unwrap();
+        let mesh = scene.lowpoly_meshes.get(&NodeId(node_id)).unwrap();
+        assert!(mesh.skin_weights.is_empty());
+
+        // Re-paint then clear one vertex.
+        execute_tool_call(
+            "mesh_set_vertex_weights",
+            &json!({ "node_id": node_id, "vertex_ids": [0, 1], "joints": [2, 0, 0, 0], "weights": [1.0, 0.0, 0.0, 0.0] }),
+            &mut scene,
+            &mut history,
+            &dir,
+        )
+        .unwrap();
+        execute_tool_call(
+            "mesh_clear_vertex_weights",
+            &json!({ "node_id": node_id, "vertex_ids": [0] }),
+            &mut scene,
+            &mut history,
+            &dir,
+        )
+        .unwrap();
+        let mesh = scene.lowpoly_meshes.get(&NodeId(node_id)).unwrap();
+        assert_eq!(mesh.skin_weights.len(), 1);
+
+        // Rejected inputs: empty ids, short quads, negative weights.
+        for bad in [
+            json!({ "node_id": node_id, "vertex_ids": [], "joints": [0, 0, 0, 0], "weights": [1.0, 0.0, 0.0, 0.0] }),
+            json!({ "node_id": node_id, "vertex_ids": [0], "joints": [0, 0, 0], "weights": [1.0, 0.0, 0.0, 0.0] }),
+            json!({ "node_id": node_id, "vertex_ids": [0], "joints": [0, 0, 0, 0], "weights": [-1.0, 1.0, 0.0, 0.0] }),
+        ] {
+            assert!(execute_tool_call(
+                "mesh_set_vertex_weights",
+                &bad,
+                &mut scene,
+                &mut history,
+                &dir
+            )
+            .is_err());
+        }
+    }
+
+    #[test]
+    fn ai_tool_morph_delta_and_clear() {
+        let mut scene = SceneState::new();
+        let mut history = HistoryStack::new();
+        let dir = std::env::temp_dir();
+
+        let created = execute_tool_call(
+            "mesh_create_primitive",
+            &json!({ "kind": "cube", "size": 1.0 }),
+            &mut scene,
+            &mut history,
+            &dir,
+        )
+        .unwrap();
+        let node_id = created["node_id"].as_u64().unwrap();
+
+        let added = execute_tool_call(
+            "mesh_morph_delta",
+            &json!({ "node_id": node_id, "name": "Smile", "vertex_ids": [0], "delta": [0.0, 0.1, 0.0] }),
+            &mut scene,
+            &mut history,
+            &dir,
+        )
+        .unwrap();
+        assert_eq!(added["ok"], true);
+        assert_eq!(added["morph"], "Smile");
+
+        let inspect = execute_tool_call(
+            "mesh_inspect",
+            &json!({ "node_id": node_id }),
+            &mut scene,
+            &mut history,
+            &dir,
+        )
+        .unwrap();
+        assert_eq!(inspect["morphs"], json!(["Smile"]));
+
+        // Undo drops the morph; re-add then clear by name.
+        history.undo(&mut scene).unwrap();
+        let mesh = scene.lowpoly_meshes.get(&NodeId(node_id)).unwrap();
+        assert!(mesh.morphs.is_empty());
+        execute_tool_call(
+            "mesh_morph_delta",
+            &json!({ "node_id": node_id, "name": "Smile", "vertex_ids": [0], "delta": [0.0, 0.1, 0.0] }),
+            &mut scene,
+            &mut history,
+            &dir,
+        )
+        .unwrap();
+        execute_tool_call(
+            "mesh_morph_clear",
+            &json!({ "node_id": node_id, "name": "Smile" }),
+            &mut scene,
+            &mut history,
+            &dir,
+        )
+        .unwrap();
+        let mesh = scene.lowpoly_meshes.get(&NodeId(node_id)).unwrap();
+        assert!(mesh.morphs.is_empty());
+
+        // Rejected inputs: empty name, empty ids, short delta.
+        for bad in [
+            json!({ "node_id": node_id, "name": "", "vertex_ids": [0], "delta": [0.0, 0.0, 0.0] }),
+            json!({ "node_id": node_id, "name": "X", "vertex_ids": [], "delta": [0.0, 0.0, 0.0] }),
+            json!({ "node_id": node_id, "name": "X", "vertex_ids": [0], "delta": [0.0, 0.0] }),
+        ] {
+            assert!(
+                execute_tool_call("mesh_morph_delta", &bad, &mut scene, &mut history, &dir)
+                    .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn ai_tool_morph_weight_keyframes() {
+        let mut scene = SceneState::new();
+        let mut history = HistoryStack::new();
+        let dir = std::env::temp_dir();
+
+        let created = execute_tool_call(
+            "mesh_create_primitive",
+            &json!({ "kind": "cube", "size": 1.0 }),
+            &mut scene,
+            &mut history,
+            &dir,
+        )
+        .unwrap();
+        let node_id = created["node_id"].as_u64().unwrap();
+        execute_tool_call(
+            "mesh_morph_delta",
+            &json!({ "node_id": node_id, "name": "Smile", "vertex_ids": [0], "delta": [0.0, 0.1, 0.0] }),
+            &mut scene,
+            &mut history,
+            &dir,
+        )
+        .unwrap();
+        execute_tool_call(
+            "character_apply_biped_rig",
+            &json!({}),
+            &mut scene,
+            &mut history,
+            &dir,
+        )
+        .unwrap();
+
+        let set = execute_tool_call(
+            "character_set_morph_weight",
+            &json!({ "clip_name": "Talk", "node_id": node_id, "target": "Smile", "time_secs": 0.5, "weight": 0.75 }),
+            &mut scene,
+            &mut history,
+            &dir,
+        )
+        .unwrap();
+        assert_eq!(set["ok"], true);
+        let clip_index = set["clip_index"].as_u64().unwrap() as usize;
+        let rig = scene.character_rig.as_ref().unwrap();
+        let clip = rig.animations.iter().find(|c| c.name == "Talk").unwrap();
+        assert_eq!(clip.morph_tracks.len(), 1);
+        assert_eq!(clip.morph_tracks[0].keys.len(), 1);
+
+        let removed = execute_tool_call(
+            "character_remove_morph_weight",
+            &json!({ "clip_index": clip_index, "node_id": node_id, "target": "Smile", "time_secs": 0.5 }),
+            &mut scene,
+            &mut history,
+            &dir,
+        )
+        .unwrap();
+        assert_eq!(removed["ok"], true);
+        let rig = scene.character_rig.as_ref().unwrap();
+        let clip = rig.animations.iter().find(|c| c.name == "Talk").unwrap();
+        assert!(clip.morph_tracks.is_empty());
+
+        // Unknown clip index is rejected.
+        assert!(execute_tool_call(
+            "character_remove_morph_weight",
+            &json!({ "clip_index": 99, "node_id": node_id, "target": "Smile", "time_secs": 0.5 }),
+            &mut scene,
+            &mut history,
+            &dir,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn ai_tool_list_vertices_paginates_cube_corners() {
+        let mut scene = SceneState::new();
+        let mut history = HistoryStack::new();
+        let dir = std::env::temp_dir();
+
+        let created = execute_tool_call(
+            "mesh_create_primitive",
+            &json!({ "kind": "cube", "size": 1.0 }),
+            &mut scene,
+            &mut history,
+            &dir,
+        )
+        .unwrap();
+        let node_id = created["node_id"].as_u64().unwrap();
+
+        let first = execute_tool_call(
+            "mesh_list_vertices",
+            &json!({ "node_id": node_id, "offset": 0, "limit": 4 }),
+            &mut scene,
+            &mut history,
+            &dir,
+        )
+        .unwrap();
+        assert_eq!(first["vertex_count"], 8);
+        assert_eq!(first["vertices"].as_array().unwrap().len(), 4);
+        assert_eq!(first["vertices"][0]["vertex_id"], 0);
+        assert_eq!(first["vertices"][0]["position"], json!([-0.5, 0.0, 0.5]));
+
+        let rest = execute_tool_call(
+            "mesh_list_vertices",
+            &json!({ "node_id": node_id, "offset": 6, "limit": 64 }),
+            &mut scene,
+            &mut history,
+            &dir,
+        )
+        .unwrap();
+        assert_eq!(rest["vertices"].as_array().unwrap().len(), 2);
+        assert_eq!(rest["vertices"][1]["vertex_id"], 7);
+
+        assert!(execute_tool_call(
+            "mesh_list_vertices",
+            &json!({ "node_id": 9999 }),
+            &mut scene,
+            &mut history,
+            &dir,
+        )
+        .is_err());
     }
 }

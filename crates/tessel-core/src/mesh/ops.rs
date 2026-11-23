@@ -2,12 +2,13 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use glam::Vec3;
 
+use crate::character::VertexSkinWeights;
 use crate::error::CoreError;
 use crate::palette::PaletteIndex;
 use crate::voxel::{greedy_mesh_volume, VoxelVolume};
 
 use super::face::Face;
-use super::lowpoly::LowPolyMesh;
+use super::lowpoly::{LowPolyMesh, MorphTarget};
 use super::nano::{FaceId, PrimitiveKind};
 
 /// Generates a starter low-poly primitive mesh centered on X/Z with base at Y = 0.
@@ -41,6 +42,8 @@ pub fn create_primitive(kind: PrimitiveKind, size: f32, material: PaletteIndex) 
                 normal_map: None,
                 smooth_shading: false,
                 material: Default::default(),
+                skin_weights: BTreeMap::new(),
+                morphs: Default::default(),
             }
         }
         PrimitiveKind::Plane => {
@@ -58,6 +61,8 @@ pub fn create_primitive(kind: PrimitiveKind, size: f32, material: PaletteIndex) 
                 normal_map: None,
                 smooth_shading: false,
                 material: Default::default(),
+                skin_weights: BTreeMap::new(),
+                morphs: Default::default(),
             }
         }
         PrimitiveKind::Cylinder => create_cylinder(8, h, s, material),
@@ -106,6 +111,8 @@ fn create_cylinder(
         normal_map: None,
         smooth_shading: false,
         material: Default::default(),
+        skin_weights: BTreeMap::new(),
+        morphs: Default::default(),
     }
 }
 
@@ -133,6 +140,8 @@ fn create_cone(segments: usize, radius: f32, height: f32, material: PaletteIndex
         normal_map: None,
         smooth_shading: false,
         material: Default::default(),
+        skin_weights: BTreeMap::new(),
+        morphs: Default::default(),
     }
 }
 
@@ -188,6 +197,8 @@ fn create_uv_sphere(
         normal_map: None,
         smooth_shading: true,
         material: Default::default(),
+        skin_weights: BTreeMap::new(),
+        morphs: Default::default(),
     }
 }
 
@@ -228,6 +239,8 @@ fn create_torus(
         normal_map: None,
         smooth_shading: true,
         material: Default::default(),
+        skin_weights: BTreeMap::new(),
+        morphs: Default::default(),
     }
 }
 
@@ -300,6 +313,8 @@ fn create_capsule(
         normal_map: None,
         smooth_shading: true,
         material: Default::default(),
+        skin_weights: BTreeMap::new(),
+        morphs: Default::default(),
     }
 }
 
@@ -391,6 +406,8 @@ pub fn create_curve_tube(
     Ok(LowPolyMesh {
         vertices,
         faces,
+        skin_weights: BTreeMap::new(),
+        morphs: Default::default(),
         texture: None,
         normal_map: None,
         smooth_shading: true,
@@ -399,6 +416,7 @@ pub fn create_curve_tube(
 }
 
 /// Simplifies `mesh` by clustering vertices on a 3D grid scaled to `target_ratio` (`0.1..=0.9`).
+/// Clears manual skin weights (full rebuild reindexes every vertex).
 pub fn decimate_mesh(mesh: &LowPolyMesh, target_ratio: f32) -> Result<LowPolyMesh, CoreError> {
     if !target_ratio.is_finite() || mesh.faces.is_empty() {
         return Err(CoreError::OutOfBounds);
@@ -459,6 +477,8 @@ pub fn decimate_mesh(mesh: &LowPolyMesh, target_ratio: f32) -> Result<LowPolyMes
         return Ok(mesh.clone());
     }
 
+    // Full rebuild: vertex indices stop meaning the same corners, so manual
+    // skin weights and morphs cannot be carried over and are cleared.
     Ok(LowPolyMesh {
         vertices: new_vertices,
         faces: new_faces,
@@ -466,6 +486,8 @@ pub fn decimate_mesh(mesh: &LowPolyMesh, target_ratio: f32) -> Result<LowPolyMes
         normal_map: mesh.normal_map.clone(),
         smooth_shading: mesh.smooth_shading,
         material: mesh.material,
+        skin_weights: BTreeMap::new(),
+        morphs: Default::default(),
     })
 }
 
@@ -487,6 +509,192 @@ pub fn translate_face(
     for vi in unique_verts {
         let v = next.vertices.get_mut(vi).ok_or(CoreError::OutOfBounds)?;
         *v += delta;
+    }
+    Ok(next)
+}
+
+/// Moves an explicit list of vertices by `delta` (per-vertex editing: unlike
+/// `translate_face`, the caller picks individual corners, including vertices
+/// shared across faces, without touching their neighbours).
+pub fn move_mesh_vertices(
+    mesh: &LowPolyMesh,
+    vertex_ids: &[usize],
+    delta: Vec3,
+) -> Result<LowPolyMesh, CoreError> {
+    if !delta.is_finite() {
+        return Err(CoreError::OutOfBounds);
+    }
+    if vertex_ids.is_empty() {
+        return Err(CoreError::OutOfBounds);
+    }
+    let unique_verts: BTreeSet<usize> = vertex_ids.iter().copied().collect();
+    if unique_verts.iter().any(|vi| *vi >= mesh.vertices.len()) {
+        return Err(CoreError::OutOfBounds);
+    }
+    let mut next = mesh.clone();
+    for vi in unique_verts {
+        next.vertices[vi] += delta;
+    }
+    Ok(next)
+}
+
+/// Sets one vertex to an absolute `position` (precise 1:1 placement).
+pub fn set_mesh_vertex(
+    mesh: &LowPolyMesh,
+    vertex_id: usize,
+    position: Vec3,
+) -> Result<LowPolyMesh, CoreError> {
+    if !position.is_finite() {
+        return Err(CoreError::OutOfBounds);
+    }
+    if vertex_id >= mesh.vertices.len() {
+        return Err(CoreError::OutOfBounds);
+    }
+    let mut next = mesh.clone();
+    next.vertices[vertex_id] = position;
+    Ok(next)
+}
+
+/// Sets manual per-corner UVs on `face_id` (manual UV unwrap: `uvs` must carry
+/// exactly one coordinate per face corner; values are clamped to `0..=1`).
+/// Export preserves them via `TEXCOORD_0`, overriding the auto box-atlas UV.
+pub fn set_face_uvs(
+    mesh: &LowPolyMesh,
+    face_id: FaceId,
+    uvs: &[[f32; 2]],
+) -> Result<LowPolyMesh, CoreError> {
+    let face = mesh.faces.get(face_id.0).ok_or(CoreError::OutOfBounds)?;
+    if face.vertices.len() < 3 || uvs.len() != face.vertices.len() {
+        return Err(CoreError::OutOfBounds);
+    }
+    if uvs
+        .iter()
+        .any(|uv| !uv[0].is_finite() || !uv[1].is_finite())
+    {
+        return Err(CoreError::OutOfBounds);
+    }
+    let mut next = mesh.clone();
+    next.faces[face_id.0].uvs = uvs
+        .iter()
+        .map(|uv| [uv[0].clamp(0.0, 1.0), uv[1].clamp(0.0, 1.0)])
+        .collect();
+    Ok(next)
+}
+
+/// Paints manual skin weights onto explicit vertices (weight paint). `joints`
+/// holds up to 4 bone indices and `weights` their influences; weights are
+/// normalized to sum 1. At least one weight must be positive. Export prefers
+/// these over the auto solver. Survives index-stable edits; cleared by
+/// bevel/subdivide/decimate.
+pub fn set_vertex_weights(
+    mesh: &LowPolyMesh,
+    vertex_ids: &[usize],
+    joints: [u16; 4],
+    weights: [f32; 4],
+) -> Result<LowPolyMesh, CoreError> {
+    if vertex_ids.is_empty() {
+        return Err(CoreError::OutOfBounds);
+    }
+    if !weights.iter().all(|w| w.is_finite() && *w >= 0.0) {
+        return Err(CoreError::OutOfBounds);
+    }
+    let sum: f32 = weights.iter().sum();
+    if !sum.is_finite() || sum <= 1e-6 {
+        return Err(CoreError::OutOfBounds);
+    }
+    let unique_verts: BTreeSet<usize> = vertex_ids.iter().copied().collect();
+    if unique_verts.iter().any(|vi| *vi >= mesh.vertices.len()) {
+        return Err(CoreError::OutOfBounds);
+    }
+    let normalized = VertexSkinWeights {
+        joints,
+        weights: [
+            weights[0] / sum,
+            weights[1] / sum,
+            weights[2] / sum,
+            weights[3] / sum,
+        ],
+    };
+    let mut next = mesh.clone();
+    for vi in unique_verts {
+        next.skin_weights.insert(vi, normalized);
+    }
+    Ok(next)
+}
+
+/// Clears manual skin-weight overrides: all of them when `vertex_ids` is
+/// `None`, otherwise only the listed vertices.
+pub fn clear_vertex_weights(
+    mesh: &LowPolyMesh,
+    vertex_ids: Option<&[usize]>,
+) -> Result<LowPolyMesh, CoreError> {
+    let mut next = mesh.clone();
+    match vertex_ids {
+        None => next.skin_weights.clear(),
+        Some(ids) => {
+            for vi in ids {
+                if *vi >= mesh.vertices.len() {
+                    return Err(CoreError::OutOfBounds);
+                }
+                next.skin_weights.remove(vi);
+            }
+        }
+    }
+    Ok(next)
+}
+
+/// Adds (accumulates) a position delta onto a named morph target
+/// (blend shape), creating the target if missing. Deltas compose with the
+/// base vertex positions at export. Survives index-stable edits; cleared by
+/// bevel/subdivide/decimate.
+pub fn add_morph_delta(
+    mesh: &LowPolyMesh,
+    name: &str,
+    vertex_ids: &[usize],
+    delta: Vec3,
+) -> Result<LowPolyMesh, CoreError> {
+    if name.is_empty() {
+        return Err(CoreError::OutOfBounds);
+    }
+    if !delta.is_finite() {
+        return Err(CoreError::OutOfBounds);
+    }
+    if vertex_ids.is_empty() {
+        return Err(CoreError::OutOfBounds);
+    }
+    let unique_verts: BTreeSet<usize> = vertex_ids.iter().copied().collect();
+    if unique_verts.iter().any(|vi| *vi >= mesh.vertices.len()) {
+        return Err(CoreError::OutOfBounds);
+    }
+    let mut next = mesh.clone();
+    let target = match next.morphs.iter_mut().find(|m| m.name == name) {
+        Some(t) => t,
+        None => {
+            next.morphs.push(MorphTarget {
+                name: name.to_string(),
+                deltas: BTreeMap::new(),
+            });
+            next.morphs.last_mut().expect("just pushed")
+        }
+    };
+    for vi in unique_verts {
+        let entry = target.deltas.entry(vi).or_insert(Vec3::ZERO);
+        *entry += delta;
+        if entry.length_squared() < 1e-12 {
+            target.deltas.remove(&vi);
+        }
+    }
+    next.morphs.retain(|m| !m.deltas.is_empty());
+    Ok(next)
+}
+
+/// Clears morph targets: all of them when `name` is `None`, otherwise only
+/// the named target (missing names are a no-op success).
+pub fn clear_morphs(mesh: &LowPolyMesh, name: Option<&str>) -> Result<LowPolyMesh, CoreError> {
+    let mut next = mesh.clone();
+    match name {
+        None => next.morphs.clear(),
+        Some(n) => next.morphs.retain(|m| m.name != n),
     }
     Ok(next)
 }
@@ -578,6 +786,7 @@ pub fn inset_face(
 
 /// Chamfers/bevels all shared edges and corners of `mesh` by `amount` (`0.05..=0.45`)
 /// while keeping main face centers flat (Doo-Sabin edge/corner bevel).
+/// Clears manual skin weights (full rebuild reindexes every vertex).
 pub fn bevel_mesh(mesh: &LowPolyMesh, amount: f32) -> Result<LowPolyMesh, CoreError> {
     if !amount.is_finite() || mesh.faces.is_empty() || mesh.faces.len() > 8_000 {
         return Err(CoreError::OutOfBounds);
@@ -679,6 +888,8 @@ pub fn bevel_mesh(mesh: &LowPolyMesh, amount: f32) -> Result<LowPolyMesh, CoreEr
         new_faces.push(Face::new(loop_verts, mat));
     }
 
+    // Full rebuild: vertex indices stop meaning the same corners, so manual
+    // skin weights and morphs cannot be carried over and are cleared.
     Ok(LowPolyMesh {
         vertices: new_vertices,
         faces: new_faces,
@@ -686,11 +897,14 @@ pub fn bevel_mesh(mesh: &LowPolyMesh, amount: f32) -> Result<LowPolyMesh, CoreEr
         normal_map: mesh.normal_map.clone(),
         smooth_shading: mesh.smooth_shading,
         material: mesh.material,
+        skin_weights: BTreeMap::new(),
+        morphs: Default::default(),
     })
 }
 
 /// Applies one iteration of Catmull-Clark smooth subdivision to `mesh`.
 /// Turns sharp corners (e.g. a Cube) into a rounded box and progressively into a smooth sphere.
+/// Clears manual skin weights (full rebuild reindexes every vertex).
 pub fn smooth_subdivide_mesh(mesh: &LowPolyMesh) -> Result<LowPolyMesh, CoreError> {
     if mesh.faces.is_empty() || mesh.faces.len() > 8_000 {
         return Err(CoreError::OutOfBounds);
@@ -813,6 +1027,8 @@ pub fn smooth_subdivide_mesh(mesh: &LowPolyMesh) -> Result<LowPolyMesh, CoreErro
         }
     }
 
+    // Full rebuild: vertex indices stop meaning the same corners, so manual
+    // skin weights and morphs cannot be carried over and are cleared.
     Ok(LowPolyMesh {
         vertices: new_vertices,
         faces: new_faces,
@@ -820,6 +1036,8 @@ pub fn smooth_subdivide_mesh(mesh: &LowPolyMesh) -> Result<LowPolyMesh, CoreErro
         normal_map: mesh.normal_map.clone(),
         smooth_shading: mesh.smooth_shading,
         material: mesh.material,
+        skin_weights: BTreeMap::new(),
+        morphs: Default::default(),
     })
 }
 
@@ -857,6 +1075,8 @@ pub fn voxel_to_lowpoly(volume: &VoxelVolume, unit_scale: f32) -> LowPolyMesh {
     LowPolyMesh {
         vertices,
         faces,
+        skin_weights: BTreeMap::new(),
+        morphs: Default::default(),
         texture: None,
         normal_map: None,
         smooth_shading: false,
@@ -1059,5 +1279,147 @@ mod tests {
         let decimated = decimate_mesh(&strap, 0.5).unwrap();
         assert!(!decimated.faces.is_empty());
         assert!(decimated.vertices.len() < strap.vertices.len());
+    }
+
+    #[test]
+    fn move_vertices_shifts_only_listed_corners() {
+        let mat = PaletteIndex::new(4).unwrap();
+        let cube = create_primitive(PrimitiveKind::Cube, 1.0, mat);
+        let untouched = cube.vertices[1];
+        let moved = move_mesh_vertices(&cube, &[0], Vec3::new(0.25, 0.0, 0.0)).unwrap();
+        assert!((moved.vertices[0].x - (cube.vertices[0].x + 0.25)).abs() < 1e-6);
+        assert_eq!(moved.vertices[1], untouched);
+    }
+
+    #[test]
+    fn move_vertices_rejects_bad_input() {
+        let mat = PaletteIndex::new(4).unwrap();
+        let cube = create_primitive(PrimitiveKind::Cube, 1.0, mat);
+        assert!(move_mesh_vertices(&cube, &[], Vec3::ONE).is_err());
+        assert!(move_mesh_vertices(&cube, &[999], Vec3::ONE).is_err());
+        assert!(move_mesh_vertices(&cube, &[0], Vec3::new(f32::NAN, 0.0, 0.0)).is_err());
+    }
+
+    #[test]
+    fn set_mesh_vertex_places_corner_absolutely() {
+        let mat = PaletteIndex::new(4).unwrap();
+        let cube = create_primitive(PrimitiveKind::Cube, 1.0, mat);
+        let target = Vec3::new(0.1, 0.2, 0.3);
+        let moved = set_mesh_vertex(&cube, 2, target).unwrap();
+        assert_eq!(moved.vertices[2], target);
+        assert!(set_mesh_vertex(&cube, 999, target).is_err());
+        assert!(set_mesh_vertex(&cube, 0, Vec3::new(f32::INFINITY, 0.0, 0.0)).is_err());
+    }
+
+    #[test]
+    fn set_face_uvs_stores_manual_unwrap() {
+        let mat = PaletteIndex::new(4).unwrap();
+        let cube = create_primitive(PrimitiveKind::Cube, 1.0, mat);
+        let uvs = [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]];
+        let unwrapped = set_face_uvs(&cube, FaceId(0), &uvs).unwrap();
+        assert_eq!(unwrapped.faces[0].uvs, uvs);
+        // Out-of-range values clamp into UV space instead of failing.
+        let clamped = set_face_uvs(
+            &cube,
+            FaceId(0),
+            &[[0.0, 0.0], [2.0, 0.0], [1.0, 1.0], [0.0, -1.0]],
+        )
+        .unwrap();
+        assert_eq!(clamped.faces[0].uvs[1], [1.0, 0.0]);
+        assert_eq!(clamped.faces[0].uvs[3], [0.0, 0.0]);
+    }
+
+    #[test]
+    fn set_face_uvs_rejects_bad_input() {
+        let mat = PaletteIndex::new(4).unwrap();
+        let cube = create_primitive(PrimitiveKind::Cube, 1.0, mat);
+        assert!(set_face_uvs(&cube, FaceId(99), &[[0.0, 0.0]; 4]).is_err());
+        assert!(set_face_uvs(&cube, FaceId(0), &[[0.0, 0.0]; 3]).is_err());
+        assert!(set_face_uvs(&cube, FaceId(0), &[[f32::NAN, 0.0]; 4]).is_err());
+    }
+
+    #[test]
+    fn set_vertex_weights_normalizes_and_rejects_bad_input() {
+        let mat = PaletteIndex::new(4).unwrap();
+        let cube = create_primitive(PrimitiveKind::Cube, 1.0, mat);
+        let painted =
+            set_vertex_weights(&cube, &[0, 1], [2, 3, 0, 0], [3.0, 1.0, 0.0, 0.0]).unwrap();
+        let w = painted.skin_weights[&0];
+        assert_eq!(w.joints, [2, 3, 0, 0]);
+        assert!((w.weights[0] - 0.75).abs() < 1e-6);
+        assert!((w.weights[1] - 0.25).abs() < 1e-6);
+        assert!((w.weights.iter().sum::<f32>() - 1.0).abs() < 1e-6);
+        assert_eq!(painted.skin_weights[&1], w);
+        assert!(!painted.skin_weights.contains_key(&2));
+
+        assert!(set_vertex_weights(&cube, &[], [0, 0, 0, 0], [1.0, 0.0, 0.0, 0.0]).is_err());
+        assert!(set_vertex_weights(&cube, &[99], [0, 0, 0, 0], [1.0, 0.0, 0.0, 0.0]).is_err());
+        assert!(set_vertex_weights(&cube, &[0], [0, 0, 0, 0], [0.0, 0.0, 0.0, 0.0]).is_err());
+        assert!(set_vertex_weights(&cube, &[0], [0, 0, 0, 0], [-1.0, 1.0, 0.0, 0.0]).is_err());
+        assert!(set_vertex_weights(&cube, &[0], [0, 0, 0, 0], [f32::NAN, 0.0, 0.0, 0.0]).is_err());
+    }
+
+    #[test]
+    fn clear_vertex_weights_clears_all_or_listed() {
+        let mat = PaletteIndex::new(4).unwrap();
+        let cube = create_primitive(PrimitiveKind::Cube, 1.0, mat);
+        let painted =
+            set_vertex_weights(&cube, &[0, 1, 2], [0, 0, 0, 0], [1.0, 0.0, 0.0, 0.0]).unwrap();
+        let partial = clear_vertex_weights(&painted, Some(&[0])).unwrap();
+        assert!(!partial.skin_weights.contains_key(&0));
+        assert!(partial.skin_weights.contains_key(&1));
+        let cleared = clear_vertex_weights(&painted, None).unwrap();
+        assert!(cleared.skin_weights.is_empty());
+        assert!(clear_vertex_weights(&painted, Some(&[99])).is_err());
+    }
+
+    #[test]
+    fn morph_deltas_accumulate_and_clear() {
+        let mat = PaletteIndex::new(4).unwrap();
+        let cube = create_primitive(PrimitiveKind::Cube, 1.0, mat);
+        let m1 = add_morph_delta(&cube, "Smile", &[0, 1], Vec3::new(0.0, 0.1, 0.0)).unwrap();
+        assert_eq!(m1.morphs.len(), 1);
+        assert_eq!(m1.morphs[0].name, "Smile");
+        let m2 = add_morph_delta(&m1, "Smile", &[0], Vec3::new(0.0, 0.1, 0.0)).unwrap();
+        assert_eq!(m2.morphs[0].deltas[&0], Vec3::new(0.0, 0.2, 0.0));
+        assert_eq!(m2.morphs[0].deltas[&1], Vec3::new(0.0, 0.1, 0.0));
+        // Cancelling deltas prune the vertex; empty targets are dropped.
+        let m3 = add_morph_delta(&m2, "Smile", &[0, 1], Vec3::new(0.0, -0.1, 0.0)).unwrap();
+        assert_eq!(m3.morphs.len(), 1);
+        assert!(!m3.morphs[0].deltas.contains_key(&1));
+        let cleared = clear_morphs(&m3, Some("Smile")).unwrap();
+        assert!(cleared.morphs.is_empty());
+        // Missing names are a no-op; None clears all.
+        let kept = clear_morphs(&m3, Some("Frown")).unwrap();
+        assert_eq!(kept.morphs.len(), 1);
+        let all = clear_morphs(&m3, None).unwrap();
+        assert!(all.morphs.is_empty());
+
+        assert!(add_morph_delta(&cube, "", &[0], Vec3::ONE).is_err());
+        assert!(add_morph_delta(&cube, "X", &[], Vec3::ONE).is_err());
+        assert!(add_morph_delta(&cube, "X", &[99], Vec3::ONE).is_err());
+        assert!(add_morph_delta(&cube, "X", &[0], Vec3::new(f32::NAN, 0.0, 0.0)).is_err());
+    }
+
+    #[test]
+    fn morphs_survive_move_but_not_rebuild() {
+        let mat = PaletteIndex::new(4).unwrap();
+        let cube = create_primitive(PrimitiveKind::Cube, 1.0, mat);
+        let morphed = add_morph_delta(&cube, "Smile", &[0], Vec3::new(0.0, 0.1, 0.0)).unwrap();
+        let moved = move_mesh_vertices(&morphed, &[0], Vec3::new(0.1, 0.0, 0.0)).unwrap();
+        assert_eq!(moved.morphs.len(), 1);
+        let beveled = bevel_mesh(&morphed, 0.2).unwrap();
+        assert!(beveled.morphs.is_empty());
+    }
+
+    #[test]
+    fn skin_weights_survive_move_but_not_rebuild() {
+        let mat = PaletteIndex::new(4).unwrap();
+        let cube = create_primitive(PrimitiveKind::Cube, 1.0, mat);
+        let painted = set_vertex_weights(&cube, &[0], [5, 0, 0, 0], [1.0, 0.0, 0.0, 0.0]).unwrap();
+        let moved = move_mesh_vertices(&painted, &[0], Vec3::new(0.1, 0.0, 0.0)).unwrap();
+        assert_eq!(moved.skin_weights[&0].joints, [5, 0, 0, 0]);
+        let beveled = bevel_mesh(&painted, 0.2).unwrap();
+        assert!(beveled.skin_weights.is_empty());
     }
 }

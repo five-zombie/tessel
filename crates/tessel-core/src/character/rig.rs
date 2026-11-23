@@ -25,6 +25,11 @@ pub struct CharacterRig {
     pub active_animation: usize,
     pub playback_time: f32,
     pub playing: bool,
+    /// Live sampled morph weights `(node, target) -> weight`, refreshed by
+    /// `apply_active_animation`. The viewport renderer does not deform meshes
+    /// with these yet; export bakes animated weights into glTF channels.
+    #[serde(default)]
+    pub morph_weights: BTreeMap<(NodeId, String), f32>,
 }
 
 impl CharacterRig {
@@ -60,6 +65,7 @@ impl CharacterRig {
             active_animation: 0,
             playback_time: 0.0,
             playing: false,
+            morph_weights: BTreeMap::new(),
         }
     }
 
@@ -107,6 +113,12 @@ impl CharacterRig {
                 bone.pose_local.scale = bone.rest_local.scale * sampled.scale;
             }
         }
+        self.morph_weights.clear();
+        for (node, target, weight) in clip.sample_morph_weights(t) {
+            if weight.is_finite() {
+                self.morph_weights.insert((node, target), weight);
+            }
+        }
     }
 
     /// Picks the closest bone joint within `pick_radius` of a world-space ray.
@@ -144,5 +156,17 @@ mod tests {
         // Head is at y = 0.8 + 0.3 + 0.45 = 1.55
         let hit = rig.pick_bone(Vec3::new(0.0, 1.55, 3.0), Vec3::new(0.0, 0.0, -1.0), 0.15);
         assert_eq!(hit, Some(BoneId(2)));
+    }
+
+    #[test]
+    fn apply_active_animation_samples_morph_weights() {
+        let mut rig = CharacterRig::biped_template();
+        let node = NodeId(3);
+        rig.animations[0].upsert_morph_weight(node, "Smile", 0.0, 0.0);
+        rig.animations[0].upsert_morph_weight(node, "Smile", 2.0, 1.0);
+        rig.playback_time = 0.5;
+        rig.apply_active_animation();
+        let w = rig.morph_weights.get(&(node, "Smile".to_string())).copied();
+        assert!((w.unwrap_or(-1.0) - 0.25).abs() < 1e-6);
     }
 }

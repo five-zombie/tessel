@@ -259,6 +259,19 @@ pub fn tool_definitions() -> Vec<Value> {
             }
         }),
         json!({
+            "name": "mesh_list_vertices",
+            "description": "List Low-Poly vertex indices and positions (paginated; use to target mesh_move_vertices / mesh_set_vertex precisely).",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "node_id": { "type": "integer" },
+                    "offset": { "type": "integer", "minimum": 0 },
+                    "limit": { "type": "integer", "minimum": 1, "maximum": 512 }
+                },
+                "required": []
+            }
+        }),
+        json!({
             "name": "mesh_translate_face",
             "description": "Translate all vertices of a selected Low-Poly face by a 3D delta [dx, dy, dz].",
             "inputSchema": {
@@ -269,6 +282,97 @@ pub fn tool_definitions() -> Vec<Value> {
                     "delta": { "type": "array", "items": { "type": "number" }, "minItems": 3, "maxItems": 3 }
                 },
                 "required": ["face_id", "delta"]
+            }
+        }),
+        json!({
+            "name": "mesh_move_vertices",
+            "description": "Move an explicit list of Low-Poly vertices by a 3D delta [dx, dy, dz] (per-vertex editing for precise 1:1 shaping).",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "node_id": { "type": "integer" },
+                    "vertex_ids": { "type": "array", "items": { "type": "integer", "minimum": 0 }, "minItems": 1 },
+                    "delta": { "type": "array", "items": { "type": "number" }, "minItems": 3, "maxItems": 3 }
+                },
+                "required": ["vertex_ids", "delta"]
+            }
+        }),
+        json!({
+            "name": "mesh_set_vertex",
+            "description": "Set one Low-Poly vertex to an absolute 3D position [x, y, z] (precise 1:1 corner placement).",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "node_id": { "type": "integer" },
+                    "vertex_id": { "type": "integer", "minimum": 0 },
+                    "position": { "type": "array", "items": { "type": "number" }, "minItems": 3, "maxItems": 3 }
+                },
+                "required": ["vertex_id", "position"]
+            }
+        }),
+        json!({
+            "name": "mesh_set_face_uvs",
+            "description": "Set manual per-corner UVs on a Low-Poly face (manual UV unwrap; one [u, v] pair per face corner, values clamped to 0..1, overrides auto box-atlas UV on export).",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "node_id": { "type": "integer" },
+                    "face_id": { "type": "integer", "minimum": 0 },
+                    "uvs": { "type": "array", "items": { "type": "array", "items": { "type": "number" }, "minItems": 2, "maxItems": 2 }, "minItems": 3 }
+                },
+                "required": ["face_id", "uvs"]
+            }
+        }),
+        json!({
+            "name": "mesh_set_vertex_weights",
+            "description": "Paint manual skin weights onto Low-Poly vertices (weight paint for smooth skinning). joints is 4 bone indices, weights is 4 influences (normalized to sum 1, negatives rejected). Export prefers these over auto weights; bevel/subdivide/decimate clear them.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "node_id": { "type": "integer" },
+                    "vertex_ids": { "type": "array", "items": { "type": "integer", "minimum": 0 }, "minItems": 1 },
+                    "joints": { "type": "array", "items": { "type": "integer", "minimum": 0 }, "minItems": 4, "maxItems": 4 },
+                    "weights": { "type": "array", "items": { "type": "number" }, "minItems": 4, "maxItems": 4 }
+                },
+                "required": ["vertex_ids", "joints", "weights"]
+            }
+        }),
+        json!({
+            "name": "mesh_morph_delta",
+            "description": "Add (accumulate) a position delta [dx, dy, dz] onto a named morph target (blend shape) for explicit vertices, creating the target if missing. Exports as glTF morph targets; bevel/subdivide/decimate clear them.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "node_id": { "type": "integer" },
+                    "name": { "type": "string" },
+                    "vertex_ids": { "type": "array", "items": { "type": "integer", "minimum": 0 }, "minItems": 1 },
+                    "delta": { "type": "array", "items": { "type": "number" }, "minItems": 3, "maxItems": 3 }
+                },
+                "required": ["name", "vertex_ids", "delta"]
+            }
+        }),
+        json!({
+            "name": "mesh_morph_clear",
+            "description": "Clear morph targets on a Low-Poly mesh (all when name is omitted, otherwise only the named target).",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "node_id": { "type": "integer" },
+                    "name": { "type": "string" }
+                },
+                "required": []
+            }
+        }),
+        json!({
+            "name": "mesh_clear_vertex_weights",
+            "description": "Clear manual skin-weight overrides on a Low-Poly mesh (all when vertex_ids is omitted, otherwise only the listed vertices; falls back to auto weights).",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "node_id": { "type": "integer" },
+                    "vertex_ids": { "type": "array", "items": { "type": "integer", "minimum": 0 }, "minItems": 1 }
+                },
+                "required": []
             }
         }),
         json!({
@@ -373,7 +477,7 @@ pub fn tool_definitions() -> Vec<Value> {
         }),
         json!({
             "name": "character_set_keyframe",
-            "description": "Insert or update a bone rotation keyframe in an animation clip (creates clip if clip_name is new).",
+            "description": "Insert or update a bone TRS keyframe in an animation clip (creates clip if clip_name is new). rotation_deg is required; translation defaults to [0,0,0] (offset added to the rest pose) and scale defaults to [1,1,1] (multiplier).",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -382,9 +486,57 @@ pub fn tool_definitions() -> Vec<Value> {
                     "duration_secs": { "type": "number", "minimum": 0.1 },
                     "bone_id": { "type": "integer", "minimum": 0 },
                     "time_secs": { "type": "number", "minimum": 0.0 },
-                    "rotation_deg": { "type": "array", "items": { "type": "number" }, "minItems": 3, "maxItems": 3 }
+                    "rotation_deg": { "type": "array", "items": { "type": "number" }, "minItems": 3, "maxItems": 3 },
+                    "translation": { "type": "array", "items": { "type": "number" }, "minItems": 3, "maxItems": 3 },
+                    "scale": { "type": "array", "items": { "type": "number" }, "minItems": 3, "maxItems": 3 }
                 },
                 "required": ["bone_id", "time_secs", "rotation_deg"]
+            }
+        }),
+        json!({
+            "name": "character_solve_ik",
+            "description": "Analytic two-bone IK: rotate root and mid bones so the end bone reaches target [x, y, z]. Chain must be parent-linked root <- mid <- end (build with character_add_bone). pole_vector steers the elbow/knee bend, defaults to [0,0,1].",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "root_bone_id": { "type": "integer", "minimum": 0 },
+                    "mid_bone_id": { "type": "integer", "minimum": 0 },
+                    "end_bone_id": { "type": "integer", "minimum": 0 },
+                    "target": { "type": "array", "items": { "type": "number" }, "minItems": 3, "maxItems": 3 },
+                    "pole_vector": { "type": "array", "items": { "type": "number" }, "minItems": 3, "maxItems": 3 }
+                },
+                "required": ["root_bone_id", "mid_bone_id", "end_bone_id", "target"]
+            }
+        }),
+        json!({
+            "name": "character_set_morph_weight",
+            "description": "Insert or update a morph-target weight keyframe on a mesh node in an animation clip (creates clip if clip_name is new). Animate blend shapes over time; export writes glTF weight channels.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "clip_index": { "type": "integer", "minimum": 0 },
+                    "clip_name": { "type": "string" },
+                    "duration_secs": { "type": "number", "minimum": 0.1 },
+                    "node_id": { "type": "integer", "minimum": 1 },
+                    "target": { "type": "string" },
+                    "time_secs": { "type": "number", "minimum": 0.0 },
+                    "weight": { "type": "number" }
+                },
+                "required": ["node_id", "target", "time_secs", "weight"]
+            }
+        }),
+        json!({
+            "name": "character_remove_morph_weight",
+            "description": "Remove a morph-target weight keyframe matching time_secs (within 1ms) from an animation clip.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "clip_index": { "type": "integer", "minimum": 0 },
+                    "node_id": { "type": "integer", "minimum": 1 },
+                    "target": { "type": "string" },
+                    "time_secs": { "type": "number", "minimum": 0.0 }
+                },
+                "required": ["clip_index", "node_id", "target", "time_secs"]
             }
         }),
         json!({

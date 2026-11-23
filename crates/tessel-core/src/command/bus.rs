@@ -123,6 +123,41 @@ pub enum Command {
         face_id: FaceId,
         delta: glam::Vec3,
     },
+    MoveMeshVertices {
+        node_id: NodeId,
+        vertex_ids: Vec<usize>,
+        delta: glam::Vec3,
+    },
+    SetMeshVertex {
+        node_id: NodeId,
+        vertex_id: usize,
+        position: glam::Vec3,
+    },
+    SetMeshFaceUvs {
+        node_id: NodeId,
+        face_id: FaceId,
+        uvs: Vec<[f32; 2]>,
+    },
+    SetMeshVertexWeights {
+        node_id: NodeId,
+        vertex_ids: Vec<usize>,
+        joints: [u16; 4],
+        weights: [f32; 4],
+    },
+    ClearMeshVertexWeights {
+        node_id: NodeId,
+        vertex_ids: Option<Vec<usize>>,
+    },
+    AddMorphDelta {
+        node_id: NodeId,
+        name: String,
+        vertex_ids: Vec<usize>,
+        delta: glam::Vec3,
+    },
+    ClearMorphs {
+        node_id: NodeId,
+        name: Option<String>,
+    },
     SmoothSubdivideMesh {
         node_id: NodeId,
     },
@@ -170,6 +205,13 @@ pub enum Command {
         bone_id: BoneId,
         rotation: Quat,
     },
+    SolveTwoBoneIk {
+        root_bone: BoneId,
+        mid_bone: BoneId,
+        end_bone: BoneId,
+        target: glam::Vec3,
+        pole: glam::Vec3,
+    },
     BindNodeToBone {
         node_id: NodeId,
         bone_id: Option<BoneId>,
@@ -186,6 +228,19 @@ pub enum Command {
     RemoveAnimationKeyframe {
         clip_index: usize,
         bone_id: BoneId,
+        time_secs: f32,
+    },
+    SetMorphWeightKeyframe {
+        clip_index: usize,
+        node_id: NodeId,
+        target: String,
+        time_secs: f32,
+        weight: f32,
+    },
+    RemoveMorphWeightKeyframe {
+        clip_index: usize,
+        node_id: NodeId,
+        target: String,
         time_secs: f32,
     },
     Transaction(Vec<Command>),
@@ -813,6 +868,122 @@ impl Command {
                     previous_mesh: current,
                 }
             }
+            Self::MoveMeshVertices {
+                node_id,
+                vertex_ids,
+                delta,
+            } => {
+                let current = scene
+                    .lowpoly_meshes
+                    .get(node_id)
+                    .ok_or(CoreError::LowPolyMeshNotFound(*node_id))?
+                    .clone();
+                let next = mesh_ops::move_mesh_vertices(&current, vertex_ids, *delta)?;
+                scene.lowpoly_meshes.insert(*node_id, next);
+                UndoDelta::RestoreLowPolyMesh {
+                    node_id: *node_id,
+                    previous_mesh: current,
+                }
+            }
+            Self::SetMeshVertex {
+                node_id,
+                vertex_id,
+                position,
+            } => {
+                let current = scene
+                    .lowpoly_meshes
+                    .get(node_id)
+                    .ok_or(CoreError::LowPolyMeshNotFound(*node_id))?
+                    .clone();
+                let next = mesh_ops::set_mesh_vertex(&current, *vertex_id, *position)?;
+                scene.lowpoly_meshes.insert(*node_id, next);
+                UndoDelta::RestoreLowPolyMesh {
+                    node_id: *node_id,
+                    previous_mesh: current,
+                }
+            }
+            Self::SetMeshFaceUvs {
+                node_id,
+                face_id,
+                uvs,
+            } => {
+                let current = scene
+                    .lowpoly_meshes
+                    .get(node_id)
+                    .ok_or(CoreError::LowPolyMeshNotFound(*node_id))?
+                    .clone();
+                let next = mesh_ops::set_face_uvs(&current, *face_id, uvs)?;
+                scene.lowpoly_meshes.insert(*node_id, next);
+                UndoDelta::RestoreLowPolyMesh {
+                    node_id: *node_id,
+                    previous_mesh: current,
+                }
+            }
+            Self::SetMeshVertexWeights {
+                node_id,
+                vertex_ids,
+                joints,
+                weights,
+            } => {
+                let current = scene
+                    .lowpoly_meshes
+                    .get(node_id)
+                    .ok_or(CoreError::LowPolyMeshNotFound(*node_id))?
+                    .clone();
+                let next = mesh_ops::set_vertex_weights(&current, vertex_ids, *joints, *weights)?;
+                scene.lowpoly_meshes.insert(*node_id, next);
+                UndoDelta::RestoreLowPolyMesh {
+                    node_id: *node_id,
+                    previous_mesh: current,
+                }
+            }
+            Self::ClearMeshVertexWeights {
+                node_id,
+                vertex_ids,
+            } => {
+                let current = scene
+                    .lowpoly_meshes
+                    .get(node_id)
+                    .ok_or(CoreError::LowPolyMeshNotFound(*node_id))?
+                    .clone();
+                let next = mesh_ops::clear_vertex_weights(&current, vertex_ids.as_deref())?;
+                scene.lowpoly_meshes.insert(*node_id, next);
+                UndoDelta::RestoreLowPolyMesh {
+                    node_id: *node_id,
+                    previous_mesh: current,
+                }
+            }
+            Self::AddMorphDelta {
+                node_id,
+                name,
+                vertex_ids,
+                delta,
+            } => {
+                let current = scene
+                    .lowpoly_meshes
+                    .get(node_id)
+                    .ok_or(CoreError::LowPolyMeshNotFound(*node_id))?
+                    .clone();
+                let next = mesh_ops::add_morph_delta(&current, name, vertex_ids, *delta)?;
+                scene.lowpoly_meshes.insert(*node_id, next);
+                UndoDelta::RestoreLowPolyMesh {
+                    node_id: *node_id,
+                    previous_mesh: current,
+                }
+            }
+            Self::ClearMorphs { node_id, name } => {
+                let current = scene
+                    .lowpoly_meshes
+                    .get(node_id)
+                    .ok_or(CoreError::LowPolyMeshNotFound(*node_id))?
+                    .clone();
+                let next = mesh_ops::clear_morphs(&current, name.as_deref())?;
+                scene.lowpoly_meshes.insert(*node_id, next);
+                UndoDelta::RestoreLowPolyMesh {
+                    node_id: *node_id,
+                    previous_mesh: current,
+                }
+            }
             Self::SmoothSubdivideMesh { node_id } => {
                 let current = scene
                     .lowpoly_meshes
@@ -1046,6 +1217,36 @@ impl Command {
                     previous,
                 }
             }
+            Self::SolveTwoBoneIk {
+                root_bone,
+                mid_bone,
+                end_bone,
+                target,
+                pole,
+            } => {
+                let rig = scene
+                    .character_rig
+                    .as_ref()
+                    .ok_or(CoreError::CharacterRigNotFound)?;
+                let (root_local, mid_local) = crate::character::ik::solve_for_rig(
+                    rig,
+                    *root_bone,
+                    *mid_bone,
+                    *end_bone,
+                    *target,
+                    Some(*pole),
+                )?;
+                let mut applied = Vec::with_capacity(2);
+                for (id, rot) in [(*root_bone, root_local), (*mid_bone, mid_local)] {
+                    let delta = Self::SetBoneRotation {
+                        bone_id: id,
+                        rotation: rot,
+                    }
+                    .apply(scene)?;
+                    applied.push(delta);
+                }
+                UndoDelta::Transaction(applied)
+            }
             Self::BindNodeToBone { node_id, bone_id } => {
                 if !scene.nodes.contains_key(node_id) {
                     return Err(CoreError::NodeNotFound(*node_id));
@@ -1104,6 +1305,12 @@ impl Command {
                 if !keyframe.time_secs.is_finite() || keyframe.time_secs < 0.0 {
                     return Err(CoreError::OutOfBounds);
                 }
+                if !keyframe.translation.is_finite()
+                    || !keyframe.scale.is_finite()
+                    || !keyframe.rotation.is_finite()
+                {
+                    return Err(CoreError::OutOfBounds);
+                }
                 let rig = scene
                     .character_rig
                     .as_mut()
@@ -1137,6 +1344,58 @@ impl Command {
                     .ok_or(CoreError::OutOfBounds)?;
                 let previous = clip.clone();
                 clip.remove_keyframe(*bone_id, *time_secs);
+                UndoDelta::RestoreAnimationClip {
+                    clip_index: *clip_index,
+                    previous,
+                }
+            }
+            Self::SetMorphWeightKeyframe {
+                clip_index,
+                node_id,
+                target,
+                time_secs,
+                weight,
+            } => {
+                if !time_secs.is_finite() || *time_secs < 0.0 || !weight.is_finite() {
+                    return Err(CoreError::OutOfBounds);
+                }
+                if target.is_empty() {
+                    return Err(CoreError::OutOfBounds);
+                }
+                if !scene.nodes.contains_key(node_id) {
+                    return Err(CoreError::NodeNotFound(*node_id));
+                }
+                let rig = scene
+                    .character_rig
+                    .as_mut()
+                    .ok_or(CoreError::CharacterRigNotFound)?;
+                let clip = rig
+                    .animations
+                    .get_mut(*clip_index)
+                    .ok_or(CoreError::OutOfBounds)?;
+                let previous = clip.clone();
+                clip.upsert_morph_weight(*node_id, target, *time_secs, *weight);
+                UndoDelta::RestoreAnimationClip {
+                    clip_index: *clip_index,
+                    previous,
+                }
+            }
+            Self::RemoveMorphWeightKeyframe {
+                clip_index,
+                node_id,
+                target,
+                time_secs,
+            } => {
+                let rig = scene
+                    .character_rig
+                    .as_mut()
+                    .ok_or(CoreError::CharacterRigNotFound)?;
+                let clip = rig
+                    .animations
+                    .get_mut(*clip_index)
+                    .ok_or(CoreError::OutOfBounds)?;
+                let previous = clip.clone();
+                clip.remove_morph_weight(*node_id, target, *time_secs);
                 UndoDelta::RestoreAnimationClip {
                     clip_index: *clip_index,
                     previous,

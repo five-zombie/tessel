@@ -1,6 +1,8 @@
 use glam::{Quat, Vec3};
 use serde::{Deserialize, Serialize};
 
+use crate::scene::NodeId;
+
 use super::nano::{BoneId, Keyframe};
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -9,12 +11,28 @@ pub struct BoneChannel {
     pub keyframes: Vec<Keyframe>,
 }
 
+/// Single weight keyframe on a morph track.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct MorphWeightKey {
+    pub time_secs: f32,
+    pub weight: f32,
+}
+
+/// Weight animation for one named morph target on one mesh node.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MorphWeightTrack {
+    pub node: NodeId,
+    pub target: String,
+    pub keys: Vec<MorphWeightKey>,
+}
+
 /// Keyframe animation clip supporting linear translation/scale & SLERP rotation.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AnimationClip {
     pub name: String,
     pub duration_secs: f32,
     pub channels: Vec<BoneChannel>,
+    pub morph_tracks: Vec<MorphWeightTrack>,
 }
 
 impl AnimationClip {
@@ -23,6 +41,7 @@ impl AnimationClip {
             name: name.into(),
             duration_secs: duration_secs.max(0.1),
             channels: Vec::new(),
+            morph_tracks: Vec::new(),
         }
     }
 
@@ -69,6 +88,97 @@ impl AnimationClip {
             self.channels.remove(ch_idx);
         }
         Some(removed)
+    }
+
+    /// Inserts or replaces a morph weight keyframe (within 1ms tolerance),
+    /// keeping timestamps sorted.
+    pub fn upsert_morph_weight(&mut self, node: NodeId, target: &str, time_secs: f32, weight: f32) {
+        let time = time_secs.max(0.0);
+        if time > self.duration_secs {
+            self.duration_secs = time;
+        }
+        if let Some(track) = self
+            .morph_tracks
+            .iter_mut()
+            .find(|t| t.node == node && t.target == target)
+        {
+            if let Some(existing) = track
+                .keys
+                .iter_mut()
+                .find(|k| (k.time_secs - time).abs() <= 1e-3)
+            {
+                existing.weight = weight;
+            } else {
+                track.keys.push(MorphWeightKey {
+                    time_secs: time,
+                    weight,
+                });
+                track
+                    .keys
+                    .sort_by(|a, b| a.time_secs.total_cmp(&b.time_secs));
+            }
+        } else {
+            self.morph_tracks.push(MorphWeightTrack {
+                node,
+                target: target.to_string(),
+                keys: vec![MorphWeightKey {
+                    time_secs: time,
+                    weight,
+                }],
+            });
+        }
+    }
+
+    /// Removes the morph weight keyframe matching `time_secs` (within 1ms
+    /// tolerance); drops the track when its last key is removed.
+    pub fn remove_morph_weight(
+        &mut self,
+        node: NodeId,
+        target: &str,
+        time_secs: f32,
+    ) -> Option<f32> {
+        let t_idx = self
+            .morph_tracks
+            .iter()
+            .position(|t| t.node == node && t.target == target)?;
+        let k_idx = self.morph_tracks[t_idx]
+            .keys
+            .iter()
+            .position(|k| (k.time_secs - time_secs).abs() <= 1e-3)?;
+        let removed = self.morph_tracks[t_idx].keys.remove(k_idx);
+        if self.morph_tracks[t_idx].keys.is_empty() {
+            self.morph_tracks.remove(t_idx);
+        }
+        Some(removed.weight)
+    }
+
+    /// Samples every morph track at `time_secs` (linear interp, clamped ends).
+    pub fn sample_morph_weights(&self, time_secs: f32) -> Vec<(NodeId, String, f32)> {
+        let mut out = Vec::with_capacity(self.morph_tracks.len());
+        for track in &self.morph_tracks {
+            if track.keys.is_empty() {
+                continue;
+            }
+            let w = if track.keys.len() == 1 || time_secs <= track.keys[0].time_secs {
+                track.keys[0].weight
+            } else if time_secs >= track.keys.last().map(|k| k.time_secs).unwrap_or(0.0) {
+                track.keys.last().map(|k| k.weight).unwrap_or(0.0)
+            } else {
+                let mut w = track.keys.last().map(|k| k.weight).unwrap_or(0.0);
+                for pair in track.keys.windows(2) {
+                    let (a, b) = (pair[0], pair[1]);
+                    if time_secs >= a.time_secs && time_secs <= b.time_secs {
+                        let span = (b.time_secs - a.time_secs).max(1e-5);
+                        let alpha = ((time_secs - a.time_secs) / span).clamp(0.0, 1.0);
+                        w = a.weight + (b.weight - a.weight) * alpha;
+                        break;
+                    }
+                }
+                w
+            };
+            out.push((track.node, track.target.clone(), w));
+        }
+        out
     }
 
     /// Returns deduplicated sorted keyframe timestamps for a specific bone or the whole clip.
@@ -118,6 +228,7 @@ impl AnimationClip {
         Self {
             name: "Idle".into(),
             duration_secs: 2.0,
+            morph_tracks: Vec::new(),
             channels: vec![BoneChannel {
                 bone_id: BoneId(1), // Torso subtle breathing
                 keyframes: vec![
@@ -150,6 +261,7 @@ impl AnimationClip {
         Self {
             name: "Walk".into(),
             duration_secs: 1.0,
+            morph_tracks: Vec::new(),
             channels: vec![
                 BoneChannel {
                     bone_id: BoneId(3), // LeftArm
@@ -226,5 +338,40 @@ mod tests {
         assert_eq!(clip.keyframe_times(Some(BoneId(4))).len(), 3);
         assert!(clip.remove_keyframe(BoneId(4), 0.5).is_some());
         assert_eq!(clip.keyframe_times(Some(BoneId(4))).len(), 2);
+    }
+
+    #[test]
+    fn morph_weight_tracks_upsert_sample_and_remove() {
+        use crate::scene::NodeId;
+
+        let node = NodeId(7);
+        let mut clip = AnimationClip::new_empty("Blink", 2.0);
+        clip.upsert_morph_weight(node, "Smile", 0.0, 0.0);
+        clip.upsert_morph_weight(node, "Smile", 1.0, 1.0);
+        clip.upsert_morph_weight(node, "Smile", 0.5, 0.5);
+        assert_eq!(clip.morph_tracks.len(), 1);
+        assert_eq!(clip.morph_tracks[0].keys.len(), 3);
+
+        // Linear interpolation between keys, clamped ends.
+        let at = |t: f32| {
+            clip.sample_morph_weights(t)
+                .into_iter()
+                .find(|(n, name, _)| *n == node && name == "Smile")
+                .map(|(_, _, w)| w)
+                .unwrap()
+        };
+        assert!((at(0.0) - 0.0).abs() < 1e-6);
+        assert!((at(0.25) - 0.25).abs() < 1e-6);
+        assert!((at(2.0) - 1.0).abs() < 1e-6);
+
+        // Overwrite within tolerance, then remove.
+        clip.upsert_morph_weight(node, "Smile", 0.5002, 0.9);
+        assert_eq!(clip.morph_tracks[0].keys.len(), 3);
+        assert_eq!(clip.remove_morph_weight(node, "Smile", 1.0), Some(1.0));
+        assert_eq!(clip.remove_morph_weight(node, "Smile", 9.9), None);
+        assert_eq!(clip.morph_tracks[0].keys.len(), 2);
+        assert_eq!(clip.remove_morph_weight(node, "Smile", 0.0), Some(0.0));
+        assert_eq!(clip.remove_morph_weight(node, "Smile", 0.5), Some(0.9));
+        assert!(clip.morph_tracks.is_empty());
     }
 }

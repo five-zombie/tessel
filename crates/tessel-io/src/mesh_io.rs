@@ -1,9 +1,12 @@
+use std::collections::BTreeMap;
 use std::fmt::Write;
 use std::fs;
 use std::path::Path;
 
 use glam::Vec3;
-use tessel_core::{Face, LowPolyMesh, MeshTexture, PaletteIndex, SceneState};
+use tessel_core::{
+    Face, LowPolyMesh, MeshTexture, MorphTarget, PaletteIndex, SceneState, VertexSkinWeights,
+};
 
 use crate::error::IoError;
 use crate::gltf::CollectedMesh;
@@ -172,6 +175,8 @@ pub fn import_obj_str(obj_text: &str, material: PaletteIndex) -> Result<LowPolyM
         normal_map: None,
         smooth_shading: false,
         material: Default::default(),
+        skin_weights: Default::default(),
+        morphs: Default::default(),
     })
 }
 
@@ -183,6 +188,8 @@ pub fn import_glb_bytes(bytes: &[u8], material: PaletteIndex) -> Result<LowPolyM
 
     let mut vertices = Vec::new();
     let mut faces = Vec::new();
+    let mut skin_weights = BTreeMap::new();
+    let mut morphs: Vec<MorphTarget> = Vec::new();
 
     for mesh in gltf.meshes() {
         for prim in mesh.primitives() {
@@ -200,6 +207,46 @@ pub fn import_glb_bytes(bytes: &[u8], material: PaletteIndex) -> Result<LowPolyM
             let added = vertices.len() - base;
             if added < 3 {
                 continue;
+            }
+            // Round-trip skinning: JOINTS_0/WEIGHTS_0 become manual overrides.
+            // All-zero rows are skipped so the auto solver still covers them.
+            if let (Some(joints), Some(weights)) = (reader.read_joints(0), reader.read_weights(0)) {
+                let joints: Vec<[u16; 4]> = joints.into_u16().collect();
+                let weights: Vec<[f32; 4]> = weights.into_f32().collect();
+                for (i, (j, w)) in joints.iter().zip(weights.iter()).enumerate() {
+                    if i >= added || !w.iter().all(|x| x.is_finite()) {
+                        continue;
+                    }
+                    if w.iter().any(|x| *x > 0.0) {
+                        skin_weights.insert(
+                            base + i,
+                            VertexSkinWeights {
+                                joints: *j,
+                                weights: *w,
+                            },
+                        );
+                    }
+                }
+            }
+            // Round-trip blend shapes: target POSITION deltas become morphs.
+            for (positions, _, _) in reader.read_morph_targets() {
+                let Some(positions) = positions else {
+                    continue;
+                };
+                let name = format!("Morph{}", morphs.len());
+                let mut map = BTreeMap::new();
+                for (i, d) in positions.enumerate() {
+                    if i >= added {
+                        break;
+                    }
+                    let v = Vec3::from_array(d);
+                    if v.is_finite() && v.length_squared() > 1e-12 {
+                        map.insert(base + i, v);
+                    }
+                }
+                if !map.is_empty() {
+                    morphs.push(MorphTarget { name, deltas: map });
+                }
             }
             let prim_uvs: Vec<[f32; 2]> = reader
                 .read_tex_coords(0)
@@ -238,6 +285,8 @@ pub fn import_glb_bytes(bytes: &[u8], material: PaletteIndex) -> Result<LowPolyM
         normal_map: None,
         smooth_shading: false,
         material: Default::default(),
+        skin_weights,
+        morphs,
     })
 }
 
@@ -343,6 +392,67 @@ mod tests {
         let (glb, _) = export_glb_bytes(&scene, ExportPreset::Godot4).unwrap();
         let imported_glb = import_glb_bytes(&glb, mat).unwrap();
         assert_eq!(imported_glb.faces.len(), 12);
+    }
+
+    #[test]
+    fn glb_roundtrip_preserves_weights_and_morphs() {
+        let mut scene = SceneState::new();
+        let mat = PaletteIndex::new(4).unwrap();
+        Command::CreatePrimitiveMesh {
+            name: "Cube".into(),
+            kind: PrimitiveKind::Cube,
+            size: 1.0,
+            material: mat,
+        }
+        .apply(&mut scene)
+        .unwrap();
+        let node_id = scene.active_lowpoly_node().unwrap();
+        Command::SetMeshVertexWeights {
+            node_id,
+            vertex_ids: vec![0, 1],
+            joints: [2, 0, 0, 0],
+            weights: [1.0, 0.0, 0.0, 0.0],
+        }
+        .apply(&mut scene)
+        .unwrap();
+        Command::AddMorphDelta {
+            node_id,
+            name: "Smile".into(),
+            vertex_ids: vec![0],
+            delta: glam::Vec3::new(0.0, 0.5, 0.0),
+        }
+        .apply(&mut scene)
+        .unwrap();
+        Command::ApplyBipedRig.apply(&mut scene).unwrap();
+
+        let (glb, _) = export_glb_bytes(&scene, ExportPreset::Godot4).unwrap();
+        let imported = import_glb_bytes(&glb, mat).unwrap();
+        // Every exported corner round-trips (manual where painted, auto
+        // solver values elsewhere); painted corners keep exact values.
+        let mesh = scene.lowpoly_meshes.get(&node_id).unwrap();
+        let tri = mesh.to_triangulated_flat();
+        assert_eq!(imported.skin_weights.len(), tri.vertices.len());
+        let painted = imported
+            .skin_weights
+            .values()
+            .filter(|w| w.joints == [2, 0, 0, 0] && w.weights == [1.0, 0.0, 0.0, 0.0])
+            .count();
+        let corners01: usize = tri
+            .source_indices
+            .iter()
+            .filter(|s| **s == 0 || **s == 1)
+            .count();
+        assert_eq!(painted, corners01);
+        for w in imported.skin_weights.values() {
+            assert!((w.weights.iter().sum::<f32>() - 1.0).abs() < 1e-5);
+        }
+        // Morph deltas survive the round trip (renamed Morph0 on import).
+        assert_eq!(imported.morphs.len(), 1);
+        let corners0: usize = tri.source_indices.iter().filter(|s| **s == 0).count();
+        assert_eq!(imported.morphs[0].deltas.len(), corners0);
+        for d in imported.morphs[0].deltas.values() {
+            assert!((d.y - 0.5).abs() < 1e-5);
+        }
     }
 
     #[test]

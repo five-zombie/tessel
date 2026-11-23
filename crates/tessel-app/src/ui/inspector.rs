@@ -9,6 +9,7 @@ use tessel_core::{
     SceneState,
 };
 
+use super::icons::{self, ToolIcon};
 use super::theme::tokens;
 
 #[derive(Default)]
@@ -126,7 +127,7 @@ fn show_palette_section(ui: &mut egui::Ui, scene: &mut SceneState, history: &mut
                 .color(tokens::ON_SURFACE),
         );
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            if ui.small_button("+ Color").clicked() {
+            if icons::hud_icon_button(ui, ToolIcon::Add, "+ Color", false) {
                 let next_raw = (1u8..=255).find(|&raw| {
                     PaletteIndex::new(raw)
                         .ok()
@@ -158,7 +159,17 @@ fn show_palette_section(ui: &mut egui::Ui, scene: &mut SceneState, history: &mut
         .map(|(idx, entry)| (*idx, entry.name.clone(), entry.color))
         .collect();
 
+    // Fixed column count derived from the inspector panel geometry
+    // (exact_width 256 minus 2x10 inner margin = 236 content): 7 columns of
+    // 24px cells + 6px gaps = 204px, leaving room for the vertical
+    // scrollbar. A static count (instead of measuring available_width)
+    // avoids a layout feedback loop where the grid forces the panel wider
+    // on the first frame. NOTE: egui Grid does NOT auto-wrap — end_row()
+    // must be called explicitly every COLS cells.
+    const COLS: usize = 7;
     egui::Grid::new("palette_swatches")
+        .num_columns(COLS)
+        .min_col_width(24.0)
         .spacing(egui::vec2(6.0, 6.0))
         .show(ui, |ui| {
             for (i, (idx, name, rgba)) in entries.into_iter().enumerate() {
@@ -184,7 +195,7 @@ fn show_palette_section(ui: &mut egui::Ui, scene: &mut SceneState, history: &mut
                 {
                     scene.active_color = idx;
                 }
-                if (i + 1) % 7 == 0 {
+                if (i + 1) % COLS == 0 {
                     ui.end_row();
                 }
             }
@@ -237,7 +248,7 @@ fn show_pixel_layers_section(
         );
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             if let Some(node_id) = scene.active_pixel_node() {
-                if ui.small_button("+ Layer").clicked() {
+                if icons::hud_icon_button(ui, ToolIcon::Add, "+ Layer", false) {
                     let frame_idx = scene
                         .pixel_canvases
                         .get(&node_id)
@@ -269,7 +280,7 @@ fn show_pixel_layers_section(
                 .size(11.5)
                 .color(tokens::ON_SURFACE_VARIANT),
         );
-        if ui.button("New 32x32 Pixel Canvas").clicked() {
+        if icons::hud_icon_button(ui, ToolIcon::Add, "New 32x32 Pixel Canvas", false) {
             let _ = history.execute(
                 scene,
                 Command::CreatePixelCanvas {
@@ -299,8 +310,12 @@ fn show_pixel_layers_section(
     if let Some((active_frame, active_layer, layers)) = snapshot {
         for (idx, layer_id, name, visible) in layers.into_iter().rev() {
             ui.horizontal(|ui| {
-                let vis_label = if visible { "On" } else { "Off" };
-                if ui.small_button(vis_label).clicked() {
+                let (vis_icon, vis_tip) = if visible {
+                    (ToolIcon::EyeOpen, "Hide layer")
+                } else {
+                    (ToolIcon::EyeClosed, "Show layer")
+                };
+                if icons::hud_icon_button(ui, vis_icon, vis_tip, false) {
                     let _ = history.execute(
                         scene,
                         Command::SetPixelLayerVisible {
@@ -345,7 +360,7 @@ fn show_character_rig_section(
                 .size(11.5)
                 .color(tokens::ON_SURFACE_VARIANT),
         );
-        if ui.button("Apply Biped Skeleton").clicked() {
+        if icons::hud_icon_button(ui, ToolIcon::BipedRig, "Apply Biped Skeleton", false) {
             let _ = history.execute(scene, Command::ApplyBipedRig);
         }
         return;
@@ -446,7 +461,7 @@ fn show_character_rig_section(
                     .color(tokens::PRIMARY),
             );
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui.small_button("Key").clicked() {
+                if icons::hud_icon_button(ui, ToolIcon::Keyframe, "Key", false) {
                     let _ = history.execute(
                         scene,
                         Command::SetAnimationKeyframe {
@@ -456,7 +471,7 @@ fn show_character_rig_section(
                         },
                     );
                 }
-                if ui.small_button("Reset").clicked() {
+                if icons::hud_icon_button(ui, ToolIcon::Reset, "Reset bone pose", false) {
                     let _ = history.execute(
                         scene,
                         Command::SetBoneRotation {
@@ -527,11 +542,14 @@ fn show_outliner_section(ui: &mut egui::Ui, scene: &mut SceneState, history: &mu
                 let _ = history.execute(scene, Command::SelectNode(Some(id)));
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui
-                    .small_button(RichText::new("×").color(tokens::ERROR))
-                    .on_hover_text("Delete node")
-                    .clicked()
-                {
+                if icons::hud_icon_button_full(
+                    ui,
+                    ToolIcon::Close,
+                    "Delete node",
+                    false,
+                    true,
+                    true,
+                ) {
                     let _ = history.execute(scene, Command::DeleteNode(id));
                 }
             });
@@ -563,7 +581,7 @@ fn show_transform_and_lighting_section(
                         .color(tokens::ON_SURFACE),
                 );
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.small_button("Reset").clicked() {
+                    if icons::hud_icon_button(ui, ToolIcon::Reset, "Reset transform", false) {
                         let _ = history.execute(
                             scene,
                             Command::SetNodeTransform {
@@ -680,7 +698,7 @@ fn show_transform_and_lighting_section(
                             .color(tokens::ON_SURFACE),
                     );
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui.small_button("Reset").clicked() {
+                        if icons::hud_icon_button(ui, ToolIcon::Reset, "Reset material", false) {
                             let _ = history.execute(
                                 scene,
                                 Command::SetMeshMaterial {
@@ -733,7 +751,8 @@ fn show_transform_and_lighting_section(
                             ("-Z", glam::Vec3::new(0.0, 0.0, -step)),
                             ("+Z", glam::Vec3::new(0.0, 0.0, step)),
                         ] {
-                            if ui.small_button(lbl).clicked() {
+                            if icons::text_icon_button(ui, lbl, &format!("Nudge face {lbl}"), false)
+                            {
                                 let _ = history.execute(
                                     scene,
                                     Command::TranslateMeshFace {
@@ -784,19 +803,24 @@ fn show_direct_ai_section(ui: &mut egui::Ui, scene: &SceneState, ai_state: &mut 
     );
     ui.add_space(4.0);
 
-    ui.horizontal_wrapped(|ui| {
-        for provider in AiProviderKind::ALL {
-            if ui
-                .selectable_label(ai_state.config.provider == provider, provider.label())
-                .clicked()
-            {
-                ai_state.config.provider = provider;
-                ai_state.config.model = provider.default_model().into();
-                ai_state.config.base_url = provider.default_base_url().into();
-                ai_state.config.api_key = crate::settings::load_api_key_from_keyring(provider);
-            }
-        }
-    });
+    egui::ScrollArea::horizontal()
+        .id_salt("direct_ai_providers")
+        .show(ui, |ui| {
+            ui.horizontal(|ui| {
+                for provider in AiProviderKind::ALL {
+                    if ui
+                        .selectable_label(ai_state.config.provider == provider, provider.label())
+                        .clicked()
+                    {
+                        ai_state.config.provider = provider;
+                        ai_state.config.model = provider.default_model().into();
+                        ai_state.config.base_url = provider.default_base_url().into();
+                        ai_state.config.api_key =
+                            crate::settings::load_api_key_from_keyring(provider);
+                    }
+                }
+            });
+        });
 
     ui.add_space(4.0);
     ui.horizontal(|ui| {
@@ -815,7 +839,7 @@ fn show_direct_ai_section(ui: &mut egui::Ui, scene: &SceneState, ai_state: &mut 
                     .color(tokens::ON_SURFACE_VARIANT),
             );
             ui.add(egui::TextEdit::singleline(&mut ai_state.config.api_key).password(true));
-            if ui.small_button("Save").clicked() {
+            if icons::hud_icon_button(ui, ToolIcon::Save, "Save API key", false) {
                 if let Err(err) = crate::settings::save_api_key_to_keyring(
                     ai_state.config.provider,
                     &ai_state.config.api_key,
@@ -837,10 +861,7 @@ fn show_direct_ai_section(ui: &mut egui::Ui, scene: &SceneState, ai_state: &mut 
     let busy = ai_state.pending.is_some();
     let can_send = !busy && !ai_state.prompt.trim().is_empty();
     ui.horizontal(|ui| {
-        if ui
-            .add_enabled(can_send, egui::Button::new("Send Prompt"))
-            .clicked()
-        {
+        if icons::hud_icon_button_enabled(ui, ToolIcon::Send, "Send Prompt", false, can_send) {
             let (tx, rx) = mpsc::channel();
             let config = ai_state.config.clone();
             let scene_clone = scene.clone();
@@ -860,7 +881,7 @@ fn show_direct_ai_section(ui: &mut egui::Ui, scene: &SceneState, ai_state: &mut 
                 let _ = tx.send(res);
             });
         }
-        if busy && ui.button("Cancel").clicked() {
+        if busy && icons::hud_icon_button(ui, ToolIcon::Close, "Cancel", false) {
             ai_state.pending = None;
         }
     });
@@ -886,6 +907,56 @@ fn show_direct_ai_section(ui: &mut egui::Ui, scene: &SceneState, ai_state: &mut 
             RichText::new("Enter a prompt to collaborate with Direct AI, or run `tessel mcp` for external agents.")
                 .size(11.0)
                 .color(tokens::ON_SURFACE_VARIANT),
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Regression test: with enough swatches to force the vertical scrollbar
+    /// (which steals panel width), no painted shape may extend past the panel
+    /// edge — i.e. the swatch grid truly fits instead of clipping.
+    #[test]
+    fn palette_grid_never_overflows_panel() {
+        let mut scene = SceneState::default();
+        for raw in 9u8..=48 {
+            if let Ok(idx) = PaletteIndex::new(raw) {
+                scene.palette.set(
+                    idx,
+                    PaletteEntry::matte(format!("Test {raw}"), Rgba8::rgb(raw, raw, 200)),
+                );
+            }
+        }
+        let mut history = HistoryStack::new();
+
+        let ctx = egui::Context::default();
+        let raw_input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1280.0, 600.0),
+            )),
+            ..Default::default()
+        };
+        let out = ctx.run(raw_input, |ctx| {
+            egui::SidePanel::right("test_inspector")
+                .exact_width(256.0)
+                .resizable(false)
+                .show(ctx, |ui| {
+                    egui::ScrollArea::vertical().show(ui, |ui| {
+                        show_palette_section(ui, &mut scene, &mut history);
+                    });
+                });
+        });
+        let right_edge = 1280.0;
+        let mut max_x = 0.0f32;
+        for s in &out.shapes {
+            max_x = max_x.max(s.shape.visual_bounding_rect().max.x);
+        }
+        assert!(
+            max_x <= right_edge + 0.5,
+            "palette paints past the panel edge: max_x={max_x}"
         );
     }
 }

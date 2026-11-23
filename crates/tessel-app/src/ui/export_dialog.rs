@@ -4,6 +4,7 @@ use egui::{CornerRadius, RichText};
 use tessel_core::SceneState;
 use tessel_io::{export_scene_to_dir, ExportFormat, ExportPreset};
 
+use super::icons::{self, ToolIcon};
 use super::theme::tokens;
 
 pub struct ExportDialogState {
@@ -130,7 +131,7 @@ pub fn show_export_dialog(ctx: &egui::Context, scene: &SceneState, state: &mut E
                         }
                     }
                 }
-                if ui.button("Close").clicked() {
+                if icons::hud_icon_button(ui, ToolIcon::Close, "Close", false) {
                     state.open = false;
                 }
             });
