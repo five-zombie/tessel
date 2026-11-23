@@ -1,7 +1,7 @@
 use glam::Quat;
 use serde::{Deserialize, Serialize};
 
-use crate::character::{BoneId, CharacterRig, SkinBinding};
+use crate::character::{AnimationClip, BoneId, CharacterRig, Keyframe, SkinBinding};
 use crate::error::CoreError;
 use crate::mesh::{ops as mesh_ops, FaceId, LowPolyMesh, PrimitiveKind};
 use crate::palette::{PaletteEntry, PaletteIndex};
@@ -108,6 +108,20 @@ pub enum Command {
         node_id: NodeId,
         bone_id: Option<BoneId>,
     },
+    AddAnimationClip {
+        name: String,
+        duration_secs: f32,
+    },
+    SetAnimationKeyframe {
+        clip_index: usize,
+        bone_id: BoneId,
+        keyframe: Keyframe,
+    },
+    RemoveAnimationKeyframe {
+        clip_index: usize,
+        bone_id: BoneId,
+        time_secs: f32,
+    },
     Transaction(Vec<Command>),
 }
 
@@ -177,6 +191,14 @@ pub enum UndoDelta {
     RestoreNodeBoneBinding {
         node_id: NodeId,
         previous: Option<BoneId>,
+    },
+    PopAnimationClip {
+        previous_active: usize,
+        previous_time: f32,
+    },
+    RestoreAnimationClip {
+        clip_index: usize,
+        previous: AnimationClip,
     },
     Transaction(Vec<UndoDelta>),
 }
@@ -641,6 +663,72 @@ impl Command {
                     previous,
                 }
             }
+            Self::AddAnimationClip {
+                name,
+                duration_secs,
+            } => {
+                let rig = scene
+                    .character_rig
+                    .as_mut()
+                    .ok_or(CoreError::CharacterRigNotFound)?;
+                let previous_active = rig.active_animation;
+                let previous_time = rig.playback_time;
+                rig.animations
+                    .push(AnimationClip::new_empty(name.clone(), *duration_secs));
+                rig.active_animation = rig.animations.len().saturating_sub(1);
+                rig.playback_time = 0.0;
+                rig.playing = false;
+                UndoDelta::PopAnimationClip {
+                    previous_active,
+                    previous_time,
+                }
+            }
+            Self::SetAnimationKeyframe {
+                clip_index,
+                bone_id,
+                keyframe,
+            } => {
+                if !keyframe.time_secs.is_finite() || keyframe.time_secs < 0.0 {
+                    return Err(CoreError::OutOfBounds);
+                }
+                let rig = scene
+                    .character_rig
+                    .as_mut()
+                    .ok_or(CoreError::CharacterRigNotFound)?;
+                if rig.bone(*bone_id).is_none() {
+                    return Err(CoreError::OutOfBounds);
+                }
+                let clip = rig
+                    .animations
+                    .get_mut(*clip_index)
+                    .ok_or(CoreError::OutOfBounds)?;
+                let previous = clip.clone();
+                clip.upsert_keyframe(*bone_id, *keyframe);
+                UndoDelta::RestoreAnimationClip {
+                    clip_index: *clip_index,
+                    previous,
+                }
+            }
+            Self::RemoveAnimationKeyframe {
+                clip_index,
+                bone_id,
+                time_secs,
+            } => {
+                let rig = scene
+                    .character_rig
+                    .as_mut()
+                    .ok_or(CoreError::CharacterRigNotFound)?;
+                let clip = rig
+                    .animations
+                    .get_mut(*clip_index)
+                    .ok_or(CoreError::OutOfBounds)?;
+                let previous = clip.clone();
+                clip.remove_keyframe(*bone_id, *time_secs);
+                UndoDelta::RestoreAnimationClip {
+                    clip_index: *clip_index,
+                    previous,
+                }
+            }
             Self::Transaction(commands) => {
                 if commands.is_empty() {
                     return Err(CoreError::EmptyTransaction);
@@ -835,6 +923,37 @@ impl UndoDelta {
                         node_id: *node_id,
                         bone_id: *bid,
                     });
+                }
+            }
+            Self::PopAnimationClip {
+                previous_active,
+                previous_time,
+            } => {
+                let rig = scene
+                    .character_rig
+                    .as_mut()
+                    .ok_or(CoreError::CharacterRigNotFound)?;
+                rig.animations.pop();
+                rig.active_animation =
+                    (*previous_active).min(rig.animations.len().saturating_sub(1));
+                rig.playback_time = *previous_time;
+                rig.apply_active_animation();
+            }
+            Self::RestoreAnimationClip {
+                clip_index,
+                previous,
+            } => {
+                let rig = scene
+                    .character_rig
+                    .as_mut()
+                    .ok_or(CoreError::CharacterRigNotFound)?;
+                let clip = rig
+                    .animations
+                    .get_mut(*clip_index)
+                    .ok_or(CoreError::OutOfBounds)?;
+                *clip = previous.clone();
+                if rig.active_animation == *clip_index {
+                    rig.apply_active_animation();
                 }
             }
             Self::Transaction(deltas) => {

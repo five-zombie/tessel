@@ -5,7 +5,8 @@ use egui::{Color32, CornerRadius, Frame, Margin, RichText, Stroke};
 use tessel_ai::direct::DirectAiResponse;
 use tessel_ai::{AiProviderKind, DirectAiConfig};
 use tessel_core::{
-    AppMode, Command, FrameIndex, HistoryStack, PaletteEntry, PaletteIndex, Rgba8, SceneState,
+    AppMode, Command, FrameIndex, HistoryStack, Keyframe, PaletteEntry, PaletteIndex, Rgba8,
+    SceneState,
 };
 
 use super::theme::tokens;
@@ -353,8 +354,17 @@ fn show_character_rig_section(
     let bones: Vec<_> = rig
         .bones
         .iter()
-        .map(|b| (b.id, b.name.clone(), b.pose_local.rotation))
+        .map(|b| {
+            (
+                b.id,
+                b.name.clone(),
+                b.rest_local.rotation,
+                b.pose_local.rotation,
+            )
+        })
         .collect();
+    let active_clip = rig.active_animation;
+    let playback_time = rig.playback_time;
     let current_binding = scene.selected_node.and_then(|nid| {
         rig.bindings
             .iter()
@@ -382,7 +392,7 @@ fn show_character_rig_section(
                         },
                     );
                 }
-                for (bid, bname, _) in &bones {
+                for (bid, bname, _, _) in &bones {
                     if ui
                         .selectable_label(current_binding == Some(*bid), bname)
                         .clicked()
@@ -401,30 +411,88 @@ fn show_character_rig_section(
         }
     }
 
-    for (bone_id, name, rot) in bones {
-        let (mut rx, mut ry, mut rz) = rot.to_euler(glam::EulerRot::XYZ);
-        ui.collapsing(name, |ui| {
-            let mut changed = false;
-            changed |= ui
-                .add(egui::Slider::new(&mut rx, -1.5..=1.5).text("Pitch"))
-                .changed();
-            changed |= ui
-                .add(egui::Slider::new(&mut ry, -1.5..=1.5).text("Yaw"))
-                .changed();
-            changed |= ui
-                .add(egui::Slider::new(&mut rz, -1.5..=1.5).text("Roll"))
-                .changed();
-            if changed {
-                let next_rot = glam::Quat::from_euler(glam::EulerRot::XYZ, rx, ry, rz);
-                let _ = history.execute(
-                    scene,
-                    Command::SetBoneRotation {
-                        bone_id,
-                        rotation: next_rot,
-                    },
-                );
+    ui.label(
+        RichText::new("Pose Editor (Degrees)")
+            .size(11.0)
+            .color(tokens::ON_SURFACE_VARIANT),
+    );
+    ui.horizontal_wrapped(|ui| {
+        for (bid, bname, _, _) in &bones {
+            let selected = scene.selected_bone == Some(*bid);
+            if ui.selectable_label(selected, bname).clicked() {
+                scene.selected_bone = Some(*bid);
             }
+        }
+    });
+    ui.add_space(4.0);
+
+    let active_bone = scene
+        .selected_bone
+        .and_then(|bid| bones.iter().find(|(id, ..)| *id == bid))
+        .or_else(|| bones.first());
+
+    if let Some((bone_id, name, rest_rot, pose_rot)) = active_bone.cloned() {
+        let delta_rot = rest_rot.inverse() * pose_rot;
+        let (rx, ry, rz) = delta_rot.to_euler(glam::EulerRot::XYZ);
+        let mut rx_deg = rx.to_degrees();
+        let mut ry_deg = ry.to_degrees();
+        let mut rz_deg = rz.to_degrees();
+
+        ui.horizontal(|ui| {
+            ui.label(
+                RichText::new(format!("Bone: {name}"))
+                    .strong()
+                    .size(11.5)
+                    .color(tokens::PRIMARY),
+            );
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.small_button("Key").clicked() {
+                    let _ = history.execute(
+                        scene,
+                        Command::SetAnimationKeyframe {
+                            clip_index: active_clip,
+                            bone_id,
+                            keyframe: Keyframe::rotation_only(playback_time, delta_rot),
+                        },
+                    );
+                }
+                if ui.small_button("Reset").clicked() {
+                    let _ = history.execute(
+                        scene,
+                        Command::SetBoneRotation {
+                            bone_id,
+                            rotation: rest_rot,
+                        },
+                    );
+                }
+            });
         });
+
+        let mut changed = false;
+        changed |= ui
+            .add(egui::Slider::new(&mut rx_deg, -180.0..=180.0).text("Pitch"))
+            .changed();
+        changed |= ui
+            .add(egui::Slider::new(&mut ry_deg, -180.0..=180.0).text("Yaw"))
+            .changed();
+        changed |= ui
+            .add(egui::Slider::new(&mut rz_deg, -180.0..=180.0).text("Roll"))
+            .changed();
+        if changed {
+            let next_delta = glam::Quat::from_euler(
+                glam::EulerRot::XYZ,
+                rx_deg.to_radians(),
+                ry_deg.to_radians(),
+                rz_deg.to_radians(),
+            );
+            let _ = history.execute(
+                scene,
+                Command::SetBoneRotation {
+                    bone_id,
+                    rotation: rest_rot * next_delta,
+                },
+            );
+        }
     }
 }
 

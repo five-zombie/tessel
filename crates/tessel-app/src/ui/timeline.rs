@@ -1,12 +1,12 @@
 use egui::{CornerRadius, Frame, Margin, RichText, Stroke};
-use tessel_core::{AppMode, Command, FrameIndex, HistoryStack, SceneState};
+use tessel_core::{AppMode, Command, FrameIndex, HistoryStack, Keyframe, SceneState};
 
 use super::theme::tokens;
 
 pub fn show_timeline(ctx: &egui::Context, scene: &mut SceneState, history: &mut HistoryStack) {
     match scene.active_mode {
         AppMode::Pixel => show_pixel_timeline(ctx, scene, history),
-        AppMode::Character => show_character_timeline(ctx, scene),
+        AppMode::Character => show_character_timeline(ctx, scene, history),
         AppMode::Voxel | AppMode::LowPoly => {}
     }
 }
@@ -86,7 +86,11 @@ fn show_pixel_timeline(ctx: &egui::Context, scene: &mut SceneState, history: &mu
         });
 }
 
-fn show_character_timeline(ctx: &egui::Context, scene: &mut SceneState) {
+fn show_character_timeline(
+    ctx: &egui::Context,
+    scene: &mut SceneState,
+    history: &mut HistoryStack,
+) {
     let Some(rig) = scene.character_rig.as_mut() else {
         return;
     };
@@ -104,13 +108,16 @@ fn show_character_timeline(ctx: &egui::Context, scene: &mut SceneState) {
         .stroke(Stroke::new(1.0, tokens::OUTLINE_VARIANT));
 
     let mut modified = false;
+    let mut pending_cmd: Option<Command> = None;
+
     egui::TopBottomPanel::bottom("tessel_character_timeline")
-        .exact_height(38.0)
+        .exact_height(42.0)
         .frame(frame)
         .show(ctx, |ui| {
             let Some(rig) = scene.character_rig.as_mut() else {
                 return;
             };
+            let selected_bone = scene.selected_bone;
             ui.horizontal_centered(|ui| {
                 let play_label = if rig.playing { "Pause" } else { "Play" };
                 if ui.small_button(play_label).clicked() {
@@ -131,6 +138,12 @@ fn show_character_timeline(ctx: &egui::Context, scene: &mut SceneState) {
                         modified = true;
                     }
                 }
+                if ui.small_button("+ Clip").clicked() {
+                    pending_cmd = Some(Command::AddAnimationClip {
+                        name: format!("Clip {}", rig.animations.len() + 1),
+                        duration_secs: 2.0,
+                    });
+                }
                 ui.separator();
 
                 let duration = rig
@@ -145,9 +158,98 @@ fn show_character_timeline(ctx: &egui::Context, scene: &mut SceneState) {
                     rig.apply_active_animation();
                     modified = true;
                 }
+                ui.separator();
+
+                if ui.small_button("+ Key").clicked() {
+                    let clip_index = rig.active_animation;
+                    let t = rig.playback_time;
+                    let targets: Vec<_> = match selected_bone {
+                        Some(bid) => rig
+                            .bone(bid)
+                            .map(|b| {
+                                vec![(
+                                    b.id,
+                                    b.rest_local.rotation.inverse() * b.pose_local.rotation,
+                                )]
+                            })
+                            .unwrap_or_default(),
+                        None => rig
+                            .bones
+                            .iter()
+                            .map(|b| {
+                                (
+                                    b.id,
+                                    b.rest_local.rotation.inverse() * b.pose_local.rotation,
+                                )
+                            })
+                            .collect(),
+                    };
+                    if targets.len() == 1 {
+                        let (bone_id, delta_rot) = targets[0];
+                        pending_cmd = Some(Command::SetAnimationKeyframe {
+                            clip_index,
+                            bone_id,
+                            keyframe: Keyframe::rotation_only(t, delta_rot),
+                        });
+                    } else if targets.len() > 1 {
+                        pending_cmd = Some(Command::Transaction(
+                            targets
+                                .into_iter()
+                                .map(|(bone_id, delta_rot)| Command::SetAnimationKeyframe {
+                                    clip_index,
+                                    bone_id,
+                                    keyframe: Keyframe::rotation_only(t, delta_rot),
+                                })
+                                .collect(),
+                        ));
+                    }
+                }
+
+                if ui.small_button("- Key").clicked() {
+                    let clip_index = rig.active_animation;
+                    let t = rig.playback_time;
+                    if let Some(bone_id) = selected_bone {
+                        pending_cmd = Some(Command::RemoveAnimationKeyframe {
+                            clip_index,
+                            bone_id,
+                            time_secs: t,
+                        });
+                    } else if let Some(clip) = rig.animations.get(clip_index) {
+                        let cmds: Vec<_> = clip
+                            .channels
+                            .iter()
+                            .map(|ch| Command::RemoveAnimationKeyframe {
+                                clip_index,
+                                bone_id: ch.bone_id,
+                                time_secs: t,
+                            })
+                            .collect();
+                        if !cmds.is_empty() {
+                            pending_cmd = Some(Command::Transaction(cmds));
+                        }
+                    }
+                }
+
+                if let Some(clip) = rig.animations.get(rig.active_animation) {
+                    let times = clip.keyframe_times(selected_bone);
+                    if !times.is_empty() {
+                        ui.separator();
+                        for kt in times {
+                            let active = (rig.playback_time - kt).abs() <= 0.02;
+                            if ui.selectable_label(active, format!("{kt:.2}s")).clicked() {
+                                rig.playback_time = kt;
+                                rig.apply_active_animation();
+                                modified = true;
+                            }
+                        }
+                    }
+                }
             });
         });
-    if modified {
+
+    if let Some(cmd) = pending_cmd {
+        let _ = history.execute(scene, cmd);
+    } else if modified {
         scene.mark_modified();
     }
 }

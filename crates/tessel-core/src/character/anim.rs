@@ -18,6 +18,72 @@ pub struct AnimationClip {
 }
 
 impl AnimationClip {
+    pub fn new_empty(name: impl Into<String>, duration_secs: f32) -> Self {
+        Self {
+            name: name.into(),
+            duration_secs: duration_secs.max(0.1),
+            channels: Vec::new(),
+        }
+    }
+
+    /// Inserts or replaces a keyframe (within 1ms tolerance) for `bone_id`, keeping timestamps sorted.
+    pub fn upsert_keyframe(&mut self, bone_id: BoneId, keyframe: Keyframe) {
+        let time = keyframe.time_secs.max(0.0);
+        let kf = Keyframe {
+            time_secs: time,
+            ..keyframe
+        };
+        if time > self.duration_secs {
+            self.duration_secs = time;
+        }
+        if let Some(channel) = self.channels.iter_mut().find(|c| c.bone_id == bone_id) {
+            if let Some(existing) = channel
+                .keyframes
+                .iter_mut()
+                .find(|k| (k.time_secs - time).abs() <= 1e-3)
+            {
+                *existing = kf;
+            } else {
+                channel.keyframes.push(kf);
+                channel
+                    .keyframes
+                    .sort_by(|a, b| a.time_secs.total_cmp(&b.time_secs));
+            }
+        } else {
+            self.channels.push(BoneChannel {
+                bone_id,
+                keyframes: vec![kf],
+            });
+        }
+    }
+
+    /// Removes the keyframe matching `time_secs` (within 1ms tolerance) for `bone_id`.
+    pub fn remove_keyframe(&mut self, bone_id: BoneId, time_secs: f32) -> Option<Keyframe> {
+        let ch_idx = self.channels.iter().position(|c| c.bone_id == bone_id)?;
+        let kf_idx = self.channels[ch_idx]
+            .keyframes
+            .iter()
+            .position(|k| (k.time_secs - time_secs).abs() <= 1e-3)?;
+        let removed = self.channels[ch_idx].keyframes.remove(kf_idx);
+        if self.channels[ch_idx].keyframes.is_empty() {
+            self.channels.remove(ch_idx);
+        }
+        Some(removed)
+    }
+
+    /// Returns deduplicated sorted keyframe timestamps for a specific bone or the whole clip.
+    pub fn keyframe_times(&self, bone_id: Option<BoneId>) -> Vec<f32> {
+        let mut times: Vec<f32> = self
+            .channels
+            .iter()
+            .filter(|c| bone_id.is_none_or(|bid| c.bone_id == bid))
+            .flat_map(|c| c.keyframes.iter().map(|k| k.time_secs))
+            .collect();
+        times.sort_by(f32::total_cmp);
+        times.dedup_by(|a, b| (*a - *b).abs() <= 1e-3);
+        times
+    }
+
     pub fn sample_bone(&self, bone_id: BoneId, time_secs: f32) -> Option<Keyframe> {
         let channel = self.channels.iter().find(|c| c.bone_id == bone_id)?;
         if channel.keyframes.is_empty() {
@@ -136,5 +202,29 @@ mod tests {
         let mats = rig.world_pose_matrices();
         assert_eq!(mats.len(), 7);
         assert!(mats[&BoneId(5)].is_finite());
+    }
+
+    #[test]
+    fn upsert_and_remove_keyframes_maintain_sorted_order() {
+        let mut clip = AnimationClip::new_empty("Wave", 1.0);
+        clip.upsert_keyframe(
+            BoneId(4),
+            Keyframe::rotation_only(1.5, Quat::from_rotation_z(0.8)),
+        );
+        clip.upsert_keyframe(BoneId(4), Keyframe::rotation_only(0.0, Quat::IDENTITY));
+        clip.upsert_keyframe(
+            BoneId(4),
+            Keyframe::rotation_only(0.5, Quat::from_rotation_z(1.2)),
+        );
+        // Overwrite existing 0.5s keyframe within tolerance
+        clip.upsert_keyframe(
+            BoneId(4),
+            Keyframe::rotation_only(0.5002, Quat::from_rotation_z(1.0)),
+        );
+
+        assert!((clip.duration_secs - 1.5).abs() < 1e-5);
+        assert_eq!(clip.keyframe_times(Some(BoneId(4))).len(), 3);
+        assert!(clip.remove_keyframe(BoneId(4), 0.5).is_some());
+        assert_eq!(clip.keyframe_times(Some(BoneId(4))).len(), 2);
     }
 }

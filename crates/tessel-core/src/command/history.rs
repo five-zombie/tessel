@@ -374,5 +374,63 @@ mod tests {
         assert_eq!(scene.character_rig.as_ref().unwrap().bindings.len(), 1);
         history.undo(&mut scene).unwrap();
         assert!(scene.character_rig.as_ref().unwrap().bindings.is_empty());
+
+        // Custom animation clip + keyframe authoring undo/redo
+        history
+            .execute(
+                &mut scene,
+                Command::AddAnimationClip {
+                    name: "Attack".into(),
+                    duration_secs: 1.5,
+                },
+            )
+            .unwrap();
+        let clip_idx = scene.character_rig.as_ref().unwrap().active_animation;
+        assert_eq!(clip_idx, 2);
+
+        history
+            .execute(
+                &mut scene,
+                Command::SetAnimationKeyframe {
+                    clip_index: clip_idx,
+                    bone_id: BoneId(4),
+                    keyframe: crate::character::Keyframe::rotation_only(
+                        0.5,
+                        Quat::from_rotation_x(0.8),
+                    ),
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            scene.character_rig.as_ref().unwrap().animations[clip_idx]
+                .keyframe_times(Some(BoneId(4)))
+                .len(),
+            1
+        );
+
+        history
+            .execute(
+                &mut scene,
+                Command::RemoveAnimationKeyframe {
+                    clip_index: clip_idx,
+                    bone_id: BoneId(4),
+                    time_secs: 0.5,
+                },
+            )
+            .unwrap();
+        assert!(scene.character_rig.as_ref().unwrap().animations[clip_idx]
+            .keyframe_times(Some(BoneId(4)))
+            .is_empty());
+
+        history.undo(&mut scene).unwrap();
+        assert_eq!(
+            scene.character_rig.as_ref().unwrap().animations[clip_idx]
+                .keyframe_times(Some(BoneId(4)))
+                .len(),
+            1
+        );
+        history.undo(&mut scene).unwrap();
+        history.undo(&mut scene).unwrap();
+        assert_eq!(scene.character_rig.as_ref().unwrap().animations.len(), 2);
     }
 }

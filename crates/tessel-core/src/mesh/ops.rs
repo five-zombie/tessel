@@ -335,7 +335,7 @@ pub fn voxel_to_lowpoly(volume: &VoxelVolume, unit_scale: f32) -> LowPolyMesh {
         ]
     };
 
-    for tri in greedy.indices.chunks_exact(3) {
+    for tri in greedy.indices.as_chunks::<3>().0 {
         let mut face_verts = Vec::with_capacity(3);
         let mat = greedy.vertices[tri[0] as usize].palette_index;
         for &idx in tri {

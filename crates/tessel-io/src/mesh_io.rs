@@ -23,7 +23,7 @@ pub fn export_obj_string(
     for uv in &mesh.uvs {
         let _ = writeln!(out, "vt {:.6} {:.6}", uv[0], uv[1]);
     }
-    for tri in mesh.indices.chunks_exact(3) {
+    for tri in mesh.indices.as_chunks::<3>().0 {
         let a = tri[0] + 1;
         let b = tri[1] + 1;
         let c = tri[2] + 1;
@@ -48,7 +48,7 @@ pub fn export_stl_bytes(
     out.extend_from_slice(&header);
     out.extend_from_slice(&(tri_count as u32).to_le_bytes());
 
-    for tri in mesh.indices.chunks_exact(3) {
+    for tri in mesh.indices.as_chunks::<3>().0 {
         let p0 = mesh.positions[tri[0] as usize];
         let p1 = mesh.positions[tri[1] as usize];
         let p2 = mesh.positions[tri[2] as usize];

@@ -148,7 +148,12 @@ impl PixelCanvas {
         let mut rgba = self.composite_frame_rgba(self.active_frame, palette);
         if self.onion_skin && self.active_frame > 0 {
             let prev = self.composite_frame_rgba(self.active_frame - 1, palette);
-            for (dst, src) in rgba.chunks_exact_mut(4).zip(prev.chunks_exact(4)) {
+            for (dst, src) in rgba
+                .as_chunks_mut::<4>()
+                .0
+                .iter_mut()
+                .zip(prev.as_chunks::<4>().0)
+            {
                 if dst[3] == 0 && src[3] > 0 {
                     dst[0] = (u16::from(src[0]) / 2) as u8;
                     dst[1] = (u16::from(src[1]) * 3 / 4) as u8;

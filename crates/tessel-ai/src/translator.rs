@@ -3,7 +3,8 @@ use std::path::Path;
 use serde_json::{json, Value};
 use tessel_core::voxel::ops as voxel_ops;
 use tessel_core::{
-    AppMode, Command, HistoryStack, NodeId, PaletteIndex, PrimitiveKind, SceneState, VoxelCoord,
+    AppMode, BoneId, Command, HistoryStack, Keyframe, NodeId, PaletteIndex, PrimitiveKind,
+    SceneState, VoxelCoord,
 };
 use tessel_io::{export_scene_to_dir, ExportFormat, ExportPreset};
 
@@ -44,6 +45,36 @@ fn parse_ivec3(val: &Value, field: &str) -> Result<VoxelCoord, AiError> {
     let c = VoxelCoord::new(x, y, z);
     check_coord(c)?;
     Ok(c)
+}
+
+fn parse_rotation_deg(val: &Value) -> Result<glam::Quat, AiError> {
+    let arr = val
+        .get("rotation_deg")
+        .and_then(Value::as_array)
+        .ok_or_else(|| AiError::InvalidArguments("missing array 'rotation_deg'".into()))?;
+    if arr.len() != 3 {
+        return Err(AiError::InvalidArguments(
+            "'rotation_deg' must have 3 numbers [pitch, yaw, roll]".into(),
+        ));
+    }
+    let rx = arr[0]
+        .as_f64()
+        .ok_or_else(|| AiError::InvalidArguments("'rotation_deg[0]' must be number".into()))?
+        as f32;
+    let ry = arr[1]
+        .as_f64()
+        .ok_or_else(|| AiError::InvalidArguments("'rotation_deg[1]' must be number".into()))?
+        as f32;
+    let rz = arr[2]
+        .as_f64()
+        .ok_or_else(|| AiError::InvalidArguments("'rotation_deg[2]' must be number".into()))?
+        as f32;
+    Ok(glam::Quat::from_euler(
+        glam::EulerRot::XYZ,
+        rx.to_radians(),
+        ry.to_radians(),
+        rz.to_radians(),
+    ))
 }
 
 fn parse_palette_index(val: &Value, default: u8) -> Result<PaletteIndex, AiError> {
@@ -215,6 +246,94 @@ pub fn execute_tool_call(
             history.execute(scene, Command::ApplyBipedRig)?;
             Ok(json!({ "ok": true, "bones": 7 }))
         }
+        "character_set_bone_pose" => {
+            let raw_id = args
+                .get("bone_id")
+                .and_then(Value::as_u64)
+                .ok_or_else(|| AiError::InvalidArguments("missing 'bone_id'".into()))?;
+            let bone_id = BoneId(
+                u32::try_from(raw_id)
+                    .map_err(|_| AiError::InvalidArguments("bone_id overflow".into()))?,
+            );
+            let delta = parse_rotation_deg(args)?;
+            let rest = scene
+                .character_rig
+                .as_ref()
+                .and_then(|r| r.bone(bone_id))
+                .map(|b| b.rest_local.rotation)
+                .unwrap_or(glam::Quat::IDENTITY);
+            history.execute(
+                scene,
+                Command::SetBoneRotation {
+                    bone_id,
+                    rotation: rest * delta,
+                },
+            )?;
+            Ok(json!({ "ok": true, "bone_id": bone_id.0 }))
+        }
+        "character_set_keyframe" => {
+            let raw_id = args
+                .get("bone_id")
+                .and_then(Value::as_u64)
+                .ok_or_else(|| AiError::InvalidArguments("missing 'bone_id'".into()))?;
+            let bone_id = BoneId(
+                u32::try_from(raw_id)
+                    .map_err(|_| AiError::InvalidArguments("bone_id overflow".into()))?,
+            );
+            let time_secs = args
+                .get("time_secs")
+                .and_then(Value::as_f64)
+                .ok_or_else(|| AiError::InvalidArguments("missing 'time_secs'".into()))?
+                as f32;
+            let rotation = parse_rotation_deg(args)?;
+            let clip_index = if let Some(idx) = args.get("clip_index").and_then(Value::as_u64) {
+                idx as usize
+            } else if let Some(name) = args.get("clip_name").and_then(Value::as_str) {
+                let existing = scene
+                    .character_rig
+                    .as_ref()
+                    .and_then(|r| r.animations.iter().position(|c| c.name == name));
+                if let Some(i) = existing {
+                    i
+                } else {
+                    let duration_secs = args
+                        .get("duration_secs")
+                        .and_then(Value::as_f64)
+                        .unwrap_or(2.0) as f32;
+                    history.execute(
+                        scene,
+                        Command::AddAnimationClip {
+                            name: name.to_string(),
+                            duration_secs,
+                        },
+                    )?;
+                    scene
+                        .character_rig
+                        .as_ref()
+                        .map_or(0, |r| r.animations.len().saturating_sub(1))
+                }
+            } else {
+                scene
+                    .character_rig
+                    .as_ref()
+                    .map_or(0, |r| r.active_animation)
+            };
+
+            history.execute(
+                scene,
+                Command::SetAnimationKeyframe {
+                    clip_index,
+                    bone_id,
+                    keyframe: Keyframe::rotation_only(time_secs, rotation),
+                },
+            )?;
+            Ok(json!({
+                "ok": true,
+                "clip_index": clip_index,
+                "bone_id": bone_id.0,
+                "time_secs": time_secs
+            }))
+        }
         "project_export" => {
             let filename = args
                 .get("filename")
@@ -284,11 +403,31 @@ pub fn scene_summary_json(scene: &SceneState) -> Value {
         })
         .collect();
 
+    let animations: Vec<Value> = scene
+        .character_rig
+        .as_ref()
+        .map(|rig| {
+            rig.animations
+                .iter()
+                .enumerate()
+                .map(|(i, c)| {
+                    json!({
+                        "index": i,
+                        "name": c.name,
+                        "duration_secs": c.duration_secs,
+                        "channels": c.channels.len()
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
     json!({
         "active_mode": scene.active_mode.label(),
         "revision": scene.revision,
         "selected_node": scene.selected_node.map(|n| n.0),
         "has_character_rig": scene.character_rig.is_some(),
+        "animations": animations,
         "nodes": nodes
     })
 }
@@ -306,4 +445,52 @@ pub fn palette_summary_json(scene: &SceneState) -> Value {
         })
         .collect();
     json!({ "colors": colors })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ai_tools_pose_and_keyframe_character_rig() {
+        let mut scene = SceneState::new();
+        let mut history = HistoryStack::new();
+        let dir = std::env::temp_dir();
+
+        execute_tool_call(
+            "character_apply_biped_rig",
+            &json!({}),
+            &mut scene,
+            &mut history,
+            &dir,
+        )
+        .unwrap();
+        execute_tool_call(
+            "character_set_bone_pose",
+            &json!({ "bone_id": 4, "rotation_deg": [0.0, 0.0, 45.0] }),
+            &mut scene,
+            &mut history,
+            &dir,
+        )
+        .unwrap();
+        execute_tool_call(
+            "character_set_keyframe",
+            &json!({
+                "clip_name": "Wave",
+                "duration_secs": 1.0,
+                "bone_id": 4,
+                "time_secs": 0.5,
+                "rotation_deg": [0.0, 0.0, 90.0]
+            }),
+            &mut scene,
+            &mut history,
+            &dir,
+        )
+        .unwrap();
+
+        let rig = scene.character_rig.as_ref().unwrap();
+        assert_eq!(rig.animations.len(), 3);
+        assert_eq!(rig.animations[2].name, "Wave");
+        assert_eq!(rig.animations[2].keyframe_times(Some(BoneId(4))), vec![0.5]);
+    }
 }
