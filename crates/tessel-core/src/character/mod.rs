@@ -6,7 +6,8 @@ mod rig;
 mod skin;
 
 pub use anim::{
-    AnimationClip, BoneChannel, MorphWeightKey, MorphWeightTrack, VisibilityKey, VisibilityTrack,
+    AnimationClip, BoneChannel, MorphWeightKey, MorphWeightTrack, ParentSwitchKey,
+    ParentSwitchTrack, VisibilityKey, VisibilityTrack,
 };
 pub use bone::Bone;
 pub use ik::{solve_for_rig, solve_two_bone_ik};

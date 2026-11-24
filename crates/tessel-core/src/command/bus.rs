@@ -334,6 +334,11 @@ pub enum Command {
         time_secs: f32,
         visible: bool,
     },
+    SetParentSwitchKeyframe {
+        clip_index: usize,
+        node_id: NodeId,
+        key: crate::ParentSwitchKey,
+    },
     SetClipLayers {
         layers: Vec<ClipLayer>,
     },
@@ -1940,6 +1945,38 @@ impl Command {
                     .ok_or(CoreError::OutOfBounds)?;
                 let previous = clip.clone();
                 clip.upsert_visibility_key(*node_id, *time_secs, *visible);
+                UndoDelta::RestoreAnimationClip {
+                    clip_index: *clip_index,
+                    previous,
+                }
+            }
+            Self::SetParentSwitchKeyframe {
+                clip_index,
+                node_id,
+                key,
+            } => {
+                if !key.time_secs.is_finite() || key.time_secs < 0.0 {
+                    return Err(CoreError::OutOfBounds);
+                }
+                if !scene.nodes.contains_key(node_id) {
+                    return Err(CoreError::NodeNotFound(*node_id));
+                }
+                let rig = scene
+                    .character_rig
+                    .as_mut()
+                    .ok_or(CoreError::CharacterRigNotFound)?;
+                if let Some(bid) = key.bone_id {
+                    if rig.bone(bid).is_none() {
+                        return Err(CoreError::OutOfBounds);
+                    }
+                }
+                let clip = rig
+                    .animations
+                    .get_mut(*clip_index)
+                    .ok_or(CoreError::OutOfBounds)?;
+                let previous = clip.clone();
+                clip.upsert_parent_switch_key(*node_id, *key);
+                rig.apply_active_animation();
                 UndoDelta::RestoreAnimationClip {
                     clip_index: *clip_index,
                     previous,

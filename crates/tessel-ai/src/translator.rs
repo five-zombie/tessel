@@ -3003,6 +3003,98 @@ pub fn execute_tool_call(
                 "floor_y": floor_y
             }))
         }
+        "character_set_parent_switch_keyframe" => {
+            let node_id = args
+                .get("node_id")
+                .and_then(Value::as_u64)
+                .map(NodeId)
+                .ok_or_else(|| AiError::InvalidArguments("missing 'node_id'".into()))?;
+            let time_secs = args
+                .get("time_secs")
+                .and_then(Value::as_f64)
+                .ok_or_else(|| AiError::InvalidArguments("missing 'time_secs'".into()))?
+                as f32;
+            if !time_secs.is_finite() || time_secs < 0.0 {
+                return Err(AiError::InvalidArguments(
+                    "'time_secs' must be finite and >= 0".into(),
+                ));
+            }
+            let bone_id = match args.get("bone_id") {
+                None | Some(Value::Null) => None,
+                Some(v) => {
+                    let raw = v.as_u64().ok_or_else(|| {
+                        AiError::InvalidArguments("'bone_id' must be integer or null".into())
+                    })?;
+                    Some(BoneId(u32::try_from(raw).map_err(|_| {
+                        AiError::InvalidArguments("bone_id overflow".into())
+                    })?))
+                }
+            };
+            let position = parse_opt_vec3(args, "position")?.unwrap_or(glam::Vec3::ZERO);
+            let rotation = if args.get("rotation_deg").is_some() {
+                parse_rotation_deg(args)?
+            } else {
+                glam::Quat::IDENTITY
+            };
+            let clip_index = if let Some(idx) = args.get("clip_index").and_then(Value::as_u64) {
+                idx as usize
+            } else if let Some(name) = args.get("clip_name").and_then(Value::as_str) {
+                let existing = scene
+                    .character_rig
+                    .as_ref()
+                    .and_then(|r| r.animations.iter().position(|c| c.name == name));
+                match existing {
+                    Some(i) => i,
+                    None => {
+                        let dur = args
+                            .get("duration_secs")
+                            .and_then(Value::as_f64)
+                            .unwrap_or((time_secs as f64).max(1.0))
+                            as f32;
+                        history.execute(
+                            scene,
+                            Command::AddAnimationClip {
+                                name: name.to_string(),
+                                duration_secs: dur.max(0.1),
+                            },
+                        )?;
+                        scene
+                            .character_rig
+                            .as_ref()
+                            .map(|r| r.animations.len().saturating_sub(1))
+                            .unwrap_or(0)
+                    }
+                }
+            } else {
+                scene
+                    .character_rig
+                    .as_ref()
+                    .map(|r| r.active_animation)
+                    .unwrap_or(0)
+            };
+            let key = tessel_core::ParentSwitchKey {
+                time_secs,
+                bone_id,
+                position,
+                rotation,
+            };
+            history.execute(
+                scene,
+                Command::SetParentSwitchKeyframe {
+                    clip_index,
+                    node_id,
+                    key,
+                },
+            )?;
+            Ok(json!({
+                "ok": true,
+                "clip_index": clip_index,
+                "node_id": node_id.0,
+                "time_secs": time_secs,
+                "bone_id": bone_id.map(|b| b.0),
+                "detached": bone_id.is_none()
+            }))
+        }
         "character_set_visibility_keyframe" => {
             let node_id = args
                 .get("node_id")
@@ -6631,5 +6723,144 @@ mod tests {
         let json_len = u32::from_le_bytes([glb[12], glb[13], glb[14], glb[15]]) as usize;
         let glb_json = std::str::from_utf8(&glb[20..20 + json_len]).unwrap();
         assert!(glb_json.contains("\"CombinedBattle\""));
+    }
+
+    #[test]
+    fn v40_dynamic_parent_switch_weapon_drop_and_glb_export() {
+        let mut scene = SceneState::new();
+        let mut history = HistoryStack::new();
+        let dir = std::env::temp_dir();
+
+        execute_tool_call(
+            "scene_set_mode",
+            &json!({ "mode": "character" }),
+            &mut scene,
+            &mut history,
+            &dir,
+        )
+        .unwrap();
+        let rifle = execute_tool_call(
+            "mesh_create_primitive",
+            &json!({ "name": "Rifle", "kind": "cube", "size": [0.1, 0.1, 0.8] }),
+            &mut scene,
+            &mut history,
+            &dir,
+        )
+        .unwrap();
+        let rifle_id = rifle["node_id"].as_u64().unwrap();
+        execute_tool_call(
+            "character_apply_biped_rig",
+            &json!({ "preset": "starter" }),
+            &mut scene,
+            &mut history,
+            &dir,
+        )
+        .unwrap();
+        let right_arm = scene
+            .character_rig
+            .as_ref()
+            .unwrap()
+            .bones
+            .iter()
+            .find(|b| b.name == "RightArm")
+            .unwrap()
+            .id
+            .0 as u64;
+
+        // Hold rifle in RightArm at t=0.0, detach & drop to floor at t=0.5 -> t=1.0
+        execute_tool_call(
+            "character_set_parent_switch_keyframe",
+            &json!({
+                "clip_name": "WeaponDrop",
+                "duration_secs": 1.0,
+                "node_id": rifle_id,
+                "time_secs": 0.0,
+                "bone_id": right_arm
+            }),
+            &mut scene,
+            &mut history,
+            &dir,
+        )
+        .unwrap();
+        execute_tool_call(
+            "character_set_parent_switch_keyframe",
+            &json!({
+                "clip_name": "WeaponDrop",
+                "node_id": rifle_id,
+                "time_secs": 0.5,
+                "bone_id": null,
+                "position": [0.5, 0.8, 0.3],
+                "rotation_deg": [0.0, 0.0, 0.0]
+            }),
+            &mut scene,
+            &mut history,
+            &dir,
+        )
+        .unwrap();
+        execute_tool_call(
+            "character_set_parent_switch_keyframe",
+            &json!({
+                "clip_name": "WeaponDrop",
+                "node_id": rifle_id,
+                "time_secs": 1.0,
+                "bone_id": null,
+                "position": [0.8, 0.05, 0.6],
+                "rotation_deg": [0.0, 45.0, 90.0]
+            }),
+            &mut scene,
+            &mut history,
+            &dir,
+        )
+        .unwrap();
+
+        // At t=0.25 rifle is still attached to RightArm
+        execute_tool_call(
+            "character_set_playback_time",
+            &json!({ "clip_name": "WeaponDrop", "time_secs": 0.25 }),
+            &mut scene,
+            &mut history,
+            &dir,
+        )
+        .unwrap();
+        let ov_hold = scene
+            .character_rig
+            .as_ref()
+            .unwrap()
+            .node_parent_overrides
+            .get(&NodeId(rifle_id))
+            .copied()
+            .unwrap();
+        assert_eq!(ov_hold.bone_id, Some(BoneId(right_arm as u32)));
+
+        // At t=0.75 rifle is detached and interpolated halfway along drop arc
+        execute_tool_call(
+            "character_set_playback_time",
+            &json!({ "clip_name": "WeaponDrop", "time_secs": 0.75 }),
+            &mut scene,
+            &mut history,
+            &dir,
+        )
+        .unwrap();
+        let ov_drop = scene
+            .character_rig
+            .as_ref()
+            .unwrap()
+            .node_parent_overrides
+            .get(&NodeId(rifle_id))
+            .copied()
+            .unwrap();
+        assert_eq!(ov_drop.bone_id, None);
+        assert!((ov_drop.position.x - 0.65).abs() < 1e-3);
+        assert!((ov_drop.position.y - 0.425).abs() < 1e-3);
+
+        // Export .glb includes WeaponDrop animation with translation + rotation channels
+        let (glb, _) =
+            tessel_io::export_glb_bytes(&scene, tessel_io::ExportPreset::Godot4).unwrap();
+        assert!(glb.starts_with(b"glTF"));
+        let json_len = u32::from_le_bytes([glb[12], glb[13], glb[14], glb[15]]) as usize;
+        let glb_json = std::str::from_utf8(&glb[20..20 + json_len]).unwrap();
+        assert!(glb_json.contains("\"WeaponDrop\""));
+        assert!(glb_json.contains("\"translation\""));
+        assert!(glb_json.contains("\"rotation\""));
     }
 }

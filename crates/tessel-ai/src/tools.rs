@@ -905,6 +905,24 @@ pub fn tool_definitions() -> Vec<Value> {
             }
         }),
         json!({
+            "name": "character_set_parent_switch_keyframe",
+            "description": "Dynamically attach, switch parent bone, or detach/drop a prop or weapon node in world space mid-clip (e.g. hold rifle in RightHand at t=0.0, detach to floor world_position at t=0.5, or switch to Torso holster). Exports as standard glTF 2.0 TRS animation channels.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "clip_index": { "type": "integer", "minimum": 0 },
+                    "clip_name": { "type": "string" },
+                    "duration_secs": { "type": "number", "minimum": 0.1 },
+                    "node_id": { "type": "integer", "minimum": 1 },
+                    "time_secs": { "type": "number", "minimum": 0.0 },
+                    "bone_id": { "type": ["integer", "null"], "description": "Bone ID to attach to, or null/omitted to detach into world space" },
+                    "position": { "type": "array", "items": { "type": "number" }, "minItems": 3, "maxItems": 3, "description": "World-space position [x,y,z] when detached (bone_id=null), or local offset when attached" },
+                    "rotation_deg": { "type": "array", "items": { "type": "number" }, "minItems": 3, "maxItems": 3, "description": "Euler XYZ degrees in world space when detached, or local offset when attached" }
+                },
+                "required": ["node_id", "time_secs"]
+            }
+        }),
+        json!({
             "name": "character_set_visibility_keyframe",
             "description": "Insert or update a step-interpolated visibility keyframe (visible: true/false) for a scene node in an animation clip (ideal for toggling muzzle flashes, tracers, or props during playback).",
             "inputSchema": {

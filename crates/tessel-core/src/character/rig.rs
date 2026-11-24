@@ -56,6 +56,10 @@ pub struct CharacterRig {
     /// `apply_active_animation` from the active clip's `visibility_tracks`.
     #[serde(default)]
     pub node_visibility: BTreeMap<NodeId, bool>,
+    /// Live sampled dynamic parent-switch / prop-drop overrides `node_id -> ParentSwitchKey`,
+    /// refreshed by `apply_active_animation` from `parent_switch_tracks`.
+    #[serde(default)]
+    pub node_parent_overrides: BTreeMap<NodeId, super::anim::ParentSwitchKey>,
     /// Optional per-prefix clip layers evaluated on top of `active_animation`.
     #[serde(default)]
     pub clip_layers: Vec<ClipLayer>,
@@ -98,6 +102,7 @@ impl CharacterRig {
             morph_weights: BTreeMap::new(),
             node_bone_masks: BTreeMap::new(),
             node_visibility: BTreeMap::new(),
+            node_parent_overrides: BTreeMap::new(),
             clip_layers: Vec::new(),
         }
     }
@@ -156,6 +161,7 @@ impl CharacterRig {
             morph_weights: BTreeMap::new(),
             node_bone_masks: BTreeMap::new(),
             node_visibility: BTreeMap::new(),
+            node_parent_overrides: BTreeMap::new(),
             clip_layers: Vec::new(),
         }
     }
@@ -166,6 +172,24 @@ impl CharacterRig {
 
     pub fn bone_mut(&mut self, id: BoneId) -> Option<&mut Bone> {
         self.bones.iter_mut().find(|b| b.id == id)
+    }
+
+    /// Computes world-space rest transform matrices for every bone in hierarchy order.
+    pub fn world_rest_matrices(&self) -> BTreeMap<BoneId, Mat4> {
+        let mut world = BTreeMap::new();
+        for bone in &self.bones {
+            let local = Mat4::from_scale_rotation_translation(
+                bone.rest_local.scale,
+                bone.rest_local.rotation,
+                bone.rest_local.translation,
+            );
+            let mat = match bone.parent.and_then(|pid| world.get(&pid)) {
+                Some(&parent_mat) => parent_mat * local,
+                None => local,
+            };
+            world.insert(bone.id, mat);
+        }
+        world
     }
 
     /// Computes world-space transform matrices for every bone in hierarchy order.
@@ -254,6 +278,10 @@ impl CharacterRig {
         for (node, visible) in clip.sample_node_visibility(t) {
             self.node_visibility.insert(node, visible);
         }
+        self.node_parent_overrides.clear();
+        for (node, key) in clip.sample_parent_switches(t) {
+            self.node_parent_overrides.insert(node, key);
+        }
 
         // Apply optional per-prefix clip layers on top of the active clip.
         let layers = self.clip_layers.clone();
@@ -285,6 +313,27 @@ impl CharacterRig {
             for (node, visible) in layer_clip.sample_node_visibility(lt) {
                 self.node_visibility.insert(node, visible);
             }
+            for (node, key) in layer_clip.sample_parent_switches(lt) {
+                self.node_parent_overrides.insert(node, key);
+            }
+        }
+    }
+
+    /// Computes the live world transform matrix of a node driven by a dynamic `ParentSwitchKey`.
+    pub fn compute_node_override_matrix(
+        key: super::anim::ParentSwitchKey,
+        base_node_mat: Mat4,
+        world_mats: &BTreeMap<BoneId, Mat4>,
+        rest_mats: &BTreeMap<BoneId, Mat4>,
+    ) -> Mat4 {
+        if let Some(bid) = key.bone_id {
+            let bone_world = world_mats.get(&bid).copied().unwrap_or(Mat4::IDENTITY);
+            let bone_rest = rest_mats.get(&bid).copied().unwrap_or(Mat4::IDENTITY);
+            let offset = Mat4::from_rotation_translation(key.rotation, key.position);
+            bone_world * offset * bone_rest.inverse() * base_node_mat
+        } else {
+            let (base_scale, _, _) = base_node_mat.to_scale_rotation_translation();
+            Mat4::from_scale_rotation_translation(base_scale, key.rotation, key.position)
         }
     }
 
@@ -438,6 +487,15 @@ impl CharacterRig {
                     baked.upsert_visibility_key(node_id, t, visible);
                     last_vis.insert(node_id, visible);
                 }
+            }
+            for (&node_id, &ps_key) in &sim.node_parent_overrides {
+                baked.upsert_parent_switch_key(
+                    node_id,
+                    super::anim::ParentSwitchKey {
+                        time_secs: t,
+                        ..ps_key
+                    },
+                );
             }
         }
         Some(baked)

@@ -40,7 +40,31 @@ pub struct VisibilityTrack {
     pub keys: Vec<VisibilityKey>,
 }
 
-/// Keyframe animation clip supporting linear translation/scale, SLERP rotation, morph weights & node visibility.
+fn default_identity_quat() -> Quat {
+    Quat::IDENTITY
+}
+
+/// Single dynamic parent-switch / prop-drop keyframe for a scene node.
+/// When `bone_id` is `Some(bid)`, the node follows that bone's live transform (plus optional local offset).
+/// When `bone_id` is `None`, the node detaches into world space at `(position, rotation)`.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct ParentSwitchKey {
+    pub time_secs: f32,
+    pub bone_id: Option<BoneId>,
+    #[serde(default)]
+    pub position: Vec3,
+    #[serde(default = "default_identity_quat")]
+    pub rotation: Quat,
+}
+
+/// Dynamic parent-switch / world-space prop drop animation track for one scene node.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ParentSwitchTrack {
+    pub node: NodeId,
+    pub keys: Vec<ParentSwitchKey>,
+}
+
+/// Keyframe animation clip supporting linear translation/scale, SLERP rotation, morph weights, visibility & parent-switch tracks.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AnimationClip {
     pub name: String,
@@ -49,6 +73,8 @@ pub struct AnimationClip {
     pub morph_tracks: Vec<MorphWeightTrack>,
     #[serde(default)]
     pub visibility_tracks: Vec<VisibilityTrack>,
+    #[serde(default)]
+    pub parent_switch_tracks: Vec<ParentSwitchTrack>,
 }
 
 impl AnimationClip {
@@ -59,6 +85,7 @@ impl AnimationClip {
             channels: Vec::new(),
             morph_tracks: Vec::new(),
             visibility_tracks: Vec::new(),
+            parent_switch_tracks: Vec::new(),
         }
     }
 
@@ -347,6 +374,84 @@ impl AnimationClip {
         out
     }
 
+    /// Inserts or replaces a dynamic parent-switch / prop-drop keyframe (within 1ms tolerance) for `node`.
+    pub fn upsert_parent_switch_key(&mut self, node: NodeId, key: ParentSwitchKey) {
+        let time = key.time_secs.max(0.0);
+        let k = ParentSwitchKey {
+            time_secs: time,
+            ..key
+        };
+        if time > self.duration_secs {
+            self.duration_secs = time;
+        }
+        if let Some(track) = self
+            .parent_switch_tracks
+            .iter_mut()
+            .find(|t| t.node == node)
+        {
+            if let Some(existing) = track
+                .keys
+                .iter_mut()
+                .find(|x| (x.time_secs - time).abs() <= 1e-3)
+            {
+                *existing = k;
+            } else {
+                track.keys.push(k);
+                track
+                    .keys
+                    .sort_by(|a, b| a.time_secs.total_cmp(&b.time_secs));
+            }
+        } else {
+            self.parent_switch_tracks.push(ParentSwitchTrack {
+                node,
+                keys: vec![k],
+            });
+        }
+    }
+
+    /// Samples every parent-switch track at `time_secs`.
+    /// Interpolates `(position, rotation)` smoothly between consecutive keys sharing the same `bone_id`
+    /// (including two detached `None` world-space keys for weapon drop / grenade throw arcs),
+    /// and step-switches when changing parent bones.
+    pub fn sample_parent_switches(&self, time_secs: f32) -> Vec<(NodeId, ParentSwitchKey)> {
+        let mut out = Vec::with_capacity(self.parent_switch_tracks.len());
+        for track in &self.parent_switch_tracks {
+            let Some(first) = track.keys.first().copied() else {
+                continue;
+            };
+            if track.keys.len() == 1 || time_secs <= first.time_secs {
+                out.push((track.node, first));
+                continue;
+            }
+            let last = track.keys.last().copied().unwrap_or(first);
+            if time_secs >= last.time_secs {
+                out.push((track.node, last));
+                continue;
+            }
+            let mut sampled = last;
+            for pair in track.keys.windows(2) {
+                let (a, b) = (pair[0], pair[1]);
+                if time_secs >= a.time_secs && time_secs <= b.time_secs {
+                    if a.bone_id == b.bone_id {
+                        let span = (b.time_secs - a.time_secs).max(1e-5);
+                        let alpha = ((time_secs - a.time_secs) / span).clamp(0.0, 1.0);
+                        sampled = ParentSwitchKey {
+                            time_secs,
+                            bone_id: a.bone_id,
+                            position: a.position.lerp(b.position, alpha),
+                            rotation: a.rotation.slerp(b.rotation, alpha),
+                        };
+                    } else {
+                        sampled = a;
+                    }
+                    break;
+                }
+            }
+            out.push((track.node, sampled));
+        }
+        out
+    }
+
     /// Returns deduplicated sorted keyframe timestamps for a specific bone or the whole clip.
     pub fn keyframe_times(&self, bone_id: Option<BoneId>) -> Vec<f32> {
         let mut times: Vec<f32> = self
@@ -398,6 +503,7 @@ impl AnimationClip {
             duration_secs: 2.0,
             morph_tracks: Vec::new(),
             visibility_tracks: Vec::new(),
+            parent_switch_tracks: Vec::new(),
             channels: vec![BoneChannel {
                 bone_id: BoneId(1), // Torso subtle breathing
                 keyframes: vec![
@@ -435,6 +541,7 @@ impl AnimationClip {
             duration_secs: 1.0,
             morph_tracks: Vec::new(),
             visibility_tracks: Vec::new(),
+            parent_switch_tracks: Vec::new(),
             channels: vec![
                 BoneChannel {
                     bone_id: BoneId(3), // LeftArm

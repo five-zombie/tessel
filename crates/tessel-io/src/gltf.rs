@@ -76,7 +76,12 @@ impl CollectedMesh {
             .map(|rig| {
                 rig.animations
                     .iter()
-                    .flat_map(|c| c.visibility_tracks.iter().map(|t| t.node))
+                    .flat_map(|c| {
+                        c.visibility_tracks
+                            .iter()
+                            .map(|t| t.node)
+                            .chain(c.parent_switch_tracks.iter().map(|t| t.node))
+                    })
                     .collect()
             })
             .unwrap_or_default();
@@ -394,7 +399,12 @@ pub fn export_glb_bytes(
         .map(|rig| {
             rig.animations
                 .iter()
-                .flat_map(|c| c.visibility_tracks.iter().map(|t| t.node))
+                .flat_map(|c| {
+                    c.visibility_tracks
+                        .iter()
+                        .map(|t| t.node)
+                        .chain(c.parent_switch_tracks.iter().map(|t| t.node))
+                })
                 .collect()
         })
         .unwrap_or_default();
@@ -764,6 +774,128 @@ pub fn export_glb_bytes(
                     "sampler": sampler_idx,
                     "target": { "node": morph_base_node + pos, "path": "scale" }
                 }));
+            }
+
+            // Export per-node dynamic parent-switch tracks as standard glTF 2.0 TRS channels.
+            if !clip.parent_switch_tracks.is_empty() {
+                let rest_mats = rig.world_rest_matrices();
+                let duration = clip.duration_secs.max(0.05);
+                let steps = ((duration * 24.0).round() as usize).max(1);
+                let clip_idx = rig
+                    .animations
+                    .iter()
+                    .position(|c| c.name == clip.name)
+                    .unwrap_or(0);
+                let mut sim = rig.clone();
+                sim.clip_layers.clear();
+                sim.active_animation = clip_idx;
+                for ps_track in &clip.parent_switch_tracks {
+                    if ps_track.keys.is_empty() {
+                        continue;
+                    }
+                    let Some(pos) = morphed_order.iter().position(|id| *id == ps_track.node) else {
+                        continue;
+                    };
+                    let base_mat = scene.node_world_matrix(ps_track.node);
+                    let base_inv = base_mat.inverse();
+                    let mut times = Vec::with_capacity(steps + 1);
+                    let mut trans_out: Vec<[f32; 3]> = Vec::with_capacity(steps + 1);
+                    let mut rot_out: Vec<[f32; 4]> = Vec::with_capacity(steps + 1);
+                    for step in 0..=steps {
+                        let t = if step == steps {
+                            duration
+                        } else {
+                            (step as f32 / steps as f32) * duration
+                        };
+                        sim.playback_time = if step == steps {
+                            (duration - 1e-4).max(0.0)
+                        } else {
+                            t
+                        };
+                        sim.apply_active_animation();
+                        let world_mats = sim.world_pose_matrices();
+                        let sampled = sim
+                            .node_parent_overrides
+                            .get(&ps_track.node)
+                            .copied()
+                            .unwrap_or(ps_track.keys[0]);
+                        let world_override =
+                            tessel_core::CharacterRig::compute_node_override_matrix(
+                                sampled,
+                                base_mat,
+                                &world_mats,
+                                &rest_mats,
+                            );
+                        let delta_mat = world_override * base_inv;
+                        let (_, r, tr) = delta_mat.to_scale_rotation_translation();
+                        times.push(t);
+                        trans_out.push((tr * scale).to_array());
+                        rot_out.push(r.normalize().to_array());
+                    }
+                    let min_t = times.iter().copied().fold(f32::INFINITY, f32::min);
+                    let max_t = times.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+                    let time_bv = push_view(
+                        &mut bin,
+                        &mut buffer_views,
+                        bytemuck::cast_slice(&times),
+                        None,
+                    );
+                    let time_acc = accessors.len();
+                    accessors.push(json!({
+                        "bufferView": time_bv,
+                        "componentType": 5126,
+                        "count": times.len(),
+                        "type": "SCALAR",
+                        "min": [min_t],
+                        "max": [max_t]
+                    }));
+                    let t_bv = push_view(
+                        &mut bin,
+                        &mut buffer_views,
+                        bytemuck::cast_slice(&trans_out),
+                        None,
+                    );
+                    let t_acc = accessors.len();
+                    accessors.push(json!({
+                        "bufferView": t_bv,
+                        "componentType": 5126,
+                        "count": trans_out.len(),
+                        "type": "VEC3"
+                    }));
+                    let t_sampler = samplers.len();
+                    samplers.push(json!({
+                        "input": time_acc,
+                        "interpolation": "LINEAR",
+                        "output": t_acc
+                    }));
+                    channels.push(json!({
+                        "sampler": t_sampler,
+                        "target": { "node": morph_base_node + pos, "path": "translation" }
+                    }));
+                    let r_bv = push_view(
+                        &mut bin,
+                        &mut buffer_views,
+                        bytemuck::cast_slice(&rot_out),
+                        None,
+                    );
+                    let r_acc = accessors.len();
+                    accessors.push(json!({
+                        "bufferView": r_bv,
+                        "componentType": 5126,
+                        "count": rot_out.len(),
+                        "type": "VEC4"
+                    }));
+                    let r_sampler = samplers.len();
+                    samplers.push(json!({
+                        "input": time_acc,
+                        "interpolation": "LINEAR",
+                        "output": r_acc
+                    }));
+                    channels.push(json!({
+                        "sampler": r_sampler,
+                        "target": { "node": morph_base_node + pos, "path": "rotation" }
+                    }));
+                }
             }
 
             if !channels.is_empty() {
