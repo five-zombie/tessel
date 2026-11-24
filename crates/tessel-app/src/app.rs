@@ -52,6 +52,9 @@ struct StudioState {
     ai_state: ui::inspector::DirectAiUiState,
     command_palette: ui::command_palette::CommandPaletteState,
     quick_start: ui::quick_start::QuickStartState,
+    confirm_new_project: bool,
+    confirm_exit: bool,
+    quit_confirmed: bool,
     project_files: ProjectFileManager,
     paths: AppPaths,
     settings: AppSettings,
@@ -183,7 +186,16 @@ fn handle_camera_tool_call(
 }
 
 impl StudioState {
-    fn poll_live_mcp(&mut self, mut capture_preview: impl FnMut() -> Option<Vec<u8>>) {
+    fn poll_live_mcp(
+        &mut self,
+        mut capture_preview: impl FnMut() -> Option<Vec<u8>>,
+        mut render_offscreen: impl FnMut(
+            &str,
+            &SceneState,
+            &std::path::Path,
+            &serde_json::Value,
+        ) -> Result<serde_json::Value, tessel_ai::AiError>,
+    ) {
         let Some(handle) = &self.live_mcp else {
             return;
         };
@@ -202,18 +214,21 @@ impl StudioState {
             } else {
                 None
             };
-            let is_camera_tool = req
+            let is_tools_call = req
                 .payload
                 .get("method")
                 .and_then(serde_json::Value::as_str)
-                == Some("tools/call")
-                && req
-                    .payload
+                == Some("tools/call");
+            let call_name = if is_tools_call {
+                req.payload
                     .get("params")
                     .and_then(|p| p.get("name"))
                     .and_then(serde_json::Value::as_str)
-                    .is_some_and(|n| n.starts_with("camera_"));
-            let reply = if is_camera_tool {
+                    .unwrap_or("")
+            } else {
+                ""
+            };
+            let reply = if call_name.starts_with("camera_") {
                 let params = req
                     .payload
                     .get("params")
@@ -224,19 +239,92 @@ impl StudioState {
                     .get("id")
                     .cloned()
                     .unwrap_or(serde_json::Value::Null);
-                let tool_name = params
-                    .get("name")
-                    .and_then(serde_json::Value::as_str)
-                    .unwrap_or("");
                 let args = params
                     .get("arguments")
                     .cloned()
                     .unwrap_or(serde_json::Value::Null);
-                let result = match handle_camera_tool_call(tool_name, &args, &mut self.camera_3d) {
+                let result = match handle_camera_tool_call(call_name, &args, &mut self.camera_3d) {
                     Ok(val) => serde_json::json!({
                         "content": [{ "type": "text", "text": val.to_string() }],
                         "isError": false
                     }),
+                    Err(err) => serde_json::json!({
+                        "content": [{ "type": "text", "text": err.to_structured_json().to_string() }],
+                        "isError": true
+                    }),
+                };
+                Some(serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "result": result,
+                }))
+            } else if call_name == "viewport_set_preview" {
+                let id = req
+                    .payload
+                    .get("id")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null);
+                let preview = req
+                    .payload
+                    .get("params")
+                    .and_then(|p| p.get("arguments"))
+                    .and_then(|a| a.get("preview"))
+                    .and_then(serde_json::Value::as_bool);
+                let result = match preview {
+                    Some(p) => {
+                        self.render_preview = p;
+                        let val = serde_json::json!({ "ok": true, "preview": p });
+                        serde_json::json!({
+                            "content": [{ "type": "text", "text": val.to_string() }],
+                            "isError": false
+                        })
+                    }
+                    None => {
+                        let err = tessel_ai::AiError::InvalidArguments(
+                            "missing boolean 'preview'".into(),
+                        );
+                        serde_json::json!({
+                            "content": [{ "type": "text", "text": err.to_structured_json().to_string() }],
+                            "isError": true
+                        })
+                    }
+                };
+                Some(serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "result": result,
+                }))
+            } else if call_name == "viewport_screenshot"
+                || call_name == "viewport_render_turntable_gif"
+            {
+                let id = req
+                    .payload
+                    .get("id")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null);
+                let args = req
+                    .payload
+                    .get("params")
+                    .and_then(|p| p.get("arguments"))
+                    .cloned()
+                    .unwrap_or_else(|| serde_json::json!({}));
+                let result = match render_offscreen(
+                    call_name,
+                    &self.scene,
+                    &self.export_dialog.output_dir,
+                    &args,
+                ) {
+                    Ok(val) => {
+                        let content = if call_name == "viewport_screenshot" {
+                            val
+                        } else {
+                            serde_json::json!([{ "type": "text", "text": val.to_string() }])
+                        };
+                        serde_json::json!({
+                            "content": content,
+                            "isError": false
+                        })
+                    }
                     Err(err) => serde_json::json!({
                         "content": [{ "type": "text", "text": err.to_structured_json().to_string() }],
                         "isError": true
@@ -344,6 +432,9 @@ impl Default for StudioState {
                 has_recovery,
                 error_message: None,
             },
+            confirm_new_project: false,
+            confirm_exit: false,
+            quit_confirmed: false,
             project_files,
             paths,
             settings,
@@ -364,7 +455,22 @@ struct GpuState {
     egui_state: egui_winit::State,
     egui_renderer: egui_wgpu::Renderer,
     viewport_renderer: ViewportRenderer,
+    offscreen_screenshot_renderer: Option<ViewportRenderer>,
     viewport_texture_id: egui::TextureId,
+    last_window_title: String,
+}
+
+/// Formats the OS window title showing active `.tessel` filename and unsaved `*` indicator.
+pub fn format_window_title(current_path: Option<&std::path::Path>, unsaved: bool) -> String {
+    let name = current_path
+        .and_then(|p| p.file_name())
+        .and_then(|n| n.to_str())
+        .unwrap_or("Untitled");
+    if unsaved {
+        format!("Tessel — {name}*")
+    } else {
+        format!("Tessel — {name}")
+    }
 }
 
 impl GpuState {
@@ -464,7 +570,9 @@ impl GpuState {
             egui_state,
             egui_renderer,
             viewport_renderer,
+            offscreen_screenshot_renderer: None,
             viewport_texture_id,
+            last_window_title: "Tessel".into(),
         })
     }
 
@@ -478,11 +586,27 @@ impl GpuState {
     }
 
     fn render(&mut self, studio: &mut StudioState) -> Result<(), RenderError> {
-        studio.poll_live_mcp(|| {
-            self.viewport_renderer
-                .capture_png_bytes(&self.device, &self.queue)
-                .ok()
-        });
+        let device = &self.device;
+        let queue = &self.queue;
+        let main_vp = &self.viewport_renderer;
+        let offscreen_vp = &mut self.offscreen_screenshot_renderer;
+        studio.poll_live_mcp(
+            || main_vp.capture_png_bytes(device, queue).ok(),
+            |tool, scene, export_dir, args| {
+                let vp =
+                    offscreen_vp.get_or_insert_with(|| ViewportRenderer::new(device, 640, 480));
+                if tool == "viewport_screenshot" {
+                    tessel_ai::headless::render_screenshot_mcp_content(
+                        vp, device, queue, scene, args,
+                    )
+                } else {
+                    let parsed = tessel_ai::headless::parse_turntable_args(export_dir, args)?;
+                    tessel_ai::headless::render_turntable_gif_with_renderer(
+                        vp, device, queue, scene, &parsed,
+                    )
+                }
+            },
+        );
         studio
             .project_files
             .set_autosave_paused(studio.quick_start.open && studio.quick_start.has_recovery);
@@ -503,6 +627,8 @@ impl GpuState {
         };
         let mut toggle_mcp_server = false;
         let mut rotate_mcp = false;
+        let mut save_and_quit = false;
+        let mut export_action = ui::export_dialog::ExportAction::None;
 
         let full_output = self.egui_ctx.run(raw_input, |ctx| {
             handle_global_shortcuts(
@@ -528,6 +654,9 @@ impl GpuState {
                 if ctx.input(|i| i.modifiers.command && i.key_pressed(egui::Key::I)) {
                     top_actions.import_mesh = true;
                 }
+                if ctx.input(|i| i.modifiers.command && i.key_pressed(egui::Key::N)) {
+                    top_actions.new_project = true;
+                }
             }
             let mcp_port = studio.live_mcp.as_ref().map(|h| h.port);
             let bar = ui::top_bar::show_top_bar(
@@ -541,6 +670,7 @@ impl GpuState {
             top_actions.open_mcp |= bar.open_mcp;
             top_actions.save_project |= bar.save_project;
             top_actions.open_project |= bar.open_project;
+            top_actions.new_project |= bar.new_project;
             top_actions.import_mesh |= bar.import_mesh;
             top_actions.open_settings |= bar.open_settings;
 
@@ -550,6 +680,8 @@ impl GpuState {
                 &studio.history,
                 &studio.camera_3d,
                 &studio.camera_2d,
+                studio.free_view,
+                studio.project_files.has_unsaved_changes(studio.scene.revision),
             );
             ui::timeline::show_timeline(ctx, &mut studio.scene, &mut studio.history);
             ui::toolbar::show_toolbar(ctx, &mut studio.scene, &mut studio.history);
@@ -575,7 +707,12 @@ impl GpuState {
             desired_viewport = vp_size;
             hover_voxel = hv;
             active_gizmo_axis = g_axis;
-            ui::export_dialog::show_export_dialog(ctx, &studio.scene, &mut studio.export_dialog);
+            export_action = ui::export_dialog::show_export_dialog(
+                ctx,
+                &studio.scene,
+                &studio.camera_3d,
+                &mut studio.export_dialog,
+            );
             ui::settings_dialog::show_settings_dialog(
                 ctx,
                 &mut studio.settings_dialog,
@@ -609,7 +746,103 @@ impl GpuState {
                 &mut studio.camera_2d,
                 &mut studio.export_dialog.open,
                 &mut top_actions.import_mesh,
+                &mut top_actions.new_project,
             );
+            if top_actions.new_project {
+                studio.confirm_new_project = true;
+                top_actions.new_project = false;
+            }
+            if studio.confirm_new_project {
+                if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+                    studio.confirm_new_project = false;
+                } else {
+                    let mut open = studio.confirm_new_project;
+                    egui::Window::new("New Project")
+                        .open(&mut open)
+                        .collapsible(false)
+                        .resizable(false)
+                        .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+                        .fixed_size(egui::vec2(360.0, 120.0))
+                        .show(ctx, |ui| {
+                            ui.label(
+                                egui::RichText::new(
+                                    "Are you sure you want to start a new empty project? Any unsaved changes in the current scene will be lost.",
+                                )
+                                .size(12.0)
+                                .color(ui::theme::tokens::ON_SURFACE),
+                            );
+                            ui.add_space(12.0);
+                            ui.horizontal(|ui| {
+                                let confirm_btn = egui::Button::new(
+                                    egui::RichText::new("Start New Project")
+                                        .strong()
+                                        .color(ui::theme::tokens::ON_PRIMARY),
+                                )
+                                .fill(ui::theme::tokens::ERROR)
+                                .corner_radius(egui::CornerRadius::same(4));
+                                if ui.add(confirm_btn).clicked() {
+                                    top_actions.new_project = true;
+                                    studio.confirm_new_project = false;
+                                }
+                                if ui.button("Cancel").clicked() {
+                                    studio.confirm_new_project = false;
+                                }
+                            });
+                        });
+                    studio.confirm_new_project = open && studio.confirm_new_project;
+                }
+            }
+            if studio.confirm_exit {
+                if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+                    studio.confirm_exit = false;
+                } else {
+                    let mut open = studio.confirm_exit;
+                    egui::Window::new("Unsaved Changes")
+                        .open(&mut open)
+                        .collapsible(false)
+                        .resizable(false)
+                        .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+                        .fixed_size(egui::vec2(380.0, 125.0))
+                        .show(ctx, |ui| {
+                            ui.label(
+                                egui::RichText::new(
+                                    "You have unsaved changes in this project. Would you like to save before closing Tessel?",
+                                )
+                                .size(12.0)
+                                .color(ui::theme::tokens::ON_SURFACE),
+                            );
+                            ui.add_space(12.0);
+                            ui.horizontal(|ui| {
+                                let save_btn = egui::Button::new(
+                                    egui::RichText::new("Save & Quit")
+                                        .strong()
+                                        .color(ui::theme::tokens::ON_PRIMARY),
+                                )
+                                .fill(ui::theme::tokens::PRIMARY_CONTAINER)
+                                .corner_radius(egui::CornerRadius::same(4));
+                                if ui.add(save_btn).clicked() {
+                                    save_and_quit = true;
+                                    studio.confirm_exit = false;
+                                }
+                                let discard_btn = egui::Button::new(
+                                    egui::RichText::new("Discard & Quit")
+                                        .strong()
+                                        .color(ui::theme::tokens::ON_PRIMARY),
+                                )
+                                .fill(ui::theme::tokens::ERROR)
+                                .corner_radius(egui::CornerRadius::same(4));
+                                if ui.add(discard_btn).clicked() {
+                                    studio.quit_confirmed = true;
+                                    studio.confirm_exit = false;
+                                }
+                                if ui.button("Cancel").clicked() {
+                                    studio.confirm_exit = false;
+                                }
+                            });
+                        });
+                    studio.confirm_exit = open && studio.confirm_exit;
+                }
+            }
         });
 
         match quick_action {
@@ -645,6 +878,37 @@ impl GpuState {
                     &mut studio.scene,
                     &mut studio.history,
                 );
+            }
+        }
+
+        if let ui::export_dialog::ExportAction::TurntableGif(args) = export_action {
+            let vp = self.offscreen_screenshot_renderer.get_or_insert_with(|| {
+                ViewportRenderer::new(&self.device, args.width, args.height)
+            });
+            match tessel_ai::headless::render_turntable_gif_with_renderer(
+                vp,
+                &self.device,
+                &self.queue,
+                &studio.scene,
+                &args,
+            ) {
+                Ok(val) => {
+                    let path = val
+                        .get("output_path")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("turntable.gif");
+                    let bytes = val
+                        .get("file_size_bytes")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0);
+                    studio.export_dialog.status_message = Some(Ok(format!(
+                        "Saved {path} ({bytes} bytes, {} frames @ {} fps)",
+                        args.frames, args.fps
+                    )));
+                }
+                Err(err) => {
+                    studio.export_dialog.status_message = Some(Err(err.to_string()));
+                }
             }
         }
 
@@ -685,7 +949,7 @@ impl GpuState {
             studio.mcp_dialog.status_message =
                 Some("Rotated MCP token. Update your client config.".into());
         }
-        if top_actions.save_project {
+        if top_actions.save_project || save_and_quit {
             let thumb = self
                 .viewport_renderer
                 .capture_png_bytes(&self.device, &self.queue)
@@ -697,6 +961,9 @@ impl GpuState {
                 Ok(Some(path)) => {
                     studio.settings.record_recent_project(path);
                     studio.settings.save(&studio.paths);
+                    if save_and_quit {
+                        studio.quit_confirmed = true;
+                    }
                 }
                 Ok(None) => {}
                 Err(err) => tracing::error!("Save project failed: {err}"),
@@ -721,10 +988,24 @@ impl GpuState {
             studio.history = HistoryStack::new();
             studio.camera_3d.reset();
             studio.camera_2d.reset();
+            studio.pixel_drag_start = None;
+            studio.gizmo_drag = None;
+            studio.export_dialog.status_message = None;
             studio.project_files.current_path = None;
             studio
                 .project_files
                 .mark_baseline_revision(studio.scene.revision);
+        }
+
+        let desired_title = format_window_title(
+            studio.project_files.current_path.as_deref(),
+            studio
+                .project_files
+                .has_unsaved_changes(studio.scene.revision),
+        );
+        if desired_title != self.last_window_title {
+            self.window.set_title(&desired_title);
+            self.last_window_title = desired_title;
         }
 
         self.egui_state
@@ -889,7 +1170,19 @@ impl ApplicationHandler for TesselApp {
         }
 
         match event {
-            WindowEvent::CloseRequested => event_loop.exit(),
+            WindowEvent::CloseRequested => {
+                if self
+                    .studio
+                    .project_files
+                    .has_unsaved_changes(self.studio.scene.revision)
+                    && !self.studio.quit_confirmed
+                {
+                    self.studio.confirm_exit = true;
+                    gpu.window.request_redraw();
+                } else {
+                    event_loop.exit();
+                }
+            }
             WindowEvent::Resized(size) => {
                 gpu.resize_surface(size.width, size.height);
                 gpu.window.request_redraw();
@@ -897,6 +1190,10 @@ impl ApplicationHandler for TesselApp {
             WindowEvent::RedrawRequested => {
                 if let Err(err) = gpu.render(&mut self.studio) {
                     tracing::error!("render error: {err}");
+                }
+                if self.studio.quit_confirmed {
+                    event_loop.exit();
+                    return;
                 }
                 gpu.window.request_redraw();
             }
@@ -908,6 +1205,21 @@ impl ApplicationHandler for TesselApp {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn format_window_title_shows_filename_and_dirty_star() {
+        assert_eq!(format_window_title(None, false), "Tessel — Untitled");
+        assert_eq!(format_window_title(None, true), "Tessel — Untitled*");
+        let path = std::path::Path::new("/tmp/hero.tessel");
+        assert_eq!(
+            format_window_title(Some(path), false),
+            "Tessel — hero.tessel"
+        );
+        assert_eq!(
+            format_window_title(Some(path), true),
+            "Tessel — hero.tessel*"
+        );
+    }
 
     #[test]
     fn camera_tools_drive_viewport_state() {

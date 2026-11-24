@@ -1,16 +1,25 @@
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpListener;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, RwLock};
 use std::time::Duration;
 
 use serde_json::{json, Value};
+
+#[derive(Default)]
+struct McpHttpMetrics {
+    requests_total: AtomicU64,
+    requests_rejected: AtomicU64,
+    requests_timed_out: AtomicU64,
+}
 
 /// Message sent from the local loopback MCP HTTP server to the live GUI main thread.
 pub struct LiveMcpRequest {
     pub payload: Value,
     pub reply_tx: mpsc::Sender<Option<Value>>,
 }
+
+const MAX_MCP_QUEUE: usize = 64;
 
 /// Handle controlling a running loopback `127.0.0.1` MCP HTTP server.
 pub struct LiveMcpServerHandle {
@@ -19,6 +28,7 @@ pub struct LiveMcpServerHandle {
     pub rx: mpsc::Receiver<LiveMcpRequest>,
     expected_auth: Arc<RwLock<String>>,
     stop: Arc<AtomicBool>,
+    join_handle: Option<std::thread::JoinHandle<()>>,
 }
 
 impl LiveMcpServerHandle {
@@ -33,18 +43,20 @@ impl LiveMcpServerHandle {
 
         let expected_auth = Arc::new(RwLock::new(format!("Bearer {token}")));
         let auth_ref = Arc::clone(&expected_auth);
-        let (tx, rx) = mpsc::channel::<LiveMcpRequest>();
+        let (tx, rx) = mpsc::sync_channel::<LiveMcpRequest>(MAX_MCP_QUEUE);
         let stop = Arc::new(AtomicBool::new(false));
         let stop_flag = Arc::clone(&stop);
+        let metrics = Arc::new(McpHttpMetrics::default());
+        let metrics_ref = Arc::clone(&metrics);
 
-        std::thread::spawn(move || {
+        let join_handle = std::thread::spawn(move || {
             while !stop_flag.load(Ordering::Relaxed) {
                 match listener.accept() {
                     Ok((mut stream, _)) => {
                         let _ = stream.set_nonblocking(false);
                         let _ = stream.set_read_timeout(Some(Duration::from_secs(3)));
                         let current_auth = auth_ref.read().map(|g| g.clone()).unwrap_or_default();
-                        handle_http_connection(&mut stream, &current_auth, &tx);
+                        handle_http_connection(&mut stream, &current_auth, &tx, &metrics_ref);
                     }
                     Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                         std::thread::sleep(Duration::from_millis(25));
@@ -60,6 +72,7 @@ impl LiveMcpServerHandle {
             rx,
             expected_auth,
             stop,
+            join_handle: Some(join_handle),
         })
     }
 
@@ -79,6 +92,9 @@ impl LiveMcpServerHandle {
 impl Drop for LiveMcpServerHandle {
     fn drop(&mut self) {
         self.stop();
+        if let Some(handle) = self.join_handle.take() {
+            let _ = handle.join();
+        }
     }
 }
 
@@ -107,7 +123,8 @@ pub fn generate_local_token() -> String {
 fn handle_http_connection(
     stream: &mut std::net::TcpStream,
     expected_auth: &str,
-    tx: &mpsc::Sender<LiveMcpRequest>,
+    tx: &mpsc::SyncSender<LiveMcpRequest>,
+    metrics: &McpHttpMetrics,
 ) {
     let Ok(cloned) = stream.try_clone() else {
         return;
@@ -118,10 +135,27 @@ fn handle_http_connection(
     if reader.read_line(&mut request_line).is_err() {
         return;
     }
-    if !request_line.starts_with("POST /mcp") {
-        write_http(stream, "404 Not Found", r#"{"error":"use POST /mcp"}"#);
+    if request_line.starts_with("GET /health") {
+        let health = json!({
+            "status": "ok",
+            "queue_capacity": MAX_MCP_QUEUE,
+            "requests_total": metrics.requests_total.load(Ordering::Relaxed),
+            "requests_rejected": metrics.requests_rejected.load(Ordering::Relaxed),
+            "requests_timed_out": metrics.requests_timed_out.load(Ordering::Relaxed),
+        });
+        write_http(stream, "200 OK", &health.to_string());
         return;
     }
+    if !request_line.starts_with("POST /mcp") {
+        metrics.requests_rejected.fetch_add(1, Ordering::Relaxed);
+        write_http(
+            stream,
+            "404 Not Found",
+            r#"{"error":"use POST /mcp or GET /health"}"#,
+        );
+        return;
+    }
+    metrics.requests_total.fetch_add(1, Ordering::Relaxed);
 
     let mut content_length: usize = 0;
     let mut authorized = false;
@@ -144,6 +178,8 @@ fn handle_http_connection(
     }
 
     if !authorized {
+        metrics.requests_rejected.fetch_add(1, Ordering::Relaxed);
+        tracing::warn!("Rejected unauthorized MCP HTTP request");
         write_http(
             stream,
             "401 Unauthorized",
@@ -180,23 +216,44 @@ fn handle_http_connection(
     };
 
     let (reply_tx, reply_rx) = mpsc::channel();
-    if tx.send(LiveMcpRequest { payload, reply_tx }).is_err() {
-        write_http(
-            stream,
-            "503 Service Unavailable",
-            r#"{"error":"studio unavailable"}"#,
-        );
-        return;
+    match tx.try_send(LiveMcpRequest { payload, reply_tx }) {
+        Ok(()) => {}
+        Err(mpsc::TrySendError::Full(_)) => {
+            metrics.requests_rejected.fetch_add(1, Ordering::Relaxed);
+            tracing::warn!(
+                queue_capacity = MAX_MCP_QUEUE,
+                "MCP HTTP queue full; shedding request"
+            );
+            write_http(
+                stream,
+                "429 Too Many Requests",
+                r#"{"error":"studio busy; request queue full"}"#,
+            );
+            return;
+        }
+        Err(mpsc::TrySendError::Disconnected(_)) => {
+            metrics.requests_rejected.fetch_add(1, Ordering::Relaxed);
+            write_http(
+                stream,
+                "503 Service Unavailable",
+                r#"{"error":"studio unavailable"}"#,
+            );
+            return;
+        }
     }
 
     match reply_rx.recv_timeout(Duration::from_secs(5)) {
         Ok(Some(resp)) => write_http(stream, "200 OK", &resp.to_string()),
         Ok(None) => write_http(stream, "202 Accepted", "{}"),
-        Err(_) => write_http(
-            stream,
-            "504 Gateway Timeout",
-            r#"{"error":"studio timeout"}"#,
-        ),
+        Err(_) => {
+            metrics.requests_timed_out.fetch_add(1, Ordering::Relaxed);
+            tracing::warn!("MCP HTTP request timed out waiting for studio main thread");
+            write_http(
+                stream,
+                "504 Gateway Timeout",
+                r#"{"error":"studio timeout"}"#,
+            )
+        }
     }
 }
 
@@ -228,8 +285,9 @@ mod tests {
 
         // Authorized request must reach channel and receive response
         let token = handle.token.clone();
+        let addr_c = addr.clone();
         let client_thread = std::thread::spawn(move || {
-            let mut s2 = std::net::TcpStream::connect(&addr).unwrap();
+            let mut s2 = std::net::TcpStream::connect(&addr_c).unwrap();
             let body = r#"{"jsonrpc":"2.0","id":1,"method":"initialize"}"#;
             let req2 = format!(
                 "POST /mcp HTTP/1.1\r\nAuthorization: Bearer {token}\r\nContent-Length: {}\r\n\r\n{body}",
@@ -253,5 +311,16 @@ mod tests {
         let response_text = client_thread.join().unwrap();
         assert!(response_text.starts_with("HTTP/1.1 200"));
         assert!(response_text.contains("\"ok\":true"));
+
+        // GET /health returns 200 OK with counters reflecting both requests
+        let mut s3 = std::net::TcpStream::connect(&addr).unwrap();
+        s3.write_all(b"GET /health HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n")
+            .unwrap();
+        let mut out3 = String::new();
+        s3.read_to_string(&mut out3).unwrap();
+        assert!(out3.starts_with("HTTP/1.1 200"));
+        assert!(out3.contains("\"status\":\"ok\""));
+        assert!(out3.contains("\"requests_total\":2"));
+        assert!(out3.contains("\"requests_rejected\":1"));
     }
 }

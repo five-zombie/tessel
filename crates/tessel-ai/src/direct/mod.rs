@@ -111,12 +111,16 @@ fn openai_tools_payload() -> Vec<Value> {
 }
 
 /// Extracts OpenAI-style `tool_calls` from a chat completion message JSON value.
-pub fn parse_openai_tool_calls(message: &Value) -> Vec<PlannedToolCall> {
+/// Returns `Err(AiError::BatchLimitExceeded)` if the provider returns more than `MAX_TOOL_TURNS` calls.
+pub fn parse_openai_tool_calls(message: &Value) -> Result<Vec<PlannedToolCall>, AiError> {
     let Some(calls) = message.get("tool_calls").and_then(Value::as_array) else {
-        return Vec::new();
+        return Ok(Vec::new());
     };
-    let mut out = Vec::new();
-    for call in calls.iter().take(MAX_TOOL_TURNS) {
+    if calls.len() > MAX_TOOL_TURNS {
+        return Err(AiError::BatchLimitExceeded);
+    }
+    let mut out = Vec::with_capacity(calls.len());
+    for call in calls {
         let Some(func) = call.get("function") else {
             continue;
         };
@@ -133,7 +137,7 @@ pub fn parse_openai_tool_calls(message: &Value) -> Vec<PlannedToolCall> {
             arguments,
         });
     }
-    out
+    Ok(out)
 }
 
 /// Resolves the final HTTP endpoint URL for any provider, honoring custom `base_url`.
@@ -171,7 +175,10 @@ pub async fn send_prompt(
     let endpoint = resolve_endpoint(config);
 
     let system_prompt = build_system_prompt(scene);
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(10))
+        .timeout(std::time::Duration::from_secs(60))
+        .build()?;
 
     let response = match config.provider {
         AiProviderKind::OpenAi | AiProviderKind::Ollama => {
@@ -216,6 +223,12 @@ pub async fn send_prompt(
 
     let status = response.status();
     let body_text = response.text().await?;
+    tracing::info!(
+        provider = ?config.provider,
+        model = %config.model,
+        status = status.as_u16(),
+        "Direct AI provider response received"
+    );
     if !status.is_success() {
         return Err(AiError::ProviderStatus {
             status: status.as_u16(),
@@ -228,7 +241,7 @@ pub async fn send_prompt(
         AiProviderKind::OpenAi | AiProviderKind::Ollama => {
             let msg = &val["choices"][0]["message"];
             let reply = msg["content"].as_str().unwrap_or("").to_string();
-            let tool_calls = parse_openai_tool_calls(msg);
+            let tool_calls = parse_openai_tool_calls(msg)?;
             Ok(DirectAiResponse { reply, tool_calls })
         }
         AiProviderKind::Gemini => {
@@ -256,7 +269,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parse_openai_tool_calls_caps_at_max_tool_turns() {
+    fn parse_openai_tool_calls_rejects_excess_tool_turns() {
         let mut calls = Vec::new();
         for i in 0..12 {
             calls.push(json!({
@@ -269,7 +282,13 @@ mod tests {
             }));
         }
         let msg = json!({ "content": null, "tool_calls": calls });
-        let parsed = parse_openai_tool_calls(&msg);
+        assert!(matches!(
+            parse_openai_tool_calls(&msg),
+            Err(AiError::BatchLimitExceeded)
+        ));
+
+        let ok_msg = json!({ "content": null, "tool_calls": &msg["tool_calls"].as_array().unwrap()[..MAX_TOOL_TURNS] });
+        let parsed = parse_openai_tool_calls(&ok_msg).unwrap();
         assert_eq!(parsed.len(), MAX_TOOL_TURNS);
         assert_eq!(parsed[0].name, "voxel_fill_box");
         assert_eq!(parsed[0].arguments["palette_index"], 4);

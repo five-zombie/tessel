@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use crate::character::{AnimationClip, Bone, BoneId, CharacterRig, Keyframe, SkinBinding};
 use crate::error::CoreError;
 use crate::mesh::{
-    ops as mesh_ops, FaceId, LowPolyMesh, MeshMaterial, MeshTexture, PrimitiveKind,
+    ops as mesh_ops, FaceId, LowPolyMesh, MeshMaterial, MeshTexture, PrimitiveKind, UvProjection,
     DEFAULT_MESH_TEX_SIZE,
 };
 use crate::palette::{PaletteEntry, PaletteIndex, Rgba8};
@@ -133,6 +133,51 @@ pub enum Command {
         vertex_id: usize,
         position: glam::Vec3,
     },
+    SetMeshVerticesBatch {
+        node_id: NodeId,
+        updates: Vec<(usize, glam::Vec3)>,
+    },
+    SetMeshFaceMaterials {
+        node_id: NodeId,
+        face_ids: Vec<FaceId>,
+        material: PaletteIndex,
+    },
+    MirrorLowPolyMesh {
+        node_id: NodeId,
+        axis: u8,
+        merge_original: bool,
+    },
+    TaperLowPolyMesh {
+        node_id: NodeId,
+        axis: u8,
+        start_scale: f32,
+        end_scale: f32,
+    },
+    BendLowPolyMesh {
+        node_id: NodeId,
+        bend_axis: u8,
+        curve_axis: u8,
+        angle_rad: f32,
+    },
+    SetMeshOrigin {
+        node_id: NodeId,
+        origin_local: glam::Vec3,
+    },
+    ApplyMeshTransform {
+        node_id: NodeId,
+    },
+    WeldMeshVertices {
+        node_id: NodeId,
+        tolerance: f32,
+    },
+    FlipMeshNormals {
+        node_id: NodeId,
+        face_ids: Option<Vec<FaceId>>,
+    },
+    JoinLowPolyMeshes {
+        target_node_id: NodeId,
+        source_node_ids: Vec<NodeId>,
+    },
     SetMeshFaceUvs {
         node_id: NodeId,
         face_id: FaceId,
@@ -183,6 +228,27 @@ pub enum Command {
         radius_px: f32,
         color: Rgba8,
     },
+    PaintMeshLine {
+        node_id: NodeId,
+        uv_start: [f32; 2],
+        uv_end: [f32; 2],
+        width_px: f32,
+        color: Rgba8,
+    },
+    PaintMeshRect {
+        node_id: NodeId,
+        uv_min: [f32; 2],
+        uv_max: [f32; 2],
+        color: Rgba8,
+    },
+    ProjectMeshUvs {
+        node_id: NodeId,
+        mode: UvProjection,
+    },
+    SubdivideMeshFace {
+        node_id: NodeId,
+        face_id: FaceId,
+    },
     FillMeshTexture {
         node_id: NodeId,
         color: Rgba8,
@@ -196,9 +262,14 @@ pub enum Command {
         normal_map: Option<MeshTexture>,
     },
     ApplyBipedRig,
+    ApplyHumanoidRig,
     AddBone {
         name: String,
         parent: Option<BoneId>,
+        position: glam::Vec3,
+    },
+    SetBoneRestPosition {
+        bone_id: BoneId,
         position: glam::Vec3,
     },
     SetBoneRotation {
@@ -215,6 +286,10 @@ pub enum Command {
     BindNodeToBone {
         node_id: NodeId,
         bone_id: Option<BoneId>,
+    },
+    SetNodeBoneMask {
+        node_id: NodeId,
+        bone_ids: Option<Vec<BoneId>>,
     },
     AddAnimationClip {
         name: String,
@@ -260,6 +335,16 @@ pub enum Command {
         node_id: NodeId,
         visible: bool,
     },
+    RenameNode {
+        node_id: NodeId,
+        name: String,
+    },
+    ClearScene,
+    SetAnimationPlaybackTime {
+        clip_index: Option<usize>,
+        time_secs: f32,
+    },
+    ResetCharacterPose,
     ClearMeshTexture {
         node_id: NodeId,
         clear_color: bool,
@@ -360,6 +445,11 @@ pub enum UndoDelta {
         bone_id: BoneId,
         previous: Quat,
     },
+    RestoreBoneRestPosition {
+        bone_id: BoneId,
+        previous_rest: glam::Vec3,
+        previous_pose: glam::Vec3,
+    },
     RestoreNodeBoneBinding {
         node_id: NodeId,
         previous: Option<BoneId>,
@@ -375,6 +465,10 @@ pub enum UndoDelta {
     RestoreNodeVisibility {
         node_id: NodeId,
         previous: bool,
+    },
+    RestoreNodeName {
+        node_id: NodeId,
+        previous: String,
     },
     Transaction(Vec<UndoDelta>),
 }
@@ -928,6 +1022,220 @@ impl Command {
                     previous_mesh: current,
                 }
             }
+            Self::SetMeshVerticesBatch { node_id, updates } => {
+                let current = scene
+                    .lowpoly_meshes
+                    .get(node_id)
+                    .ok_or(CoreError::LowPolyMeshNotFound(*node_id))?
+                    .clone();
+                let next = mesh_ops::set_vertices_batch(&current, updates)?;
+                scene.lowpoly_meshes.insert(*node_id, next);
+                UndoDelta::RestoreLowPolyMesh {
+                    node_id: *node_id,
+                    previous_mesh: current,
+                }
+            }
+            Self::SetMeshFaceMaterials {
+                node_id,
+                face_ids,
+                material,
+            } => {
+                let current = scene
+                    .lowpoly_meshes
+                    .get(node_id)
+                    .ok_or(CoreError::LowPolyMeshNotFound(*node_id))?
+                    .clone();
+                let next = mesh_ops::set_face_materials(&current, face_ids, *material)?;
+                scene.lowpoly_meshes.insert(*node_id, next);
+                UndoDelta::RestoreLowPolyMesh {
+                    node_id: *node_id,
+                    previous_mesh: current,
+                }
+            }
+            Self::MirrorLowPolyMesh {
+                node_id,
+                axis,
+                merge_original,
+            } => {
+                let current = scene
+                    .lowpoly_meshes
+                    .get(node_id)
+                    .ok_or(CoreError::LowPolyMeshNotFound(*node_id))?
+                    .clone();
+                let next = mesh_ops::mirror_mesh(&current, *axis, *merge_original)?;
+                scene.lowpoly_meshes.insert(*node_id, next);
+                UndoDelta::RestoreLowPolyMesh {
+                    node_id: *node_id,
+                    previous_mesh: current,
+                }
+            }
+            Self::TaperLowPolyMesh {
+                node_id,
+                axis,
+                start_scale,
+                end_scale,
+            } => {
+                let current = scene
+                    .lowpoly_meshes
+                    .get(node_id)
+                    .ok_or(CoreError::LowPolyMeshNotFound(*node_id))?
+                    .clone();
+                let next = mesh_ops::taper_mesh(&current, *axis, *start_scale, *end_scale)?;
+                scene.lowpoly_meshes.insert(*node_id, next);
+                UndoDelta::RestoreLowPolyMesh {
+                    node_id: *node_id,
+                    previous_mesh: current,
+                }
+            }
+            Self::BendLowPolyMesh {
+                node_id,
+                bend_axis,
+                curve_axis,
+                angle_rad,
+            } => {
+                let current = scene
+                    .lowpoly_meshes
+                    .get(node_id)
+                    .ok_or(CoreError::LowPolyMeshNotFound(*node_id))?
+                    .clone();
+                let next = mesh_ops::bend_mesh(&current, *bend_axis, *curve_axis, *angle_rad)?;
+                scene.lowpoly_meshes.insert(*node_id, next);
+                UndoDelta::RestoreLowPolyMesh {
+                    node_id: *node_id,
+                    previous_mesh: current,
+                }
+            }
+            Self::SetMeshOrigin {
+                node_id,
+                origin_local,
+            } => {
+                let current = scene
+                    .lowpoly_meshes
+                    .get(node_id)
+                    .ok_or(CoreError::LowPolyMeshNotFound(*node_id))?
+                    .clone();
+                let next = mesh_ops::set_mesh_origin(&current, *origin_local)?;
+                let node = scene
+                    .nodes
+                    .get_mut(node_id)
+                    .ok_or(CoreError::NodeNotFound(*node_id))?;
+                let previous_transform = node.transform;
+                let world_shift = node.transform.rotation * (node.transform.scale * *origin_local);
+                node.transform.translation += world_shift;
+                scene.lowpoly_meshes.insert(*node_id, next);
+                UndoDelta::Transaction(vec![
+                    UndoDelta::RestoreLowPolyMesh {
+                        node_id: *node_id,
+                        previous_mesh: current,
+                    },
+                    UndoDelta::RestoreNodeTransform {
+                        node_id: *node_id,
+                        previous: previous_transform,
+                    },
+                ])
+            }
+            Self::ApplyMeshTransform { node_id } => {
+                let current = scene
+                    .lowpoly_meshes
+                    .get(node_id)
+                    .ok_or(CoreError::LowPolyMeshNotFound(*node_id))?
+                    .clone();
+                let node = scene
+                    .nodes
+                    .get_mut(node_id)
+                    .ok_or(CoreError::NodeNotFound(*node_id))?;
+                let previous_transform = node.transform;
+                let baked = mesh_ops::apply_transform(&current, &previous_transform)?;
+                node.transform = Transform::default();
+                scene.lowpoly_meshes.insert(*node_id, baked);
+                UndoDelta::Transaction(vec![
+                    UndoDelta::RestoreLowPolyMesh {
+                        node_id: *node_id,
+                        previous_mesh: current,
+                    },
+                    UndoDelta::RestoreNodeTransform {
+                        node_id: *node_id,
+                        previous: previous_transform,
+                    },
+                ])
+            }
+            Self::WeldMeshVertices { node_id, tolerance } => {
+                let current = scene
+                    .lowpoly_meshes
+                    .get(node_id)
+                    .ok_or(CoreError::LowPolyMeshNotFound(*node_id))?
+                    .clone();
+                let (next, _) = mesh_ops::weld_vertices(&current, *tolerance)?;
+                scene.lowpoly_meshes.insert(*node_id, next);
+                UndoDelta::RestoreLowPolyMesh {
+                    node_id: *node_id,
+                    previous_mesh: current,
+                }
+            }
+            Self::FlipMeshNormals { node_id, face_ids } => {
+                let current = scene
+                    .lowpoly_meshes
+                    .get(node_id)
+                    .ok_or(CoreError::LowPolyMeshNotFound(*node_id))?
+                    .clone();
+                let next = mesh_ops::flip_normals(&current, face_ids.as_deref())?;
+                scene.lowpoly_meshes.insert(*node_id, next);
+                UndoDelta::RestoreLowPolyMesh {
+                    node_id: *node_id,
+                    previous_mesh: current,
+                }
+            }
+            Self::JoinLowPolyMeshes {
+                target_node_id,
+                source_node_ids,
+            } => {
+                if source_node_ids.is_empty() {
+                    return Err(CoreError::OutOfBounds);
+                }
+                let target_mesh = scene
+                    .lowpoly_meshes
+                    .get(target_node_id)
+                    .ok_or(CoreError::LowPolyMeshNotFound(*target_node_id))?
+                    .clone();
+                let target_world = scene.node_world_matrix(*target_node_id);
+                let target_inv = target_world.inverse();
+                let mut owned_sources: Vec<(NodeId, LowPolyMesh, glam::Mat4)> =
+                    Vec::with_capacity(source_node_ids.len());
+                for &src_id in source_node_ids {
+                    if src_id == *target_node_id {
+                        continue;
+                    }
+                    let src_mesh = scene
+                        .lowpoly_meshes
+                        .get(&src_id)
+                        .ok_or(CoreError::LowPolyMeshNotFound(src_id))?
+                        .clone();
+                    let src_world = scene.node_world_matrix(src_id);
+                    owned_sources.push((src_id, src_mesh, src_world));
+                }
+                if owned_sources.is_empty() {
+                    return Err(CoreError::OutOfBounds);
+                }
+                let mut parts: Vec<(&LowPolyMesh, glam::Mat4)> =
+                    Vec::with_capacity(1 + owned_sources.len());
+                parts.push((&target_mesh, target_world));
+                for (_, m, w) in &owned_sources {
+                    parts.push((m, *w));
+                }
+                let merged = mesh_ops::join_meshes(&parts, target_inv)?;
+                scene.lowpoly_meshes.insert(*target_node_id, merged);
+                let mut deltas = Vec::with_capacity(1 + owned_sources.len());
+                deltas.push(UndoDelta::RestoreLowPolyMesh {
+                    node_id: *target_node_id,
+                    previous_mesh: target_mesh,
+                });
+                for (src_id, _, _) in owned_sources {
+                    let del = Self::DeleteNode(src_id).apply(scene)?;
+                    deltas.push(del);
+                }
+                scene.selected_node = Some(*target_node_id);
+                UndoDelta::Transaction(deltas)
+            }
             Self::SetMeshFaceUvs {
                 node_id,
                 face_id,
@@ -1116,6 +1424,89 @@ impl Command {
                     previous_pixels,
                 }
             }
+            Self::PaintMeshLine {
+                node_id,
+                uv_start,
+                uv_end,
+                width_px,
+                color,
+            } => {
+                let base_color = scene
+                    .lowpoly_meshes
+                    .get(node_id)
+                    .and_then(|m| m.faces.first())
+                    .and_then(|f| scene.palette.get(f.material))
+                    .map(|e| e.color)
+                    .unwrap_or(Rgba8::rgb(225, 226, 235));
+                let mesh = scene
+                    .lowpoly_meshes
+                    .get_mut(node_id)
+                    .ok_or(CoreError::LowPolyMeshNotFound(*node_id))?;
+                let was_none = mesh.texture.is_none();
+                let tex = mesh.texture.get_or_insert_with(|| {
+                    MeshTexture::solid(DEFAULT_MESH_TEX_SIZE, DEFAULT_MESH_TEX_SIZE, base_color)
+                });
+                let previous_pixels = tex.paint_line(*uv_start, *uv_end, *width_px, *color);
+                UndoDelta::RestoreMeshTexturePixels {
+                    node_id: *node_id,
+                    was_none,
+                    previous_pixels,
+                }
+            }
+            Self::PaintMeshRect {
+                node_id,
+                uv_min,
+                uv_max,
+                color,
+            } => {
+                let base_color = scene
+                    .lowpoly_meshes
+                    .get(node_id)
+                    .and_then(|m| m.faces.first())
+                    .and_then(|f| scene.palette.get(f.material))
+                    .map(|e| e.color)
+                    .unwrap_or(Rgba8::rgb(225, 226, 235));
+                let mesh = scene
+                    .lowpoly_meshes
+                    .get_mut(node_id)
+                    .ok_or(CoreError::LowPolyMeshNotFound(*node_id))?;
+                let was_none = mesh.texture.is_none();
+                let tex = mesh.texture.get_or_insert_with(|| {
+                    MeshTexture::solid(DEFAULT_MESH_TEX_SIZE, DEFAULT_MESH_TEX_SIZE, base_color)
+                });
+                let previous_pixels = tex.paint_rect(*uv_min, *uv_max, *color);
+                UndoDelta::RestoreMeshTexturePixels {
+                    node_id: *node_id,
+                    was_none,
+                    previous_pixels,
+                }
+            }
+            Self::ProjectMeshUvs { node_id, mode } => {
+                let current = scene
+                    .lowpoly_meshes
+                    .get(node_id)
+                    .ok_or(CoreError::LowPolyMeshNotFound(*node_id))?
+                    .clone();
+                let next = mesh_ops::project_uvs(&current, *mode)?;
+                scene.lowpoly_meshes.insert(*node_id, next);
+                UndoDelta::RestoreLowPolyMesh {
+                    node_id: *node_id,
+                    previous_mesh: current,
+                }
+            }
+            Self::SubdivideMeshFace { node_id, face_id } => {
+                let current = scene
+                    .lowpoly_meshes
+                    .get(node_id)
+                    .ok_or(CoreError::LowPolyMeshNotFound(*node_id))?
+                    .clone();
+                let next = mesh_ops::subdivide_face(&current, *face_id)?;
+                scene.lowpoly_meshes.insert(*node_id, next);
+                UndoDelta::RestoreLowPolyMesh {
+                    node_id: *node_id,
+                    previous_mesh: current,
+                }
+            }
             Self::FillMeshTexture { node_id, color } => {
                 let mesh = scene
                     .lowpoly_meshes
@@ -1194,6 +1585,12 @@ impl Command {
                 let prev = scene.character_rig.replace(CharacterRig::biped_template());
                 UndoDelta::RestoreCharacterRig(prev)
             }
+            Self::ApplyHumanoidRig => {
+                let prev = scene
+                    .character_rig
+                    .replace(CharacterRig::humanoid_template());
+                UndoDelta::RestoreCharacterRig(prev)
+            }
             Self::AddBone {
                 name,
                 parent,
@@ -1241,6 +1638,25 @@ impl Command {
                 UndoDelta::RestoreBoneRotation {
                     bone_id: *bone_id,
                     previous,
+                }
+            }
+            Self::SetBoneRestPosition { bone_id, position } => {
+                if !position.is_finite() {
+                    return Err(CoreError::OutOfBounds);
+                }
+                let rig = scene
+                    .character_rig
+                    .as_mut()
+                    .ok_or(CoreError::CharacterRigNotFound)?;
+                let bone = rig.bone_mut(*bone_id).ok_or(CoreError::OutOfBounds)?;
+                let previous_rest = bone.rest_local.translation;
+                let previous_pose = bone.pose_local.translation;
+                bone.rest_local.translation = *position;
+                bone.pose_local.translation = *position;
+                UndoDelta::RestoreBoneRestPosition {
+                    bone_id: *bone_id,
+                    previous_rest,
+                    previous_pose,
                 }
             }
             Self::SolveTwoBoneIk {
@@ -1302,6 +1718,31 @@ impl Command {
                     node_id: *node_id,
                     previous,
                 }
+            }
+            Self::SetNodeBoneMask { node_id, bone_ids } => {
+                if !scene.nodes.contains_key(node_id) {
+                    return Err(CoreError::NodeNotFound(*node_id));
+                }
+                let prev = scene.character_rig.clone();
+                let rig = scene
+                    .character_rig
+                    .as_mut()
+                    .ok_or(CoreError::CharacterRigNotFound)?;
+                match bone_ids {
+                    Some(ids) if !ids.is_empty() => {
+                        for bid in ids {
+                            if rig.bone(*bid).is_none() {
+                                scene.character_rig = prev;
+                                return Err(CoreError::OutOfBounds);
+                            }
+                        }
+                        rig.node_bone_masks.insert(*node_id, ids.clone());
+                    }
+                    _ => {
+                        rig.node_bone_masks.remove(node_id);
+                    }
+                }
+                UndoDelta::RestoreCharacterRig(prev)
             }
             Self::AddAnimationClip {
                 name,
@@ -1545,6 +1986,74 @@ impl Command {
                     node_id: *node_id,
                     previous,
                 }
+            }
+            Self::RenameNode { node_id, name } => {
+                let trimmed = name.trim();
+                if trimmed.is_empty() {
+                    return Err(CoreError::OutOfBounds);
+                }
+                let node = scene
+                    .nodes
+                    .get_mut(node_id)
+                    .ok_or(CoreError::NodeNotFound(*node_id))?;
+                let previous = std::mem::replace(&mut node.name, trimmed.to_string());
+                UndoDelta::RestoreNodeName {
+                    node_id: *node_id,
+                    previous,
+                }
+            }
+            Self::ClearScene => {
+                let node_ids: Vec<NodeId> = scene.nodes.keys().copied().collect();
+                let mut deltas = Vec::with_capacity(node_ids.len() + 1);
+                for id in node_ids {
+                    deltas.push(Self::DeleteNode(id).apply(scene)?);
+                }
+                let prev_rig = scene.character_rig.take();
+                if prev_rig.is_some() {
+                    deltas.push(UndoDelta::RestoreCharacterRig(prev_rig));
+                }
+                scene.selected_node = None;
+                scene.selected_bone = None;
+                scene.selected_face = None;
+                UndoDelta::Transaction(deltas)
+            }
+            Self::SetAnimationPlaybackTime {
+                clip_index,
+                time_secs,
+            } => {
+                if !time_secs.is_finite() || *time_secs < 0.0 {
+                    return Err(CoreError::OutOfBounds);
+                }
+                let prev = scene.character_rig.clone();
+                let rig = scene
+                    .character_rig
+                    .as_mut()
+                    .ok_or(CoreError::CharacterRigNotFound)?;
+                if let Some(idx) = *clip_index {
+                    if idx >= rig.animations.len() {
+                        scene.character_rig = prev;
+                        return Err(CoreError::OutOfBounds);
+                    }
+                    rig.active_animation = idx;
+                }
+                rig.playback_time = *time_secs;
+                rig.playing = false;
+                rig.apply_active_animation();
+                UndoDelta::RestoreCharacterRig(prev)
+            }
+            Self::ResetCharacterPose => {
+                let prev = scene.character_rig.clone();
+                let rig = scene
+                    .character_rig
+                    .as_mut()
+                    .ok_or(CoreError::CharacterRigNotFound)?;
+                for bone in &mut rig.bones {
+                    bone.pose_local = bone.rest_local;
+                }
+                rig.morph_weights.clear();
+                rig.playback_time = 0.0;
+                rig.playing = false;
+                UndoDelta::RestoreCharacterRig(prev)
             }
             Self::ClearMeshTexture {
                 node_id,
@@ -1823,6 +2332,19 @@ impl UndoDelta {
                 let bone = rig.bone_mut(*bone_id).ok_or(CoreError::OutOfBounds)?;
                 bone.pose_local.rotation = *previous;
             }
+            Self::RestoreBoneRestPosition {
+                bone_id,
+                previous_rest,
+                previous_pose,
+            } => {
+                let rig = scene
+                    .character_rig
+                    .as_mut()
+                    .ok_or(CoreError::CharacterRigNotFound)?;
+                let bone = rig.bone_mut(*bone_id).ok_or(CoreError::OutOfBounds)?;
+                bone.rest_local.translation = *previous_rest;
+                bone.pose_local.translation = *previous_pose;
+            }
             Self::RestoreNodeBoneBinding { node_id, previous } => {
                 let rig = scene
                     .character_rig
@@ -1874,11 +2396,17 @@ impl UndoDelta {
                     .ok_or(CoreError::NodeNotFound(*node_id))?;
                 node.visible = *previous;
             }
+            Self::RestoreNodeName { node_id, previous } => {
+                let node = scene
+                    .nodes
+                    .get_mut(node_id)
+                    .ok_or(CoreError::NodeNotFound(*node_id))?;
+                node.name = previous.clone();
+            }
             Self::Transaction(deltas) => {
                 for delta in deltas.iter().rev() {
                     delta.revert(scene)?;
                 }
-                return Ok(());
             }
         }
         scene.mark_modified();

@@ -6,6 +6,7 @@ license.workspace = true
 
 [dependencies]
 base64.workspace = true
+gif.workspace = true
 glam.workspace = true
 pollster.workspace = true
 tessel-render = { path = "../tessel-render" }

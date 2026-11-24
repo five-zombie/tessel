@@ -45,6 +45,102 @@ impl AnimationClip {
         }
     }
 
+    /// Starter 19-bone humanoid Idle animation (subtle breathing + head/arm relaxation).
+    pub fn humanoid_idle() -> Self {
+        let mut clip = Self::new_empty("Idle", 2.0);
+        // Spine (1) gentle breathing pitch
+        clip.upsert_keyframe(BoneId(1), Keyframe::rotation_only(0.0, Quat::IDENTITY));
+        clip.upsert_keyframe(
+            BoneId(1),
+            Keyframe::rotation_only(1.0, Quat::from_rotation_x(0.03)),
+        );
+        clip.upsert_keyframe(BoneId(1), Keyframe::rotation_only(2.0, Quat::IDENTITY));
+        // Head (4) subtle look sway
+        clip.upsert_keyframe(BoneId(4), Keyframe::rotation_only(0.0, Quat::IDENTITY));
+        clip.upsert_keyframe(
+            BoneId(4),
+            Keyframe::rotation_only(1.0, Quat::from_rotation_y(0.05)),
+        );
+        clip.upsert_keyframe(BoneId(4), Keyframe::rotation_only(2.0, Quat::IDENTITY));
+        // Arms (6 = LeftUpperArm, 10 = RightUpperArm) subtle breath lift
+        clip.upsert_keyframe(BoneId(6), Keyframe::rotation_only(0.0, Quat::IDENTITY));
+        clip.upsert_keyframe(
+            BoneId(6),
+            Keyframe::rotation_only(1.0, Quat::from_rotation_z(0.04)),
+        );
+        clip.upsert_keyframe(BoneId(6), Keyframe::rotation_only(2.0, Quat::IDENTITY));
+        clip.upsert_keyframe(BoneId(10), Keyframe::rotation_only(0.0, Quat::IDENTITY));
+        clip.upsert_keyframe(
+            BoneId(10),
+            Keyframe::rotation_only(1.0, Quat::from_rotation_z(-0.04)),
+        );
+        clip.upsert_keyframe(BoneId(10), Keyframe::rotation_only(2.0, Quat::IDENTITY));
+        clip
+    }
+
+    /// Starter 19-bone humanoid Walk cycle (counter-swinging arms, legs, knees, elbows).
+    pub fn humanoid_walk() -> Self {
+        let mut clip = Self::new_empty("Walk", 1.0);
+        let swing = 0.42f32;
+        let knee = 0.48f32;
+        let elbow = -0.35f32;
+        // LeftThigh (13) & RightThigh (16)
+        for &(bone, sign) in &[(13u32, 1.0f32), (16u32, -1.0f32)] {
+            clip.upsert_keyframe(BoneId(bone), Keyframe::rotation_only(0.0, Quat::IDENTITY));
+            clip.upsert_keyframe(
+                BoneId(bone),
+                Keyframe::rotation_only(0.25, Quat::from_rotation_x(-swing * sign)),
+            );
+            clip.upsert_keyframe(BoneId(bone), Keyframe::rotation_only(0.5, Quat::IDENTITY));
+            clip.upsert_keyframe(
+                BoneId(bone),
+                Keyframe::rotation_only(0.75, Quat::from_rotation_x(swing * sign)),
+            );
+            clip.upsert_keyframe(BoneId(bone), Keyframe::rotation_only(1.0, Quat::IDENTITY));
+        }
+        // LeftCalf (14) & RightCalf (17) knee bend on swing phase
+        clip.upsert_keyframe(BoneId(14), Keyframe::rotation_only(0.0, Quat::IDENTITY));
+        clip.upsert_keyframe(
+            BoneId(14),
+            Keyframe::rotation_only(0.25, Quat::from_rotation_x(knee)),
+        );
+        clip.upsert_keyframe(BoneId(14), Keyframe::rotation_only(0.5, Quat::IDENTITY));
+        clip.upsert_keyframe(BoneId(14), Keyframe::rotation_only(1.0, Quat::IDENTITY));
+        clip.upsert_keyframe(BoneId(17), Keyframe::rotation_only(0.0, Quat::IDENTITY));
+        clip.upsert_keyframe(BoneId(17), Keyframe::rotation_only(0.5, Quat::IDENTITY));
+        clip.upsert_keyframe(
+            BoneId(17),
+            Keyframe::rotation_only(0.75, Quat::from_rotation_x(knee)),
+        );
+        clip.upsert_keyframe(BoneId(17), Keyframe::rotation_only(1.0, Quat::IDENTITY));
+        // LeftUpperArm (6) & RightUpperArm (10) counter-swing
+        for &(bone, sign) in &[(6u32, -1.0f32), (10u32, 1.0f32)] {
+            clip.upsert_keyframe(BoneId(bone), Keyframe::rotation_only(0.0, Quat::IDENTITY));
+            clip.upsert_keyframe(
+                BoneId(bone),
+                Keyframe::rotation_only(0.25, Quat::from_rotation_x(-swing * 0.7 * sign)),
+            );
+            clip.upsert_keyframe(BoneId(bone), Keyframe::rotation_only(0.5, Quat::IDENTITY));
+            clip.upsert_keyframe(
+                BoneId(bone),
+                Keyframe::rotation_only(0.75, Quat::from_rotation_x(swing * 0.7 * sign)),
+            );
+            clip.upsert_keyframe(BoneId(bone), Keyframe::rotation_only(1.0, Quat::IDENTITY));
+        }
+        // Forearms (7, 11) slight elbow flex
+        for bone in [7u32, 11u32] {
+            clip.upsert_keyframe(
+                BoneId(bone),
+                Keyframe::rotation_only(0.0, Quat::from_rotation_x(elbow)),
+            );
+            clip.upsert_keyframe(
+                BoneId(bone),
+                Keyframe::rotation_only(1.0, Quat::from_rotation_x(elbow)),
+            );
+        }
+        clip
+    }
+
     /// Inserts or replaces a keyframe (within 1ms tolerance) for `bone_id`, keeping timestamps sorted.
     pub fn upsert_keyframe(&mut self, bone_id: BoneId, keyframe: Keyframe) {
         let time = keyframe.time_secs.max(0.0);

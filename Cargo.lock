@@ -3272,6 +3272,7 @@ name = "tessel-ai"
 version = "0.1.0"
 dependencies = [
  "base64 0.22.1",
+ "gif",
  "glam",
  "pollster",
  "reqwest",
@@ -3336,6 +3337,7 @@ dependencies = [
  "serde_json",
  "tessel-core",
  "thiserror 2.0.21",
+ "tracing",
  "zip",
 ]
 

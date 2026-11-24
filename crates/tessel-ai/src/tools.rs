@@ -45,6 +45,46 @@ pub fn tool_definitions() -> Vec<Value> {
             }
         }),
         json!({
+            "name": "scene_rename_node",
+            "description": "Rename an existing scene node by node_id (supports Undo/Redo).",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "node_id": { "type": "integer", "minimum": 1 },
+                    "name": { "type": "string", "minLength": 1 }
+                },
+                "required": ["node_id", "name"]
+            }
+        }),
+        json!({
+            "name": "scene_clear",
+            "description": "Remove all nodes and reset the active character rig to start a clean empty scene (undoable as a single transaction).",
+            "inputSchema": { "type": "object", "properties": {} }
+        }),
+        json!({
+            "name": "scene_batch",
+            "description": "Execute up to 512 tool calls atomically in one MCP request. If any call fails, the entire scene and undo history roll back cleanly.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "calls": {
+                        "type": "array",
+                        "minItems": 1,
+                        "maxItems": 128,
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "name": { "type": "string" },
+                                "arguments": { "type": "object" }
+                            },
+                            "required": ["name"]
+                        }
+                    }
+                },
+                "required": ["calls"]
+            }
+        }),
+        json!({
             "name": "scene_set_node_transform",
             "description": "Set a scene node's world position [x,y,z], rotation_deg [pitch,yaw,roll], and/or scale [sx,sy,sz] (omitted fields keep their current values).",
             "inputSchema": {
@@ -122,19 +162,82 @@ pub fn tool_definitions() -> Vec<Value> {
         }),
         json!({
             "name": "mesh_create_primitive",
-            "description": "Create a low-poly primitive mesh (cube, plane, cylinder, cone, sphere, torus, capsule) with optional world position, rotation_deg, and scale.",
+            "description": "Create a low-poly primitive mesh (cube, plane, cylinder, cone, sphere, torus, capsule) with optional world position, rotation_deg, and scale. 'size' accepts either a scalar (>= 0.005) or [sx, sy, sz] non-uniform dimensions. Local pivot is bottom-centered: y in [0, size] (torus y in [0, 0.28*size]); x,z in [-size/2, size/2] (capsule x,z in [-size/4, size/4]).",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "name": { "type": "string" },
                     "kind": { "type": "string", "enum": ["cube", "plane", "cylinder", "cone", "sphere", "torus", "capsule"] },
-                    "size": { "type": "number" },
+                    "size": {
+                        "oneOf": [
+                            { "type": "number", "minimum": 0.005 },
+                            { "type": "array", "items": { "type": "number", "minimum": 0.005 }, "minItems": 3, "maxItems": 3 }
+                        ]
+                    },
                     "palette_index": { "type": "integer", "minimum": 1, "maximum": 255 },
                     "position": { "type": "array", "items": { "type": "number" }, "minItems": 3, "maxItems": 3 },
                     "rotation_deg": { "type": "array", "items": { "type": "number" }, "minItems": 3, "maxItems": 3 },
                     "scale": { "type": "array", "items": { "type": "number" }, "minItems": 3, "maxItems": 3 }
                 },
                 "required": ["kind"]
+            }
+        }),
+        json!({
+            "name": "mesh_create_lathe",
+            "description": "Create a surface-of-revolution (lathe) Low-Poly mesh by revolving a 2D profile [[radius, y], ...] (bottom-to-top) around the +Y axis with automatic outward CCW winding and pole collapse. Use angle_deg=360 for domes/helmets/boots/props or partial arcs (e.g. 160-180) for curved visors and shields.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "name": { "type": "string" },
+                    "profile": {
+                        "type": "array",
+                        "minItems": 2,
+                        "maxItems": 128,
+                        "items": { "type": "array", "items": { "type": "number" }, "minItems": 2, "maxItems": 2 }
+                    },
+                    "segments": { "type": "integer", "minimum": 3, "maximum": 64 },
+                    "angle_deg": { "type": "number", "minimum": 1.1, "maximum": 360.0 },
+                    "cap_ends": { "type": "boolean" },
+                    "palette_index": { "type": "integer", "minimum": 1, "maximum": 255 },
+                    "position": { "type": "array", "items": { "type": "number" }, "minItems": 3, "maxItems": 3 },
+                    "rotation_deg": { "type": "array", "items": { "type": "number" }, "minItems": 3, "maxItems": 3 },
+                    "scale": { "type": "array", "items": { "type": "number" }, "minItems": 3, "maxItems": 3 }
+                },
+                "required": ["profile"]
+            }
+        }),
+        json!({
+            "name": "mesh_create_raw",
+            "description": "Create a custom Low-Poly mesh directly from explicit 3D vertices [[x,y,z], ...] and faces (triangles/quads/n-gons with optional per-face palette_index and per-corner uvs). Ideal for bespoke 1:1 character anatomy, helmets, clothing, and organic silhouettes.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "name": { "type": "string" },
+                    "vertices": {
+                        "type": "array",
+                        "minItems": 3,
+                        "items": { "type": "array", "items": { "type": "number" }, "minItems": 3, "maxItems": 3 }
+                    },
+                    "faces": {
+                        "type": "array",
+                        "minItems": 1,
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "vertices": { "type": "array", "items": { "type": "integer", "minimum": 0 }, "minItems": 3 },
+                                "palette_index": { "type": "integer", "minimum": 1, "maximum": 255 },
+                                "uvs": { "type": "array", "items": { "type": "array", "items": { "type": "number" }, "minItems": 2, "maxItems": 2 }, "minItems": 3 }
+                            },
+                            "required": ["vertices"]
+                        }
+                    },
+                    "palette_index": { "type": "integer", "minimum": 1, "maximum": 255 },
+                    "smooth": { "type": "boolean" },
+                    "position": { "type": "array", "items": { "type": "number" }, "minItems": 3, "maxItems": 3 },
+                    "rotation_deg": { "type": "array", "items": { "type": "number" }, "minItems": 3, "maxItems": 3 },
+                    "scale": { "type": "array", "items": { "type": "number" }, "minItems": 3, "maxItems": 3 }
+                },
+                "required": ["vertices", "faces"]
             }
         }),
         json!({
@@ -220,6 +323,59 @@ pub fn tool_definitions() -> Vec<Value> {
                     "mirror_x": { "type": "boolean" }
                 },
                 "required": ["palette_index"]
+            }
+        }),
+        json!({
+            "name": "mesh_paint_line",
+            "description": "Paint a crisp line segment (seams, stitching, eyebrows, stripes) onto a Low-Poly mesh's RGBA texture between uv_start and uv_end.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "node_id": { "type": "integer" },
+                    "uv_start": { "type": "array", "items": { "type": "number" }, "minItems": 2, "maxItems": 2 },
+                    "uv_end": { "type": "array", "items": { "type": "number" }, "minItems": 2, "maxItems": 2 },
+                    "width_px": { "type": "number", "minimum": 1.0, "maximum": 96.0 },
+                    "palette_index": { "type": "integer", "minimum": 1, "maximum": 255 }
+                },
+                "required": ["uv_start", "uv_end", "palette_index"]
+            }
+        }),
+        json!({
+            "name": "mesh_paint_rect",
+            "description": "Paint a solid axis-aligned UV rectangle (pockets, panels, camo blocks, visor frames) onto a Low-Poly mesh's RGBA texture.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "node_id": { "type": "integer" },
+                    "uv_min": { "type": "array", "items": { "type": "number" }, "minItems": 2, "maxItems": 2 },
+                    "uv_max": { "type": "array", "items": { "type": "number" }, "minItems": 2, "maxItems": 2 },
+                    "palette_index": { "type": "integer", "minimum": 1, "maximum": 255 }
+                },
+                "required": ["uv_min", "uv_max", "palette_index"]
+            }
+        }),
+        json!({
+            "name": "mesh_project_uvs",
+            "description": "Automatically project per-corner UVs onto every face of a Low-Poly mesh using 'box', 'planar_x', 'planar_y', 'planar_z', 'cylindrical', or 'spherical' projection.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "node_id": { "type": "integer" },
+                    "mode": { "type": "string", "enum": ["box", "planar_x", "planar_y", "planar_z", "cylindrical", "spherical"] }
+                },
+                "required": ["mode"]
+            }
+        }),
+        json!({
+            "name": "mesh_subdivide_face",
+            "description": "Locally subdivide one Low-Poly face into N quads around its centroid and edge midpoints (adds local joint/face topology density without subdividing the whole mesh).",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "node_id": { "type": "integer", "minimum": 1 },
+                    "face_id": { "type": "integer", "minimum": 0 }
+                },
+                "required": ["face_id"]
             }
         }),
         json!({
@@ -311,6 +467,138 @@ pub fn tool_definitions() -> Vec<Value> {
             }
         }),
         json!({
+            "name": "mesh_set_vertices",
+            "description": "Batch-update multiple Low-Poly vertex positions in a single atomic undoable command.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "node_id": { "type": "integer" },
+                    "updates": {
+                        "type": "array",
+                        "minItems": 1,
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "vertex_id": { "type": "integer", "minimum": 0 },
+                                "position": { "type": "array", "items": { "type": "number" }, "minItems": 3, "maxItems": 3 }
+                            },
+                            "required": ["vertex_id", "position"]
+                        }
+                    }
+                },
+                "required": ["updates"]
+            }
+        }),
+        json!({
+            "name": "mesh_set_face_material",
+            "description": "Assign a palette_index color to one or more faces on a Low-Poly mesh (enables multi-color unified meshes without splitting nodes).",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "node_id": { "type": "integer" },
+                    "face_ids": { "type": "array", "items": { "type": "integer", "minimum": 0 }, "minItems": 1 },
+                    "palette_index": { "type": "integer", "minimum": 1, "maximum": 255 }
+                },
+                "required": ["face_ids", "palette_index"]
+            }
+        }),
+        json!({
+            "name": "mesh_join",
+            "description": "Merge source_node_ids Low-Poly meshes into target_node_id (baking world transforms into target local space, preserving per-face materials/UVs, deleting source nodes).",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "target_node_id": { "type": "integer", "minimum": 1 },
+                    "source_node_ids": { "type": "array", "items": { "type": "integer", "minimum": 1 }, "minItems": 1 }
+                },
+                "required": ["target_node_id", "source_node_ids"]
+            }
+        }),
+        json!({
+            "name": "mesh_mirror",
+            "description": "Mirror a Low-Poly mesh across axis ('x', 'y', or 'z'), preserving outward normals. Set merge_original=true (default) for symmetrical modeling.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "node_id": { "type": "integer" },
+                    "axis": { "type": "string", "enum": ["x", "y", "z"] },
+                    "merge_original": { "type": "boolean" }
+                }
+            }
+        }),
+        json!({
+            "name": "mesh_taper",
+            "description": "Linearly taper a Low-Poly mesh along axis ('x', 'y', or 'z') from start_scale (min) to end_scale (max) — ideal for forearms, calves, thighs, and V-tapered torsos.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "node_id": { "type": "integer" },
+                    "axis": { "type": "string", "enum": ["x", "y", "z"] },
+                    "start_scale": { "type": "number", "minimum": 0.05 },
+                    "end_scale": { "type": "number", "minimum": 0.05 }
+                },
+                "required": ["start_scale", "end_scale"]
+            }
+        }),
+        json!({
+            "name": "mesh_bend",
+            "description": "Smoothly bend a Low-Poly mesh along bend_axis ('x'|'y'|'z') curving toward curve_axis ('x'|'y'|'z') by angle_deg — ideal for curved helmet visors, collars, and armor plates.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "node_id": { "type": "integer" },
+                    "bend_axis": { "type": "string", "enum": ["x", "y", "z"] },
+                    "curve_axis": { "type": "string", "enum": ["x", "y", "z"] },
+                    "angle_deg": { "type": "number" }
+                },
+                "required": ["bend_axis", "curve_axis", "angle_deg"]
+            }
+        }),
+        json!({
+            "name": "mesh_set_origin",
+            "description": "Move a Low-Poly mesh's local pivot/origin to 'center', 'bottom', or an explicit local point [x,y,z] while keeping its world position unchanged.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "node_id": { "type": "integer" },
+                    "mode": { "type": "string", "enum": ["center", "bottom"] },
+                    "origin": { "type": "array", "items": { "type": "number" }, "minItems": 3, "maxItems": 3 }
+                }
+            }
+        }),
+        json!({
+            "name": "mesh_apply_transform",
+            "description": "Bake a Low-Poly node's position, rotation, and scale directly into its mesh vertices and reset the node transform to identity (use before mesh_mirror or mesh_bend for exact 1:1 world-space symmetry).",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "node_id": { "type": "integer" }
+                }
+            }
+        }),
+        json!({
+            "name": "mesh_weld_vertices",
+            "description": "Merge coincident vertices within tolerance (default 0.001) and remap faces to remove center-seam shading creases after mesh_mirror or mesh_join.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "node_id": { "type": "integer" },
+                    "tolerance": { "type": "number", "minimum": 0.00001, "maximum": 0.5 }
+                }
+            }
+        }),
+        json!({
+            "name": "mesh_flip_normals",
+            "description": "Reverse face winding (flip outward normals) on all faces of a Low-Poly mesh or on explicit face_ids to fix inside-out faces.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "node_id": { "type": "integer" },
+                    "face_ids": { "type": "array", "items": { "type": "integer", "minimum": 0 }, "minItems": 1 }
+                }
+            }
+        }),
+        json!({
             "name": "mesh_set_face_uvs",
             "description": "Set manual per-corner UVs on a Low-Poly face (manual UV unwrap; one [u, v] pair per face corner, values clamped to 0..1, overrides auto box-atlas UV on export).",
             "inputSchema": {
@@ -339,16 +627,18 @@ pub fn tool_definitions() -> Vec<Value> {
         }),
         json!({
             "name": "mesh_morph_delta",
-            "description": "Add (accumulate) a position delta [dx, dy, dz] onto a named morph target (blend shape) for explicit vertices, creating the target if missing. Exports as glTF morph targets; bevel/subdivide/decimate clear them.",
+            "description": "Add (accumulate) a position delta [dx, dy, dz] onto a named morph target (blend shape), creating the target if missing. Select vertices either by explicit 'vertex_ids' OR by local-space bounding box ('bounds_min' + 'bounds_max'). Exports as glTF morph targets; bevel/subdivide/decimate clear them.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "node_id": { "type": "integer" },
                     "name": { "type": "string" },
                     "vertex_ids": { "type": "array", "items": { "type": "integer", "minimum": 0 }, "minItems": 1 },
+                    "bounds_min": { "type": "array", "items": { "type": "number" }, "minItems": 3, "maxItems": 3, "description": "Local-space AABB min [x, y, z] for spatial vertex selection (alternative to vertex_ids)" },
+                    "bounds_max": { "type": "array", "items": { "type": "number" }, "minItems": 3, "maxItems": 3, "description": "Local-space AABB max [x, y, z] for spatial vertex selection (alternative to vertex_ids)" },
                     "delta": { "type": "array", "items": { "type": "number" }, "minItems": 3, "maxItems": 3 }
                 },
-                "required": ["name", "vertex_ids", "delta"]
+                "required": ["name", "delta"]
             }
         }),
         json!({
@@ -435,8 +725,25 @@ pub fn tool_definitions() -> Vec<Value> {
         }),
         json!({
             "name": "character_apply_biped_rig",
-            "description": "Apply the starter 7-bone biped humanoid skeleton with Idle & Walk animations.",
-            "inputSchema": { "type": "object", "properties": {} }
+            "description": "Apply a humanoid skeleton rig (Right-Handed +Y Up, +Z Front: Left=+X, Right=-X). Pass preset='starter' (default, 7 bones with Idle & Walk) or preset='humanoid' (19-bone 1:1 full humanoid skeleton).",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "preset": { "type": "string", "enum": ["starter", "humanoid"] }
+                }
+            }
+        }),
+        json!({
+            "name": "character_set_bone_rest_position",
+            "description": "Move an existing bone's local rest position [x, y, z] without deleting its subtree.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "bone_id": { "type": "integer", "minimum": 0 },
+                    "position": { "type": "array", "items": { "type": "number" }, "minItems": 3, "maxItems": 3 }
+                },
+                "required": ["bone_id", "position"]
+            }
         }),
         json!({
             "name": "character_add_bone",
@@ -459,6 +766,18 @@ pub fn tool_definitions() -> Vec<Value> {
                 "properties": {
                     "node_id": { "type": "integer", "minimum": 1 },
                     "bone_id": { "type": ["integer", "null"], "minimum": 0 }
+                },
+                "required": ["node_id"]
+            }
+        }),
+        json!({
+            "name": "character_set_node_bone_mask",
+            "description": "Restrict which bones may auto-skin a scene node (e.g. allow only leg/root bones on trousers so hanging arms never pull the hips). Pass null or empty array to clear the mask.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "node_id": { "type": "integer", "minimum": 1 },
+                    "bone_ids": { "type": ["array", "null"], "items": { "type": "integer", "minimum": 0 } }
                 },
                 "required": ["node_id"]
             }
@@ -495,17 +814,33 @@ pub fn tool_definitions() -> Vec<Value> {
         }),
         json!({
             "name": "character_solve_ik",
-            "description": "Analytic two-bone IK: rotate root and mid bones so the end bone reaches target [x, y, z]. Chain must be parent-linked root <- mid <- end (build with character_add_bone). pole_vector steers the elbow/knee bend, defaults to [0,0,1].",
+            "description": "Analytic two-bone IK: rotate root and mid bones so the end bone reaches target [x, y, z], optionally aiming end_bone_id via end_rotation_deg. Returns reached position and resulting bone delta rotations_deg. Use character_snapshot_pose_to_keyframe to bake the solved pose into an animation clip.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "root_bone_id": { "type": "integer", "minimum": 0 },
                     "mid_bone_id": { "type": "integer", "minimum": 0 },
                     "end_bone_id": { "type": "integer", "minimum": 0 },
-                    "target": { "type": "array", "items": { "type": "number" }, "minItems": 3, "maxItems": 3 },
-                    "pole_vector": { "type": "array", "items": { "type": "number" }, "minItems": 3, "maxItems": 3 }
+                    "target": { "type": "array", "items": { "type": "number" }, "minItems": 3, "maxItems": 3, "description": "World-space target position [x, y, z] for end_bone_id" },
+                    "pole_vector": { "type": "array", "items": { "type": "number" }, "minItems": 3, "maxItems": 3, "description": "World-space DIRECTION vector (not a world point) steering the elbow/knee bend plane; e.g. [0, -1, -1] for elbow down-back, [0, 0, 1] for knee forward" },
+                    "end_rotation_deg": { "type": "array", "items": { "type": "number" }, "minItems": 3, "maxItems": 3, "description": "Optional Euler XYZ degrees (relative to rest pose) applied to end_bone_id after solving IK" }
                 },
                 "required": ["root_bone_id", "mid_bone_id", "end_bone_id", "target"]
+            }
+        }),
+        json!({
+            "name": "character_snapshot_pose_to_keyframe",
+            "description": "Bake/snapshot the current live bone pose (e.g. after character_solve_ik or manual posing) into an animation clip at time_secs as a single atomic transaction. Creates the clip automatically if clip_name is new.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "clip_index": { "type": "integer", "minimum": 0 },
+                    "clip_name": { "type": "string" },
+                    "duration_secs": { "type": "number", "minimum": 0.1 },
+                    "time_secs": { "type": "number", "minimum": 0.0 },
+                    "bone_ids": { "type": "array", "items": { "type": "integer", "minimum": 0 }, "description": "Optional subset of bone IDs to snapshot (defaults to all bones in the rig)" }
+                },
+                "required": ["time_secs"]
             }
         }),
         json!({
@@ -545,6 +880,17 @@ pub fn tool_definitions() -> Vec<Value> {
             "inputSchema": { "type": "object", "properties": {} }
         }),
         json!({
+            "name": "character_inspect_weights",
+            "description": "Inspect skinning bone influences at a 3D world point [x,y,z] and/or for a scene node_id (reports rigid binding, manual weight count, and resolved bone names + weights).",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "node_id": { "type": "integer", "minimum": 1 },
+                    "point": { "type": "array", "items": { "type": "number" }, "minItems": 3, "maxItems": 3 }
+                }
+            }
+        }),
+        json!({
             "name": "character_inspect_clip",
             "description": "Inspect an animation clip in full: keyframes per bone channel (time, translation, rotation quat + degrees, scale) and morph weight tracks.",
             "inputSchema": {
@@ -578,6 +924,24 @@ pub fn tool_definitions() -> Vec<Value> {
                     "clip_name": { "type": "string" }
                 }
             }
+        }),
+        json!({
+            "name": "character_set_playback_time",
+            "description": "Scrub an animation clip to time_secs and immediately apply its bone poses and morph weights to the live viewport for visual inspection or viewport_screenshot.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "clip_index": { "type": "integer", "minimum": 0 },
+                    "clip_name": { "type": "string" },
+                    "time_secs": { "type": "number", "minimum": 0.0 }
+                },
+                "required": ["time_secs"]
+            }
+        }),
+        json!({
+            "name": "character_reset_pose",
+            "description": "Reset all bones to their rest pose and clear live morph weights in a single undoable command.",
+            "inputSchema": { "type": "object", "properties": {} }
         }),
         json!({
             "name": "character_remove_keyframe",
@@ -647,6 +1011,28 @@ pub fn tool_definitions() -> Vec<Value> {
                     "node_id": { "type": "integer" },
                     "target": { "type": "string", "enum": ["color", "normal", "both"] }
                 }
+            }
+        }),
+        json!({
+            "name": "project_save",
+            "description": "Atomically save the current editable scene (nodes, palette, rig, animations) to a .tessel project archive inside the allowed export directory.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "filename": { "type": "string" }
+                },
+                "required": ["filename"]
+            }
+        }),
+        json!({
+            "name": "project_open",
+            "description": "Load an editable .tessel project archive from the allowed export directory, replacing the active scene and resetting undo history.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "filename": { "type": "string" }
+                },
+                "required": ["filename"]
             }
         }),
         json!({
@@ -740,19 +1126,56 @@ pub fn tool_definitions() -> Vec<Value> {
             }
         }),
         json!({
+            "name": "viewport_set_preview",
+            "description": "Toggle clean Render Preview mode (hides wireframe overlay and editor gizmos in the live GUI viewport and tessel://viewport/preview). Requires the live GUI viewport.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "preview": { "type": "boolean" }
+                },
+                "required": ["preview"]
+            }
+        }),
+        json!({
             "name": "viewport_screenshot",
-            "description": "Render the current scene offscreen (headless GPU) and return an sRGB PNG image. Fully args-driven (width, height, target, yaw, pitch, distance, preview); needs a GPU (software GL works). Use it to visually verify assets.",
+            "description": "Render the current scene offscreen (headless GPU) and return an sRGB PNG image. Prefer yaw_deg/pitch_deg (degrees); yaw/pitch are in radians. Needs a GPU (software GL works).",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "width": { "type": "integer", "minimum": 16, "maximum": 1024 },
                     "height": { "type": "integer", "minimum": 16, "maximum": 1024 },
                     "target": { "type": "array", "items": { "type": "number" }, "minItems": 3, "maxItems": 3 },
-                    "yaw": { "type": "number" },
-                    "pitch": { "type": "number" },
+                    "yaw_deg": { "type": "number", "description": "Camera yaw in degrees (e.g. 25)" },
+                    "pitch_deg": { "type": "number", "description": "Camera pitch in degrees (e.g. 15)" },
+                    "yaw": { "type": "number", "description": "Camera yaw in radians (use yaw_deg for degrees)" },
+                    "pitch": { "type": "number", "description": "Camera pitch in radians (use pitch_deg for degrees)" },
                     "distance": { "type": "number", "minimum": 0 },
                     "preview": { "type": "boolean" }
                 }
+            }
+        }),
+        json!({
+            "name": "viewport_render_turntable_gif",
+            "description": "Render a 360-degree 3D turntable animated .gif (optionally playing clip_name/clip_index across the loop) and save it inside the allowed export directory (relative filename or absolute path inside exports/). Prefer yaw_deg/pitch_deg (degrees); yaw/pitch are in radians.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "filename": { "type": "string", "description": "Relative filename inside exports/ (e.g. 'turntable.gif')" },
+                    "width": { "type": "integer", "minimum": 64, "maximum": 512 },
+                    "height": { "type": "integer", "minimum": 64, "maximum": 512 },
+                    "frames": { "type": "integer", "minimum": 4, "maximum": 36 },
+                    "fps": { "type": "integer", "minimum": 2, "maximum": 30 },
+                    "target": { "type": "array", "items": { "type": "number" }, "minItems": 3, "maxItems": 3 },
+                    "yaw_deg": { "type": "number", "description": "Starting camera yaw in degrees" },
+                    "pitch_deg": { "type": "number", "description": "Camera pitch in degrees" },
+                    "yaw": { "type": "number", "description": "Starting camera yaw in radians (use yaw_deg for degrees)" },
+                    "pitch": { "type": "number", "description": "Camera pitch in radians (use pitch_deg for degrees)" },
+                    "distance": { "type": "number", "minimum": 0.25 },
+                    "preview": { "type": "boolean" },
+                    "clip_name": { "type": "string" },
+                    "clip_index": { "type": "integer", "minimum": 0 }
+                },
+                "required": ["filename"]
             }
         }),
     ]

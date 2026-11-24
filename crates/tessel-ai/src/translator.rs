@@ -7,8 +7,8 @@ use tessel_core::{
     PrimitiveKind, Rgba8, SceneState, VoxelCoord,
 };
 use tessel_io::{
-    export_scene_to_dir, import_mesh_from_path, import_mesh_texture_from_path,
-    resolve_safe_export_path, ExportFormat, ExportPreset,
+    export_scene_to_dir, import_mesh_from_path, import_mesh_texture_from_path, load_tessel_project,
+    resolve_safe_export_path, save_tessel_project_atomic, ExportFormat, ExportPreset,
 };
 
 use crate::error::AiError;
@@ -33,18 +33,18 @@ fn parse_ivec3(val: &Value, field: &str) -> Result<VoxelCoord, AiError> {
             "'{field}' must have 3 integers"
         )));
     }
-    let x = arr[0]
+    let x_raw = arr[0]
         .as_i64()
-        .ok_or_else(|| AiError::InvalidArguments(format!("'{field}[0]' must be int")))?
-        as i32;
-    let y = arr[1]
+        .ok_or_else(|| AiError::InvalidArguments(format!("'{field}[0]' must be int")))?;
+    let y_raw = arr[1]
         .as_i64()
-        .ok_or_else(|| AiError::InvalidArguments(format!("'{field}[1]' must be int")))?
-        as i32;
-    let z = arr[2]
+        .ok_or_else(|| AiError::InvalidArguments(format!("'{field}[1]' must be int")))?;
+    let z_raw = arr[2]
         .as_i64()
-        .ok_or_else(|| AiError::InvalidArguments(format!("'{field}[2]' must be int")))?
-        as i32;
+        .ok_or_else(|| AiError::InvalidArguments(format!("'{field}[2]' must be int")))?;
+    let x = i32::try_from(x_raw).map_err(|_| AiError::OutOfBounds)?;
+    let y = i32::try_from(y_raw).map_err(|_| AiError::OutOfBounds)?;
+    let z = i32::try_from(z_raw).map_err(|_| AiError::OutOfBounds)?;
     let c = VoxelCoord::new(x, y, z);
     check_coord(c)?;
     Ok(c)
@@ -100,6 +100,11 @@ fn parse_rotation_deg(val: &Value) -> Result<glam::Quat, AiError> {
         .as_f64()
         .ok_or_else(|| AiError::InvalidArguments("'rotation_deg[2]' must be number".into()))?
         as f32;
+    if !rx.is_finite() || !ry.is_finite() || !rz.is_finite() {
+        return Err(AiError::InvalidArguments(
+            "'rotation_deg' values must be finite".into(),
+        ));
+    }
     Ok(glam::Quat::from_euler(
         glam::EulerRot::XYZ,
         rx.to_radians(),
@@ -218,14 +223,19 @@ pub fn execute_tool_call(
                 .get("mode")
                 .and_then(Value::as_str)
                 .ok_or_else(|| AiError::InvalidArguments("missing 'mode'".into()))?;
-            let mode = match mode_str {
+            let normalized: String = mode_str
+                .chars()
+                .filter(|c| c.is_ascii_alphanumeric())
+                .map(|c| c.to_ascii_lowercase())
+                .collect();
+            let mode = match normalized.as_str() {
                 "pixel" => AppMode::Pixel,
                 "voxel" => AppMode::Voxel,
                 "lowpoly" => AppMode::LowPoly,
                 "character" => AppMode::Character,
-                other => {
+                _ => {
                     return Err(AiError::InvalidArguments(format!(
-                        "unsupported mode '{other}'"
+                        "unsupported mode '{mode_str}'"
                     )));
                 }
             };
@@ -245,9 +255,15 @@ pub fn execute_tool_call(
                         "'rgb' must have 3 integers [r, g, b]".into(),
                     ));
                 }
-                let r = arr[0].as_u64().unwrap_or(0).min(255) as u8;
-                let g = arr[1].as_u64().unwrap_or(0).min(255) as u8;
-                let b = arr[2].as_u64().unwrap_or(0).min(255) as u8;
+                let parse_ch = |i: usize| -> Result<u8, AiError> {
+                    let v = arr[i].as_u64().ok_or_else(|| {
+                        AiError::InvalidArguments(format!("'rgb[{i}]' must be an integer 0..=255"))
+                    })?;
+                    u8::try_from(v).map_err(|_| {
+                        AiError::InvalidArguments(format!("'rgb[{i}]' out of range 0..=255"))
+                    })
+                };
+                let (r, g, b) = (parse_ch(0)?, parse_ch(1)?, parse_ch(2)?);
                 Rgba8::rgb(r, g, b)
             } else if let Some(hex_raw) = args.get("hex").and_then(Value::as_str) {
                 let hex = hex_raw.trim().trim_start_matches('#');
@@ -295,6 +311,84 @@ pub fn execute_tool_call(
             let node_id = NodeId(raw_id);
             history.execute(scene, Command::DeleteNode(node_id))?;
             Ok(json!({ "ok": true, "deleted_node_id": raw_id }))
+        }
+        "scene_rename_node" => {
+            let raw_id = args
+                .get("node_id")
+                .and_then(Value::as_u64)
+                .ok_or_else(|| AiError::InvalidArguments("missing 'node_id'".into()))?;
+            let name = args
+                .get("name")
+                .and_then(Value::as_str)
+                .ok_or_else(|| AiError::InvalidArguments("missing 'name'".into()))?
+                .trim()
+                .to_string();
+            if name.is_empty() {
+                return Err(AiError::InvalidArguments("'name' cannot be empty".into()));
+            }
+            history.execute(
+                scene,
+                Command::RenameNode {
+                    node_id: NodeId(raw_id),
+                    name: name.clone(),
+                },
+            )?;
+            Ok(json!({ "ok": true, "node_id": raw_id, "name": name }))
+        }
+        "scene_clear" => {
+            let removed = scene.nodes.len();
+            history.execute(scene, Command::ClearScene)?;
+            Ok(json!({ "ok": true, "removed_nodes": removed }))
+        }
+        "scene_batch" => {
+            const MAX_BATCH_CALLS: usize = 512;
+            let calls = args
+                .get("calls")
+                .and_then(Value::as_array)
+                .ok_or_else(|| AiError::InvalidArguments("missing 'calls' array".into()))?;
+            if calls.is_empty() {
+                return Err(AiError::InvalidArguments(
+                    "'calls' must contain at least 1 tool call".into(),
+                ));
+            }
+            if calls.len() > MAX_BATCH_CALLS {
+                return Err(AiError::BatchLimitExceeded);
+            }
+            let prev_scene = scene.clone();
+            let prev_history = history.clone();
+            let mut results = Vec::with_capacity(calls.len());
+            for (idx, item) in calls.iter().enumerate() {
+                let Some(sub_name) = item.get("name").and_then(Value::as_str) else {
+                    *scene = prev_scene;
+                    *history = prev_history;
+                    return Err(AiError::InvalidArguments(format!(
+                        "calls[{idx}] missing 'name'"
+                    )));
+                };
+                if sub_name == "scene_batch" {
+                    *scene = prev_scene;
+                    *history = prev_history;
+                    return Err(AiError::InvalidArguments(
+                        "nested 'scene_batch' is not allowed".into(),
+                    ));
+                }
+                let sub_args = item.get("arguments").cloned().unwrap_or_else(|| json!({}));
+                match execute_tool_call(sub_name, &sub_args, scene, history, allowed_export_dir) {
+                    Ok(val) => results.push(val),
+                    Err(err) => {
+                        *scene = prev_scene;
+                        *history = prev_history;
+                        return Err(AiError::InvalidArguments(format!(
+                            "batch aborted at calls[{idx}] ({sub_name}): {err}"
+                        )));
+                    }
+                }
+            }
+            Ok(json!({
+                "ok": true,
+                "count": results.len(),
+                "results": results
+            }))
         }
         "scene_set_node_transform" | "set_node_transform" => {
             let node_id = args
@@ -402,11 +496,25 @@ pub fn execute_tool_call(
                     "'radii' must have 3 numbers".into(),
                 ));
             }
-            let radii = [
-                radii_arr[0].as_f64().unwrap_or(1.0) as f32,
-                radii_arr[1].as_f64().unwrap_or(1.0) as f32,
-                radii_arr[2].as_f64().unwrap_or(1.0) as f32,
-            ];
+            let mut radii = [1.0f32; 3];
+            for (i, item) in radii_arr.iter().enumerate() {
+                let v = item.as_f64().ok_or_else(|| {
+                    AiError::InvalidArguments(format!("'radii[{i}]' must be a number"))
+                })? as f32;
+                if !v.is_finite() || v <= 0.0 {
+                    return Err(AiError::InvalidArguments(format!(
+                        "'radii[{i}]' must be finite and > 0"
+                    )));
+                }
+                radii[i] = v;
+            }
+            // Reject oversized ellipsoids BEFORE allocating the full voxel edit buffer.
+            let bx = (radii[0].ceil() as u64).saturating_mul(2).saturating_add(1);
+            let by = (radii[1].ceil() as u64).saturating_mul(2).saturating_add(1);
+            let bz = (radii[2].ceil() as u64).saturating_mul(2).saturating_add(1);
+            if bx.saturating_mul(by).saturating_mul(bz) > (MAX_BATCH_VOXELS as u64) * 2 {
+                return Err(AiError::BatchLimitExceeded);
+            }
             let edits =
                 voxel_ops::ellipsoid_fill_edits(center, radii, Some(parse_palette_index(args, 4)?));
             if edits.len() > MAX_BATCH_VOXELS {
@@ -452,7 +560,33 @@ pub fn execute_tool_call(
                     )));
                 }
             };
-            let size = args.get("size").and_then(Value::as_f64).unwrap_or(1.0) as f32;
+            let (size, size_vec_scale) = match args.get("size") {
+                None => (1.0f32, None),
+                Some(Value::Array(_)) => {
+                    let v = parse_opt_vec3(args, "size")?.ok_or_else(|| {
+                        AiError::InvalidArguments("'size' array must be [sx, sy, sz]".into())
+                    })?;
+                    if v.x <= 0.0 || v.y <= 0.0 || v.z <= 0.0 {
+                        return Err(AiError::InvalidArguments(
+                            "'size' components must be finite and > 0".into(),
+                        ));
+                    }
+                    (1.0f32, Some(v))
+                }
+                Some(v) => {
+                    let s = v.as_f64().ok_or_else(|| {
+                        AiError::InvalidArguments(
+                            "'size' must be a number or [sx, sy, sz]".into(),
+                        )
+                    })? as f32;
+                    if !s.is_finite() || s <= 0.0 {
+                        return Err(AiError::InvalidArguments(
+                            "'size' must be finite and > 0".into(),
+                        ));
+                    }
+                    (s, None)
+                }
+            };
             let material = parse_palette_index(args, 4)?;
             let name = args
                 .get("name")
@@ -465,7 +599,12 @@ pub fn execute_tool_call(
             } else {
                 None
             };
-            let sc = parse_opt_vec3(args, "scale")?;
+            let sc = match (parse_opt_vec3(args, "scale")?, size_vec_scale) {
+                (Some(a), Some(b)) => Some(a * b),
+                (Some(a), None) => Some(a),
+                (None, Some(b)) => Some(b),
+                (None, None) => None,
+            };
             history.execute(
                 scene,
                 Command::CreatePrimitiveMesh {
@@ -495,7 +634,230 @@ pub fn execute_tool_call(
                 }
                 history.execute(scene, Command::SetNodeTransform { node_id, transform })?;
             }
-            Ok(json!({ "ok": true, "node_id": created_id.map(|n| n.0) }))
+            let actual_size = size.max(tessel_core::mesh::ops::MIN_PRIMITIVE_SIZE);
+            let bounds = created_id
+                .and_then(|id| scene.lowpoly_meshes.get(&id))
+                .map(|m| {
+                    let (lo, hi) = m.bounds();
+                    json!({ "min": lo.to_array(), "max": hi.to_array() })
+                });
+            Ok(json!({
+                "ok": true,
+                "node_id": created_id.map(|n| n.0),
+                "actual_size": actual_size,
+                "clamped": (actual_size - size).abs() > 1e-6,
+                "bounds": bounds
+            }))
+        }
+        "mesh_create_lathe" => {
+            let prof_arr = args
+                .get("profile")
+                .and_then(Value::as_array)
+                .ok_or_else(|| AiError::InvalidArguments("missing 'profile' array".into()))?;
+            let mut profile = Vec::with_capacity(prof_arr.len());
+            for (i, item) in prof_arr.iter().enumerate() {
+                let pair = item.as_array().ok_or_else(|| {
+                    AiError::InvalidArguments(format!("profile[{i}] must be [radius, y]"))
+                })?;
+                if pair.len() != 2 {
+                    return Err(AiError::InvalidArguments(format!(
+                        "profile[{i}] must have 2 numbers [radius, y]"
+                    )));
+                }
+                let r = pair[0].as_f64().ok_or_else(|| {
+                    AiError::InvalidArguments(format!("profile[{i}][0] must be a number"))
+                })? as f32;
+                let y = pair[1].as_f64().ok_or_else(|| {
+                    AiError::InvalidArguments(format!("profile[{i}][1] must be a number"))
+                })? as f32;
+                profile.push([r, y]);
+            }
+            let segments = args
+                .get("segments")
+                .and_then(Value::as_u64)
+                .unwrap_or(16)
+                .clamp(3, 64) as u32;
+            let angle_deg = args
+                .get("angle_deg")
+                .and_then(Value::as_f64)
+                .unwrap_or(360.0) as f32;
+            let cap_ends = args
+                .get("cap_ends")
+                .and_then(Value::as_bool)
+                .unwrap_or(true);
+            let material = parse_palette_index(args, 4)?;
+            let name = args
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or("LatheMesh")
+                .to_string();
+            let pos = parse_opt_vec3(args, "position")?;
+            let rot = if args.get("rotation_deg").is_some() {
+                Some(parse_rotation_deg(args)?)
+            } else {
+                None
+            };
+            let sc = parse_opt_vec3(args, "scale")?;
+            let mesh = tessel_core::mesh::ops::create_lathe_mesh(
+                &profile, segments, angle_deg, cap_ends, material,
+            )?;
+            let vert_count = mesh.vertices.len();
+            let face_count = mesh.faces.len();
+            let (lo, hi) = mesh.bounds();
+            history.execute(scene, Command::ImportLowPolyMesh { name, mesh })?;
+            let created_id = scene.selected_node;
+            if let (Some(node_id), true) =
+                (created_id, pos.is_some() || rot.is_some() || sc.is_some())
+            {
+                let mut transform = scene
+                    .nodes
+                    .get(&node_id)
+                    .map(|n| n.transform)
+                    .unwrap_or_default();
+                if let Some(p) = pos {
+                    transform.translation = p;
+                }
+                if let Some(r) = rot {
+                    transform.rotation = r;
+                }
+                if let Some(s) = sc {
+                    transform.scale = s;
+                }
+                history.execute(scene, Command::SetNodeTransform { node_id, transform })?;
+            }
+            Ok(json!({
+                "ok": true,
+                "node_id": created_id.map(|n| n.0),
+                "vertices": vert_count,
+                "faces": face_count,
+                "bounds": { "min": lo.to_array(), "max": hi.to_array() }
+            }))
+        }
+        "mesh_create_raw" => {
+            let verts_arr = args
+                .get("vertices")
+                .and_then(Value::as_array)
+                .ok_or_else(|| AiError::InvalidArguments("missing 'vertices' array".into()))?;
+            let faces_arr = args
+                .get("faces")
+                .and_then(Value::as_array)
+                .ok_or_else(|| AiError::InvalidArguments("missing 'faces' array".into()))?;
+            let default_mat = parse_palette_index(args, 4)?;
+            let smooth = args
+                .get("smooth")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            let mut vertices = Vec::with_capacity(verts_arr.len());
+            for (i, item) in verts_arr.iter().enumerate() {
+                let arr = item.as_array().ok_or_else(|| {
+                    AiError::InvalidArguments(format!("'vertices[{i}]' must be [x,y,z]"))
+                })?;
+                if arr.len() != 3 {
+                    return Err(AiError::InvalidArguments(format!(
+                        "'vertices[{i}]' must have 3 numbers"
+                    )));
+                }
+                let x = arr[0].as_f64().ok_or_else(|| {
+                    AiError::InvalidArguments(format!("'vertices[{i}][0]' must be number"))
+                })? as f32;
+                let y = arr[1].as_f64().ok_or_else(|| {
+                    AiError::InvalidArguments(format!("'vertices[{i}][1]' must be number"))
+                })? as f32;
+                let z = arr[2].as_f64().ok_or_else(|| {
+                    AiError::InvalidArguments(format!("'vertices[{i}][2]' must be number"))
+                })? as f32;
+                vertices.push(glam::Vec3::new(x, y, z));
+            }
+            let mut faces = Vec::with_capacity(faces_arr.len());
+            for (fi, item) in faces_arr.iter().enumerate() {
+                let v_ids_arr = item
+                    .get("vertices")
+                    .and_then(Value::as_array)
+                    .ok_or_else(|| {
+                        AiError::InvalidArguments(format!("'faces[{fi}].vertices' missing"))
+                    })?;
+                let mut f_verts = Vec::with_capacity(v_ids_arr.len());
+                for v in v_ids_arr {
+                    let idx = v.as_u64().ok_or_else(|| {
+                        AiError::InvalidArguments(format!(
+                            "'faces[{fi}].vertices' entries must be integers"
+                        ))
+                    })? as usize;
+                    f_verts.push(idx);
+                }
+                let mat = if item.get("palette_index").is_some() {
+                    parse_palette_index(item, default_mat.get())?
+                } else {
+                    default_mat
+                };
+                let mut face = tessel_core::mesh::Face::new(f_verts, mat);
+                if let Some(uvs_arr) = item.get("uvs").and_then(Value::as_array) {
+                    let mut uvs = Vec::with_capacity(uvs_arr.len());
+                    for pair in uvs_arr {
+                        let p = pair.as_array().ok_or_else(|| {
+                            AiError::InvalidArguments(format!(
+                                "'faces[{fi}].uvs' entries must be [u,v]"
+                            ))
+                        })?;
+                        if p.len() != 2 {
+                            return Err(AiError::InvalidArguments(format!(
+                                "'faces[{fi}].uvs' entries must be [u,v]"
+                            )));
+                        }
+                        let u = p[0].as_f64().ok_or_else(|| {
+                            AiError::InvalidArguments(format!("'faces[{fi}].uvs' must be numbers"))
+                        })? as f32;
+                        let v = p[1].as_f64().ok_or_else(|| {
+                            AiError::InvalidArguments(format!("'faces[{fi}].uvs' must be numbers"))
+                        })? as f32;
+                        uvs.push([u.clamp(0.0, 1.0), v.clamp(0.0, 1.0)]);
+                    }
+                    face.uvs = uvs;
+                }
+                faces.push(face);
+            }
+            let mesh = tessel_core::mesh::ops::create_raw_mesh(vertices, faces, smooth)?;
+            let v_count = mesh.vertices.len();
+            let f_count = mesh.faces.len();
+            let name = args
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or("CustomMesh")
+                .to_string();
+            let pos = parse_opt_vec3(args, "position")?;
+            let rot = if args.get("rotation_deg").is_some() {
+                Some(parse_rotation_deg(args)?)
+            } else {
+                None
+            };
+            let sc = parse_opt_vec3(args, "scale")?;
+            history.execute(scene, Command::ImportLowPolyMesh { name, mesh })?;
+            let created_id = scene.selected_node;
+            if let (Some(node_id), true) =
+                (created_id, pos.is_some() || rot.is_some() || sc.is_some())
+            {
+                let mut transform = scene
+                    .nodes
+                    .get(&node_id)
+                    .map(|n| n.transform)
+                    .unwrap_or_default();
+                if let Some(p) = pos {
+                    transform.translation = p;
+                }
+                if let Some(r) = rot {
+                    transform.rotation = r;
+                }
+                if let Some(s) = sc {
+                    transform.scale = s;
+                }
+                history.execute(scene, Command::SetNodeTransform { node_id, transform })?;
+            }
+            Ok(json!({
+                "ok": true,
+                "node_id": created_id.map(|n| n.0),
+                "vertices": v_count,
+                "faces": f_count
+            }))
         }
         "mesh_create_curve_tube" => {
             let pts_arr = args
@@ -736,6 +1098,175 @@ pub fn execute_tool_call(
                 )?;
             }
             Ok(json!({ "ok": true, "node_id": node_id.0, "uv": uv, "mirror_x": mirror_x }))
+        }
+        "mesh_paint_line" => {
+            let node_id = args
+                .get("node_id")
+                .and_then(Value::as_u64)
+                .map(NodeId)
+                .or_else(|| scene.active_lowpoly_node())
+                .ok_or_else(|| AiError::InvalidArguments("no low-poly mesh found".into()))?;
+            let idx = parse_palette_index(args, 3)?;
+            let color = scene
+                .palette
+                .get(idx)
+                .map(|e| e.color)
+                .ok_or_else(|| AiError::InvalidArguments("palette index not defined".into()))?;
+            let parse_uv = |key: &str| -> Result<[f32; 2], AiError> {
+                let arr = args
+                    .get(key)
+                    .and_then(Value::as_array)
+                    .ok_or_else(|| AiError::InvalidArguments(format!("missing '{key}'")))?;
+                if arr.len() != 2 {
+                    return Err(AiError::InvalidArguments(format!(
+                        "'{key}' must have 2 numbers"
+                    )));
+                }
+                let u = arr[0].as_f64().ok_or_else(|| {
+                    AiError::InvalidArguments(format!("'{key}[0]' must be number"))
+                })? as f32;
+                let v = arr[1].as_f64().ok_or_else(|| {
+                    AiError::InvalidArguments(format!("'{key}[1]' must be number"))
+                })? as f32;
+                if !u.is_finite() || !v.is_finite() {
+                    return Err(AiError::InvalidArguments(format!(
+                        "'{key}' must be finite"
+                    )));
+                }
+                Ok([u, v])
+            };
+            let uv_start = parse_uv("uv_start")?;
+            let uv_end = parse_uv("uv_end")?;
+            let width_px = args
+                .get("width_px")
+                .and_then(Value::as_f64)
+                .unwrap_or(4.0) as f32;
+            if !width_px.is_finite() || width_px <= 0.0 {
+                return Err(AiError::InvalidArguments(
+                    "'width_px' must be finite and > 0".into(),
+                ));
+            }
+            history.execute(
+                scene,
+                Command::PaintMeshLine {
+                    node_id,
+                    uv_start,
+                    uv_end,
+                    width_px,
+                    color,
+                },
+            )?;
+            Ok(json!({ "ok": true, "node_id": node_id.0 }))
+        }
+        "mesh_paint_rect" => {
+            let node_id = args
+                .get("node_id")
+                .and_then(Value::as_u64)
+                .map(NodeId)
+                .or_else(|| scene.active_lowpoly_node())
+                .ok_or_else(|| AiError::InvalidArguments("no low-poly mesh found".into()))?;
+            let idx = parse_palette_index(args, 3)?;
+            let color = scene
+                .palette
+                .get(idx)
+                .map(|e| e.color)
+                .ok_or_else(|| AiError::InvalidArguments("palette index not defined".into()))?;
+            let parse_uv = |key: &str| -> Result<[f32; 2], AiError> {
+                let arr = args
+                    .get(key)
+                    .and_then(Value::as_array)
+                    .ok_or_else(|| AiError::InvalidArguments(format!("missing '{key}'")))?;
+                if arr.len() != 2 {
+                    return Err(AiError::InvalidArguments(format!(
+                        "'{key}' must have 2 numbers"
+                    )));
+                }
+                let u = arr[0].as_f64().ok_or_else(|| {
+                    AiError::InvalidArguments(format!("'{key}[0]' must be number"))
+                })? as f32;
+                let v = arr[1].as_f64().ok_or_else(|| {
+                    AiError::InvalidArguments(format!("'{key}[1]' must be number"))
+                })? as f32;
+                if !u.is_finite() || !v.is_finite() {
+                    return Err(AiError::InvalidArguments(format!(
+                        "'{key}' must be finite"
+                    )));
+                }
+                Ok([u, v])
+            };
+            let uv_min = parse_uv("uv_min")?;
+            let uv_max = parse_uv("uv_max")?;
+            history.execute(
+                scene,
+                Command::PaintMeshRect {
+                    node_id,
+                    uv_min,
+                    uv_max,
+                    color,
+                },
+            )?;
+            Ok(json!({ "ok": true, "node_id": node_id.0 }))
+        }
+        "mesh_project_uvs" => {
+            let node_id = args
+                .get("node_id")
+                .and_then(Value::as_u64)
+                .map(NodeId)
+                .or_else(|| scene.active_lowpoly_node())
+                .ok_or_else(|| AiError::InvalidArguments("no low-poly mesh found".into()))?;
+            let mode_str = args
+                .get("mode")
+                .and_then(Value::as_str)
+                .ok_or_else(|| AiError::InvalidArguments("missing 'mode'".into()))?;
+            let mode = match mode_str {
+                "box" => tessel_core::mesh::UvProjection::Box,
+                "planar_x" => tessel_core::mesh::UvProjection::PlanarX,
+                "planar_y" => tessel_core::mesh::UvProjection::PlanarY,
+                "planar_z" => tessel_core::mesh::UvProjection::PlanarZ,
+                "cylindrical" => tessel_core::mesh::UvProjection::CylindricalY,
+                "spherical" => tessel_core::mesh::UvProjection::Spherical,
+                other => {
+                    return Err(AiError::InvalidArguments(format!(
+                        "unknown UV projection '{other}'"
+                    )));
+                }
+            };
+            history.execute(scene, Command::ProjectMeshUvs { node_id, mode })?;
+            let face_count = scene
+                .lowpoly_meshes
+                .get(&node_id)
+                .map_or(0, |m| m.faces.len());
+            Ok(json!({
+                "ok": true,
+                "node_id": node_id.0,
+                "mode": mode_str,
+                "faces_projected": face_count
+            }))
+        }
+        "mesh_subdivide_face" => {
+            let node_id = args
+                .get("node_id")
+                .and_then(Value::as_u64)
+                .map(NodeId)
+                .or_else(|| scene.active_lowpoly_node())
+                .ok_or_else(|| AiError::InvalidArguments("no low-poly mesh found".into()))?;
+            let face_id = tessel_core::FaceId(
+                args.get("face_id")
+                    .and_then(Value::as_u64)
+                    .ok_or_else(|| AiError::InvalidArguments("missing 'face_id'".into()))?
+                    as usize,
+            );
+            history.execute(scene, Command::SubdivideMeshFace { node_id, face_id })?;
+            let (verts, faces) = scene
+                .lowpoly_meshes
+                .get(&node_id)
+                .map_or((0, 0), |m| (m.vertices.len(), m.faces.len()));
+            Ok(json!({
+                "ok": true,
+                "node_id": node_id.0,
+                "vertices": verts,
+                "faces": faces
+            }))
         }
         "mesh_inspect" => {
             let node_id = args
@@ -1035,6 +1566,333 @@ pub fn execute_tool_call(
             )?;
             Ok(json!({ "ok": true, "node_id": node_id.0, "vertex_id": vertex_idx }))
         }
+        "mesh_set_vertices" => {
+            let node_id = args
+                .get("node_id")
+                .and_then(Value::as_u64)
+                .map(NodeId)
+                .or_else(|| scene.active_lowpoly_node())
+                .ok_or_else(|| AiError::InvalidArguments("no low-poly mesh found".into()))?;
+            let upd_arr = args
+                .get("updates")
+                .and_then(Value::as_array)
+                .ok_or_else(|| AiError::InvalidArguments("missing 'updates' array".into()))?;
+            let mut updates = Vec::with_capacity(upd_arr.len());
+            for (i, item) in upd_arr.iter().enumerate() {
+                let vid = item
+                    .get("vertex_id")
+                    .and_then(Value::as_u64)
+                    .ok_or_else(|| {
+                        AiError::InvalidArguments(format!("'updates[{i}].vertex_id' missing"))
+                    })? as usize;
+                let pos = parse_opt_vec3(item, "position")?.ok_or_else(|| {
+                    AiError::InvalidArguments(format!("'updates[{i}].position' missing"))
+                })?;
+                updates.push((vid, pos));
+            }
+            let count = updates.len();
+            history.execute(scene, Command::SetMeshVerticesBatch { node_id, updates })?;
+            Ok(json!({ "ok": true, "node_id": node_id.0, "updated": count }))
+        }
+        "mesh_set_face_material" => {
+            let node_id = args
+                .get("node_id")
+                .and_then(Value::as_u64)
+                .map(NodeId)
+                .or_else(|| scene.active_lowpoly_node())
+                .ok_or_else(|| AiError::InvalidArguments("no low-poly mesh found".into()))?;
+            let f_arr = args
+                .get("face_ids")
+                .and_then(Value::as_array)
+                .ok_or_else(|| AiError::InvalidArguments("missing 'face_ids' array".into()))?;
+            let mut face_ids = Vec::with_capacity(f_arr.len());
+            for v in f_arr {
+                let idx = v.as_u64().ok_or_else(|| {
+                    AiError::InvalidArguments("'face_ids' must be integers".into())
+                })? as usize;
+                face_ids.push(tessel_core::FaceId(idx));
+            }
+            let material = parse_palette_index(args, 4)?;
+            let count = face_ids.len();
+            history.execute(
+                scene,
+                Command::SetMeshFaceMaterials {
+                    node_id,
+                    face_ids,
+                    material,
+                },
+            )?;
+            Ok(json!({
+                "ok": true,
+                "node_id": node_id.0,
+                "faces_updated": count,
+                "palette_index": material.get()
+            }))
+        }
+        "mesh_join" => {
+            let target_node_id = NodeId(
+                args.get("target_node_id")
+                    .and_then(Value::as_u64)
+                    .ok_or_else(|| AiError::InvalidArguments("missing 'target_node_id'".into()))?,
+            );
+            let src_arr = args
+                .get("source_node_ids")
+                .and_then(Value::as_array)
+                .ok_or_else(|| {
+                    AiError::InvalidArguments("missing 'source_node_ids' array".into())
+                })?;
+            let mut source_node_ids = Vec::with_capacity(src_arr.len());
+            for v in src_arr {
+                let id = v.as_u64().ok_or_else(|| {
+                    AiError::InvalidArguments("'source_node_ids' must be integers".into())
+                })?;
+                source_node_ids.push(NodeId(id));
+            }
+            let joined_count = source_node_ids.len();
+            history.execute(
+                scene,
+                Command::JoinLowPolyMeshes {
+                    target_node_id,
+                    source_node_ids,
+                },
+            )?;
+            let (verts, faces) = scene
+                .lowpoly_meshes
+                .get(&target_node_id)
+                .map_or((0, 0), |m| (m.vertices.len(), m.faces.len()));
+            Ok(json!({
+                "ok": true,
+                "target_node_id": target_node_id.0,
+                "joined_sources": joined_count,
+                "vertices": verts,
+                "faces": faces
+            }))
+        }
+        "mesh_mirror" => {
+            let node_id = args
+                .get("node_id")
+                .and_then(Value::as_u64)
+                .map(NodeId)
+                .or_else(|| scene.active_lowpoly_node())
+                .ok_or_else(|| AiError::InvalidArguments("no low-poly mesh found".into()))?;
+            let axis = match args.get("axis").and_then(Value::as_str).unwrap_or("x") {
+                "x" => 0u8,
+                "y" => 1u8,
+                "z" => 2u8,
+                other => {
+                    return Err(AiError::InvalidArguments(format!(
+                        "invalid axis '{other}'; use 'x', 'y', or 'z'"
+                    )));
+                }
+            };
+            let merge_original = args
+                .get("merge_original")
+                .and_then(Value::as_bool)
+                .unwrap_or(true);
+            history.execute(
+                scene,
+                Command::MirrorLowPolyMesh {
+                    node_id,
+                    axis,
+                    merge_original,
+                },
+            )?;
+            let (verts, faces) = scene
+                .lowpoly_meshes
+                .get(&node_id)
+                .map_or((0, 0), |m| (m.vertices.len(), m.faces.len()));
+            Ok(json!({
+                "ok": true,
+                "node_id": node_id.0,
+                "vertices": verts,
+                "faces": faces
+            }))
+        }
+        "mesh_taper" => {
+            let node_id = args
+                .get("node_id")
+                .and_then(Value::as_u64)
+                .map(NodeId)
+                .or_else(|| scene.active_lowpoly_node())
+                .ok_or_else(|| AiError::InvalidArguments("no low-poly mesh found".into()))?;
+            let axis = match args.get("axis").and_then(Value::as_str).unwrap_or("y") {
+                "x" => 0u8,
+                "y" => 1u8,
+                "z" => 2u8,
+                other => {
+                    return Err(AiError::InvalidArguments(format!(
+                        "invalid axis '{other}'; use 'x', 'y', or 'z'"
+                    )));
+                }
+            };
+            let start_scale = args
+                .get("start_scale")
+                .and_then(Value::as_f64)
+                .ok_or_else(|| AiError::InvalidArguments("missing 'start_scale'".into()))?
+                as f32;
+            let end_scale = args
+                .get("end_scale")
+                .and_then(Value::as_f64)
+                .ok_or_else(|| AiError::InvalidArguments("missing 'end_scale'".into()))?
+                as f32;
+            history.execute(
+                scene,
+                Command::TaperLowPolyMesh {
+                    node_id,
+                    axis,
+                    start_scale,
+                    end_scale,
+                },
+            )?;
+            Ok(json!({ "ok": true, "node_id": node_id.0 }))
+        }
+        "mesh_bend" => {
+            let node_id = args
+                .get("node_id")
+                .and_then(Value::as_u64)
+                .map(NodeId)
+                .or_else(|| scene.active_lowpoly_node())
+                .ok_or_else(|| AiError::InvalidArguments("no low-poly mesh found".into()))?;
+            let parse_ax = |key: &str| -> Result<u8, AiError> {
+                match args.get(key).and_then(Value::as_str) {
+                    Some("x") => Ok(0),
+                    Some("y") => Ok(1),
+                    Some("z") => Ok(2),
+                    _ => Err(AiError::InvalidArguments(format!(
+                        "'{key}' must be 'x', 'y', or 'z'"
+                    ))),
+                }
+            };
+            let bend_axis = parse_ax("bend_axis")?;
+            let curve_axis = parse_ax("curve_axis")?;
+            let angle_deg = args
+                .get("angle_deg")
+                .and_then(Value::as_f64)
+                .ok_or_else(|| AiError::InvalidArguments("missing 'angle_deg'".into()))?
+                as f32;
+            history.execute(
+                scene,
+                Command::BendLowPolyMesh {
+                    node_id,
+                    bend_axis,
+                    curve_axis,
+                    angle_rad: angle_deg.to_radians(),
+                },
+            )?;
+            Ok(json!({ "ok": true, "node_id": node_id.0, "angle_deg": angle_deg }))
+        }
+        "mesh_set_origin" => {
+            let node_id = args
+                .get("node_id")
+                .and_then(Value::as_u64)
+                .map(NodeId)
+                .or_else(|| scene.active_lowpoly_node())
+                .ok_or_else(|| AiError::InvalidArguments("no low-poly mesh found".into()))?;
+            let origin_local = if let Some(explicit) = parse_opt_vec3(args, "origin")? {
+                explicit
+            } else {
+                let (lo, hi) = scene
+                    .lowpoly_meshes
+                    .get(&node_id)
+                    .map(|m| m.bounds())
+                    .ok_or_else(|| AiError::InvalidArguments("low-poly mesh not found".into()))?;
+                match args.get("mode").and_then(Value::as_str).unwrap_or("center") {
+                    "center" => (lo + hi) * 0.5,
+                    "bottom" => glam::Vec3::new((lo.x + hi.x) * 0.5, lo.y, (lo.z + hi.z) * 0.5),
+                    other => {
+                        return Err(AiError::InvalidArguments(format!(
+                            "unknown mode '{other}'; use 'center', 'bottom', or 'origin'"
+                        )));
+                    }
+                }
+            };
+            history.execute(
+                scene,
+                Command::SetMeshOrigin {
+                    node_id,
+                    origin_local,
+                },
+            )?;
+            let pos = scene
+                .nodes
+                .get(&node_id)
+                .map(|n| n.transform.translation.to_array())
+                .unwrap_or([0.0; 3]);
+            Ok(json!({ "ok": true, "node_id": node_id.0, "position": pos }))
+        }
+        "mesh_apply_transform" => {
+            let node_id = args
+                .get("node_id")
+                .and_then(Value::as_u64)
+                .map(NodeId)
+                .or_else(|| scene.active_lowpoly_node())
+                .ok_or_else(|| AiError::InvalidArguments("no low-poly mesh found".into()))?;
+            history.execute(scene, Command::ApplyMeshTransform { node_id })?;
+            let bounds = scene.lowpoly_meshes.get(&node_id).map(|m| {
+                let (lo, hi) = m.bounds();
+                json!({ "min": lo.to_array(), "max": hi.to_array() })
+            });
+            Ok(json!({ "ok": true, "node_id": node_id.0, "bounds": bounds }))
+        }
+        "mesh_weld_vertices" => {
+            let node_id = args
+                .get("node_id")
+                .and_then(Value::as_u64)
+                .map(NodeId)
+                .or_else(|| scene.active_lowpoly_node())
+                .ok_or_else(|| AiError::InvalidArguments("no low-poly mesh found".into()))?;
+            let tolerance = args
+                .get("tolerance")
+                .and_then(Value::as_f64)
+                .unwrap_or(0.001) as f32;
+            let before = scene
+                .lowpoly_meshes
+                .get(&node_id)
+                .map_or(0, |m| m.vertices.len());
+            history.execute(
+                scene,
+                Command::WeldMeshVertices { node_id, tolerance },
+            )?;
+            let after = scene
+                .lowpoly_meshes
+                .get(&node_id)
+                .map_or(0, |m| m.vertices.len());
+            Ok(json!({
+                "ok": true,
+                "node_id": node_id.0,
+                "vertices_before": before,
+                "vertices_after": after,
+                "removed": before.saturating_sub(after)
+            }))
+        }
+        "mesh_flip_normals" => {
+            let node_id = args
+                .get("node_id")
+                .and_then(Value::as_u64)
+                .map(NodeId)
+                .or_else(|| scene.active_lowpoly_node())
+                .ok_or_else(|| AiError::InvalidArguments("no low-poly mesh found".into()))?;
+            let face_ids = match args.get("face_ids") {
+                None | Some(Value::Null) => None,
+                Some(Value::Array(arr)) => {
+                    let mut out = Vec::with_capacity(arr.len());
+                    for v in arr {
+                        let idx = v.as_u64().ok_or_else(|| {
+                            AiError::InvalidArguments("'face_ids' must be integers".into())
+                        })? as usize;
+                        out.push(tessel_core::FaceId(idx));
+                    }
+                    Some(out)
+                }
+                _ => {
+                    return Err(AiError::InvalidArguments(
+                        "'face_ids' must be an array of integers".into(),
+                    ));
+                }
+            };
+            history.execute(scene, Command::FlipMeshNormals { node_id, face_ids })?;
+            Ok(json!({ "ok": true, "node_id": node_id.0 }))
+        }
         "mesh_set_face_uvs" => {
             let node_id = args
                 .get("node_id")
@@ -1196,21 +2054,57 @@ pub fn execute_tool_call(
             if name.is_empty() {
                 return Err(AiError::InvalidArguments("'name' must not be empty".into()));
             }
-            let ids_arr = args
-                .get("vertex_ids")
-                .and_then(Value::as_array)
-                .ok_or_else(|| AiError::InvalidArguments("missing 'vertex_ids'".into()))?;
-            if ids_arr.is_empty() {
+            let vertex_ids: Vec<usize> = if let Some(ids_arr) =
+                args.get("vertex_ids").and_then(Value::as_array)
+            {
+                if ids_arr.is_empty() {
+                    return Err(AiError::InvalidArguments(
+                        "'vertex_ids' must not be empty".into(),
+                    ));
+                }
+                let mut out = Vec::with_capacity(ids_arr.len());
+                for id in ids_arr {
+                    out.push(id.as_u64().ok_or_else(|| {
+                        AiError::InvalidArguments("'vertex_ids' must be integers".into())
+                    })? as usize);
+                }
+                out
+            } else if let (Some(bmin), Some(bmax)) = (
+                parse_opt_vec3(args, "bounds_min")?,
+                parse_opt_vec3(args, "bounds_max")?,
+            ) {
+                let lo = bmin.min(bmax);
+                let hi = bmin.max(bmax);
+                let mesh = scene
+                    .lowpoly_meshes
+                    .get(&node_id)
+                    .ok_or_else(|| AiError::InvalidArguments("mesh node not found".into()))?;
+                let matched: Vec<usize> = mesh
+                    .vertices
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, v)| {
+                        v.x >= lo.x
+                            && v.x <= hi.x
+                            && v.y >= lo.y
+                            && v.y <= hi.y
+                            && v.z >= lo.z
+                            && v.z <= hi.z
+                    })
+                    .map(|(i, _)| i)
+                    .collect();
+                if matched.is_empty() {
+                    return Err(AiError::InvalidArguments(
+                        "no vertices matched bounds_min..=bounds_max".into(),
+                    ));
+                }
+                matched
+            } else {
                 return Err(AiError::InvalidArguments(
-                    "'vertex_ids' must not be empty".into(),
+                    "missing 'vertex_ids' or ('bounds_min' + 'bounds_max')".into(),
                 ));
-            }
-            let mut vertex_ids = Vec::with_capacity(ids_arr.len());
-            for id in ids_arr {
-                vertex_ids.push(id.as_u64().ok_or_else(|| {
-                    AiError::InvalidArguments("'vertex_ids' must be integers".into())
-                })? as usize);
-            }
+            };
+            let affected_vertices = vertex_ids.len();
             let d_arr = args
                 .get("delta")
                 .and_then(Value::as_array)
@@ -1237,7 +2131,12 @@ pub fn execute_tool_call(
                     delta,
                 },
             )?;
-            Ok(json!({ "ok": true, "node_id": node_id.0, "morph": name }))
+            Ok(json!({
+                "ok": true,
+                "node_id": node_id.0,
+                "morph": name,
+                "affected_vertices": affected_vertices
+            }))
         }
         "mesh_morph_clear" => {
             let node_id = args
@@ -1373,8 +2272,34 @@ pub fn execute_tool_call(
             }))
         }
         "character_apply_biped_rig" => {
-            history.execute(scene, Command::ApplyBipedRig)?;
-            Ok(json!({ "ok": true, "bones": 7 }))
+            let preset = args
+                .get("preset")
+                .and_then(Value::as_str)
+                .unwrap_or("starter");
+            match preset {
+                "starter" => {
+                    history.execute(scene, Command::ApplyBipedRig)?;
+                    Ok(json!({ "ok": true, "preset": "starter", "bones": 7 }))
+                }
+                "humanoid" => {
+                    history.execute(scene, Command::ApplyHumanoidRig)?;
+                    Ok(json!({ "ok": true, "preset": "humanoid", "bones": 19 }))
+                }
+                other => Err(AiError::InvalidArguments(format!(
+                    "unknown rig preset '{other}'; use 'starter' or 'humanoid'"
+                ))),
+            }
+        }
+        "character_set_bone_rest_position" => {
+            let bone_id = parse_bone_id(args, "bone_id")?;
+            let position = parse_opt_vec3(args, "position")?
+                .ok_or_else(|| AiError::InvalidArguments("missing 'position'".into()))?;
+            history.execute(scene, Command::SetBoneRestPosition { bone_id, position })?;
+            Ok(json!({
+                "ok": true,
+                "bone_id": bone_id.0,
+                "rest_position": position.to_array()
+            }))
         }
         "character_add_bone" => {
             let name = args
@@ -1424,6 +2349,41 @@ pub fn execute_tool_call(
                 "ok": true,
                 "node_id": node_id.0,
                 "bone_id": bone_id.map(|b| b.0)
+            }))
+        }
+        "character_set_node_bone_mask" => {
+            let node_id = NodeId(
+                args.get("node_id")
+                    .and_then(Value::as_u64)
+                    .ok_or_else(|| AiError::InvalidArguments("missing 'node_id'".into()))?,
+            );
+            let bone_ids = match args.get("bone_ids") {
+                None | Some(Value::Null) => None,
+                Some(Value::Array(arr)) => {
+                    let mut out = Vec::with_capacity(arr.len());
+                    for v in arr {
+                        let raw = v.as_u64().ok_or_else(|| {
+                            AiError::InvalidArguments("'bone_ids' must be integers".into())
+                        })?;
+                        let id = u32::try_from(raw).map_err(|_| {
+                            AiError::InvalidArguments("'bone_ids' entry overflows u32".into())
+                        })?;
+                        out.push(BoneId(id));
+                    }
+                    Some(out)
+                }
+                _ => {
+                    return Err(AiError::InvalidArguments(
+                        "'bone_ids' must be an array of integers or null".into(),
+                    ));
+                }
+            };
+            let count = bone_ids.as_ref().map_or(0, Vec::len);
+            history.execute(scene, Command::SetNodeBoneMask { node_id, bone_ids })?;
+            Ok(json!({
+                "ok": true,
+                "node_id": node_id.0,
+                "masked_bones": count
             }))
         }
         "character_set_bone_pose" => {
@@ -1539,16 +2499,51 @@ pub fn execute_tool_call(
             let target = parse_opt_vec3(args, "target")?
                 .ok_or_else(|| AiError::InvalidArguments("missing 'target'".into()))?;
             let pole = parse_opt_vec3(args, "pole_vector")?.unwrap_or(glam::Vec3::Z);
-            history.execute(
-                scene,
-                Command::SolveTwoBoneIk {
-                    root_bone: root,
-                    mid_bone: mid,
-                    end_bone: end,
-                    target,
-                    pole,
-                },
-            )?;
+            let end_rot_deg = parse_opt_vec3(args, "end_rotation_deg")?;
+
+            let mut cmds = vec![Command::SolveTwoBoneIk {
+                root_bone: root,
+                mid_bone: mid,
+                end_bone: end,
+                target,
+                pole,
+            }];
+            if let Some(deg) = end_rot_deg {
+                let rest = scene
+                    .character_rig
+                    .as_ref()
+                    .and_then(|r| r.bone(end))
+                    .map(|b| b.rest_local.rotation)
+                    .unwrap_or(glam::Quat::IDENTITY);
+                let delta = glam::Quat::from_euler(
+                    glam::EulerRot::XYZ,
+                    deg.x.to_radians(),
+                    deg.y.to_radians(),
+                    deg.z.to_radians(),
+                );
+                cmds.push(Command::SetBoneRotation {
+                    bone_id: end,
+                    rotation: rest * delta,
+                });
+            }
+            if cmds.len() == 1 {
+                history.execute(scene, cmds.remove(0))?;
+            } else {
+                history.execute(scene, Command::Transaction(cmds))?;
+            }
+
+            let bone_delta_deg = |bid: BoneId| -> [f32; 3] {
+                scene
+                    .character_rig
+                    .as_ref()
+                    .and_then(|rig| rig.bone(bid))
+                    .map(|b| {
+                        let d = b.rest_local.rotation.inverse() * b.pose_local.rotation;
+                        let (rx, ry, rz) = d.to_euler(glam::EulerRot::XYZ);
+                        [rx.to_degrees(), ry.to_degrees(), rz.to_degrees()]
+                    })
+                    .unwrap_or([0.0, 0.0, 0.0])
+            };
             let reached = scene
                 .character_rig
                 .as_ref()
@@ -1560,7 +2555,113 @@ pub fn execute_tool_call(
                 "root_bone_id": root.0,
                 "mid_bone_id": mid.0,
                 "end_bone_id": end.0,
-                "reached": reached
+                "reached": reached,
+                "rotations_deg": {
+                    "root": bone_delta_deg(root),
+                    "mid": bone_delta_deg(mid),
+                    "end": bone_delta_deg(end)
+                }
+            }))
+        }
+        "character_snapshot_pose_to_keyframe" => {
+            let time_secs = args
+                .get("time_secs")
+                .and_then(Value::as_f64)
+                .ok_or_else(|| AiError::InvalidArguments("missing 'time_secs'".into()))?
+                as f32;
+            if !time_secs.is_finite() || time_secs < 0.0 {
+                return Err(AiError::InvalidArguments(
+                    "'time_secs' must be finite and >= 0".into(),
+                ));
+            }
+            let clip_index = if let Some(idx) = args.get("clip_index").and_then(Value::as_u64) {
+                idx as usize
+            } else if let Some(name) = args.get("clip_name").and_then(Value::as_str) {
+                let existing = scene
+                    .character_rig
+                    .as_ref()
+                    .and_then(|r| r.animations.iter().position(|c| c.name == name));
+                match existing {
+                    Some(i) => i,
+                    None => {
+                        let dur = args
+                            .get("duration_secs")
+                            .and_then(Value::as_f64)
+                            .unwrap_or((time_secs as f64).max(1.0))
+                            as f32;
+                        history.execute(
+                            scene,
+                            Command::AddAnimationClip {
+                                name: name.to_string(),
+                                duration_secs: dur.max(0.1),
+                            },
+                        )?;
+                        scene
+                            .character_rig
+                            .as_ref()
+                            .map(|r| r.animations.len().saturating_sub(1))
+                            .unwrap_or(0)
+                    }
+                }
+            } else {
+                scene
+                    .character_rig
+                    .as_ref()
+                    .map(|r| r.active_animation)
+                    .unwrap_or(0)
+            };
+
+            let rig = scene
+                .character_rig
+                .as_ref()
+                .ok_or_else(|| AiError::InvalidArguments("no character rig applied".into()))?;
+            let filter_ids: Option<Vec<BoneId>> = match args.get("bone_ids") {
+                None => None,
+                Some(v) => {
+                    let arr = v.as_array().ok_or_else(|| {
+                        AiError::InvalidArguments("'bone_ids' must be an array".into())
+                    })?;
+                    let mut out = Vec::with_capacity(arr.len());
+                    for item in arr {
+                        let raw = item.as_u64().ok_or_else(|| {
+                            AiError::InvalidArguments("'bone_ids' must contain integers".into())
+                        })?;
+                        out.push(BoneId(u32::try_from(raw).map_err(|_| {
+                            AiError::InvalidArguments("bone_id overflow".into())
+                        })?));
+                    }
+                    Some(out)
+                }
+            };
+            let cmds: Vec<Command> = rig
+                .bones
+                .iter()
+                .filter(|b| {
+                    filter_ids
+                        .as_ref()
+                        .is_none_or(|list| list.contains(&b.id))
+                })
+                .map(|b| {
+                    let delta = b.rest_local.rotation.inverse() * b.pose_local.rotation;
+                    Command::SetAnimationKeyframe {
+                        clip_index,
+                        bone_id: b.id,
+                        keyframe: Keyframe::rotation_only(time_secs, delta),
+                    }
+                })
+                .collect();
+            let keyframed_bones = cmds.len();
+            if keyframed_bones == 0 {
+                return Err(AiError::InvalidArguments(
+                    "no matching bones found to snapshot".into(),
+                ));
+            }
+            history.execute(scene, Command::Transaction(cmds))?;
+            Ok(json!({
+                "ok": true,
+                "clip_index": clip_index,
+                "time_secs": time_secs,
+                "keyframed_bones": keyframed_bones
             }))
         }
         "character_set_morph_weight" => {
@@ -1689,6 +2790,63 @@ pub fn execute_tool_call(
                 .collect();
             Ok(json!({ "ok": true, "bone_count": bones.len(), "bones": bones }))
         }
+        "character_inspect_weights" => {
+            let rig = scene
+                .character_rig
+                .as_ref()
+                .ok_or_else(|| AiError::InvalidArguments("no character rig in scene".into()))?;
+            let solver = tessel_core::AutoSkinSolver::from_rig(rig, 1.0)
+                .ok_or_else(|| AiError::InvalidArguments("character rig has no bones".into()))?;
+            let node_id = args.get("node_id").and_then(Value::as_u64).map(NodeId);
+            let sample_point = if let Some(pt) = parse_opt_vec3(args, "point")? {
+                pt
+            } else if let Some(nid) = node_id {
+                let mat = scene.node_world_matrix(nid);
+                if let Some(m) = scene.lowpoly_meshes.get(&nid) {
+                    let (lo, hi) = m.bounds();
+                    mat.transform_point3((lo + hi) * 0.5)
+                } else {
+                    mat.transform_point3(glam::Vec3::ZERO)
+                }
+            } else {
+                return Err(AiError::InvalidArguments(
+                    "provide 'point' [x,y,z] and/or 'node_id'".into(),
+                ));
+            };
+            let rigid_bone = node_id.and_then(|nid| {
+                rig.bindings
+                    .iter()
+                    .find(|b| b.node_id == nid)
+                    .map(|b| b.bone_id.0)
+            });
+            let manual_weight_vertices = node_id
+                .and_then(|nid| scene.lowpoly_meshes.get(&nid))
+                .map_or(0, |m| m.skin_weights.len());
+            let w = solver.weights_for_vertex(node_id, sample_point);
+            let mut influences = Vec::new();
+            for k in 0..4 {
+                if w.weights[k] > 0.0 {
+                    let bone_name = rig
+                        .bones
+                        .get(usize::from(w.joints[k]))
+                        .map(|b| b.name.as_str())
+                        .unwrap_or("unknown");
+                    influences.push(json!({
+                        "joint_index": w.joints[k],
+                        "bone_name": bone_name,
+                        "weight": w.weights[k]
+                    }));
+                }
+            }
+            Ok(json!({
+                "ok": true,
+                "node_id": node_id.map(|n| n.0),
+                "sample_point": sample_point.to_array(),
+                "rigid_bone_id": rigid_bone,
+                "manual_weight_vertices": manual_weight_vertices,
+                "influences": influences
+            }))
+        }
         "character_inspect_clip" => {
             let clip_index = resolve_clip_index(args, scene, history, false)?;
             let rig = scene
@@ -1780,6 +2938,39 @@ pub fn execute_tool_call(
             let clip_index = resolve_clip_index(args, scene, history, false)?;
             history.execute(scene, Command::SetActiveAnimationClip { clip_index })?;
             Ok(json!({ "ok": true, "clip_index": clip_index }))
+        }
+        "character_set_playback_time" => {
+            let clip_index = if args.get("clip_index").is_some() || args.get("clip_name").is_some()
+            {
+                Some(resolve_clip_index(args, scene, history, false)?)
+            } else {
+                None
+            };
+            let time_secs = args
+                .get("time_secs")
+                .and_then(Value::as_f64)
+                .ok_or_else(|| AiError::InvalidArguments("missing 'time_secs'".into()))?
+                as f32;
+            history.execute(
+                scene,
+                Command::SetAnimationPlaybackTime {
+                    clip_index,
+                    time_secs,
+                },
+            )?;
+            let active_idx = scene
+                .character_rig
+                .as_ref()
+                .map_or(0, |r| r.active_animation);
+            Ok(json!({
+                "ok": true,
+                "clip_index": active_idx,
+                "time_secs": time_secs
+            }))
+        }
+        "character_reset_pose" => {
+            history.execute(scene, Command::ResetCharacterPose)?;
+            Ok(json!({ "ok": true }))
         }
         "character_remove_keyframe" => {
             let clip_index = resolve_clip_index(args, scene, history, false)?;
@@ -1893,6 +3084,42 @@ pub fn execute_tool_call(
             )?;
             Ok(json!({ "ok": true, "node_id": node_id.0, "cleared": target }))
         }
+        "project_save" => {
+            let filename = args
+                .get("filename")
+                .and_then(Value::as_str)
+                .ok_or_else(|| AiError::InvalidArguments("missing 'filename'".into()))?;
+            let target = resolve_safe_export_path(allowed_export_dir, filename)?;
+            if let Some(parent) = target.parent() {
+                std::fs::create_dir_all(parent).map_err(tessel_io::IoError::from)?;
+            }
+            save_tessel_project_atomic(&target, scene)?;
+            let size = std::fs::metadata(&target).map(|m| m.len()).unwrap_or(0);
+            Ok(json!({
+                "ok": true,
+                "output_path": target.display().to_string(),
+                "file_size_bytes": size
+            }))
+        }
+        "project_open" => {
+            let filename = args
+                .get("filename")
+                .and_then(Value::as_str)
+                .ok_or_else(|| AiError::InvalidArguments("missing 'filename'".into()))?;
+            let target = resolve_safe_export_path(allowed_export_dir, filename)?;
+            let mut loaded = load_tessel_project(&target)?;
+            loaded.mark_modified();
+            let node_count = loaded.nodes.len();
+            let has_rig = loaded.character_rig.is_some();
+            *scene = loaded;
+            *history = HistoryStack::new();
+            Ok(json!({
+                "ok": true,
+                "path": target.display().to_string(),
+                "node_count": node_count,
+                "has_character_rig": has_rig
+            }))
+        }
         "project_export" => {
             let filename = args
                 .get("filename")
@@ -1921,8 +3148,11 @@ pub fn execute_tool_call(
         other if other.starts_with("camera_") => Err(AiError::InvalidArguments(
             "camera tools need the live GUI viewport (HTTP bridge); this headless session has no camera".into(),
         )),
-        "viewport_screenshot" => Err(AiError::InvalidArguments(
-            "viewport_screenshot is served by the MCP server itself (needs its own GPU); the Direct AI path has no renderer".into(),
+        "viewport_set_preview" => Err(AiError::InvalidArguments(
+            "viewport_set_preview needs the live GUI viewport (HTTP bridge)".into(),
+        )),
+        "viewport_screenshot" | "viewport_render_turntable_gif" => Err(AiError::InvalidArguments(
+            "viewport rendering tools are served by the MCP server itself (needs its own GPU); the Direct AI path has no renderer".into(),
         )),
         other => Err(AiError::UnknownTool(other.to_string())),
     }
@@ -3093,5 +4323,926 @@ mod tests {
             &dir,
         )
         .is_err());
+    }
+
+    #[test]
+    fn lowpoly_1to1_modeling_and_humanoid_rig_tools_roundtrip_and_undo() {
+        let mut scene = SceneState::new();
+        let mut history = HistoryStack::new();
+        let dir = std::env::temp_dir();
+
+        // 1. mesh_create_raw with per-face materials
+        let raw = execute_tool_call(
+            "mesh_create_raw",
+            &json!({
+                "name": "CustomVisor",
+                "vertices": [
+                    [-0.1, 0.0, 0.0], [0.1, 0.0, 0.0], [0.1, 0.2, 0.0], [-0.1, 0.2, 0.0]
+                ],
+                "faces": [
+                    { "vertices": [0, 1, 2, 3], "palette_index": 2 }
+                ],
+                "smooth": true
+            }),
+            &mut scene,
+            &mut history,
+            &dir,
+        )
+        .unwrap();
+        let raw_id = raw["node_id"].as_u64().unwrap();
+        assert_eq!(raw["vertices"], 4);
+        assert_eq!(raw["faces"], 1);
+
+        // 2. mesh_set_vertices (batch) & mesh_set_face_material
+        let batch = execute_tool_call(
+            "mesh_set_vertices",
+            &json!({
+                "node_id": raw_id,
+                "updates": [
+                    { "vertex_id": 2, "position": [0.12, 0.22, 0.02] },
+                    { "vertex_id": 3, "position": [-0.12, 0.22, 0.02] }
+                ]
+            }),
+            &mut scene,
+            &mut history,
+            &dir,
+        )
+        .unwrap();
+        assert_eq!(batch["updated"], 2);
+
+        let mat = execute_tool_call(
+            "mesh_set_face_material",
+            &json!({ "node_id": raw_id, "face_ids": [0], "palette_index": 5 }),
+            &mut scene,
+            &mut history,
+            &dir,
+        )
+        .unwrap();
+        assert_eq!(mat["palette_index"], 5);
+
+        // 3. mesh_taper, mesh_bend, mesh_mirror, mesh_set_origin
+        execute_tool_call(
+            "mesh_taper",
+            &json!({ "node_id": raw_id, "axis": "y", "start_scale": 0.8, "end_scale": 1.1 }),
+            &mut scene,
+            &mut history,
+            &dir,
+        )
+        .unwrap();
+        execute_tool_call(
+            "mesh_bend",
+            &json!({ "node_id": raw_id, "bend_axis": "x", "curve_axis": "z", "angle_deg": 35.0 }),
+            &mut scene,
+            &mut history,
+            &dir,
+        )
+        .unwrap();
+        let mir = execute_tool_call(
+            "mesh_mirror",
+            &json!({ "node_id": raw_id, "axis": "x", "merge_original": true }),
+            &mut scene,
+            &mut history,
+            &dir,
+        )
+        .unwrap();
+        assert_eq!(mir["faces"], 2);
+        execute_tool_call(
+            "mesh_set_origin",
+            &json!({ "node_id": raw_id, "mode": "center" }),
+            &mut scene,
+            &mut history,
+            &dir,
+        )
+        .unwrap();
+
+        // 4. Thin primitive (size 0.015m) is NOT clamped to 0.1m anymore!
+        let thin = execute_tool_call(
+            "mesh_create_primitive",
+            &json!({ "name": "Tie", "kind": "cube", "size": 0.015, "palette_index": 1 }),
+            &mut scene,
+            &mut history,
+            &dir,
+        )
+        .unwrap();
+        assert_eq!(thin["clamped"], false);
+        let thin_id = thin["node_id"].as_u64().unwrap();
+
+        // 5. mesh_join merges thin into raw_id and deletes thin_id; undo restores both
+        let joined = execute_tool_call(
+            "mesh_join",
+            &json!({ "target_node_id": raw_id, "source_node_ids": [thin_id] }),
+            &mut scene,
+            &mut history,
+            &dir,
+        )
+        .unwrap();
+        assert_eq!(joined["faces"], 8);
+        assert!(!scene.nodes.contains_key(&NodeId(thin_id)));
+        history.undo(&mut scene).unwrap();
+        assert!(scene.nodes.contains_key(&NodeId(thin_id)));
+
+        // 6. Humanoid 19-bone rig (Left=+X, Right=-X) + character_set_bone_rest_position
+        let rig = execute_tool_call(
+            "character_apply_biped_rig",
+            &json!({ "preset": "humanoid" }),
+            &mut scene,
+            &mut history,
+            &dir,
+        )
+        .unwrap();
+        assert_eq!(rig["bones"], 19);
+        let bones = execute_tool_call(
+            "character_list_bones",
+            &json!({}),
+            &mut scene,
+            &mut history,
+            &dir,
+        )
+        .unwrap();
+        let left_shoulder = bones["bones"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|b| b["name"] == "LeftShoulder")
+            .unwrap();
+        assert!(left_shoulder["rest_position"][0].as_f64().unwrap() > 0.0);
+
+        execute_tool_call(
+            "character_set_bone_rest_position",
+            &json!({ "bone_id": 4, "position": [0.0, 0.15, 0.01] }),
+            &mut scene,
+            &mut history,
+            &dir,
+        )
+        .unwrap();
+        assert!(
+            (scene.character_rig.as_ref().unwrap().bones[4]
+                .rest_local
+                .translation
+                .y
+                - 0.15)
+                .abs()
+                < 1e-5
+        );
+    }
+
+    #[test]
+    fn audit_p1_input_validation_and_transaction_undo_revision() {
+        let mut scene = SceneState::new();
+        let mut history = HistoryStack::new();
+        let dir = std::env::temp_dir();
+
+        // 1. i64 wrapping bypass in parse_ivec3 must be rejected (4_294_967_296 wraps to 0 as i32)
+        assert!(execute_tool_call(
+            "voxel_fill_box",
+            &json!({ "min": [4_294_967_296_i64, 0, 0], "max": [1, 1, 1], "palette_index": 4 }),
+            &mut scene,
+            &mut history,
+            &dir,
+        )
+        .is_err());
+
+        // 2. Oversized ellipsoid fails fast before allocating edits
+        assert!(matches!(
+            execute_tool_call(
+                "voxel_fill_ellipsoid",
+                &json!({ "center": [0, 0, 0], "radii": [200.0, 200.0, 200.0], "palette_index": 4 }),
+                &mut scene,
+                &mut history,
+                &dir,
+            ),
+            Err(AiError::BatchLimitExceeded)
+        ));
+
+        // 3. Out-of-range rgb in palette_set_color is rejected (no silent unwrap_or(0))
+        assert!(execute_tool_call(
+            "palette_set_color",
+            &json!({ "palette_index": 9, "rgb": [300, 10, 10] }),
+            &mut scene,
+            &mut history,
+            &dir,
+        )
+        .is_err());
+
+        // 4. Undo of a Transaction bumps scene.revision and sets dirty_viewport
+        let created = execute_tool_call(
+            "mesh_create_primitive",
+            &json!({ "name": "Box", "kind": "cube", "size": 1.0, "palette_index": 4 }),
+            &mut scene,
+            &mut history,
+            &dir,
+        )
+        .unwrap();
+        let nid = created["node_id"].as_u64().unwrap();
+        execute_tool_call(
+            "mesh_set_origin",
+            &json!({ "node_id": nid, "mode": "center" }),
+            &mut scene,
+            &mut history,
+            &dir,
+        )
+        .unwrap();
+        scene.dirty_viewport = false;
+        let rev_before = scene.revision;
+        history.undo(&mut scene).unwrap();
+        assert!(scene.revision > rev_before);
+        assert!(scene.dirty_viewport);
+    }
+
+    #[test]
+    fn texture_paint_line_rect_uv_project_and_local_face_subdivide_roundtrip() {
+        let mut scene = SceneState::new();
+        let mut history = HistoryStack::new();
+        let dir = std::env::temp_dir();
+
+        let created = execute_tool_call(
+            "mesh_create_primitive",
+            &json!({ "name": "Torso", "kind": "cube", "size": 1.0, "palette_index": 3 }),
+            &mut scene,
+            &mut history,
+            &dir,
+        )
+        .unwrap();
+        let nid = created["node_id"].as_u64().unwrap();
+
+        // Project cylindrical UVs
+        let proj = execute_tool_call(
+            "mesh_project_uvs",
+            &json!({ "node_id": nid, "mode": "cylindrical" }),
+            &mut scene,
+            &mut history,
+            &dir,
+        )
+        .unwrap();
+        assert_eq!(proj["faces_projected"], 6);
+        assert_eq!(scene.lowpoly_meshes[&NodeId(nid)].faces[0].uvs.len(), 4);
+
+        // Paint line & rect on RGBA texture + undo
+        execute_tool_call(
+            "mesh_paint_line",
+            &json!({
+                "node_id": nid,
+                "uv_start": [0.1, 0.2],
+                "uv_end": [0.9, 0.2],
+                "width_px": 6.0,
+                "palette_index": 1
+            }),
+            &mut scene,
+            &mut history,
+            &dir,
+        )
+        .unwrap();
+        execute_tool_call(
+            "mesh_paint_rect",
+            &json!({
+                "node_id": nid,
+                "uv_min": [0.4, 0.4],
+                "uv_max": [0.6, 0.6],
+                "palette_index": 5
+            }),
+            &mut scene,
+            &mut history,
+            &dir,
+        )
+        .unwrap();
+        assert!(scene.lowpoly_meshes[&NodeId(nid)].texture.is_some());
+
+        // Local face subdivision: 6 faces -> 1 quad replaced by 4 quads = 9 faces
+        let sub = execute_tool_call(
+            "mesh_subdivide_face",
+            &json!({ "node_id": nid, "face_id": 0 }),
+            &mut scene,
+            &mut history,
+            &dir,
+        )
+        .unwrap();
+        assert_eq!(sub["faces"], 9);
+        history.undo(&mut scene).unwrap();
+        assert_eq!(scene.lowpoly_meshes[&NodeId(nid)].faces.len(), 6);
+
+        // Apply transform bakes world offset + scale into vertices so mirror_x works across world X=0
+        execute_tool_call(
+            "scene_set_node_transform",
+            &json!({ "node_id": nid, "position": [0.3, 0.0, 0.0], "scale": [0.1, 0.1, 0.1] }),
+            &mut scene,
+            &mut history,
+            &dir,
+        )
+        .unwrap();
+        execute_tool_call(
+            "mesh_apply_transform",
+            &json!({ "node_id": nid }),
+            &mut scene,
+            &mut history,
+            &dir,
+        )
+        .unwrap();
+        assert_eq!(
+            scene.nodes[&NodeId(nid)].transform,
+            tessel_core::Transform::default()
+        );
+        execute_tool_call(
+            "mesh_mirror",
+            &json!({ "node_id": nid, "axis": "x", "merge_original": true }),
+            &mut scene,
+            &mut history,
+            &dir,
+        )
+        .unwrap();
+        let (lo, hi) = scene.lowpoly_meshes[&NodeId(nid)].bounds();
+        assert!((lo.x + 0.35).abs() < 1e-4);
+        assert!((hi.x - 0.35).abs() < 1e-4);
+    }
+
+    #[test]
+    fn mcp_project_save_open_and_node_bone_mask_roundtrip() {
+        let dir = std::env::temp_dir().join("tessel_mcp_proj_io_test");
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut scene = SceneState::new();
+        let mut history = HistoryStack::new();
+
+        let created = execute_tool_call(
+            "mesh_create_primitive",
+            &json!({ "name": "Legs", "kind": "cube", "size": 0.4, "palette_index": 7, "position": [-0.15, 0.7, 0.0] }),
+            &mut scene,
+            &mut history,
+            &dir,
+        )
+        .unwrap();
+        let nid = created["node_id"].as_u64().unwrap();
+        execute_tool_call(
+            "character_apply_biped_rig",
+            &json!({ "preset": "humanoid" }),
+            &mut scene,
+            &mut history,
+            &dir,
+        )
+        .unwrap();
+
+        // Restrict Legs node to Root(0) + leg bones (13..=18) so hanging RightHand(12) never pulls hip
+        execute_tool_call(
+            "character_set_node_bone_mask",
+            &json!({ "node_id": nid, "bone_ids": [0, 13, 14, 15, 16, 17, 18] }),
+            &mut scene,
+            &mut history,
+            &dir,
+        )
+        .unwrap();
+        let inspected = execute_tool_call(
+            "character_inspect_weights",
+            &json!({ "node_id": nid, "point": [-0.25, 0.85, 0.0] }),
+            &mut scene,
+            &mut history,
+            &dir,
+        )
+        .unwrap();
+        for inf in inspected["influences"].as_array().unwrap() {
+            let j = inf["joint_index"].as_u64().unwrap();
+            assert!(
+                j == 0 || (13..=18).contains(&j),
+                "unexpected arm bone influence {j} on masked legs node"
+            );
+        }
+
+        // Save .tessel atomically inside allowed_export_dir
+        let saved = execute_tool_call(
+            "project_save",
+            &json!({ "filename": "hero_checkpoint.tessel" }),
+            &mut scene,
+            &mut history,
+            &dir,
+        )
+        .unwrap();
+        assert!(saved["file_size_bytes"].as_u64().unwrap() > 0);
+
+        // Path traversal must be denied on both save and open
+        assert!(execute_tool_call(
+            "project_save",
+            &json!({ "filename": "../escape.tessel" }),
+            &mut scene,
+            &mut history,
+            &dir,
+        )
+        .is_err());
+        assert!(execute_tool_call(
+            "project_open",
+            &json!({ "filename": "../escape.tessel" }),
+            &mut scene,
+            &mut history,
+            &dir,
+        )
+        .is_err());
+
+        // Load into a fresh SceneState and verify rig + bone mask survived round-trip
+        let mut fresh_scene = SceneState::new();
+        let mut fresh_history = HistoryStack::new();
+        let opened = execute_tool_call(
+            "project_open",
+            &json!({ "filename": "hero_checkpoint.tessel" }),
+            &mut fresh_scene,
+            &mut fresh_history,
+            &dir,
+        )
+        .unwrap();
+        assert_eq!(opened["has_character_rig"], true);
+        assert!(fresh_scene
+            .character_rig
+            .as_ref()
+            .unwrap()
+            .node_bone_masks
+            .contains_key(&NodeId(nid)));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn mcp_v18_animation_scrub_pose_reset_rename_and_clear_roundtrip() {
+        let dir = std::env::temp_dir();
+        let mut scene = SceneState::new();
+        let mut history = HistoryStack::new();
+
+        // 1. scene_clear removes all nodes atomically and is undoable
+        execute_tool_call(
+            "mesh_create_primitive",
+            &json!({ "name": "StarterA", "kind": "cube", "size": 0.5, "palette_index": 3 }),
+            &mut scene,
+            &mut history,
+            &dir,
+        )
+        .unwrap();
+        execute_tool_call(
+            "mesh_create_primitive",
+            &json!({ "name": "StarterB", "kind": "sphere", "size": 0.5, "palette_index": 4 }),
+            &mut scene,
+            &mut history,
+            &dir,
+        )
+        .unwrap();
+        let before = scene.nodes.len();
+        assert_eq!(before, 2);
+        let cleared =
+            execute_tool_call("scene_clear", &json!({}), &mut scene, &mut history, &dir).unwrap();
+        assert_eq!(cleared["removed_nodes"], before);
+        assert!(scene.nodes.is_empty());
+        history.undo(&mut scene).unwrap();
+        assert_eq!(scene.nodes.len(), before);
+
+        // 2. scene_rename_node renames cleanly + undo
+        let created = execute_tool_call(
+            "mesh_create_primitive",
+            &json!({ "name": "TempPart", "kind": "cube", "size": 0.5, "palette_index": 3 }),
+            &mut scene,
+            &mut history,
+            &dir,
+        )
+        .unwrap();
+        let nid = created["node_id"].as_u64().unwrap();
+        execute_tool_call(
+            "scene_rename_node",
+            &json!({ "node_id": nid, "name": "PUBG_Helmet" }),
+            &mut scene,
+            &mut history,
+            &dir,
+        )
+        .unwrap();
+        assert_eq!(scene.nodes[&NodeId(nid)].name, "PUBG_Helmet");
+        history.undo(&mut scene).unwrap();
+        assert_eq!(scene.nodes[&NodeId(nid)].name, "TempPart");
+
+        // 3. character_set_playback_time scrubs Walk clip live + character_reset_pose resets
+        execute_tool_call(
+            "character_apply_biped_rig",
+            &json!({ "preset": "humanoid" }),
+            &mut scene,
+            &mut history,
+            &dir,
+        )
+        .unwrap();
+        execute_tool_call(
+            "character_set_playback_time",
+            &json!({ "clip_name": "Walk", "time_secs": 0.25 }),
+            &mut scene,
+            &mut history,
+            &dir,
+        )
+        .unwrap();
+        let rig = scene.character_rig.as_ref().unwrap();
+        assert_eq!(rig.active_animation, 1);
+        assert!(
+            rig.bone(BoneId(13))
+                .unwrap()
+                .pose_local
+                .rotation
+                .angle_between(glam::Quat::IDENTITY)
+                > 0.1
+        );
+
+        execute_tool_call(
+            "character_reset_pose",
+            &json!({}),
+            &mut scene,
+            &mut history,
+            &dir,
+        )
+        .unwrap();
+        let rig = scene.character_rig.as_ref().unwrap();
+        assert!(
+            rig.bone(BoneId(13))
+                .unwrap()
+                .pose_local
+                .rotation
+                .angle_between(glam::Quat::IDENTITY)
+                < 1e-5
+        );
+    }
+
+    #[test]
+    fn mcp_v19_batch_atomic_rollback_weld_and_flip_normals() {
+        let dir = std::env::temp_dir();
+        let mut scene = SceneState::new();
+        let mut history = HistoryStack::new();
+
+        // 1. Atomic scene_batch succeeds and returns per-call results
+        let ok = execute_tool_call(
+            "scene_batch",
+            &json!({
+                "calls": [
+                    { "name": "mesh_create_primitive", "arguments": { "name": "Half", "kind": "cube", "size": 1.0, "palette_index": 4, "position": [0.5, 0.0, 0.0] } },
+                    { "name": "mesh_apply_transform", "arguments": {} },
+                    { "name": "mesh_mirror", "arguments": { "axis": "x", "merge_original": true } }
+                ]
+            }),
+            &mut scene,
+            &mut history,
+            &dir,
+        )
+        .unwrap();
+        assert_eq!(ok["count"], 3);
+        let nid = ok["results"][0]["node_id"].as_u64().unwrap();
+        assert_eq!(scene.lowpoly_meshes[&NodeId(nid)].vertices.len(), 16);
+
+        // 2. mesh_weld_vertices collapses the 4 duplicated center-seam vertices at X=0 (16 -> 12)
+        let welded = execute_tool_call(
+            "mesh_weld_vertices",
+            &json!({ "node_id": nid, "tolerance": 0.001 }),
+            &mut scene,
+            &mut history,
+            &dir,
+        )
+        .unwrap();
+        assert_eq!(welded["removed"], 4);
+        assert_eq!(welded["vertices_after"], 12);
+
+        // 3. mesh_flip_normals reverses face 0 winding
+        let orig_f0 = scene.lowpoly_meshes[&NodeId(nid)].faces[0].vertices.clone();
+        execute_tool_call(
+            "mesh_flip_normals",
+            &json!({ "node_id": nid, "face_ids": [0] }),
+            &mut scene,
+            &mut history,
+            &dir,
+        )
+        .unwrap();
+        let mut expected = orig_f0;
+        expected.reverse();
+        assert_eq!(
+            scene.lowpoly_meshes[&NodeId(nid)].faces[0].vertices,
+            expected
+        );
+
+        // 4. Failed scene_batch rolls back completely (scene node count unchanged!)
+        let count_before = scene.nodes.len();
+        let failed = execute_tool_call(
+            "scene_batch",
+            &json!({
+                "calls": [
+                    { "name": "mesh_create_primitive", "arguments": { "name": "WillRollback", "kind": "cube", "size": 1.0, "palette_index": 2 } },
+                    { "name": "scene_delete_node", "arguments": { "node_id": 999999 } }
+                ]
+            }),
+            &mut scene,
+            &mut history,
+            &dir,
+        );
+        assert!(failed.is_err());
+        assert_eq!(scene.nodes.len(), count_before);
+    }
+
+    #[test]
+    fn v27_mcp_friction_fixes_ik_morph_and_glb_roundtrip() {
+        let mut scene = SceneState::new();
+        let mut history = HistoryStack::new();
+        let dir = std::env::temp_dir().join("tessel_v27_mcp_roundtrip");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // 1. scene_set_mode accepts "Low-Poly" (matching scene_inspect output)
+        let mode_res = execute_tool_call(
+            "scene_set_mode",
+            &json!({ "mode": "Low-Poly" }),
+            &mut scene,
+            &mut history,
+            &dir,
+        )
+        .unwrap();
+        assert_eq!(mode_res["active_mode"], "Low-Poly");
+
+        // 2. mesh_create_primitive accepts non-uniform size [sx, sy, sz]
+        let prim = execute_tool_call(
+            "mesh_create_primitive",
+            &json!({
+                "name": "Torso",
+                "kind": "cube",
+                "size": [0.42, 0.56, 0.24],
+                "palette_index": 2
+            }),
+            &mut scene,
+            &mut history,
+            &dir,
+        )
+        .unwrap();
+        let node_id = prim["node_id"].as_u64().unwrap();
+        let sc = scene.nodes[&tessel_core::NodeId(node_id)].transform.scale;
+        assert!((sc.x - 0.42).abs() < 1e-4 && (sc.y - 0.56).abs() < 1e-4);
+
+        // 3. Apply humanoid rig & verify character_solve_ik moves arm bones
+        execute_tool_call(
+            "character_apply_biped_rig",
+            &json!({ "preset": "humanoid" }),
+            &mut scene,
+            &mut history,
+            &dir,
+        )
+        .unwrap();
+        let rig = scene.character_rig.as_ref().unwrap();
+        let upper = rig
+            .bones
+            .iter()
+            .find(|b| b.name == "RightUpperArm")
+            .unwrap()
+            .id
+            .0;
+        let mid = rig
+            .bones
+            .iter()
+            .find(|b| b.name == "RightForearm")
+            .unwrap()
+            .id
+            .0;
+        let end = rig
+            .bones
+            .iter()
+            .find(|b| b.name == "RightHand")
+            .unwrap()
+            .id
+            .0;
+        let before_rot = rig
+            .bone(tessel_core::BoneId(upper))
+            .unwrap()
+            .pose_local
+            .rotation;
+        execute_tool_call(
+            "character_solve_ik",
+            &json!({
+                "root_bone_id": upper,
+                "mid_bone_id": mid,
+                "end_bone_id": end,
+                "target": [-0.35, 1.35, 0.45],
+                "pole": [-0.5, 1.1, -0.3]
+            }),
+            &mut scene,
+            &mut history,
+            &dir,
+        )
+        .unwrap();
+        let after_rot = scene
+            .character_rig
+            .as_ref()
+            .unwrap()
+            .bone(tessel_core::BoneId(upper))
+            .unwrap()
+            .pose_local
+            .rotation;
+        assert!(before_rot.angle_between(after_rot) > 1e-3);
+
+        // 4. Verify morph target creation & weight application
+        execute_tool_call(
+            "mesh_morph_delta",
+            &json!({
+                "node_id": node_id,
+                "name": "Breathe",
+                "vertex_ids": [0, 1],
+                "delta": [0.0, 0.04, 0.02]
+            }),
+            &mut scene,
+            &mut history,
+            &dir,
+        )
+        .unwrap();
+        let morph_res = execute_tool_call(
+            "character_set_morph_weight",
+            &json!({
+                "clip_name": "Idle",
+                "node_id": node_id,
+                "target": "Breathe",
+                "time_secs": 0.5,
+                "weight": 0.75
+            }),
+            &mut scene,
+            &mut history,
+            &dir,
+        )
+        .unwrap();
+        assert_eq!(morph_res["ok"], true);
+        let idle = scene
+            .character_rig
+            .as_ref()
+            .unwrap()
+            .animations
+            .iter()
+            .find(|c| c.name == "Idle")
+            .unwrap();
+        assert!(idle
+            .morph_tracks
+            .iter()
+            .any(|t| t.target == "Breathe" && !t.keys.is_empty()));
+
+        // 5. Export .glb (using absolute path inside exports dir) & round-trip parse it
+        let abs_out = dir.join("v27_character.glb");
+        let exp = execute_tool_call(
+            "project_export",
+            &json!({
+                "format": "glb",
+                "filename": abs_out.to_string_lossy(),
+                "preset": "godot4"
+            }),
+            &mut scene,
+            &mut history,
+            &dir,
+        )
+        .unwrap();
+        assert!(exp["file_size_bytes"].as_u64().unwrap() > 0);
+        assert!(exp["triangles"].as_u64().unwrap() > 0);
+        let bytes = std::fs::read(&abs_out).unwrap();
+        let parsed =
+            tessel_io::import_glb_bytes(&bytes, tessel_core::PaletteIndex::new(1).unwrap())
+                .unwrap();
+        assert!(!parsed.vertices.is_empty());
+        assert!(!parsed.faces.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn mesh_create_lathe_builds_helmet_dome_and_visor() {
+        let mut scene = SceneState::new();
+        let mut history = HistoryStack::new();
+        let dir = std::env::temp_dir();
+
+        let dome = execute_tool_call(
+            "mesh_create_lathe",
+            &json!({
+                "name": "AltynDome",
+                "profile": [[0.14, 0.0], [0.15, 0.08], [0.11, 0.16], [0.0, 0.19]],
+                "segments": 16,
+                "angle_deg": 360.0,
+                "cap_ends": true,
+                "palette_index": 3,
+                "position": [0.0, 1.55, 0.0]
+            }),
+            &mut scene,
+            &mut history,
+            &dir,
+        )
+        .unwrap();
+        assert_eq!(dome["ok"], true);
+        assert_eq!(dome["vertices"], 49);
+        assert_eq!(dome["faces"], 49);
+
+        let visor = execute_tool_call(
+            "mesh_create_lathe",
+            &json!({
+                "name": "AltynVisor",
+                "profile": [[0.155, 0.0], [0.155, 0.10]],
+                "segments": 8,
+                "angle_deg": 160.0,
+                "palette_index": 5
+            }),
+            &mut scene,
+            &mut history,
+            &dir,
+        )
+        .unwrap();
+        assert_eq!(visor["ok"], true);
+        assert_eq!(visor["faces"], 8);
+    }
+
+    #[test]
+    fn v29_ik_end_rotation_snapshot_keyframe_and_morph_bounds() {
+        let mut scene = SceneState::new();
+        let mut history = HistoryStack::new();
+        let dir = std::env::temp_dir();
+
+        execute_tool_call(
+            "character_apply_biped_rig",
+            &json!({ "preset": "humanoid" }),
+            &mut scene,
+            &mut history,
+            &dir,
+        )
+        .unwrap();
+        let rig = scene.character_rig.as_ref().unwrap();
+        let upper = rig
+            .bones
+            .iter()
+            .find(|b| b.name == "RightUpperArm")
+            .unwrap()
+            .id
+            .0;
+        let mid = rig
+            .bones
+            .iter()
+            .find(|b| b.name == "RightForearm")
+            .unwrap()
+            .id
+            .0;
+        let end = rig
+            .bones
+            .iter()
+            .find(|b| b.name == "RightHand")
+            .unwrap()
+            .id
+            .0;
+
+        // 1. Solve IK with pole direction + end_rotation_deg and inspect returned rotations_deg
+        let ik = execute_tool_call(
+            "character_solve_ik",
+            &json!({
+                "root_bone_id": upper,
+                "mid_bone_id": mid,
+                "end_bone_id": end,
+                "target": [-0.25, 1.30, 0.40],
+                "pole_vector": [0.0, -1.0, -1.0],
+                "end_rotation_deg": [0.0, 20.0, 0.0]
+            }),
+            &mut scene,
+            &mut history,
+            &dir,
+        )
+        .unwrap();
+        assert!(ik["rotations_deg"]["root"].is_array());
+        assert!((ik["rotations_deg"]["end"][1].as_f64().unwrap() - 20.0).abs() < 1e-2);
+
+        // 2. Snapshot solved pose directly into a new clip keyframe
+        let snap = execute_tool_call(
+            "character_snapshot_pose_to_keyframe",
+            &json!({
+                "clip_name": "AimClip",
+                "duration_secs": 1.0,
+                "time_secs": 0.5,
+                "bone_ids": [upper, mid, end]
+            }),
+            &mut scene,
+            &mut history,
+            &dir,
+        )
+        .unwrap();
+        assert_eq!(snap["ok"], true);
+        assert_eq!(snap["keyframed_bones"], 3);
+        let aim_clip = scene
+            .character_rig
+            .as_ref()
+            .unwrap()
+            .animations
+            .iter()
+            .find(|c| c.name == "AimClip")
+            .unwrap();
+        assert_eq!(aim_clip.channels.len(), 3);
+
+        // 3. Spatial bounding-box morph target selection (without manual vertex_ids)
+        let mesh_res = execute_tool_call(
+            "mesh_create_primitive",
+            &json!({ "name": "Head", "kind": "cube", "size": 1.0, "palette_index": 2 }),
+            &mut scene,
+            &mut history,
+            &dir,
+        )
+        .unwrap();
+        let node_id = mesh_res["node_id"].as_u64().unwrap();
+        let morph = execute_tool_call(
+            "mesh_morph_delta",
+            &json!({
+                "node_id": node_id,
+                "name": "RaiseTop",
+                "bounds_min": [-1.0, 0.5, -1.0],
+                "bounds_max": [1.0, 1.5, 1.0],
+                "delta": [0.0, 0.2, 0.0]
+            }),
+            &mut scene,
+            &mut history,
+            &dir,
+        )
+        .unwrap();
+        assert_eq!(morph["ok"], true);
+        assert_eq!(morph["affected_vertices"], 4);
     }
 }

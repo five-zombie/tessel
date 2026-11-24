@@ -127,10 +127,14 @@ impl ViewportRenderer {
             }
         }
 
-        let bone_mats = scene
+        let skin_solver = scene
             .character_rig
             .as_ref()
-            .map(|r| r.world_pose_matrices());
+            .and_then(|r| tessel_core::AutoSkinSolver::from_rig(r, 1.0));
+        let skin_mats = skin_solver
+            .as_ref()
+            .zip(scene.character_rig.as_ref())
+            .map(|(solver, rig)| solver.skin_matrices(rig));
 
         let mut vertices = Vec::new();
         let mut indices = Vec::new();
@@ -140,30 +144,24 @@ impl ViewportRenderer {
                 continue;
             }
             let node_mat = scene.node_world_matrix(*node_id);
-            let bound_mat = scene
-                .character_rig
-                .as_ref()
-                .and_then(|rig| rig.bindings.iter().find(|b| b.node_id == *node_id))
-                .and_then(|binding| bone_mats.as_ref().and_then(|m| m.get(&binding.bone_id)))
-                .copied();
-            let combined_mat = match bound_mat {
-                Some(bm) => node_mat * bm,
-                None => node_mat,
-            };
+            let normal_mat = node_mat.inverse().transpose();
             let mesh = greedy_mesh_volume(vol, scene.unit_scale);
             let base = vertices.len() as u32;
             for v in mesh.vertices {
                 let u = (f32::from(v.palette_index.get()) + 0.5) / 256.0;
-                let pos = combined_mat
-                    .transform_point3(glam::Vec3::from_array(v.position))
-                    .to_array();
-                let norm = combined_mat
+                let mut wp = node_mat.transform_point3(glam::Vec3::from_array(v.position));
+                let mut wn = normal_mat
                     .transform_vector3(glam::Vec3::from_array(v.normal))
-                    .normalize_or_zero()
-                    .to_array();
+                    .normalize_or_zero();
+                if let (Some(solver), Some(mats)) = (&skin_solver, &skin_mats) {
+                    let w = solver.weights_for_vertex(Some(*node_id), wp);
+                    let (sp, sn) = solver.deform_point_normal(mats, w, wp, wn);
+                    wp = sp;
+                    wn = sn;
+                }
                 vertices.push(StudioVertex3D {
-                    position: pos,
-                    normal: norm,
+                    position: wp.to_array(),
+                    normal: wn.to_array(),
                     palette_uv: [u, 0.5],
                     ao: v.ao,
                     tangent: [1.0, 0.0, 0.0, 1.0],
@@ -179,49 +177,78 @@ impl ViewportRenderer {
                 continue;
             }
             let node_mat = scene.node_world_matrix(*node_id);
-            let bound_mat = scene
-                .character_rig
-                .as_ref()
-                .and_then(|rig| rig.bindings.iter().find(|b| b.node_id == *node_id))
-                .and_then(|binding| bone_mats.as_ref().and_then(|m| m.get(&binding.bone_id)))
-                .copied();
-            let combined_mat = match bound_mat {
-                Some(bm) => node_mat * bm,
-                None => node_mat,
-            };
+            let normal_mat = node_mat.inverse().transpose();
 
-            let tri = mesh.to_triangulated_flat();
-            let has_custom = mesh.texture.is_some()
-                || mesh.normal_map.is_some()
-                || mesh.material != tessel_core::MeshMaterial::default();
+            // Apply live morph-target deformations when any morph weight for this node is non-zero.
+            let morphed_mesh = scene.character_rig.as_ref().and_then(|rig| {
+                let has_active_morph = mesh.morphs.iter().any(|m| {
+                    rig.morph_weights
+                        .get(&(*node_id, m.name.clone()))
+                        .is_some_and(|&w| w.abs() > 1e-5)
+                });
+                if !has_active_morph {
+                    return None;
+                }
+                let mut deformed = mesh.clone();
+                for morph in &mesh.morphs {
+                    let w = rig
+                        .morph_weights
+                        .get(&(*node_id, morph.name.clone()))
+                        .copied()
+                        .unwrap_or(0.0);
+                    if w.abs() <= 1e-5 {
+                        continue;
+                    }
+                    for (&vi, &delta) in &morph.deltas {
+                        if let Some(pos) = deformed.vertices.get_mut(vi) {
+                            *pos += delta * w;
+                        }
+                    }
+                }
+                Some(deformed)
+            });
+            let active_mesh = morphed_mesh.as_ref().unwrap_or(mesh);
+            let tri = active_mesh.to_triangulated_flat();
+            let has_custom = active_mesh.texture.is_some()
+                || active_mesh.normal_map.is_some()
+                || active_mesh.material != tessel_core::MeshMaterial::default();
             if has_custom {
                 let mut t_verts = Vec::with_capacity(tri.vertices.len());
-                for v in tri.vertices {
-                    let pos = combined_mat
-                        .transform_point3(glam::Vec3::from_array(v.position))
-                        .to_array();
-                    let norm = combined_mat
+                for (corner, v) in tri.vertices.into_iter().enumerate() {
+                    let mut wp = node_mat.transform_point3(glam::Vec3::from_array(v.position));
+                    let mut wn = normal_mat
                         .transform_vector3(glam::Vec3::from_array(v.normal))
-                        .normalize_or_zero()
-                        .to_array();
-                    let tang = combined_mat
+                        .normalize_or_zero();
+                    let mut wt = normal_mat
                         .transform_vector3(glam::Vec3::new(
                             v.tangent[0],
                             v.tangent[1],
                             v.tangent[2],
                         ))
                         .normalize_or_zero();
-                    let uv = if mesh.texture.is_some() || mesh.normal_map.is_some() {
+                    if let (Some(solver), Some(mats)) = (&skin_solver, &skin_mats) {
+                        let w = tri
+                            .source_indices
+                            .get(corner)
+                            .and_then(|src| active_mesh.skin_weights.get(src).copied())
+                            .unwrap_or_else(|| solver.weights_for_vertex(Some(*node_id), wp));
+                        let (sp, sn) = solver.deform_point_normal(mats, w, wp, wn);
+                        let (_, st) = solver.deform_point_normal(mats, w, wp, wt);
+                        wp = sp;
+                        wn = sn;
+                        wt = st;
+                    }
+                    let uv = if active_mesh.texture.is_some() || active_mesh.normal_map.is_some() {
                         v.uv
                     } else {
                         [(f32::from(v.palette_index.get()) + 0.5) / 256.0, 0.5]
                     };
                     t_verts.push(StudioVertex3D {
-                        position: pos,
-                        normal: norm,
+                        position: wp.to_array(),
+                        normal: wn.to_array(),
                         palette_uv: uv,
                         ao: 1.0,
-                        tangent: [tang.x, tang.y, tang.z, v.tangent[3]],
+                        tangent: [wt.x, wt.y, wt.z, v.tangent[3]],
                     });
                 }
                 custom_items.push(crate::mesh_pass::CustomMeshUpload {
@@ -233,18 +260,25 @@ impl ViewportRenderer {
                 });
             } else {
                 let base = vertices.len() as u32;
-                for v in tri.vertices {
+                for (corner, v) in tri.vertices.into_iter().enumerate() {
                     let u = (f32::from(v.palette_index.get()) + 0.5) / 256.0;
-                    let pos = combined_mat
-                        .transform_point3(glam::Vec3::from_array(v.position))
-                        .to_array();
-                    let norm = combined_mat
+                    let mut wp = node_mat.transform_point3(glam::Vec3::from_array(v.position));
+                    let mut wn = normal_mat
                         .transform_vector3(glam::Vec3::from_array(v.normal))
-                        .normalize_or_zero()
-                        .to_array();
+                        .normalize_or_zero();
+                    if let (Some(solver), Some(mats)) = (&skin_solver, &skin_mats) {
+                        let w = tri
+                            .source_indices
+                            .get(corner)
+                            .and_then(|src| active_mesh.skin_weights.get(src).copied())
+                            .unwrap_or_else(|| solver.weights_for_vertex(Some(*node_id), wp));
+                        let (sp, sn) = solver.deform_point_normal(mats, w, wp, wn);
+                        wp = sp;
+                        wn = sn;
+                    }
                     vertices.push(StudioVertex3D {
-                        position: pos,
-                        normal: norm,
+                        position: wp.to_array(),
+                        normal: wn.to_array(),
                         palette_uv: [u, 0.5],
                         ao: 1.0,
                         tangent: [1.0, 0.0, 0.0, 1.0],
@@ -347,12 +381,12 @@ impl ViewportRenderer {
         }
     }
 
-    /// Captures the current offscreen viewport texture as PNG bytes for MCP `tessel://viewport/preview`.
-    pub fn capture_png_bytes(
+    /// Captures the current offscreen viewport texture as raw sRGB RGBA8 bytes `(width, height, rgba)`.
+    pub fn capture_rgba_bytes(
         &self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
-    ) -> Result<Vec<u8>, RenderError> {
+    ) -> Result<(u32, u32, Vec<u8>), RenderError> {
         let (width, height) = self.size;
         let bytes_per_pixel = 4u32;
         let unpadded_bpr = width * bytes_per_pixel;
@@ -410,7 +444,16 @@ impl ViewportRenderer {
         }
         drop(mapped);
         staging.unmap();
+        Ok((width, height, rgba))
+    }
 
+    /// Captures the current offscreen viewport texture as PNG bytes for MCP `tessel://viewport/preview`.
+    pub fn capture_png_bytes(
+        &self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+    ) -> Result<Vec<u8>, RenderError> {
+        let (width, height, rgba) = self.capture_rgba_bytes(device, queue)?;
         let img = RgbaImage::from_raw(width, height, rgba)
             .ok_or_else(|| RenderError::PreviewEncode("invalid image buffer size".into()))?;
         let mut out = Cursor::new(Vec::new());

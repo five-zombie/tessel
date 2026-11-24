@@ -686,6 +686,21 @@ pub fn export_glb_bytes(
     // morph targets as dedicated primitives (morphs need per-mesh targets,
     // which the merged palette mesh cannot carry).
     let mut palette_tex_index: Option<usize> = if has_palette_prim { Some(0) } else { None };
+    // Deduplicate identical PBR materials across nodes so multi-part assets avoid redundant draw calls.
+    type MaterialKey = (usize, Option<usize>, u32, u32, [u32; 3]);
+    let mut material_cache: BTreeMap<MaterialKey, usize> = BTreeMap::new();
+    if has_palette_prim {
+        material_cache.insert(
+            (
+                0,
+                None,
+                0.0_f32.to_bits(),
+                0.85_f32.to_bits(),
+                [0.0_f32.to_bits(); 3],
+            ),
+            0,
+        );
+    }
     let mut morphed: Vec<(tessel_core::NodeId, Value, Vec<f64>)> = Vec::new();
     for (node_id, lp_mesh) in &scene.lowpoly_meshes {
         let visible = scene.nodes.get(node_id).map(|n| n.visible).unwrap_or(true);
@@ -787,28 +802,50 @@ pub fn export_glb_bytes(
             "bufferView": i_bv, "componentType": 5125, "count": tri.indices.len(), "type": "SCALAR"
         }));
 
-        let mat_idx = materials.len();
-        let mut mat_json = json!({
-            "name": format!("TesselMeshMaterial_{}", node_id.0),
-            "pbrMetallicRoughness": {
-                "baseColorTexture": { "index": tex_idx },
-                "metallicFactor": lp_mesh.material.metallic,
-                "roughnessFactor": lp_mesh.material.roughness
-            }
-        });
-        if lp_mesh.material.emissive.iter().any(|&c| c > 0.0) {
-            mat_json["emissiveFactor"] = json!(lp_mesh.material.emissive);
-        }
-        if let Some(nmap) = &lp_mesh.normal_map {
+        let norm_tex_idx = if let Some(nmap) = &lp_mesh.normal_map {
             let norm_png = encode_rgba_png(nmap.width, nmap.height, &nmap.rgba)?;
             let n_img_bv = push_view(&mut bin, &mut buffer_views, &norm_png, None);
             let n_img_idx = images.len();
             images.push(json!({ "bufferView": n_img_bv, "mimeType": "image/png" }));
             let n_tex_idx = textures.len();
             textures.push(json!({ "sampler": 0, "source": n_img_idx }));
-            mat_json["normalTexture"] = json!({ "index": n_tex_idx });
-        }
-        materials.push(mat_json);
+            Some(n_tex_idx)
+        } else {
+            None
+        };
+        let mat_key: MaterialKey = (
+            tex_idx,
+            norm_tex_idx,
+            lp_mesh.material.metallic.to_bits(),
+            lp_mesh.material.roughness.to_bits(),
+            [
+                lp_mesh.material.emissive[0].to_bits(),
+                lp_mesh.material.emissive[1].to_bits(),
+                lp_mesh.material.emissive[2].to_bits(),
+            ],
+        );
+        let mat_idx = if let Some(&existing) = material_cache.get(&mat_key) {
+            existing
+        } else {
+            let idx = materials.len();
+            let mut mat_json = json!({
+                "name": format!("TesselMeshMaterial_{}", idx),
+                "pbrMetallicRoughness": {
+                    "baseColorTexture": { "index": tex_idx },
+                    "metallicFactor": lp_mesh.material.metallic,
+                    "roughnessFactor": lp_mesh.material.roughness
+                }
+            });
+            if lp_mesh.material.emissive.iter().any(|&c| c > 0.0) {
+                mat_json["emissiveFactor"] = json!(lp_mesh.material.emissive);
+            }
+            if let Some(n_tex_idx) = norm_tex_idx {
+                mat_json["normalTexture"] = json!({ "index": n_tex_idx });
+            }
+            materials.push(mat_json);
+            material_cache.insert(mat_key, idx);
+            idx
+        };
         let mut custom_attrs = json!({
             "POSITION": p_acc,
             "NORMAL": n_acc,
@@ -1436,5 +1473,36 @@ mod tests {
         assert!((min_x - 4.0).abs() < 1e-4);
         assert!((max_x - 6.0).abs() < 1e-4);
         assert!((min_y - 2.0).abs() < 1e-4);
+    }
+
+    #[test]
+    fn glb_export_deduplicates_identical_pbr_materials() {
+        let mut scene = SceneState::new();
+        let mat = tessel_core::MeshMaterial {
+            metallic: 0.45,
+            roughness: 0.5,
+            emissive: [0.0; 3],
+        };
+        for i in 0..4 {
+            Command::CreatePrimitiveMesh {
+                name: format!("Part_{i}"),
+                kind: PrimitiveKind::Cube,
+                size: 0.5,
+                material: PaletteIndex::new((i + 1) as u8).unwrap(),
+            }
+            .apply(&mut scene)
+            .unwrap();
+            let id = scene.active_lowpoly_node().unwrap();
+            Command::SetMeshMaterial {
+                node_id: id,
+                material: mat,
+            }
+            .apply(&mut scene)
+            .unwrap();
+        }
+        let (glb, _) = export_glb_bytes(&scene, ExportPreset::Godot4).unwrap();
+        let parsed = gltf::Gltf::from_slice(&glb).unwrap();
+        // All 4 parts share identical PBR parameters + palette texture -> deduplicated to 1 material!
+        assert_eq!(parsed.materials().count(), 1);
     }
 }

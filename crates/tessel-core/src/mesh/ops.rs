@@ -11,9 +11,16 @@ use super::face::Face;
 use super::lowpoly::{LowPolyMesh, MorphTarget};
 use super::nano::{FaceId, PrimitiveKind};
 
+/// Minimum primitive size allowed by [`create_primitive`] (5 mm).
+pub const MIN_PRIMITIVE_SIZE: f32 = 0.005;
+
 /// Generates a starter low-poly primitive mesh centered on X/Z with base at Y = 0.
 pub fn create_primitive(kind: PrimitiveKind, size: f32, material: PaletteIndex) -> LowPolyMesh {
-    let s = size.max(0.1);
+    let s = if size.is_finite() {
+        size.max(MIN_PRIMITIVE_SIZE)
+    } else {
+        1.0
+    };
     let h = s * 0.5;
     match kind {
         PrimitiveKind::Cube => {
@@ -252,7 +259,7 @@ fn create_capsule(
     material: PaletteIndex,
 ) -> LowPolyMesh {
     let r = radius.min(total_height * 0.45);
-    let cyl_h = (total_height - 2.0 * r).max(0.05);
+    let cyl_h = (total_height - 2.0 * r).max(0.001);
     let mut vertices = Vec::new();
     vertices.push(Vec3::new(0.0, 0.0, 0.0)); // 0: bottom pole
 
@@ -411,6 +418,118 @@ pub fn create_curve_tube(
         texture: None,
         normal_map: None,
         smooth_shading: true,
+        material: Default::default(),
+    })
+}
+
+/// Generates a surface-of-revolution (lathe) mesh by revolving a 2D `profile` (`[radius, y]`,
+/// ordered bottom-to-top) around the `+Y` axis. Supports full 360° revolutions and partial arcs
+/// (e.g. `180.0` centered on `+Z` front for visors/shields) with automatic pole-collapse and
+/// guaranteed outward CCW winding.
+pub fn create_lathe_mesh(
+    profile: &[[f32; 2]],
+    segments: u32,
+    angle_deg: f32,
+    cap_ends: bool,
+    material: PaletteIndex,
+) -> Result<LowPolyMesh, CoreError> {
+    if profile.len() < 2
+        || profile.len() > 128
+        || !angle_deg.is_finite()
+        || angle_deg <= 1.0
+        || angle_deg > 360.0
+        || profile
+            .iter()
+            .any(|&[r, y]| !r.is_finite() || !y.is_finite() || r < 0.0)
+    {
+        return Err(CoreError::OutOfBounds);
+    }
+
+    let segs = segments.clamp(3, 64) as usize;
+    let full_circle = angle_deg >= 359.99;
+    let sweep = if full_circle {
+        std::f32::consts::TAU
+    } else {
+        angle_deg.to_radians()
+    };
+    let start_angle = if full_circle { 0.0 } else { -sweep * 0.5 };
+    let cols = if full_circle { segs } else { segs + 1 };
+
+    let mut vertices = Vec::with_capacity(profile.len() * cols);
+    // Each profile point maps either to a single pole vertex or a ring of `cols` vertices.
+    enum Ring {
+        Pole(usize),
+        Loop(usize),
+    }
+    let mut rings = Vec::with_capacity(profile.len());
+
+    for &[r, y] in profile {
+        if r <= 1e-4 {
+            let idx = vertices.len();
+            vertices.push(Vec3::new(0.0, y, 0.0));
+            rings.push(Ring::Pole(idx));
+        } else {
+            let base = vertices.len();
+            for s in 0..cols {
+                let frac = s as f32 / segs as f32;
+                let theta = start_angle + frac * sweep;
+                vertices.push(Vec3::new(r * theta.sin(), y, r * theta.cos()));
+            }
+            rings.push(Ring::Loop(base));
+        }
+    }
+
+    let mut faces = Vec::with_capacity(profile.len() * segs + 2);
+    for pair in rings.windows(2) {
+        match (&pair[0], &pair[1]) {
+            (Ring::Pole(_), Ring::Pole(_)) => {}
+            (Ring::Pole(p0), Ring::Loop(r1)) => {
+                for s in 0..segs {
+                    let next = if full_circle { (s + 1) % segs } else { s + 1 };
+                    faces.push(Face::new(vec![*p0, r1 + next, r1 + s], material));
+                }
+            }
+            (Ring::Loop(r0), Ring::Pole(p1)) => {
+                for s in 0..segs {
+                    let next = if full_circle { (s + 1) % segs } else { s + 1 };
+                    faces.push(Face::new(vec![r0 + s, r0 + next, *p1], material));
+                }
+            }
+            (Ring::Loop(r0), Ring::Loop(r1)) => {
+                for s in 0..segs {
+                    let next = if full_circle { (s + 1) % segs } else { s + 1 };
+                    faces.push(Face::new(
+                        vec![r0 + s, r0 + next, r1 + next, r1 + s],
+                        material,
+                    ));
+                }
+            }
+        }
+    }
+
+    if cap_ends && full_circle {
+        if let Some(Ring::Loop(r0)) = rings.first() {
+            let bottom: Vec<usize> = (0..segs).rev().map(|s| r0 + s).collect();
+            faces.push(Face::new(bottom, material));
+        }
+        if let Some(Ring::Loop(rl)) = rings.last() {
+            let top: Vec<usize> = (0..segs).map(|s| rl + s).collect();
+            faces.push(Face::new(top, material));
+        }
+    }
+
+    if faces.is_empty() {
+        return Err(CoreError::OutOfBounds);
+    }
+
+    Ok(LowPolyMesh {
+        vertices,
+        faces,
+        skin_weights: BTreeMap::new(),
+        morphs: Default::default(),
+        texture: None,
+        normal_map: None,
+        smooth_shading: false,
         material: Default::default(),
     })
 }
@@ -1084,6 +1203,535 @@ pub fn voxel_to_lowpoly(volume: &VoxelVolume, unit_scale: f32) -> LowPolyMesh {
     }
 }
 
+/// Validates and builds a custom `LowPolyMesh` directly from explicit vertices and faces.
+pub fn create_raw_mesh(
+    vertices: Vec<Vec3>,
+    faces: Vec<Face>,
+    smooth_shading: bool,
+) -> Result<LowPolyMesh, CoreError> {
+    if vertices.is_empty() || faces.is_empty() {
+        return Err(CoreError::OutOfBounds);
+    }
+    if vertices.iter().any(|v| !v.is_finite()) {
+        return Err(CoreError::OutOfBounds);
+    }
+    let vlen = vertices.len();
+    for face in &faces {
+        if face.vertices.len() < 3 {
+            return Err(CoreError::OutOfBounds);
+        }
+        if face.vertices.iter().any(|&vi| vi >= vlen) {
+            return Err(CoreError::OutOfBounds);
+        }
+        if !face.uvs.is_empty()
+            && (face.uvs.len() != face.vertices.len()
+                || face
+                    .uvs
+                    .iter()
+                    .any(|uv| !uv[0].is_finite() || !uv[1].is_finite()))
+        {
+            return Err(CoreError::OutOfBounds);
+        }
+    }
+    Ok(LowPolyMesh {
+        vertices,
+        faces,
+        texture: None,
+        normal_map: None,
+        smooth_shading,
+        material: Default::default(),
+        skin_weights: BTreeMap::new(),
+        morphs: Default::default(),
+    })
+}
+
+/// Updates multiple vertex positions in one atomic operation.
+pub fn set_vertices_batch(
+    mesh: &LowPolyMesh,
+    updates: &[(usize, Vec3)],
+) -> Result<LowPolyMesh, CoreError> {
+    if updates.is_empty() {
+        return Err(CoreError::OutOfBounds);
+    }
+    let vlen = mesh.vertices.len();
+    for &(vid, pos) in updates {
+        if vid >= vlen || !pos.is_finite() {
+            return Err(CoreError::OutOfBounds);
+        }
+    }
+    let mut out = mesh.clone();
+    for &(vid, pos) in updates {
+        out.vertices[vid] = pos;
+    }
+    Ok(out)
+}
+
+/// Assigns `material` to one or more faces on `mesh`.
+pub fn set_face_materials(
+    mesh: &LowPolyMesh,
+    face_ids: &[FaceId],
+    material: PaletteIndex,
+) -> Result<LowPolyMesh, CoreError> {
+    if face_ids.is_empty() {
+        return Err(CoreError::OutOfBounds);
+    }
+    let flen = mesh.faces.len();
+    for &fid in face_ids {
+        if fid.0 >= flen {
+            return Err(CoreError::OutOfBounds);
+        }
+    }
+    let mut out = mesh.clone();
+    for &fid in face_ids {
+        out.faces[fid.0].material = material;
+    }
+    Ok(out)
+}
+
+/// Mirrors `mesh` across `axis` (`0=X`, `1=Y`, `2=Z`), flipping mirrored face winding so normals
+/// remain outward. When `merge_original` is true, appends the mirrored copy to the original mesh.
+pub fn mirror_mesh(
+    mesh: &LowPolyMesh,
+    axis: u8,
+    merge_original: bool,
+) -> Result<LowPolyMesh, CoreError> {
+    if axis > 2 || mesh.vertices.is_empty() {
+        return Err(CoreError::OutOfBounds);
+    }
+    let flip = |v: Vec3| -> Vec3 {
+        match axis {
+            0 => Vec3::new(-v.x, v.y, v.z),
+            1 => Vec3::new(v.x, -v.y, v.z),
+            _ => Vec3::new(v.x, v.y, -v.z),
+        }
+    };
+    let mut out = mesh.clone();
+    out.skin_weights.clear();
+    out.morphs.clear();
+    if !merge_original {
+        for v in &mut out.vertices {
+            *v = flip(*v);
+        }
+        for f in &mut out.faces {
+            f.vertices.reverse();
+            f.uvs.reverse();
+        }
+        return Ok(out);
+    }
+
+    let base_v = out.vertices.len();
+    let orig_verts = out.vertices.clone();
+    let orig_faces = out.faces.clone();
+    out.vertices.extend(orig_verts.into_iter().map(flip));
+    for mut f in orig_faces {
+        for vi in &mut f.vertices {
+            *vi += base_v;
+        }
+        f.vertices.reverse();
+        f.uvs.reverse();
+        out.faces.push(f);
+    }
+    Ok(out)
+}
+
+/// Linearly tapers perpendicular axes of `mesh` along `axis` (`0=X`, `1=Y`, `2=Z`)
+/// from `start_scale` (at min) to `end_scale` (at max).
+pub fn taper_mesh(
+    mesh: &LowPolyMesh,
+    axis: u8,
+    start_scale: f32,
+    end_scale: f32,
+) -> Result<LowPolyMesh, CoreError> {
+    if axis > 2
+        || mesh.vertices.is_empty()
+        || !start_scale.is_finite()
+        || !end_scale.is_finite()
+        || start_scale <= 0.0
+        || end_scale <= 0.0
+    {
+        return Err(CoreError::OutOfBounds);
+    }
+    let (min_b, max_b) = mesh.bounds();
+    let center = (min_b + max_b) * 0.5;
+    let a = usize::from(axis);
+    let span = (max_b[a] - min_b[a]).max(1e-5);
+    let mut out = mesh.clone();
+    for v in &mut out.vertices {
+        let t = ((v[a] - min_b[a]) / span).clamp(0.0, 1.0);
+        let s = start_scale + (end_scale - start_scale) * t;
+        for k in 0..3 {
+            if k != a {
+                v[k] = center[k] + (v[k] - center[k]) * s;
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Smoothly bends `mesh` along `bend_axis` (`0=X`, `1=Y`, `2=Z`) curving toward `curve_axis`
+/// by total angle `angle_rad` around the mesh center.
+pub fn bend_mesh(
+    mesh: &LowPolyMesh,
+    bend_axis: u8,
+    curve_axis: u8,
+    angle_rad: f32,
+) -> Result<LowPolyMesh, CoreError> {
+    if bend_axis > 2
+        || curve_axis > 2
+        || bend_axis == curve_axis
+        || mesh.vertices.is_empty()
+        || !angle_rad.is_finite()
+    {
+        return Err(CoreError::OutOfBounds);
+    }
+    if angle_rad.abs() < 1e-5 {
+        return Ok(mesh.clone());
+    }
+    let (min_b, max_b) = mesh.bounds();
+    let center = (min_b + max_b) * 0.5;
+    let ba = usize::from(bend_axis);
+    let ca = usize::from(curve_axis);
+    let span = (max_b[ba] - min_b[ba]).max(1e-5);
+    let radius = span / angle_rad;
+    let mut out = mesh.clone();
+    for v in &mut out.vertices {
+        let local_b = v[ba] - center[ba];
+        let local_c = v[ca] - center[ca];
+        let theta = (local_b / span) * angle_rad;
+        let r = radius - local_c;
+        v[ba] = center[ba] + r * theta.sin();
+        v[ca] = center[ca] + radius - r * theta.cos();
+    }
+    Ok(out)
+}
+
+/// Shifts all vertices by `-origin_local` so the mesh's local origin moves to `origin_local`.
+pub fn set_mesh_origin(mesh: &LowPolyMesh, origin_local: Vec3) -> Result<LowPolyMesh, CoreError> {
+    if !origin_local.is_finite() {
+        return Err(CoreError::OutOfBounds);
+    }
+    let mut out = mesh.clone();
+    for v in &mut out.vertices {
+        *v -= origin_local;
+    }
+    Ok(out)
+}
+
+/// Joins multiple `(mesh, world_matrix)` parts into one unified `LowPolyMesh` in `target_inv` space,
+/// preserving per-face materials and manual UVs.
+pub fn join_meshes(
+    parts: &[(&LowPolyMesh, glam::Mat4)],
+    target_inv: glam::Mat4,
+) -> Result<LowPolyMesh, CoreError> {
+    let Some((first, _)) = parts.first() else {
+        return Err(CoreError::OutOfBounds);
+    };
+    let mut vertices = Vec::new();
+    let mut faces = Vec::new();
+    for &(mesh, world_mat) in parts {
+        let rel = target_inv * world_mat;
+        let det_neg = rel.determinant() < 0.0;
+        let base_v = vertices.len();
+        for &v in &mesh.vertices {
+            vertices.push(rel.transform_point3(v));
+        }
+        for f in &mesh.faces {
+            let mut next = f.clone();
+            for vi in &mut next.vertices {
+                *vi += base_v;
+            }
+            if det_neg {
+                next.vertices.reverse();
+                next.uvs.reverse();
+            }
+            faces.push(next);
+        }
+    }
+    Ok(LowPolyMesh {
+        vertices,
+        faces,
+        texture: first.texture.clone(),
+        normal_map: first.normal_map.clone(),
+        smooth_shading: first.smooth_shading,
+        material: first.material,
+        skin_weights: BTreeMap::new(),
+        morphs: Default::default(),
+    })
+}
+
+/// Projects explicit per-corner UVs onto every face of `mesh` using `mode`.
+pub fn project_uvs(
+    mesh: &LowPolyMesh,
+    mode: super::texture::UvProjection,
+) -> Result<LowPolyMesh, CoreError> {
+    use super::texture::{box_atlas_uv, UvProjection};
+    if mesh.vertices.is_empty() || mesh.faces.is_empty() {
+        return Err(CoreError::OutOfBounds);
+    }
+    let (min_b, max_b) = mesh.bounds();
+    let ext = (max_b - min_b).max(Vec3::splat(1e-4));
+    let center = (min_b + max_b) * 0.5;
+    let mut out = mesh.clone();
+
+    for face in &mut out.faces {
+        if face.vertices.len() < 3 {
+            continue;
+        }
+        let p0 = mesh
+            .vertices
+            .get(face.vertices[0])
+            .copied()
+            .unwrap_or_default();
+        let p1 = mesh
+            .vertices
+            .get(face.vertices[1])
+            .copied()
+            .unwrap_or_default();
+        let p2 = mesh
+            .vertices
+            .get(face.vertices[2])
+            .copied()
+            .unwrap_or_default();
+        let normal = (p1 - p0).cross(p2 - p0).normalize_or_zero();
+
+        let mut uvs = Vec::with_capacity(face.vertices.len());
+        for &vi in &face.vertices {
+            let p = mesh.vertices.get(vi).copied().unwrap_or_default();
+            let uv = match mode {
+                UvProjection::Box => box_atlas_uv(p, normal, min_b, max_b),
+                UvProjection::PlanarX => [
+                    ((p.z - min_b.z) / ext.z).clamp(0.0, 1.0),
+                    (1.0 - (p.y - min_b.y) / ext.y).clamp(0.0, 1.0),
+                ],
+                UvProjection::PlanarY => [
+                    ((p.x - min_b.x) / ext.x).clamp(0.0, 1.0),
+                    ((p.z - min_b.z) / ext.z).clamp(0.0, 1.0),
+                ],
+                UvProjection::PlanarZ => [
+                    ((p.x - min_b.x) / ext.x).clamp(0.0, 1.0),
+                    (1.0 - (p.y - min_b.y) / ext.y).clamp(0.0, 1.0),
+                ],
+                UvProjection::CylindricalY => {
+                    let rel = p - center;
+                    let u = (rel.x.atan2(rel.z) / std::f32::consts::TAU + 0.5).clamp(0.0, 1.0);
+                    let v = (1.0 - (p.y - min_b.y) / ext.y).clamp(0.0, 1.0);
+                    [u, v]
+                }
+                UvProjection::Spherical => {
+                    let dir = (p - center).normalize_or_zero();
+                    let u = (dir.x.atan2(dir.z) / std::f32::consts::TAU + 0.5).clamp(0.0, 1.0);
+                    let v = (dir.y.clamp(-1.0, 1.0).acos() / std::f32::consts::PI).clamp(0.0, 1.0);
+                    [u, v]
+                }
+            };
+            uvs.push(uv);
+        }
+        face.uvs = uvs;
+    }
+    Ok(out)
+}
+
+/// Locally subdivides a single face into `N` quads around its centroid and edge midpoints
+/// without subdividing the rest of the mesh (ideal for local joint/face topology density).
+pub fn subdivide_face(mesh: &LowPolyMesh, face_id: FaceId) -> Result<LowPolyMesh, CoreError> {
+    let face = mesh.faces.get(face_id.0).ok_or(CoreError::OutOfBounds)?;
+    let n = face.vertices.len();
+    if n < 3 {
+        return Err(CoreError::OutOfBounds);
+    }
+    let mut out = mesh.clone();
+    out.skin_weights.clear();
+    out.morphs.clear();
+
+    let mut centroid = Vec3::ZERO;
+    for &vi in &face.vertices {
+        centroid += *out.vertices.get(vi).ok_or(CoreError::OutOfBounds)?;
+    }
+    centroid /= n as f32;
+    let c_idx = out.vertices.len();
+    out.vertices.push(centroid);
+
+    let mut mid_indices = Vec::with_capacity(n);
+    for i in 0..n {
+        let a = out.vertices[face.vertices[i]];
+        let b = out.vertices[face.vertices[(i + 1) % n]];
+        let m_idx = out.vertices.len();
+        out.vertices.push((a + b) * 0.5);
+        mid_indices.push(m_idx);
+    }
+
+    let has_uvs = face.uvs.len() == n;
+    let c_uv = if has_uvs {
+        let sum = face
+            .uvs
+            .iter()
+            .fold([0.0f32, 0.0f32], |acc, uv| [acc[0] + uv[0], acc[1] + uv[1]]);
+        [sum[0] / n as f32, sum[1] / n as f32]
+    } else {
+        [0.0, 0.0]
+    };
+
+    let mat = face.material;
+    let orig_verts = face.vertices.clone();
+    let orig_uvs = face.uvs.clone();
+
+    let mut new_faces = Vec::with_capacity(n);
+    for i in 0..n {
+        let prev = (i + n - 1) % n;
+        let mut q = Face::new(
+            vec![orig_verts[i], mid_indices[i], c_idx, mid_indices[prev]],
+            mat,
+        );
+        if has_uvs {
+            let uv_i = orig_uvs[i];
+            let uv_next = orig_uvs[(i + 1) % n];
+            let uv_prev = orig_uvs[prev];
+            q.uvs = vec![
+                uv_i,
+                [(uv_i[0] + uv_next[0]) * 0.5, (uv_i[1] + uv_next[1]) * 0.5],
+                c_uv,
+                [(uv_prev[0] + uv_i[0]) * 0.5, (uv_prev[1] + uv_i[1]) * 0.5],
+            ];
+        }
+        new_faces.push(q);
+    }
+
+    out.faces.splice(face_id.0..=face_id.0, new_faces);
+    Ok(out)
+}
+
+/// Bakes a node's local `Transform` (`translation`, `rotation`, `scale`) directly into the mesh
+/// vertices so the node's transform can be reset to identity (standard "Apply Transform").
+pub fn apply_transform(
+    mesh: &LowPolyMesh,
+    transform: &crate::scene::Transform,
+) -> Result<LowPolyMesh, CoreError> {
+    if !transform.translation.is_finite()
+        || !transform.rotation.is_finite()
+        || !transform.scale.is_finite()
+    {
+        return Err(CoreError::OutOfBounds);
+    }
+    let mat = glam::Mat4::from_scale_rotation_translation(
+        transform.scale,
+        transform.rotation,
+        transform.translation,
+    );
+    let det_neg = mat.determinant() < 0.0;
+    let mut out = mesh.clone();
+    for v in &mut out.vertices {
+        *v = mat.transform_point3(*v);
+    }
+    if det_neg {
+        for f in &mut out.faces {
+            f.vertices.reverse();
+            f.uvs.reverse();
+        }
+    }
+    Ok(out)
+}
+
+/// Welds coincident vertices within `tolerance` (`1e-5..=0.5`), remapping all face indices
+/// (ideal for removing center-seam creases after `mesh_mirror` or `mesh_join`).
+/// Returns `(welded_mesh, removed_vertex_count)`.
+pub fn weld_vertices(
+    mesh: &LowPolyMesh,
+    tolerance: f32,
+) -> Result<(LowPolyMesh, usize), CoreError> {
+    if !tolerance.is_finite() || tolerance <= 0.0 || mesh.vertices.is_empty() {
+        return Err(CoreError::OutOfBounds);
+    }
+    let tol = tolerance.clamp(1e-5, 0.5);
+    let inv = 1.0 / tol;
+    let mut cell_map: BTreeMap<[i64; 3], usize> = BTreeMap::new();
+    let mut new_verts: Vec<Vec3> = Vec::with_capacity(mesh.vertices.len());
+    let mut remap: Vec<usize> = Vec::with_capacity(mesh.vertices.len());
+
+    for &v in &mesh.vertices {
+        let key = [
+            (v.x * inv).round() as i64,
+            (v.y * inv).round() as i64,
+            (v.z * inv).round() as i64,
+        ];
+        let idx = *cell_map.entry(key).or_insert_with(|| {
+            let id = new_verts.len();
+            new_verts.push(v);
+            id
+        });
+        remap.push(idx);
+    }
+
+    let removed = mesh.vertices.len().saturating_sub(new_verts.len());
+    let mut new_faces = Vec::with_capacity(mesh.faces.len());
+    for f in &mesh.faces {
+        let mut verts = Vec::with_capacity(f.vertices.len());
+        let mut uvs = Vec::new();
+        let has_uvs = f.uvs.len() == f.vertices.len();
+        for (i, &vi) in f.vertices.iter().enumerate() {
+            let mapped = *remap.get(vi).ok_or(CoreError::OutOfBounds)?;
+            if verts.last() != Some(&mapped) {
+                verts.push(mapped);
+                if has_uvs {
+                    uvs.push(f.uvs[i]);
+                }
+            }
+        }
+        if verts.len() > 1 && verts.first() == verts.last() {
+            verts.pop();
+            if has_uvs {
+                uvs.pop();
+            }
+        }
+        if verts.len() >= 3 {
+            let mut next = Face::new(verts, f.material);
+            if has_uvs && uvs.len() == next.vertices.len() {
+                next.uvs = uvs;
+            }
+            new_faces.push(next);
+        }
+    }
+
+    let mut out = mesh.clone();
+    out.vertices = new_verts;
+    out.faces = new_faces;
+    if removed > 0 {
+        out.skin_weights.clear();
+        out.morphs.clear();
+    }
+    Ok((out, removed))
+}
+
+/// Reverses face winding (flipping outward normals) on all faces or on explicit `face_ids`.
+pub fn flip_normals(
+    mesh: &LowPolyMesh,
+    face_ids: Option<&[FaceId]>,
+) -> Result<LowPolyMesh, CoreError> {
+    if mesh.faces.is_empty() {
+        return Err(CoreError::OutOfBounds);
+    }
+    let mut out = mesh.clone();
+    if let Some(ids) = face_ids {
+        if ids.is_empty() {
+            return Err(CoreError::OutOfBounds);
+        }
+        for &fid in ids {
+            if fid.0 >= out.faces.len() {
+                return Err(CoreError::OutOfBounds);
+            }
+        }
+        for &fid in ids {
+            out.faces[fid.0].vertices.reverse();
+            out.faces[fid.0].uvs.reverse();
+        }
+    } else {
+        for f in &mut out.faces {
+            f.vertices.reverse();
+            f.uvs.reverse();
+        }
+    }
+    Ok(out)
+}
+
 /// Detailed raycast hit on a `LowPolyMesh`, including the auto-UV coordinate for 3D texture painting.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct MeshRayHit {
@@ -1198,6 +1846,29 @@ mod tests {
         let cube = create_primitive(PrimitiveKind::Cube, 1.0, mat);
         let hit = raycast_mesh_face(&cube, Vec3::new(0.0, 0.5, 3.0), Vec3::new(0.0, 0.0, -1.0));
         assert_eq!(hit, Some(FaceId(0))); // +Z front face
+    }
+
+    #[test]
+    fn lathe_dome_has_outward_normals_and_pole_collapse() {
+        let mat = PaletteIndex::new(3).unwrap();
+        let profile = [[0.5, 0.0], [0.5, 0.3], [0.35, 0.55], [0.0, 0.65]];
+        let dome = create_lathe_mesh(&profile, 12, 360.0, true, mat).unwrap();
+        // 3 rings of 12 + 1 collapsed top pole = 37 vertices
+        assert_eq!(dome.vertices.len(), 37);
+        // 2 quad bands (24) + 1 top cap band of tris (12) + 1 bottom cap (1) = 37 faces
+        assert_eq!(dome.faces.len(), 37);
+        let tri = dome.to_triangulated_flat();
+        assert!(tri.vertices[0].normal[2] > 0.5);
+    }
+
+    #[test]
+    fn lathe_partial_arc_visor_centers_on_front_z() {
+        let mat = PaletteIndex::new(5).unwrap();
+        let profile = [[0.4, 0.0], [0.4, 0.25]];
+        let visor = create_lathe_mesh(&profile, 8, 180.0, true, mat).unwrap();
+        assert_eq!(visor.faces.len(), 8);
+        let (lo, hi) = visor.bounds();
+        assert!(hi.z > 0.35 && lo.z >= -1e-4, "180° visor faces +Z front");
     }
 
     #[test]

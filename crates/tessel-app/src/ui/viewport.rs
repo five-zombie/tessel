@@ -69,21 +69,27 @@ pub fn show_viewport(
                 pixel_drag_start,
             );
         } else {
-            let gizmo_consumed = handle_gizmo_drag_input(
-                rect,
-                &response,
-                scene,
-                history,
-                camera_3d,
-                gizmo_drag,
-                &mut active_gizmo_axis,
-            );
+            let gizmo_consumed = if *free_view {
+                *gizmo_drag = None;
+                active_gizmo_axis = None;
+                false
+            } else {
+                handle_gizmo_drag_input(
+                    rect,
+                    &response,
+                    scene,
+                    history,
+                    camera_3d,
+                    gizmo_drag,
+                    &mut active_gizmo_axis,
+                )
+            };
             let allow_primary_orbit = *free_view
                 && !gizmo_consumed
                 && !(scene.active_mode == AppMode::LowPoly && scene.lowpoly_paint_mode);
             handle_3d_viewport_input(ui, &response, camera_3d, allow_primary_orbit);
 
-            if !gizmo_consumed {
+            if !gizmo_consumed && !*free_view {
                 match scene.active_mode {
                     AppMode::Voxel => {
                         hover_voxel = compute_hover_voxel(rect, &response, scene, camera_3d);
@@ -103,28 +109,20 @@ pub fn show_viewport(
                                 ];
                                 let aspect = rect.width() / rect.height().max(1.0);
                                 let (orig, dir) = camera_3d.screen_ray(uv, aspect);
-                                if let Some(node_id) = scene.active_lowpoly_node() {
-                                    let node_mat = scene
-                                        .nodes
-                                        .get(&node_id)
-                                        .map(|n| {
-                                            glam::Mat4::from_scale_rotation_translation(
-                                                n.transform.scale,
-                                                n.transform.rotation,
-                                                n.transform.translation,
-                                            )
-                                        })
-                                        .unwrap_or(glam::Mat4::IDENTITY);
-                                    let inv = node_mat.inverse();
-                                    let local_orig = inv.transform_point3(orig);
-                                    let local_dir = inv.transform_vector3(dir).normalize_or_zero();
-                                    let hit = scene.lowpoly_meshes.get(&node_id).and_then(|mesh| {
-                                        tessel_core::mesh::ops::raycast_mesh_hit(
-                                            mesh, local_orig, local_dir,
-                                        )
-                                    });
-                                    if let Some(h) = hit {
-                                        if paint_active {
+                                if paint_active {
+                                    if let Some(node_id) = scene.active_lowpoly_node() {
+                                        let node_mat = scene.node_world_matrix(node_id);
+                                        let inv = node_mat.inverse();
+                                        let local_orig = inv.transform_point3(orig);
+                                        let local_dir =
+                                            inv.transform_vector3(dir).normalize_or_zero();
+                                        let hit =
+                                            scene.lowpoly_meshes.get(&node_id).and_then(|mesh| {
+                                                tessel_core::mesh::ops::raycast_mesh_hit(
+                                                    mesh, local_orig, local_dir,
+                                                )
+                                            });
+                                        if let Some(h) = hit {
                                             let color = scene
                                                 .palette
                                                 .get(scene.active_color)
@@ -175,11 +173,40 @@ pub fn show_viewport(
                                                     },
                                                 );
                                             }
-                                        } else {
-                                            scene.selected_face = Some(h.face_id);
-                                            scene.mark_modified();
                                         }
-                                    } else if pick_active {
+                                    }
+                                } else {
+                                    // Select mode: pick closest visible low-poly mesh & face
+                                    let mut best: Option<(f32, NodeId, tessel_core::FaceId)> = None;
+                                    for (&nid, mesh) in &scene.lowpoly_meshes {
+                                        let visible =
+                                            scene.nodes.get(&nid).is_some_and(|n| n.visible);
+                                        if !visible {
+                                            continue;
+                                        }
+                                        let node_mat = scene.node_world_matrix(nid);
+                                        let inv = node_mat.inverse();
+                                        let local_orig = inv.transform_point3(orig);
+                                        let local_dir =
+                                            inv.transform_vector3(dir).normalize_or_zero();
+                                        if let Some(h) = tessel_core::mesh::ops::raycast_mesh_hit(
+                                            mesh, local_orig, local_dir,
+                                        ) {
+                                            let world_hit = node_mat.transform_point3(h.point);
+                                            let dist_sq = (world_hit - orig).length_squared();
+                                            if best.is_none_or(|(d, _, _)| dist_sq < d) {
+                                                best = Some((dist_sq, nid, h.face_id));
+                                            }
+                                        }
+                                    }
+                                    if let Some((_, hit_nid, face_id)) = best {
+                                        if scene.selected_node != Some(hit_nid) {
+                                            let _ = history
+                                                .execute(scene, Command::SelectNode(Some(hit_nid)));
+                                        }
+                                        scene.selected_face = Some(face_id);
+                                        scene.mark_modified();
+                                    } else {
                                         scene.selected_face = None;
                                         scene.mark_modified();
                                     }
@@ -206,6 +233,10 @@ pub fn show_viewport(
                     AppMode::Pixel => {}
                 }
             }
+        }
+
+        if scene.active_mode != AppMode::Pixel && !*render_preview {
+            draw_selection_brackets(ui, rect, scene, camera_3d);
         }
 
         show_viewport_hud(
@@ -414,11 +445,19 @@ fn show_viewport_hud(
                             ui.separator();
                             if icons::hud_icon_button(
                                 ui,
-                                ToolIcon::FreeView,
-                                "Free View: Left-drag to orbit 360°, Shift+Left-drag to pan",
+                                ToolIcon::Select,
+                                "Select Mode: click objects to select & drag gizmo to move",
+                                !*free_view,
+                            ) {
+                                *free_view = false;
+                            }
+                            if icons::hud_icon_button(
+                                ui,
+                                ToolIcon::Hand,
+                                "Handfree Mode: orbit & pan camera only (objects locked)",
                                 *free_view,
                             ) {
-                                *free_view = !*free_view;
+                                *free_view = true;
                             }
                             if icons::hud_icon_button(
                                 ui,
@@ -753,5 +792,184 @@ fn handle_voxel_click_input(
 
     if !edits.is_empty() {
         let _ = history.execute(scene, Command::SetVoxels { node_id, edits });
+    }
+}
+
+/// Computes the world-space AABB `(min, max)` of `node_id` for selection brackets.
+pub fn selected_node_world_bounds(
+    scene: &SceneState,
+    node_id: NodeId,
+) -> Option<(glam::Vec3, glam::Vec3)> {
+    let node = scene.nodes.get(&node_id)?;
+    if !node.visible {
+        return None;
+    }
+    let mat = scene.node_world_matrix(node_id);
+    if let Some(mesh) = scene.lowpoly_meshes.get(&node_id) {
+        if !mesh.vertices.is_empty() {
+            let (lmin, lmax) = mesh.bounds();
+            return Some(transform_aabb(mat, lmin, lmax));
+        }
+    }
+    if let Some(vol) = scene.voxel_volumes.get(&node_id) {
+        if !vol.is_empty() {
+            let mut min_c = glam::IVec3::splat(i32::MAX);
+            let mut max_c = glam::IVec3::splat(i32::MIN);
+            for (coord, _) in vol.iter_voxels() {
+                min_c = min_c.min(glam::IVec3::new(coord.x, coord.y, coord.z));
+                max_c = max_c.max(glam::IVec3::new(coord.x, coord.y, coord.z));
+            }
+            let s = scene.unit_scale;
+            let lmin = min_c.as_vec3() * s;
+            let lmax = (max_c + glam::IVec3::ONE).as_vec3() * s;
+            return Some(transform_aabb(mat, lmin, lmax));
+        }
+    }
+    let center = mat.transform_point3(glam::Vec3::ZERO);
+    Some((
+        center - glam::Vec3::splat(0.25),
+        center + glam::Vec3::splat(0.25),
+    ))
+}
+
+fn transform_aabb(mat: glam::Mat4, min: glam::Vec3, max: glam::Vec3) -> (glam::Vec3, glam::Vec3) {
+    let mut wmin = glam::Vec3::splat(f32::INFINITY);
+    let mut wmax = glam::Vec3::splat(f32::NEG_INFINITY);
+    for dx in [min.x, max.x] {
+        for dy in [min.y, max.y] {
+            for dz in [min.z, max.z] {
+                let p = mat.transform_point3(glam::Vec3::new(dx, dy, dz));
+                wmin = wmin.min(p);
+                wmax = wmax.max(p);
+            }
+        }
+    }
+    (wmin, wmax)
+}
+
+/// Projects a world-space AABB into a padded 2D screen rectangle inside `viewport_rect`.
+pub fn project_bounds_to_screen_rect(
+    min: glam::Vec3,
+    max: glam::Vec3,
+    camera: &OrbitCamera,
+    viewport_rect: egui::Rect,
+) -> Option<egui::Rect> {
+    let w = viewport_rect.width().max(1.0);
+    let h = viewport_rect.height().max(1.0);
+    let aspect = w / h;
+    let view = glam::Mat4::look_at_rh(camera.position(), camera.target, glam::Vec3::Y);
+    let proj = glam::Mat4::perspective_rh(camera.fov_y_radians, aspect, camera.near, camera.far);
+    let vp = proj * view;
+
+    let mut smin = egui::pos2(f32::INFINITY, f32::INFINITY);
+    let mut smax = egui::pos2(f32::NEG_INFINITY, f32::NEG_INFINITY);
+    let mut any_visible = false;
+
+    for dx in [min.x, max.x] {
+        for dy in [min.y, max.y] {
+            for dz in [min.z, max.z] {
+                let clip = vp * glam::Vec4::new(dx, dy, dz, 1.0);
+                if clip.w <= 1e-4 {
+                    continue;
+                }
+                let ndc = clip.truncate() / clip.w;
+                let sx = viewport_rect.left() + (ndc.x * 0.5 + 0.5) * w;
+                let sy = viewport_rect.top() + (0.5 - ndc.y * 0.5) * h;
+                smin.x = smin.x.min(sx);
+                smin.y = smin.y.min(sy);
+                smax.x = smax.x.max(sx);
+                smax.y = smax.y.max(sy);
+                any_visible = true;
+            }
+        }
+    }
+    if !any_visible {
+        return None;
+    }
+    let rect = egui::Rect::from_min_max(smin, smax).expand(8.0);
+    if !rect.intersects(viewport_rect) {
+        return None;
+    }
+    Some(rect.intersect(viewport_rect))
+}
+
+fn draw_selection_brackets(
+    ui: &egui::Ui,
+    viewport_rect: egui::Rect,
+    scene: &SceneState,
+    camera: &OrbitCamera,
+) {
+    let Some(node_id) = scene.selected_node else {
+        return;
+    };
+    let Some((wmin, wmax)) = selected_node_world_bounds(scene, node_id) else {
+        return;
+    };
+    let Some(sel) = project_bounds_to_screen_rect(wmin, wmax, camera, viewport_rect) else {
+        return;
+    };
+
+    let painter = ui.painter_at(viewport_rect);
+    let stroke = Stroke::new(2.2, tokens::PRIMARY);
+    let arm_x = (sel.width() * 0.22).clamp(8.0, 22.0);
+    let arm_y = (sel.height() * 0.22).clamp(8.0, 22.0);
+
+    // Left `[` bracket (top-left + bottom-left corners)
+    let tl = sel.left_top();
+    let bl = sel.left_bottom();
+    painter.line_segment([tl, egui::pos2(tl.x + arm_x, tl.y)], stroke);
+    painter.line_segment([tl, egui::pos2(tl.x, tl.y + arm_y)], stroke);
+    painter.line_segment([bl, egui::pos2(bl.x + arm_x, bl.y)], stroke);
+    painter.line_segment([bl, egui::pos2(bl.x, bl.y - arm_y)], stroke);
+
+    // Right `]` bracket (top-right + bottom-right corners)
+    let tr = sel.right_top();
+    let br = sel.right_bottom();
+    painter.line_segment([tr, egui::pos2(tr.x - arm_x, tr.y)], stroke);
+    painter.line_segment([tr, egui::pos2(tr.x, tr.y + arm_y)], stroke);
+    painter.line_segment([br, egui::pos2(br.x - arm_x, br.y)], stroke);
+    painter.line_segment([br, egui::pos2(br.x, br.y - arm_y)], stroke);
+
+    if let Some(name) = scene.nodes.get(&node_id).map(|n| n.name.as_str()) {
+        let tag_pos = egui::pos2(tl.x + 2.0, (tl.y - 16.0).max(viewport_rect.top() + 4.0));
+        painter.text(
+            tag_pos,
+            egui::Align2::LEFT_TOP,
+            format!("[ {name} ]"),
+            egui::FontId::monospace(10.5),
+            tokens::PRIMARY,
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tessel_core::{PaletteIndex, PrimitiveKind};
+
+    #[test]
+    fn selection_brackets_compute_and_project_mesh_bounds() {
+        let mut scene = SceneState::new();
+        let mut history = HistoryStack::new();
+        history
+            .execute(
+                &mut scene,
+                Command::CreatePrimitiveMesh {
+                    name: "HeroCube".into(),
+                    kind: PrimitiveKind::Cube,
+                    size: 1.0,
+                    material: PaletteIndex::new(1).unwrap(),
+                },
+            )
+            .unwrap();
+        let node_id = scene.selected_node.unwrap();
+        let (wmin, wmax) = selected_node_world_bounds(&scene, node_id).unwrap();
+        assert!(wmax.y > wmin.y);
+
+        let cam = OrbitCamera::new();
+        let vp = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 600.0));
+        let screen = project_bounds_to_screen_rect(wmin, wmax, &cam, vp).unwrap();
+        assert!(screen.width() > 10.0 && screen.height() > 10.0);
+        assert!(vp.contains_rect(screen));
     }
 }

@@ -106,29 +106,76 @@ pub struct ExportReport {
     pub triangles: usize,
 }
 
-/// Validates that `filename` is a safe relative path without parent traversal (`..`),
-/// preventing arbitrary OS file writes from MCP or UI.
+/// Validates that `filename` is a safe relative path without parent traversal (`..`)
+/// or symlink escapes outside `allowed_dir`, preventing arbitrary OS file writes from MCP or UI.
 pub fn resolve_safe_export_path(allowed_dir: &Path, filename: &str) -> Result<PathBuf, IoError> {
     if filename.trim().is_empty() {
         return Err(IoError::ExportPathDenied("empty filename".into()));
     }
     let candidate = Path::new(filename);
-    if candidate.is_absolute() {
-        return Err(IoError::ExportPathDenied(
-            "absolute paths are not allowed".into(),
-        ));
-    }
-    for comp in candidate.components() {
-        if matches!(
-            comp,
-            Component::ParentDir | Component::RootDir | Component::Prefix(_)
-        ) {
+    let joined = if candidate.is_absolute() {
+        for comp in candidate.components() {
+            if matches!(comp, Component::ParentDir) {
+                return Err(IoError::ExportPathDenied(
+                    "directory traversal is forbidden".into(),
+                ));
+            }
+        }
+        let canon_allowed = std::fs::canonicalize(allowed_dir).ok();
+        let rel = candidate.strip_prefix(allowed_dir).ok().or_else(|| {
+            canon_allowed
+                .as_deref()
+                .and_then(|ca| candidate.strip_prefix(ca).ok())
+        });
+        let Some(rel_inside) = rel else {
             return Err(IoError::ExportPathDenied(
-                "directory traversal is forbidden".into(),
+                "absolute paths outside allowed export directory are not allowed".into(),
             ));
+        };
+        allowed_dir.join(rel_inside)
+    } else {
+        for comp in candidate.components() {
+            if matches!(
+                comp,
+                Component::ParentDir | Component::RootDir | Component::Prefix(_)
+            ) {
+                return Err(IoError::ExportPathDenied(
+                    "directory traversal is forbidden".into(),
+                ));
+            }
+        }
+        allowed_dir.join(candidate)
+    };
+    if let Ok(canon_allowed) = std::fs::canonicalize(allowed_dir) {
+        // Walk up to the deepest existing path component (target itself if it exists/is a symlink)
+        // and verify its canonical location stays strictly inside `canon_allowed`.
+        let mut probe = joined.as_path();
+        loop {
+            if probe.exists() || probe.symlink_metadata().is_ok() {
+                let canon_probe = std::fs::canonicalize(probe).map_err(|_| {
+                    IoError::ExportPathDenied("symlink target outside allowed directory".into())
+                })?;
+                if !canon_probe.starts_with(&canon_allowed) {
+                    tracing::warn!(
+                        filename,
+                        "Blocked export path escaping allowed directory via symlink"
+                    );
+                    return Err(IoError::ExportPathDenied(
+                        "symlink escapes allowed directory".into(),
+                    ));
+                }
+                break;
+            }
+            let Some(parent) = probe.parent() else {
+                break;
+            };
+            if parent == allowed_dir || parent.as_os_str().is_empty() {
+                break;
+            }
+            probe = parent;
         }
     }
-    Ok(allowed_dir.join(candidate))
+    Ok(joined)
 }
 
 /// Exports the current scene in `format` into `allowed_dir/filename` safely.
@@ -182,6 +229,14 @@ pub fn export_scene_to_dir(
 
     let size = bytes.len();
     fs::write(&target, bytes)?;
+    tracing::info!(
+        format = ?format,
+        preset = ?preset,
+        file_size_bytes = size,
+        triangles,
+        output_path = %target.display(),
+        "Exported scene"
+    );
     Ok(ExportReport {
         output_path: target.display().to_string(),
         file_size_bytes: size,
@@ -199,5 +254,18 @@ mod tests {
         assert!(resolve_safe_export_path(base, "../evil.glb").is_err());
         assert!(resolve_safe_export_path(base, "/etc/passwd").is_err());
         assert!(resolve_safe_export_path(base, "hero.glb").is_ok());
+        assert!(resolve_safe_export_path(base, "/tmp/tessel_exports/sub/hero.glb").is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlink_escape_is_blocked() {
+        let dir = std::env::temp_dir().join("tessel_symlink_escape_test");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let link = dir.join("escape");
+        std::os::unix::fs::symlink("/tmp", &link).unwrap();
+        assert!(resolve_safe_export_path(&dir, "escape/outside.glb").is_err());
+        let _ = fs::remove_dir_all(&dir);
     }
 }

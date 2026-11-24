@@ -5,8 +5,8 @@ use egui::{Color32, CornerRadius, Frame, Margin, RichText, Stroke};
 use tessel_ai::direct::DirectAiResponse;
 use tessel_ai::{AiProviderKind, DirectAiConfig};
 use tessel_core::{
-    AppMode, Command, FrameIndex, HistoryStack, Keyframe, PaletteEntry, PaletteIndex, Rgba8,
-    SceneState,
+    AppMode, BoneId, Command, FrameIndex, HistoryStack, Keyframe, NodeId, PaletteEntry,
+    PaletteIndex, Rgba8, SceneState,
 };
 
 use super::icons::{self, ToolIcon};
@@ -17,6 +17,7 @@ pub struct DirectAiUiState {
     pub config: DirectAiConfig,
     pub prompt: String,
     pub pending: Option<mpsc::Receiver<Result<DirectAiResponse, String>>>,
+    pub cancel_handle: Option<tokio::task::AbortHandle>,
     pub last_result: Option<Result<String, String>>,
 }
 
@@ -32,6 +33,7 @@ impl DirectAiUiState {
             return;
         };
         self.pending = None;
+        self.cancel_handle = None;
 
         match result {
             Ok(resp) => {
@@ -425,11 +427,15 @@ fn show_character_rig_section(
             .find(|b| b.node_id == nid)
             .map(|b| b.bone_id)
     });
+    let current_mask = scene
+        .selected_node
+        .and_then(|nid| rig.node_bone_masks.get(&nid).cloned());
 
     if let Some(selected_id) = scene.selected_node {
         if let Some(node) = scene.nodes.get(&selected_id) {
+            let node_name = node.name.clone();
             ui.label(
-                RichText::new(format!("Bind '{}' to Bone:", node.name))
+                RichText::new(format!("Bind '{node_name}' to Bone:"))
                     .size(11.0)
                     .color(tokens::ON_SURFACE_VARIANT),
             );
@@ -462,14 +468,52 @@ fn show_character_rig_section(
                 }
             });
             ui.add_space(6.0);
+
+            ui.label(
+                RichText::new(format!("Bone Mask ('{node_name}'):"))
+                    .size(11.0)
+                    .color(tokens::ON_SURFACE_VARIANT),
+            );
+            ui.horizontal_wrapped(|ui| {
+                if ui.selectable_label(current_mask.is_none(), "All").clicked() {
+                    let _ = history.execute(
+                        scene,
+                        Command::SetNodeBoneMask {
+                            node_id: selected_id,
+                            bone_ids: None,
+                        },
+                    );
+                }
+                for (bid, bname, _, _) in &bones {
+                    let in_mask = current_mask.as_ref().is_some_and(|list| list.contains(bid));
+                    if ui.selectable_label(in_mask, bname).clicked() {
+                        let next_mask = toggle_bone_in_mask(current_mask.as_deref(), *bid);
+                        let _ = history.execute(
+                            scene,
+                            Command::SetNodeBoneMask {
+                                node_id: selected_id,
+                                bone_ids: next_mask,
+                            },
+                        );
+                    }
+                }
+            });
+            ui.add_space(6.0);
         }
     }
 
-    ui.label(
-        RichText::new("Pose Editor (Degrees)")
-            .size(11.0)
-            .color(tokens::ON_SURFACE_VARIANT),
-    );
+    ui.horizontal(|ui| {
+        ui.label(
+            RichText::new("Pose Editor (Degrees)")
+                .size(11.0)
+                .color(tokens::ON_SURFACE_VARIANT),
+        );
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            if icons::hud_icon_button(ui, ToolIcon::Reset, "Reset all bones to rest pose", false) {
+                let _ = history.execute(scene, Command::ResetCharacterPose);
+            }
+        });
+    });
     ui.horizontal_wrapped(|ui| {
         for (bid, bname, _, _) in &bones {
             let selected = scene.selected_bone == Some(*bid);
@@ -550,6 +594,44 @@ fn show_character_rig_section(
     }
 }
 
+fn toggle_bone_in_mask(current: Option<&[BoneId]>, bone_id: BoneId) -> Option<Vec<BoneId>> {
+    let mut next = current.map(ToOwned::to_owned).unwrap_or_default();
+    if let Some(pos) = next.iter().position(|b| *b == bone_id) {
+        next.remove(pos);
+    } else {
+        next.push(bone_id);
+    }
+    if next.is_empty() {
+        None
+    } else {
+        Some(next)
+    }
+}
+
+fn rename_node_if_changed(
+    scene: &mut SceneState,
+    history: &mut HistoryStack,
+    node_id: NodeId,
+    draft: &str,
+) -> bool {
+    let trimmed = draft.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    if scene.nodes.get(&node_id).is_some_and(|n| n.name == trimmed) {
+        return false;
+    }
+    history
+        .execute(
+            scene,
+            Command::RenameNode {
+                node_id,
+                name: trimmed.to_string(),
+            },
+        )
+        .is_ok()
+}
+
 fn show_outliner_section(ui: &mut egui::Ui, scene: &mut SceneState, history: &mut HistoryStack) {
     ui.label(
         RichText::new("Scene Outliner")
@@ -568,17 +650,47 @@ fn show_outliner_section(ui: &mut egui::Ui, scene: &mut SceneState, history: &mu
         return;
     }
 
+    let rename_state_id = egui::Id::new("tessel_outliner_rename");
+    let mut renaming: Option<(NodeId, String)> = ui
+        .ctx()
+        .data_mut(|d| d.get_temp::<(NodeId, String)>(rename_state_id));
+
     let nodes: Vec<_> = scene
         .nodes
         .values()
-        .map(|n| (n.id, n.name.clone(), n.kind))
+        .map(|n| (n.id, n.name.clone(), n.kind, n.visible))
         .collect();
-    for (id, name, kind) in nodes {
+    for (id, name, kind, visible) in nodes {
         let selected = scene.selected_node == Some(id);
-        let label = format!("{name} ({kind:?})");
+        let is_renaming = renaming.as_ref().is_some_and(|(rid, _)| *rid == id);
         ui.horizontal(|ui| {
-            if ui.selectable_label(selected, label).clicked() && !selected {
-                let _ = history.execute(scene, Command::SelectNode(Some(id)));
+            if is_renaming {
+                if let Some((_, ref mut draft)) = renaming {
+                    let resp = ui.add(
+                        egui::TextEdit::singleline(draft)
+                            .desired_width(140.0)
+                            .hint_text("Node name"),
+                    );
+                    let enter = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                    let escape = ui.input(|i| i.key_pressed(egui::Key::Escape));
+                    if escape {
+                        renaming = None;
+                    } else if enter || resp.lost_focus() {
+                        let committed = draft.clone();
+                        rename_node_if_changed(scene, history, id, &committed);
+                        renaming = None;
+                    }
+                }
+            } else {
+                let label_text = format!("{name} ({kind:?})");
+                let text = if visible {
+                    RichText::new(label_text)
+                } else {
+                    RichText::new(label_text).color(tokens::ON_SURFACE_VARIANT)
+                };
+                if ui.selectable_label(selected, text).clicked() && !selected {
+                    let _ = history.execute(scene, Command::SelectNode(Some(id)));
+                }
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if icons::hud_icon_button_full(
@@ -589,11 +701,52 @@ fn show_outliner_section(ui: &mut egui::Ui, scene: &mut SceneState, history: &mu
                     true,
                     true,
                 ) {
+                    if renaming.as_ref().is_some_and(|(rid, _)| *rid == id) {
+                        renaming = None;
+                    }
                     let _ = history.execute(scene, Command::DeleteNode(id));
+                }
+                if icons::hud_icon_button_full(
+                    ui,
+                    ToolIcon::Pencil,
+                    "Rename node",
+                    is_renaming,
+                    true,
+                    true,
+                ) {
+                    if is_renaming {
+                        if let Some((_, draft)) = renaming.take() {
+                            rename_node_if_changed(scene, history, id, &draft);
+                        }
+                    } else {
+                        renaming = Some((id, name.clone()));
+                    }
+                }
+                let (vis_icon, vis_tip) = if visible {
+                    (ToolIcon::EyeOpen, "Hide node")
+                } else {
+                    (ToolIcon::EyeClosed, "Show node")
+                };
+                if icons::hud_icon_button_full(ui, vis_icon, vis_tip, !visible, true, true) {
+                    let _ = history.execute(
+                        scene,
+                        Command::SetNodeVisibility {
+                            node_id: id,
+                            visible: !visible,
+                        },
+                    );
                 }
             });
         });
     }
+
+    ui.ctx().data_mut(|d| {
+        if let Some(state) = renaming {
+            d.insert_temp(rename_state_id, state);
+        } else {
+            d.remove::<(NodeId, String)>(rename_state_id);
+        }
+    });
 }
 
 fn show_transform_and_lighting_section(
@@ -687,7 +840,7 @@ fn show_transform_and_lighting_section(
                     .add(
                         egui::DragValue::new(&mut tx.scale.x)
                             .speed(0.02)
-                            .range(0.05..=20.0)
+                            .range(0.005..=100.0)
                             .prefix("X "),
                     )
                     .changed();
@@ -695,7 +848,7 @@ fn show_transform_and_lighting_section(
                     .add(
                         egui::DragValue::new(&mut tx.scale.y)
                             .speed(0.02)
-                            .range(0.05..=20.0)
+                            .range(0.005..=100.0)
                             .prefix("Y "),
                     )
                     .changed();
@@ -703,7 +856,7 @@ fn show_transform_and_lighting_section(
                     .add(
                         egui::DragValue::new(&mut tx.scale.z)
                             .speed(0.02)
-                            .range(0.05..=20.0)
+                            .range(0.005..=100.0)
                             .prefix("Z "),
                     )
                     .changed();
@@ -902,25 +1055,38 @@ fn show_direct_ai_section(ui: &mut egui::Ui, scene: &SceneState, ai_state: &mut 
     ui.horizontal(|ui| {
         if icons::hud_icon_button_enabled(ui, ToolIcon::Send, "Send Prompt", false, can_send) {
             let (tx, rx) = mpsc::channel();
+            let (abort_tx, abort_rx) = mpsc::channel();
             let config = ai_state.config.clone();
             let scene_clone = scene.clone();
             let prompt = ai_state.prompt.clone();
             ai_state.pending = Some(rx);
             std::thread::spawn(move || {
                 let res = match tokio::runtime::Runtime::new() {
-                    Ok(rt) => rt
-                        .block_on(tessel_ai::direct::send_prompt(
-                            &config,
-                            &scene_clone,
-                            &prompt,
-                        ))
-                        .map_err(|e| e.to_string()),
+                    Ok(rt) => rt.block_on(async move {
+                        let task = tokio::spawn(async move {
+                            tessel_ai::direct::send_prompt(&config, &scene_clone, &prompt)
+                                .await
+                                .map_err(|e| e.to_string())
+                        });
+                        let _ = abort_tx.send(task.abort_handle());
+                        match task.await {
+                            Ok(inner) => inner,
+                            Err(err) if err.is_cancelled() => Err("request cancelled".into()),
+                            Err(err) => Err(format!("worker join error: {err}")),
+                        }
+                    }),
                     Err(e) => Err(format!("async runtime error: {e}")),
                 };
                 let _ = tx.send(res);
             });
+            ai_state.cancel_handle = abort_rx
+                .recv_timeout(std::time::Duration::from_millis(200))
+                .ok();
         }
         if busy && icons::hud_icon_button(ui, ToolIcon::Close, "Cancel", false) {
+            if let Some(handle) = ai_state.cancel_handle.take() {
+                handle.abort();
+            }
             ai_state.pending = None;
         }
     });
@@ -997,5 +1163,114 @@ mod tests {
             max_x <= right_edge + 0.5,
             "palette paints past the panel edge: max_x={max_x}"
         );
+    }
+
+    #[test]
+    fn toggle_bone_in_mask_adds_removes_and_clears_to_none() {
+        let b1 = BoneId(1);
+        let b2 = BoneId(2);
+        let m1 = toggle_bone_in_mask(None, b1);
+        assert_eq!(m1, Some(vec![b1]));
+
+        let m2 = toggle_bone_in_mask(m1.as_deref(), b2);
+        assert_eq!(m2, Some(vec![b1, b2]));
+
+        let m3 = toggle_bone_in_mask(m2.as_deref(), b1);
+        assert_eq!(m3, Some(vec![b2]));
+
+        let m4 = toggle_bone_in_mask(m3.as_deref(), b2);
+        assert_eq!(m4, None);
+    }
+
+    #[test]
+    fn rename_node_if_changed_commits_trimmed_and_ignores_blank_or_same() {
+        let mut scene = SceneState::new();
+        let mut history = HistoryStack::new();
+        history
+            .execute(
+                &mut scene,
+                Command::CreatePrimitiveMesh {
+                    name: "Helmet".into(),
+                    kind: tessel_core::PrimitiveKind::Cube,
+                    size: 1.0,
+                    material: PaletteIndex::new(1).unwrap(),
+                },
+            )
+            .unwrap();
+        let node_id = scene.selected_node.unwrap();
+
+        assert!(!rename_node_if_changed(
+            &mut scene,
+            &mut history,
+            node_id,
+            "   "
+        ));
+        assert!(!rename_node_if_changed(
+            &mut scene,
+            &mut history,
+            node_id,
+            "Helmet"
+        ));
+        assert!(rename_node_if_changed(
+            &mut scene,
+            &mut history,
+            node_id,
+            "  AltynHelmet  "
+        ));
+        assert_eq!(scene.nodes[&node_id].name, "AltynHelmet");
+
+        history.undo(&mut scene).unwrap();
+        assert_eq!(scene.nodes[&node_id].name, "Helmet");
+    }
+
+    #[test]
+    fn inspector_renders_outliner_and_character_rig_without_panic() {
+        let mut scene = SceneState::new();
+        let mut history = HistoryStack::new();
+        history
+            .execute(
+                &mut scene,
+                Command::CreatePrimitiveMesh {
+                    name: "Torso".into(),
+                    kind: tessel_core::PrimitiveKind::Cube,
+                    size: 1.0,
+                    material: PaletteIndex::new(1).unwrap(),
+                },
+            )
+            .unwrap();
+        let node_id = scene.selected_node.unwrap();
+        history
+            .execute(&mut scene, Command::ApplyHumanoidRig)
+            .unwrap();
+        history
+            .execute(
+                &mut scene,
+                Command::SetNodeVisibility {
+                    node_id,
+                    visible: false,
+                },
+            )
+            .unwrap();
+
+        let ctx = egui::Context::default();
+        let raw_input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1280.0, 720.0),
+            )),
+            ..Default::default()
+        };
+        let out = ctx.run(raw_input, |ctx| {
+            egui::SidePanel::right("test_inspector_v23")
+                .exact_width(256.0)
+                .resizable(false)
+                .show(ctx, |ui| {
+                    egui::ScrollArea::vertical().show(ui, |ui| {
+                        show_character_rig_section(ui, &mut scene, &mut history);
+                        show_outliner_section(ui, &mut scene, &mut history);
+                    });
+                });
+        });
+        assert!(!out.shapes.is_empty());
     }
 }

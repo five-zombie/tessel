@@ -42,7 +42,6 @@ pub enum ToolIcon {
     ZoomIn,
     ZoomOut,
     ResetCamera,
-    FreeView,
     Preview,
     ViewIso,
     ViewFront,
@@ -72,6 +71,8 @@ pub enum ToolIcon {
     Reset,
     Stop,
     NewProject,
+    Hand,
+    Select,
 }
 
 impl ToolIcon {
@@ -114,7 +115,6 @@ impl ToolIcon {
             Self::ZoomIn => r::PLUS,
             Self::ZoomOut => r::MINUS,
             Self::ResetCamera => r::CROSSHAIR,
-            Self::FreeView => r::GLOBE,
             Self::Preview => r::EYE,
             Self::ViewIso => r::CUBE,
             Self::ViewFront => r::SQUARE,
@@ -144,13 +144,15 @@ impl ToolIcon {
             Self::Reset => r::ARROW_COUNTER_CLOCKWISE,
             Self::Stop => r::STOP,
             Self::NewProject => r::FILE_PLUS,
+            Self::Hand => r::HAND,
+            Self::Select => r::CURSOR,
         }
     }
 }
 
 /// Every icon, for the headless paint smoke test below.
 #[cfg(test)]
-pub const ALL: [ToolIcon; 64] = [
+pub const ALL: [ToolIcon; 65] = [
     ToolIcon::Pencil,
     ToolIcon::Eraser,
     ToolIcon::Fill,
@@ -185,7 +187,6 @@ pub const ALL: [ToolIcon; 64] = [
     ToolIcon::ZoomIn,
     ToolIcon::ZoomOut,
     ToolIcon::ResetCamera,
-    ToolIcon::FreeView,
     ToolIcon::Preview,
     ToolIcon::ViewIso,
     ToolIcon::ViewFront,
@@ -215,6 +216,8 @@ pub const ALL: [ToolIcon; 64] = [
     ToolIcon::Reset,
     ToolIcon::Stop,
     ToolIcon::NewProject,
+    ToolIcon::Hand,
+    ToolIcon::Select,
 ];
 
 /// One clickable toolbar cell. To add a button, push one of these into a
@@ -244,7 +247,12 @@ pub enum ToolbarAction {
     Smooth,
     Decimate,
     ToggleShade,
+    SubdivideFace,
+    MirrorMeshX,
+    ApplyTransform,
+    ProjectUvs,
     ApplyBipedRig,
+    ApplyHumanoidRig,
     TogglePixelSymX,
     TogglePixelSymY,
     ToggleVoxelSymX,

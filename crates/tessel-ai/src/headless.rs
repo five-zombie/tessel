@@ -1,7 +1,230 @@
+use base64::Engine as _;
+use serde_json::{json, Value};
 use tessel_core::SceneState;
 use tessel_render::{OrbitCamera, PixelCamera2D, ViewportRenderer};
 
 use crate::error::AiError;
+
+/// Renders `scene` offscreen using any `wgpu::Device`/`Queue` + `ViewportRenderer` and returns
+/// the MCP `content` array (text + sRGB PNG image block). Shared by stdio MCP and live GUI HTTP MCP.
+pub fn render_screenshot_mcp_content(
+    viewport: &mut ViewportRenderer,
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    scene: &SceneState,
+    args: &Value,
+) -> Result<Value, AiError> {
+    let w = args
+        .get("width")
+        .and_then(Value::as_u64)
+        .unwrap_or(640)
+        .clamp(16, 1024) as u32;
+    let h = args
+        .get("height")
+        .and_then(Value::as_u64)
+        .unwrap_or(480)
+        .clamp(16, 1024) as u32;
+    let preview = args
+        .get("preview")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let cam = screenshot_camera(args)?;
+    viewport.resize(device, w, h);
+    viewport.sync_scene(device, queue, scene, None, None);
+    let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+        label: Some("tessel-offscreen-screenshot"),
+    });
+    viewport.render(
+        queue,
+        &mut encoder,
+        scene,
+        &cam,
+        &PixelCamera2D::new(),
+        1.0,
+        preview,
+    );
+    queue.submit(Some(encoder.finish()));
+    let png = viewport
+        .capture_png_bytes(device, queue)
+        .map_err(|e| AiError::InvalidArguments(format!("viewport capture failed: {e}")))?;
+    Ok(json!([
+        { "type": "text", "text": format!("viewport {w}x{h} sRGB PNG") },
+        { "type": "image", "data": base64::engine::general_purpose::STANDARD.encode(&png), "mimeType": "image/png" },
+    ]))
+}
+
+/// Parsed parameters for a 3D turntable GIF render (validated before touching any GPU).
+pub struct TurntableArgs {
+    pub target_path: std::path::PathBuf,
+    pub width: u32,
+    pub height: u32,
+    pub frames: u32,
+    pub fps: u32,
+    pub preview: bool,
+    pub clip_name: Option<String>,
+    pub clip_index: Option<usize>,
+    pub camera: OrbitCamera,
+}
+
+/// Validates `viewport_render_turntable_gif` arguments and output path before GPU allocation.
+pub fn parse_turntable_args(
+    allowed_export_dir: &std::path::Path,
+    args: &Value,
+) -> Result<TurntableArgs, AiError> {
+    let filename = args
+        .get("filename")
+        .and_then(Value::as_str)
+        .ok_or_else(|| AiError::InvalidArguments("missing 'filename'".into()))?;
+    let target_path = tessel_io::resolve_safe_export_path(allowed_export_dir, filename)?;
+    let width = args
+        .get("width")
+        .and_then(Value::as_u64)
+        .unwrap_or(320)
+        .clamp(64, 512) as u32;
+    let height = args
+        .get("height")
+        .and_then(Value::as_u64)
+        .unwrap_or(320)
+        .clamp(64, 512) as u32;
+    let frames = args
+        .get("frames")
+        .and_then(Value::as_u64)
+        .unwrap_or(16)
+        .clamp(4, 36) as u32;
+    let fps = args
+        .get("fps")
+        .and_then(Value::as_u64)
+        .unwrap_or(12)
+        .clamp(2, 30) as u32;
+    let preview = args.get("preview").and_then(Value::as_bool).unwrap_or(true);
+    let clip_name = args
+        .get("clip_name")
+        .and_then(Value::as_str)
+        .map(ToString::to_string);
+    let clip_index = args
+        .get("clip_index")
+        .and_then(Value::as_u64)
+        .map(|v| v as usize);
+    let camera = screenshot_camera(args)?;
+    Ok(TurntableArgs {
+        target_path,
+        width,
+        height,
+        frames,
+        fps,
+        preview,
+        clip_name,
+        clip_index,
+        camera,
+    })
+}
+
+/// Renders a 360-degree animated turntable `.gif` offscreen and writes it to `parsed.target_path`.
+pub fn render_turntable_gif_with_renderer(
+    viewport: &mut ViewportRenderer,
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    scene: &SceneState,
+    parsed: &TurntableArgs,
+) -> Result<Value, AiError> {
+    if let Some(parent) = parsed.target_path.parent() {
+        std::fs::create_dir_all(parent).map_err(tessel_io::IoError::from)?;
+    }
+
+    let mut work_scene = scene.clone();
+    let active_clip_duration: Option<f32> = work_scene.character_rig.as_mut().and_then(|rig| {
+        let idx = if let Some(ci) = parsed.clip_index {
+            (ci < rig.animations.len()).then_some(ci)
+        } else if let Some(ref cname) = parsed.clip_name {
+            rig.animations.iter().position(|c| c.name == *cname)
+        } else {
+            None
+        }?;
+        rig.active_animation = idx;
+        Some(rig.animations[idx].duration_secs)
+    });
+
+    viewport.resize(device, parsed.width, parsed.height);
+    let mut gif_bytes = Vec::new();
+    {
+        let mut encoder = gif::Encoder::new(
+            &mut gif_bytes,
+            parsed.width as u16,
+            parsed.height as u16,
+            &[],
+        )
+        .map_err(|e| AiError::InvalidArguments(format!("gif encoder init failed: {e}")))?;
+        encoder
+            .set_repeat(gif::Repeat::Infinite)
+            .map_err(|e| AiError::InvalidArguments(format!("gif repeat failed: {e}")))?;
+
+        let delay_cs = (100 / parsed.fps).max(3) as u16;
+        let base_yaw = parsed.camera.yaw;
+        for i in 0..parsed.frames {
+            let frac = i as f32 / parsed.frames as f32;
+            let mut cam = parsed.camera;
+            cam.yaw = base_yaw + frac * std::f32::consts::TAU;
+            if let Some(dur) = active_clip_duration {
+                if let Some(rig) = work_scene.character_rig.as_mut() {
+                    rig.playback_time = frac * dur;
+                    rig.apply_active_animation();
+                    work_scene.mark_modified();
+                }
+            }
+            viewport.sync_scene(device, queue, &work_scene, None, None);
+            let mut cmd = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("tessel-turntable-frame"),
+            });
+            viewport.render(
+                queue,
+                &mut cmd,
+                &work_scene,
+                &cam,
+                &PixelCamera2D::new(),
+                1.0,
+                parsed.preview,
+            );
+            queue.submit(Some(cmd.finish()));
+            let (w, h, mut rgba) = viewport
+                .capture_rgba_bytes(device, queue)
+                .map_err(|e| AiError::InvalidArguments(format!("turntable capture failed: {e}")))?;
+            let mut frame = gif::Frame::from_rgba_speed(w as u16, h as u16, &mut rgba, 10);
+            frame.delay = delay_cs;
+            encoder
+                .write_frame(&frame)
+                .map_err(|e| AiError::InvalidArguments(format!("gif frame encode failed: {e}")))?;
+        }
+    }
+
+    let size = gif_bytes.len();
+    std::fs::write(&parsed.target_path, gif_bytes).map_err(tessel_io::IoError::from)?;
+    Ok(json!({
+        "ok": true,
+        "output_path": parsed.target_path.display().to_string(),
+        "file_size_bytes": size,
+        "width": parsed.width,
+        "height": parsed.height,
+        "frames": parsed.frames,
+        "fps": parsed.fps
+    }))
+}
+
+impl HeadlessRenderer {
+    /// Renders a 360-degree animated turntable `.gif` using this headless GPU context.
+    pub fn render_turntable_gif(
+        &mut self,
+        scene: &SceneState,
+        parsed: &TurntableArgs,
+    ) -> Result<Value, AiError> {
+        render_turntable_gif_with_renderer(
+            &mut self.viewport,
+            &self.device,
+            &self.queue,
+            scene,
+            parsed,
+        )
+    }
+}
 
 /// Owned headless GPU context for agent screenshots. Created lazily on the
 /// first `viewport_screenshot` call so servers without a GPU keep working
@@ -133,10 +356,14 @@ pub fn screenshot_camera(args: &serde_json::Value) -> Result<OrbitCamera, AiErro
             }
         }
     };
-    if let Some(yaw) = num("yaw")? {
+    if let Some(yaw_deg) = num("yaw_deg")? {
+        cam.yaw = yaw_deg.to_radians();
+    } else if let Some(yaw) = num("yaw")? {
         cam.yaw = yaw;
     }
-    if let Some(pitch) = num("pitch")? {
+    if let Some(pitch_deg) = num("pitch_deg")? {
+        cam.pitch = pitch_deg.to_radians().clamp(-1.52, 1.52);
+    } else if let Some(pitch) = num("pitch")? {
         cam.pitch = pitch.clamp(-1.52, 1.52);
     }
     if let Some(distance) = num("distance")? {
@@ -145,7 +372,7 @@ pub fn screenshot_camera(args: &serde_json::Value) -> Result<OrbitCamera, AiErro
                 "screenshot 'distance' must be > 0".into(),
             ));
         }
-        cam.distance = distance.clamp(1.0, 120.0);
+        cam.distance = distance.clamp(0.25, 120.0);
     }
     Ok(cam)
 }
@@ -167,13 +394,21 @@ mod tests {
             "target": [1.0, 2.0, 3.0],
             "yaw": 1.0,
             "pitch": 99.0,
-            "distance": 0.5,
+            "distance": 0.1,
         }))
         .unwrap();
         assert_eq!(cam.target, glam::Vec3::new(1.0, 2.0, 3.0));
         assert!((cam.yaw - 1.0).abs() < 1e-6);
         assert!((cam.pitch - 1.52).abs() < 1e-4, "pitch clamps");
-        assert!((cam.distance - 1.0).abs() < 1e-6, "distance clamps to min");
+        assert!((cam.distance - 0.25).abs() < 1e-6, "distance clamps to min");
+
+        let cam_deg = screenshot_camera(&serde_json::json!({
+            "yaw_deg": 45.0,
+            "pitch_deg": 30.0,
+        }))
+        .unwrap();
+        assert!((cam_deg.yaw - 45.0_f32.to_radians()).abs() < 1e-5);
+        assert!((cam_deg.pitch - 30.0_f32.to_radians()).abs() < 1e-5);
     }
 
     #[test]
@@ -187,5 +422,30 @@ mod tests {
         ] {
             assert!(screenshot_camera(&bad).is_err(), "should reject {bad}");
         }
+    }
+
+    #[test]
+    fn parse_turntable_args_clamps_and_blocks_traversal() {
+        let dir = std::env::temp_dir();
+        assert!(parse_turntable_args(&dir, &json!({ "filename": "../escape.gif" })).is_err());
+        assert!(parse_turntable_args(&dir, &json!({})).is_err());
+
+        let ok = parse_turntable_args(
+            &dir,
+            &json!({
+                "filename": "spin.gif",
+                "width": 9999,
+                "height": 10,
+                "frames": 100,
+                "fps": 1,
+                "clip_name": "Walk"
+            }),
+        )
+        .unwrap();
+        assert_eq!(ok.width, 512);
+        assert_eq!(ok.height, 64);
+        assert_eq!(ok.frames, 36);
+        assert_eq!(ok.fps, 2);
+        assert_eq!(ok.clip_name.as_deref(), Some("Walk"));
     }
 }

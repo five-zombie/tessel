@@ -217,6 +217,30 @@ pub fn show_toolbar(ctx: &egui::Context, scene: &mut SceneState, history: &mut H
                                 active: is_smooth,
                                 action: ToolbarAction::ToggleShade,
                             },
+                            IconItem {
+                                icon: icons::ToolIcon::BoxFill,
+                                tip: "Subdiv Face",
+                                active: false,
+                                action: ToolbarAction::SubdivideFace,
+                            },
+                            IconItem {
+                                icon: icons::ToolIcon::AxisX,
+                                tip: "Mirror Mesh X",
+                                active: false,
+                                action: ToolbarAction::MirrorMeshX,
+                            },
+                            IconItem {
+                                icon: icons::ToolIcon::Reset,
+                                tip: "Apply Xform",
+                                active: false,
+                                action: ToolbarAction::ApplyTransform,
+                            },
+                            IconItem {
+                                icon: icons::ToolIcon::Picture,
+                                tip: "Project UVs",
+                                active: false,
+                                action: ToolbarAction::ProjectUvs,
+                            },
                         ];
                         if let Some(action) = icons::icon_group(ui, "mesh_edit", "EDIT", &edit) {
                             fire_toolbar_action(action, scene, history);
@@ -236,12 +260,20 @@ pub fn show_toolbar(ctx: &egui::Context, scene: &mut SceneState, history: &mut H
                     }
                 }
                 AppMode::Character => {
-                    let rig = [IconItem {
-                        icon: icons::ToolIcon::BipedRig,
-                        tip: "Biped Rig",
-                        active: false,
-                        action: ToolbarAction::ApplyBipedRig,
-                    }];
+                    let rig = [
+                        IconItem {
+                            icon: icons::ToolIcon::BipedRig,
+                            tip: "Biped 7",
+                            active: false,
+                            action: ToolbarAction::ApplyBipedRig,
+                        },
+                        IconItem {
+                            icon: icons::ToolIcon::ModeCharacter,
+                            tip: "Humanoid 19",
+                            active: false,
+                            action: ToolbarAction::ApplyHumanoidRig,
+                        },
+                    ];
                     if let Some(action) = icons::icon_group(ui, "char_rig", "RIG", &rig) {
                         fire_toolbar_action(action, scene, history);
                     }
@@ -411,8 +443,45 @@ fn fire_toolbar_action(action: ToolbarAction, scene: &mut SceneState, history: &
                 );
             }
         }
+        ToolbarAction::SubdivideFace => {
+            if let Some(node_id) = scene.active_lowpoly_node() {
+                let face_id = scene.selected_face.unwrap_or(FaceId(0));
+                let _ = history.execute(scene, Command::SubdivideMeshFace { node_id, face_id });
+            }
+        }
+        ToolbarAction::MirrorMeshX => {
+            if let Some(node_id) = scene.active_lowpoly_node() {
+                let _ = history.execute(
+                    scene,
+                    Command::MirrorLowPolyMesh {
+                        node_id,
+                        axis: 0,
+                        merge_original: true,
+                    },
+                );
+            }
+        }
+        ToolbarAction::ApplyTransform => {
+            if let Some(node_id) = scene.active_lowpoly_node() {
+                let _ = history.execute(scene, Command::ApplyMeshTransform { node_id });
+            }
+        }
+        ToolbarAction::ProjectUvs => {
+            if let Some(node_id) = scene.active_lowpoly_node() {
+                let _ = history.execute(
+                    scene,
+                    Command::ProjectMeshUvs {
+                        node_id,
+                        mode: tessel_core::mesh::UvProjection::Box,
+                    },
+                );
+            }
+        }
         ToolbarAction::ApplyBipedRig => {
             let _ = history.execute(scene, Command::ApplyBipedRig);
+        }
+        ToolbarAction::ApplyHumanoidRig => {
+            let _ = history.execute(scene, Command::ApplyHumanoidRig);
         }
         ToolbarAction::TogglePixelSymX => {
             scene.pixel_symmetry.x = !scene.pixel_symmetry.x;

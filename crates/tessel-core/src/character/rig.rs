@@ -35,10 +35,13 @@ pub struct CharacterRig {
     pub playback_time: f32,
     pub playing: bool,
     /// Live sampled morph weights `(node, target) -> weight`, refreshed by
-    /// `apply_active_animation`. The viewport renderer does not deform meshes
-    /// with these yet; export bakes animated weights into glTF channels.
+    /// `apply_active_animation` and applied live in `tessel-render` as well as glTF export.
     #[serde(default)]
     pub morph_weights: BTreeMap<(NodeId, String), f32>,
+    /// Optional per-node bone allowlist restricting `AutoSkinSolver` influences
+    /// (e.g. isolate leg/pelvis meshes from hanging arm bones).
+    #[serde(default)]
+    pub node_bone_masks: BTreeMap<NodeId, Vec<BoneId>>,
 }
 
 impl CharacterRig {
@@ -61,10 +64,11 @@ impl CharacterRig {
             bone(0, "Root", None, Vec3::new(0.0, 0.8, 0.0)),
             bone(1, "Torso", Some(0), Vec3::new(0.0, 0.3, 0.0)),
             bone(2, "Head", Some(1), Vec3::new(0.0, 0.45, 0.0)),
-            bone(3, "LeftArm", Some(1), Vec3::new(-0.35, 0.35, 0.0)),
-            bone(4, "RightArm", Some(1), Vec3::new(0.35, 0.35, 0.0)),
-            bone(5, "LeftLeg", Some(0), Vec3::new(-0.18, -0.05, 0.0)),
-            bone(6, "RightLeg", Some(0), Vec3::new(0.18, -0.05, 0.0)),
+            // Right-Handed +Y Up, +Z Front: character's Left is +X, Right is -X.
+            bone(3, "LeftArm", Some(1), Vec3::new(0.22, 0.35, 0.0)),
+            bone(4, "RightArm", Some(1), Vec3::new(-0.22, 0.35, 0.0)),
+            bone(5, "LeftLeg", Some(0), Vec3::new(0.11, -0.05, 0.0)),
+            bone(6, "RightLeg", Some(0), Vec3::new(-0.11, -0.05, 0.0)),
         ];
 
         Self {
@@ -75,6 +79,63 @@ impl CharacterRig {
             playback_time: 0.0,
             playing: false,
             morph_weights: BTreeMap::new(),
+            node_bone_masks: BTreeMap::new(),
+        }
+    }
+
+    /// Creates a 19-bone 1:1 humanoid skeleton (~1.82m tall, Right-Handed +Y Up, +Z Front: Left=+X, Right=-X).
+    pub fn humanoid_template() -> Self {
+        let bone = |id: u32, name: &str, parent: Option<u32>, pos: Vec3| {
+            Bone::new(
+                BoneId(id),
+                name,
+                parent.map(BoneId),
+                Transform {
+                    translation: pos,
+                    rotation: Quat::IDENTITY,
+                    scale: Vec3::ONE,
+                },
+            )
+        };
+
+        let bones = vec![
+            bone(0, "Root", None, Vec3::new(0.0, 0.92, 0.0)),
+            bone(1, "Spine", Some(0), Vec3::new(0.0, 0.16, 0.0)),
+            bone(2, "Chest", Some(1), Vec3::new(0.0, 0.24, 0.0)),
+            bone(3, "Neck", Some(2), Vec3::new(0.0, 0.16, 0.0)),
+            bone(4, "Head", Some(3), Vec3::new(0.0, 0.12, 0.0)),
+            // Left arm (+X)
+            bone(5, "LeftShoulder", Some(2), Vec3::new(0.10, 0.10, 0.0)),
+            bone(6, "LeftUpperArm", Some(5), Vec3::new(0.12, -0.02, 0.0)),
+            bone(7, "LeftForearm", Some(6), Vec3::new(0.04, -0.28, 0.0)),
+            bone(8, "LeftHand", Some(7), Vec3::new(0.03, -0.24, 0.02)),
+            // Right arm (-X)
+            bone(9, "RightShoulder", Some(2), Vec3::new(-0.10, 0.10, 0.0)),
+            bone(10, "RightUpperArm", Some(9), Vec3::new(-0.12, -0.02, 0.0)),
+            bone(11, "RightForearm", Some(10), Vec3::new(-0.04, -0.28, 0.0)),
+            bone(12, "RightHand", Some(11), Vec3::new(-0.03, -0.24, 0.02)),
+            // Left leg (+X)
+            bone(13, "LeftThigh", Some(0), Vec3::new(0.11, -0.04, 0.0)),
+            bone(14, "LeftCalf", Some(13), Vec3::new(0.0, -0.38, 0.0)),
+            bone(15, "LeftFoot", Some(14), Vec3::new(0.0, -0.40, 0.04)),
+            // Right leg (-X)
+            bone(16, "RightThigh", Some(0), Vec3::new(-0.11, -0.04, 0.0)),
+            bone(17, "RightCalf", Some(16), Vec3::new(0.0, -0.38, 0.0)),
+            bone(18, "RightFoot", Some(17), Vec3::new(0.0, -0.40, 0.04)),
+        ];
+
+        Self {
+            bones,
+            bindings: Vec::new(),
+            animations: vec![
+                AnimationClip::humanoid_idle(),
+                AnimationClip::humanoid_walk(),
+            ],
+            active_animation: 0,
+            playback_time: 0.0,
+            playing: false,
+            morph_weights: BTreeMap::new(),
+            node_bone_masks: BTreeMap::new(),
         }
     }
 

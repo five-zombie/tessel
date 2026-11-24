@@ -93,7 +93,31 @@ impl AppSettings {
         let Ok(raw) = fs::read_to_string(&paths.settings_file) else {
             return Self::default();
         };
-        serde_json::from_str(&raw).unwrap_or_default()
+        match serde_json::from_str::<Self>(&raw) {
+            Ok(mut loaded) => {
+                let trimmed = loaded.ai_base_url.trim();
+                if !trimmed.is_empty()
+                    && !trimmed.starts_with("http://")
+                    && !trimmed.starts_with("https://")
+                {
+                    tracing::warn!(
+                        base_url = trimmed,
+                        "Invalid ai_base_url scheme in settings.json; resetting to provider default"
+                    );
+                    loaded.ai_base_url = loaded.ai_provider.default_base_url().into();
+                }
+                loaded
+            }
+            Err(err) => {
+                tracing::error!(
+                    path = %paths.settings_file.display(),
+                    "Corrupt settings.json ({err}); backing up to settings.json.corrupt and using defaults"
+                );
+                let backup = paths.settings_file.with_extension("json.corrupt");
+                let _ = fs::copy(&paths.settings_file, &backup);
+                Self::default()
+            }
+        }
     }
 
     pub fn save(&self, paths: &AppPaths) {

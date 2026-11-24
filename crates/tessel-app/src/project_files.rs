@@ -56,6 +56,10 @@ impl ProjectFileManager {
         self.last_change_at = Instant::now();
     }
 
+    pub fn has_unsaved_changes(&self, scene_revision: u64) -> bool {
+        scene_revision != self.last_saved_revision
+    }
+
     pub fn set_autosave_paused(&mut self, paused: bool) {
         self.autosave_paused = paused;
     }
