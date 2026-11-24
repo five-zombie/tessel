@@ -733,6 +733,165 @@ pub fn execute_tool_call(
                 "bounds": { "min": lo.to_array(), "max": hi.to_array() }
             }))
         }
+        "mesh_create_extruded_polygon" => {
+            let pts_arr = args
+                .get("points")
+                .and_then(Value::as_array)
+                .ok_or_else(|| AiError::InvalidArguments("missing 'points' array".into()))?;
+            let mut points = Vec::with_capacity(pts_arr.len());
+            for (i, item) in pts_arr.iter().enumerate() {
+                let pair = item.as_array().ok_or_else(|| {
+                    AiError::InvalidArguments(format!("points[{i}] must be [x, y]"))
+                })?;
+                if pair.len() != 2 {
+                    return Err(AiError::InvalidArguments(format!(
+                        "points[{i}] must have 2 numbers [x, y]"
+                    )));
+                }
+                let x = pair[0].as_f64().ok_or_else(|| {
+                    AiError::InvalidArguments(format!("points[{i}][0] must be a number"))
+                })? as f32;
+                let y = pair[1].as_f64().ok_or_else(|| {
+                    AiError::InvalidArguments(format!("points[{i}][1] must be a number"))
+                })? as f32;
+                points.push([x, y]);
+            }
+            let depth = args
+                .get("depth")
+                .and_then(Value::as_f64)
+                .ok_or_else(|| AiError::InvalidArguments("missing 'depth'".into()))?
+                as f32;
+            let material = parse_palette_index(args, 4)?;
+            let name = args
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or("ExtrudedPolygon")
+                .to_string();
+            let pos = parse_opt_vec3(args, "position")?;
+            let rot = if args.get("rotation_deg").is_some() {
+                Some(parse_rotation_deg(args)?)
+            } else {
+                None
+            };
+            let sc = parse_opt_vec3(args, "scale")?;
+            let mesh = tessel_core::mesh::ops::create_extruded_polygon(&points, depth, material)?;
+            let vert_count = mesh.vertices.len();
+            let face_count = mesh.faces.len();
+            let (lo, hi) = mesh.bounds();
+            history.execute(scene, Command::ImportLowPolyMesh { name, mesh })?;
+            let created_id = scene.selected_node;
+            if let (Some(node_id), true) =
+                (created_id, pos.is_some() || rot.is_some() || sc.is_some())
+            {
+                let mut transform = scene
+                    .nodes
+                    .get(&node_id)
+                    .map(|n| n.transform)
+                    .unwrap_or_default();
+                if let Some(p) = pos {
+                    transform.translation = p;
+                }
+                if let Some(r) = rot {
+                    transform.rotation = r;
+                }
+                if let Some(s) = sc {
+                    transform.scale = s;
+                }
+                history.execute(scene, Command::SetNodeTransform { node_id, transform })?;
+            }
+            Ok(json!({
+                "ok": true,
+                "node_id": created_id.map(|n| n.0),
+                "vertices": vert_count,
+                "faces": face_count,
+                "bounds": { "min": lo.to_array(), "max": hi.to_array() }
+            }))
+        }
+        "mesh_create_loft" => {
+            let secs_arr = args
+                .get("sections")
+                .and_then(Value::as_array)
+                .ok_or_else(|| AiError::InvalidArguments("missing 'sections' array".into()))?;
+            let mut sections = Vec::with_capacity(secs_arr.len());
+            for (si, sec_val) in secs_arr.iter().enumerate() {
+                let ring_arr = sec_val.as_array().ok_or_else(|| {
+                    AiError::InvalidArguments(format!("sections[{si}] must be an array of [x,y,z]"))
+                })?;
+                let mut ring = Vec::with_capacity(ring_arr.len());
+                for (vi, pt) in ring_arr.iter().enumerate() {
+                    let coords = pt.as_array().ok_or_else(|| {
+                        AiError::InvalidArguments(format!(
+                            "sections[{si}][{vi}] must be [x, y, z]"
+                        ))
+                    })?;
+                    if coords.len() != 3 {
+                        return Err(AiError::InvalidArguments(format!(
+                            "sections[{si}][{vi}] must have 3 numbers"
+                        )));
+                    }
+                    let x = coords[0].as_f64().ok_or_else(|| {
+                        AiError::InvalidArguments(format!("sections[{si}][{vi}][0] must be number"))
+                    })? as f32;
+                    let y = coords[1].as_f64().ok_or_else(|| {
+                        AiError::InvalidArguments(format!("sections[{si}][{vi}][1] must be number"))
+                    })? as f32;
+                    let z = coords[2].as_f64().ok_or_else(|| {
+                        AiError::InvalidArguments(format!("sections[{si}][{vi}][2] must be number"))
+                    })? as f32;
+                    ring.push(glam::Vec3::new(x, y, z));
+                }
+                sections.push(ring);
+            }
+            let cap_ends = args
+                .get("cap_ends")
+                .and_then(Value::as_bool)
+                .unwrap_or(true);
+            let material = parse_palette_index(args, 4)?;
+            let name = args
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or("LoftMesh")
+                .to_string();
+            let pos = parse_opt_vec3(args, "position")?;
+            let rot = if args.get("rotation_deg").is_some() {
+                Some(parse_rotation_deg(args)?)
+            } else {
+                None
+            };
+            let sc = parse_opt_vec3(args, "scale")?;
+            let mesh = tessel_core::mesh::ops::create_loft_mesh(&sections, cap_ends, material)?;
+            let vert_count = mesh.vertices.len();
+            let face_count = mesh.faces.len();
+            let (lo, hi) = mesh.bounds();
+            history.execute(scene, Command::ImportLowPolyMesh { name, mesh })?;
+            let created_id = scene.selected_node;
+            if let (Some(node_id), true) =
+                (created_id, pos.is_some() || rot.is_some() || sc.is_some())
+            {
+                let mut transform = scene
+                    .nodes
+                    .get(&node_id)
+                    .map(|n| n.transform)
+                    .unwrap_or_default();
+                if let Some(p) = pos {
+                    transform.translation = p;
+                }
+                if let Some(r) = rot {
+                    transform.rotation = r;
+                }
+                if let Some(s) = sc {
+                    transform.scale = s;
+                }
+                history.execute(scene, Command::SetNodeTransform { node_id, transform })?;
+            }
+            Ok(json!({
+                "ok": true,
+                "node_id": created_id.map(|n| n.0),
+                "vertices": vert_count,
+                "faces": face_count,
+                "bounds": { "min": lo.to_array(), "max": hi.to_array() }
+            }))
+        }
         "mesh_create_raw" => {
             let verts_arr = args
                 .get("vertices")
@@ -2276,6 +2435,64 @@ pub fn execute_tool_call(
                 .get("preset")
                 .and_then(Value::as_str)
                 .unwrap_or("starter");
+            let append = args.get("append").and_then(Value::as_bool).unwrap_or(false);
+            if append {
+                let template = match preset {
+                    "starter" => tessel_core::CharacterRig::biped_template(),
+                    "humanoid" => tessel_core::CharacterRig::humanoid_template(),
+                    other => {
+                        return Err(AiError::InvalidArguments(format!(
+                            "unknown rig preset '{other}'; use 'starter' or 'humanoid'"
+                        )));
+                    }
+                };
+                if scene.character_rig.is_none() {
+                    history.execute(scene, Command::ApplyHumanoidRig)?;
+                }
+                let prefix = args.get("prefix").and_then(Value::as_str).unwrap_or("P2_");
+                let offset = parse_opt_vec3(args, "offset")?.unwrap_or(glam::Vec3::ZERO);
+                let yaw_deg = args.get("yaw_deg").and_then(Value::as_f64).unwrap_or(0.0) as f32;
+                if !yaw_deg.is_finite() {
+                    return Err(AiError::InvalidArguments("'yaw_deg' must be finite".into()));
+                }
+                let yaw_q = glam::Quat::from_rotation_y(yaw_deg.to_radians());
+
+                let base_id = scene
+                    .character_rig
+                    .as_ref()
+                    .and_then(|r| r.bones.iter().map(|b| b.id.0).max())
+                    .map(|m| m + 1)
+                    .unwrap_or(0);
+                let mut id_map = std::collections::BTreeMap::new();
+                let mut cmds = Vec::with_capacity(template.bones.len());
+                let mut bone_ids_json = serde_json::Map::new();
+                for (i, b) in template.bones.iter().enumerate() {
+                    let new_id = BoneId(base_id + i as u32);
+                    id_map.insert(b.id, new_id);
+                    let new_parent = b.parent.and_then(|p| id_map.get(&p).copied());
+                    let pos = if new_parent.is_none() {
+                        offset + yaw_q * b.rest_local.translation
+                    } else {
+                        yaw_q * b.rest_local.translation
+                    };
+                    let name = format!("{prefix}{}", b.name);
+                    bone_ids_json.insert(name.clone(), json!(new_id.0));
+                    cmds.push(Command::AddBone {
+                        name,
+                        parent: new_parent,
+                        position: pos,
+                    });
+                }
+                let count = cmds.len();
+                history.execute(scene, Command::Transaction(cmds))?;
+                return Ok(json!({
+                    "ok": true,
+                    "preset": preset,
+                    "appended": true,
+                    "bones_added": count,
+                    "bone_ids": bone_ids_json
+                }));
+            }
             match preset {
                 "starter" => {
                     history.execute(scene, Command::ApplyBipedRig)?;
@@ -2498,17 +2715,57 @@ pub fn execute_tool_call(
             let end = parse_bone("end_bone_id")?;
             let target = parse_opt_vec3(args, "target")?
                 .ok_or_else(|| AiError::InvalidArguments("missing 'target'".into()))?;
-            let pole = parse_opt_vec3(args, "pole_vector")?.unwrap_or(glam::Vec3::Z);
+            let pole = if let Some(pt) = parse_opt_vec3(args, "pole_target")? {
+                let root_world = scene
+                    .character_rig
+                    .as_ref()
+                    .and_then(|r| r.world_pose_matrices().get(&root).copied())
+                    .map(|m| m.transform_point3(glam::Vec3::ZERO))
+                    .unwrap_or(glam::Vec3::ZERO);
+                let dir = pt - root_world;
+                if dir.length_squared() > 1e-8 {
+                    dir.normalize()
+                } else {
+                    glam::Vec3::Z
+                }
+            } else {
+                parse_opt_vec3(args, "pole_vector")?.unwrap_or(glam::Vec3::Z)
+            };
+            let end_world_rot_deg = parse_opt_vec3(args, "end_world_rotation_deg")?;
             let end_rot_deg = parse_opt_vec3(args, "end_rotation_deg")?;
 
-            let mut cmds = vec![Command::SolveTwoBoneIk {
-                root_bone: root,
-                mid_bone: mid,
-                end_bone: end,
-                target,
-                pole,
-            }];
-            if let Some(deg) = end_rot_deg {
+            history.execute(
+                scene,
+                Command::SolveTwoBoneIk {
+                    root_bone: root,
+                    mid_bone: mid,
+                    end_bone: end,
+                    target,
+                    pole,
+                },
+            )?;
+            if let Some(wdeg) = end_world_rot_deg {
+                let desired_world = glam::Quat::from_euler(
+                    glam::EulerRot::XYZ,
+                    wdeg.x.to_radians(),
+                    wdeg.y.to_radians(),
+                    wdeg.z.to_radians(),
+                );
+                let parent_world_rot = scene
+                    .character_rig
+                    .as_ref()
+                    .and_then(|r| r.world_pose_matrices().get(&mid).copied())
+                    .map(|m| glam::Quat::from_mat4(&m).normalize())
+                    .unwrap_or(glam::Quat::IDENTITY);
+                let local_rot = (parent_world_rot.inverse() * desired_world).normalize();
+                history.execute(
+                    scene,
+                    Command::SetBoneRotation {
+                        bone_id: end,
+                        rotation: local_rot,
+                    },
+                )?;
+            } else if let Some(deg) = end_rot_deg {
                 let rest = scene
                     .character_rig
                     .as_ref()
@@ -2521,15 +2778,13 @@ pub fn execute_tool_call(
                     deg.y.to_radians(),
                     deg.z.to_radians(),
                 );
-                cmds.push(Command::SetBoneRotation {
-                    bone_id: end,
-                    rotation: rest * delta,
-                });
-            }
-            if cmds.len() == 1 {
-                history.execute(scene, cmds.remove(0))?;
-            } else {
-                history.execute(scene, Command::Transaction(cmds))?;
+                history.execute(
+                    scene,
+                    Command::SetBoneRotation {
+                        bone_id: end,
+                        rotation: rest * delta,
+                    },
+                )?;
             }
 
             let bone_delta_deg = |bid: BoneId| -> [f32; 3] {
@@ -5244,5 +5499,133 @@ mod tests {
         .unwrap();
         assert_eq!(morph["ok"], true);
         assert_eq!(morph["affected_vertices"], 4);
+    }
+
+    #[test]
+    fn v30_extruded_polygon_and_ik_world_end_rotation() {
+        let mut scene = SceneState::new();
+        let mut history = HistoryStack::new();
+        let dir = std::env::temp_dir();
+
+        // 1. Create necktie silhouette via mesh_create_extruded_polygon
+        let tie = execute_tool_call(
+            "mesh_create_extruded_polygon",
+            &json!({
+                "name": "Necktie",
+                "points": [[-0.03, 0.0], [0.03, 0.0], [0.045, -0.32], [0.0, -0.38], [-0.045, -0.32]],
+                "depth": 0.015,
+                "palette_index": 1,
+                "position": [0.0, 1.42, 0.12]
+            }),
+            &mut scene,
+            &mut history,
+            &dir,
+        )
+        .unwrap();
+        assert_eq!(tie["ok"], true);
+        assert_eq!(tie["vertices"], 10);
+        assert_eq!(tie["faces"], 7);
+
+        // 2. IK with pole_target (world point) + end_world_rotation_deg (world-space aim)
+        execute_tool_call(
+            "character_apply_biped_rig",
+            &json!({ "preset": "humanoid" }),
+            &mut scene,
+            &mut history,
+            &dir,
+        )
+        .unwrap();
+        let rig = scene.character_rig.as_ref().unwrap();
+        let upper = rig
+            .bones
+            .iter()
+            .find(|b| b.name == "RightUpperArm")
+            .unwrap()
+            .id;
+        let mid = rig
+            .bones
+            .iter()
+            .find(|b| b.name == "RightForearm")
+            .unwrap()
+            .id;
+        let end = rig.bones.iter().find(|b| b.name == "RightHand").unwrap().id;
+
+        execute_tool_call(
+            "character_solve_ik",
+            &json!({
+                "root_bone_id": upper.0,
+                "mid_bone_id": mid.0,
+                "end_bone_id": end.0,
+                "target": [-0.18, 1.25, 0.35],
+                "pole_target": [-0.35, 0.90, -0.15],
+                "end_world_rotation_deg": [0.0, 0.0, 0.0]
+            }),
+            &mut scene,
+            &mut history,
+            &dir,
+        )
+        .unwrap();
+        let end_world_mat = scene.character_rig.as_ref().unwrap().world_pose_matrices()[&end];
+        let end_world_rot = glam::Quat::from_mat4(&end_world_mat).normalize();
+        assert!(
+            end_world_rot.angle_between(glam::Quat::IDENTITY) < 1e-2,
+            "end_bone_id world rotation should match identity [0,0,0] regardless of forearm IK"
+        );
+    }
+
+    #[test]
+    fn v32_loft_mesh_and_multi_character_subrig_append() {
+        let mut scene = SceneState::new();
+        let mut history = HistoryStack::new();
+        let dir = std::env::temp_dir();
+
+        // 1. Create tapered torso via mesh_create_loft
+        let loft = execute_tool_call(
+            "mesh_create_loft",
+            &json!({
+                "name": "TaperedTorso",
+                "sections": [
+                    [[0.0, 0.0, 0.2], [0.25, 0.0, 0.0], [0.0, 0.0, -0.2], [-0.25, 0.0, 0.0]],
+                    [[0.0, 0.5, 0.16], [0.20, 0.5, 0.0], [0.0, 0.5, -0.16], [-0.20, 0.5, 0.0]]
+                ],
+                "cap_ends": true,
+                "palette_index": 3
+            }),
+            &mut scene,
+            &mut history,
+            &dir,
+        )
+        .unwrap();
+        assert_eq!(loft["ok"], true);
+        assert_eq!(loft["vertices"], 8);
+        assert_eq!(loft["faces"], 6);
+
+        // 2. Apply P1 humanoid rig, then append P2 humanoid sub-rig at z=2.0 facing -Z (yaw 180)
+        execute_tool_call(
+            "character_apply_biped_rig",
+            &json!({ "preset": "humanoid" }),
+            &mut scene,
+            &mut history,
+            &dir,
+        )
+        .unwrap();
+        let p2 = execute_tool_call(
+            "character_apply_biped_rig",
+            &json!({
+                "preset": "humanoid",
+                "append": true,
+                "prefix": "P2_",
+                "offset": [0.0, 0.0, 2.0],
+                "yaw_deg": 180.0
+            }),
+            &mut scene,
+            &mut history,
+            &dir,
+        )
+        .unwrap();
+        assert_eq!(p2["ok"], true);
+        assert_eq!(p2["bones_added"], 19);
+        assert_eq!(p2["bone_ids"]["P2_Root"], 19);
+        assert_eq!(scene.character_rig.as_ref().unwrap().bones.len(), 38);
     }
 }

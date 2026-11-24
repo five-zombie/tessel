@@ -207,6 +207,55 @@ pub fn tool_definitions() -> Vec<Value> {
             }
         }),
         json!({
+            "name": "mesh_create_extruded_polygon",
+            "description": "Create a 3D Low-Poly mesh by extruding a 2D XY polygon [[x, y], ...] (3..=64 points) by 'depth' along Z (centered on [-depth/2, +depth/2]). Automatically normalizes CW/CCW winding so front/back caps and side walls always face outward. Ideal for neckties, armor plates, buckles, weapon silhouettes, blades, and emblems.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "name": { "type": "string" },
+                    "points": {
+                        "type": "array",
+                        "minItems": 3,
+                        "maxItems": 64,
+                        "items": { "type": "array", "items": { "type": "number" }, "minItems": 2, "maxItems": 2 }
+                    },
+                    "depth": { "type": "number", "minimum": 0.005 },
+                    "palette_index": { "type": "integer", "minimum": 1, "maximum": 255 },
+                    "position": { "type": "array", "items": { "type": "number" }, "minItems": 3, "maxItems": 3 },
+                    "rotation_deg": { "type": "array", "items": { "type": "number" }, "minItems": 3, "maxItems": 3 },
+                    "scale": { "type": "array", "items": { "type": "number" }, "minItems": 3, "maxItems": 3 }
+                },
+                "required": ["points", "depth"]
+            }
+        }),
+        json!({
+            "name": "mesh_create_loft",
+            "description": "Create a lofted Low-Poly mesh by connecting 2..=32 closed 3D cross-section rings of equal vertex count (3..=64) with automatic outward CCW winding and optional end caps. Ideal for tapered torsos, limbs, boots, backpacks, capes, and rifle stocks.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "name": { "type": "string" },
+                    "sections": {
+                        "type": "array",
+                        "minItems": 2,
+                        "maxItems": 32,
+                        "items": {
+                            "type": "array",
+                            "minItems": 3,
+                            "maxItems": 64,
+                            "items": { "type": "array", "items": { "type": "number" }, "minItems": 3, "maxItems": 3 }
+                        }
+                    },
+                    "cap_ends": { "type": "boolean" },
+                    "palette_index": { "type": "integer", "minimum": 1, "maximum": 255 },
+                    "position": { "type": "array", "items": { "type": "number" }, "minItems": 3, "maxItems": 3 },
+                    "rotation_deg": { "type": "array", "items": { "type": "number" }, "minItems": 3, "maxItems": 3 },
+                    "scale": { "type": "array", "items": { "type": "number" }, "minItems": 3, "maxItems": 3 }
+                },
+                "required": ["sections"]
+            }
+        }),
+        json!({
             "name": "mesh_create_raw",
             "description": "Create a custom Low-Poly mesh directly from explicit 3D vertices [[x,y,z], ...] and faces (triangles/quads/n-gons with optional per-face palette_index and per-corner uvs). Ideal for bespoke 1:1 character anatomy, helmets, clothing, and organic silhouettes.",
             "inputSchema": {
@@ -725,11 +774,15 @@ pub fn tool_definitions() -> Vec<Value> {
         }),
         json!({
             "name": "character_apply_biped_rig",
-            "description": "Apply a humanoid skeleton rig (Right-Handed +Y Up, +Z Front: Left=+X, Right=-X). Pass preset='starter' (default, 7 bones with Idle & Walk) or preset='humanoid' (19-bone 1:1 full humanoid skeleton).",
+            "description": "Apply a humanoid skeleton rig (Right-Handed +Y Up, +Z Front: Left=+X, Right=-X). Pass preset='starter' (default, 7 bones) or preset='humanoid' (19-bone 1:1 humanoid). For multi-character scenes, pass append=true with prefix (e.g. 'P2_'), offset [x,y,z], and yaw_deg (e.g. 180) to spawn an additional prefixed skeleton into the active rig in 1 call and receive its bone_ids map.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "preset": { "type": "string", "enum": ["starter", "humanoid"] }
+                    "preset": { "type": "string", "enum": ["starter", "humanoid"] },
+                    "append": { "type": "boolean", "description": "When true, append a new sub-skeleton into the existing CharacterRig instead of replacing it (ideal for 2+ character scenes)" },
+                    "prefix": { "type": "string", "description": "Bone name prefix when append=true (e.g. 'P2_')" },
+                    "offset": { "type": "array", "items": { "type": "number" }, "minItems": 3, "maxItems": 3, "description": "World-space root translation [x, y, z] for appended sub-skeleton" },
+                    "yaw_deg": { "type": "number", "description": "Yaw rotation in degrees around +Y for appended sub-skeleton (e.g. 180 to face -Z)" }
                 }
             }
         }),
@@ -814,7 +867,7 @@ pub fn tool_definitions() -> Vec<Value> {
         }),
         json!({
             "name": "character_solve_ik",
-            "description": "Analytic two-bone IK: rotate root and mid bones so the end bone reaches target [x, y, z], optionally aiming end_bone_id via end_rotation_deg. Returns reached position and resulting bone delta rotations_deg. Use character_snapshot_pose_to_keyframe to bake the solved pose into an animation clip.",
+            "description": "Analytic two-bone IK: rotate root and mid bones so the end bone reaches target [x, y, z]. Use 'pole_target' for a world-space bend point OR 'pole_vector' for a world-space bend direction. Use 'end_world_rotation_deg' to orient end_bone_id in world space (auto-compensating forearm rotation) or 'end_rotation_deg' for local rotation. Returns reached position and resulting bone delta rotations_deg.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -822,8 +875,10 @@ pub fn tool_definitions() -> Vec<Value> {
                     "mid_bone_id": { "type": "integer", "minimum": 0 },
                     "end_bone_id": { "type": "integer", "minimum": 0 },
                     "target": { "type": "array", "items": { "type": "number" }, "minItems": 3, "maxItems": 3, "description": "World-space target position [x, y, z] for end_bone_id" },
+                    "pole_target": { "type": "array", "items": { "type": "number" }, "minItems": 3, "maxItems": 3, "description": "World-space POINT [x, y, z] that the elbow/knee bends toward (auto-converted to direction from root_bone_id)" },
                     "pole_vector": { "type": "array", "items": { "type": "number" }, "minItems": 3, "maxItems": 3, "description": "World-space DIRECTION vector (not a world point) steering the elbow/knee bend plane; e.g. [0, -1, -1] for elbow down-back, [0, 0, 1] for knee forward" },
-                    "end_rotation_deg": { "type": "array", "items": { "type": "number" }, "minItems": 3, "maxItems": 3, "description": "Optional Euler XYZ degrees (relative to rest pose) applied to end_bone_id after solving IK" }
+                    "end_world_rotation_deg": { "type": "array", "items": { "type": "number" }, "minItems": 3, "maxItems": 3, "description": "Optional WORLD-SPACE Euler XYZ degrees for end_bone_id after solving IK (automatically compensates for mid_bone_id world rotation)" },
+                    "end_rotation_deg": { "type": "array", "items": { "type": "number" }, "minItems": 3, "maxItems": 3, "description": "Optional LOCAL Euler XYZ degrees (relative to rest pose) applied to end_bone_id after solving IK" }
                 },
                 "required": ["root_bone_id", "mid_bone_id", "end_bone_id", "target"]
             }

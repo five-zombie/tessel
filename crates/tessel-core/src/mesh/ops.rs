@@ -534,6 +534,145 @@ pub fn create_lathe_mesh(
     })
 }
 
+/// Extrudes a 2D polygon `points` (`[[x, y], ...]`, 3..=64 vertices) along the Z axis centered at
+/// `[-depth/2, +depth/2]`. Automatically normalizes clockwise input to CCW via signed shoelace
+/// area so front cap (`+Z`), back cap (`-Z`), and all perimeter side walls have outward normals.
+pub fn create_extruded_polygon(
+    points: &[[f32; 2]],
+    depth: f32,
+    material: PaletteIndex,
+) -> Result<LowPolyMesh, CoreError> {
+    if points.len() < 3
+        || points.len() > 64
+        || !depth.is_finite()
+        || depth < MIN_PRIMITIVE_SIZE
+        || points
+            .iter()
+            .any(|&[x, y]| !x.is_finite() || !y.is_finite())
+    {
+        return Err(CoreError::OutOfBounds);
+    }
+
+    let mut poly: Vec<[f32; 2]> = points.to_vec();
+    let mut area2 = 0.0f32;
+    for i in 0..poly.len() {
+        let [x0, y0] = poly[i];
+        let [x1, y1] = poly[(i + 1) % poly.len()];
+        area2 += x0 * y1 - x1 * y0;
+    }
+    if area2.abs() < 1e-7 {
+        return Err(CoreError::OutOfBounds);
+    }
+    if area2 < 0.0 {
+        poly.reverse();
+    }
+
+    let n = poly.len();
+    let half_z = depth * 0.5;
+    let mut vertices = Vec::with_capacity(n * 2);
+    for &[x, y] in &poly {
+        vertices.push(Vec3::new(x, y, half_z));
+    }
+    for &[x, y] in &poly {
+        vertices.push(Vec3::new(x, y, -half_z));
+    }
+
+    let mut faces = Vec::with_capacity(n + 2);
+    // Front (+Z) cap
+    faces.push(Face::new((0..n).collect(), material));
+    // Back (-Z) cap
+    faces.push(Face::new((0..n).rev().map(|i| n + i).collect(), material));
+    // Perimeter side walls (outward CCW)
+    for i in 0..n {
+        let j = (i + 1) % n;
+        faces.push(Face::new(vec![i, n + i, n + j, j], material));
+    }
+
+    Ok(LowPolyMesh {
+        vertices,
+        faces,
+        skin_weights: BTreeMap::new(),
+        morphs: Default::default(),
+        texture: None,
+        normal_map: None,
+        smooth_shading: false,
+        material: Default::default(),
+    })
+}
+
+/// Connects 2..=32 closed cross-section rings of equal vertex count (`3..=64`) into a lofted
+/// Low-Poly mesh with automatic outward CCW winding and optional end caps.
+pub fn create_loft_mesh(
+    sections: &[Vec<Vec3>],
+    cap_ends: bool,
+    material: PaletteIndex,
+) -> Result<LowPolyMesh, CoreError> {
+    if sections.len() < 2 || sections.len() > 32 {
+        return Err(CoreError::OutOfBounds);
+    }
+    let ring_len = sections[0].len();
+    if !(3..=64).contains(&ring_len)
+        || sections
+            .iter()
+            .any(|s| s.len() != ring_len || s.iter().any(|v| !v.is_finite()))
+    {
+        return Err(CoreError::OutOfBounds);
+    }
+
+    // Detect whether the first band's quad normals point outward from ring 0's centroid.
+    let c0: Vec3 = sections[0].iter().copied().sum::<Vec3>() / (ring_len as f32);
+    let mut outward_score = 0.0f32;
+    for i in 0..ring_len {
+        let j = (i + 1) % ring_len;
+        let v00 = sections[0][i];
+        let v01 = sections[0][j];
+        let v10 = sections[1][i];
+        let n = (v01 - v00).cross(v10 - v00);
+        let radial = (v00 + v01) * 0.5 - c0;
+        outward_score += n.dot(radial);
+    }
+    let flip = outward_score < 0.0;
+
+    let mut vertices = Vec::with_capacity(sections.len() * ring_len);
+    for sec in sections {
+        if flip {
+            vertices.extend(sec.iter().rev().copied());
+        } else {
+            vertices.extend(sec.iter().copied());
+        }
+    }
+
+    let mut faces = Vec::with_capacity((sections.len() - 1) * ring_len + 2);
+    for r in 0..(sections.len() - 1) {
+        let b0 = r * ring_len;
+        let b1 = (r + 1) * ring_len;
+        for i in 0..ring_len {
+            let j = (i + 1) % ring_len;
+            faces.push(Face::new(vec![b0 + i, b0 + j, b1 + j, b1 + i], material));
+        }
+    }
+
+    if cap_ends {
+        faces.push(Face::new((0..ring_len).rev().collect(), material));
+        let last_base = (sections.len() - 1) * ring_len;
+        faces.push(Face::new(
+            (0..ring_len).map(|i| last_base + i).collect(),
+            material,
+        ));
+    }
+
+    Ok(LowPolyMesh {
+        vertices,
+        faces,
+        skin_weights: BTreeMap::new(),
+        morphs: Default::default(),
+        texture: None,
+        normal_map: None,
+        smooth_shading: false,
+        material: Default::default(),
+    })
+}
+
 /// Simplifies `mesh` by clustering vertices on a 3D grid scaled to `target_ratio` (`0.1..=0.9`).
 /// Clears manual skin weights (full rebuild reindexes every vertex).
 pub fn decimate_mesh(mesh: &LowPolyMesh, target_ratio: f32) -> Result<LowPolyMesh, CoreError> {
@@ -1869,6 +2008,44 @@ mod tests {
         assert_eq!(visor.faces.len(), 8);
         let (lo, hi) = visor.bounds();
         assert!(hi.z > 0.35 && lo.z >= -1e-4, "180° visor faces +Z front");
+    }
+
+    #[test]
+    fn extruded_polygon_normalizes_cw_input_and_caps_both_sides() {
+        let mat = PaletteIndex::new(2).unwrap();
+        // Deliberately clockwise square
+        let cw = [[0.0, 0.0], [0.0, 1.0], [1.0, 1.0], [1.0, 0.0]];
+        let mesh = create_extruded_polygon(&cw, 0.2, mat).unwrap();
+        assert_eq!(mesh.vertices.len(), 8);
+        assert_eq!(mesh.faces.len(), 6);
+        let tri = mesh.to_triangulated_flat();
+        // Front cap normal must point +Z
+        assert!(tri.vertices[0].normal[2] > 0.99);
+        // Reject degenerate collinear polygon
+        assert!(create_extruded_polygon(&[[0.0, 0.0], [1.0, 0.0], [2.0, 0.0]], 0.2, mat).is_err());
+    }
+
+    #[test]
+    fn loft_mesh_connects_tapered_rings_with_outward_normals() {
+        let mat = PaletteIndex::new(4).unwrap();
+        let ring = |y: f32, r: f32| {
+            vec![
+                Vec3::new(0.0, y, r),
+                Vec3::new(r, y, 0.0),
+                Vec3::new(0.0, y, -r),
+                Vec3::new(-r, y, 0.0),
+            ]
+        };
+        let mesh = create_loft_mesh(
+            &[ring(0.0, 0.5), ring(0.5, 0.35), ring(1.0, 0.2)],
+            true,
+            mat,
+        )
+        .unwrap();
+        assert_eq!(mesh.vertices.len(), 12);
+        assert_eq!(mesh.faces.len(), 10); // 8 side quads + 2 caps
+        let tri = mesh.to_triangulated_flat();
+        assert!(tri.vertices[0].normal[2] > 0.4 && tri.vertices[0].normal[0] > 0.4);
     }
 
     #[test]

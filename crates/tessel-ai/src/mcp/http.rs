@@ -120,6 +120,21 @@ pub fn generate_local_token() -> String {
     format!("tsl_{:016x}{:08x}", nanos ^ (pid << 32), pid)
 }
 
+fn request_timeout_for_payload(payload: &Value) -> Duration {
+    let tool_name = payload
+        .get("params")
+        .and_then(|p| p.get("name"))
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    match tool_name {
+        "viewport_render_turntable_gif"
+        | "viewport_screenshot"
+        | "project_export"
+        | "scene_batch" => Duration::from_secs(120),
+        _ => Duration::from_secs(15),
+    }
+}
+
 fn handle_http_connection(
     stream: &mut std::net::TcpStream,
     expected_auth: &str,
@@ -215,6 +230,7 @@ fn handle_http_connection(
         }
     };
 
+    let timeout = request_timeout_for_payload(&payload);
     let (reply_tx, reply_rx) = mpsc::channel();
     match tx.try_send(LiveMcpRequest { payload, reply_tx }) {
         Ok(()) => {}
@@ -242,7 +258,7 @@ fn handle_http_connection(
         }
     }
 
-    match reply_rx.recv_timeout(Duration::from_secs(5)) {
+    match reply_rx.recv_timeout(timeout) {
         Ok(Some(resp)) => write_http(stream, "200 OK", &resp.to_string()),
         Ok(None) => write_http(stream, "202 Accepted", "{}"),
         Err(_) => {
@@ -322,5 +338,30 @@ mod tests {
         assert!(out3.contains("\"status\":\"ok\""));
         assert!(out3.contains("\"requests_total\":2"));
         assert!(out3.contains("\"requests_rejected\":1"));
+    }
+
+    #[test]
+    fn heavy_render_tools_get_extended_http_timeout() {
+        let gif_req = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": { "name": "viewport_render_turntable_gif", "arguments": {} }
+        });
+        assert_eq!(
+            request_timeout_for_payload(&gif_req),
+            Duration::from_secs(120)
+        );
+
+        let inspect_req = json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/call",
+            "params": { "name": "scene_inspect", "arguments": {} }
+        });
+        assert_eq!(
+            request_timeout_for_payload(&inspect_req),
+            Duration::from_secs(15)
+        );
     }
 }
