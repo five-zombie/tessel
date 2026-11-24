@@ -64,7 +64,16 @@ pub struct ParentSwitchTrack {
     pub keys: Vec<ParentSwitchKey>,
 }
 
-/// Keyframe animation clip supporting linear translation/scale, SLERP rotation, morph weights, visibility & parent-switch tracks.
+/// Per-node local TRS keyframe animation track (works without any skeletal bones,
+/// and supports animating meshes, voxels, or `NodeKind::Group` hierarchies).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct NodeTransformTrack {
+    pub node: NodeId,
+    pub keyframes: Vec<Keyframe>,
+}
+
+/// Keyframe animation clip supporting linear translation/scale, SLERP rotation, morph weights,
+/// visibility, parent-switch, and per-node transform tracks.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AnimationClip {
     pub name: String,
@@ -75,6 +84,8 @@ pub struct AnimationClip {
     pub visibility_tracks: Vec<VisibilityTrack>,
     #[serde(default)]
     pub parent_switch_tracks: Vec<ParentSwitchTrack>,
+    #[serde(default)]
+    pub node_transform_tracks: Vec<NodeTransformTrack>,
 }
 
 impl AnimationClip {
@@ -86,6 +97,7 @@ impl AnimationClip {
             morph_tracks: Vec::new(),
             visibility_tracks: Vec::new(),
             parent_switch_tracks: Vec::new(),
+            node_transform_tracks: Vec::new(),
         }
     }
 
@@ -452,6 +464,80 @@ impl AnimationClip {
         out
     }
 
+    /// Inserts or replaces a per-node local TRS delta keyframe (within 1ms tolerance),
+    /// keeping timestamps sorted and extending `duration_secs` if needed.
+    pub fn upsert_node_transform_key(&mut self, node: NodeId, keyframe: Keyframe) {
+        let time = keyframe.time_secs.max(0.0);
+        if time > self.duration_secs {
+            self.duration_secs = time;
+        }
+        let kf = Keyframe {
+            time_secs: time,
+            ..keyframe
+        };
+        if let Some(track) = self
+            .node_transform_tracks
+            .iter_mut()
+            .find(|t| t.node == node)
+        {
+            if let Some(existing) = track
+                .keyframes
+                .iter_mut()
+                .find(|k| (k.time_secs - time).abs() <= 1e-3)
+            {
+                *existing = kf;
+            } else {
+                track.keyframes.push(kf);
+                track
+                    .keyframes
+                    .sort_by(|a, b| a.time_secs.total_cmp(&b.time_secs));
+            }
+        } else {
+            self.node_transform_tracks.push(NodeTransformTrack {
+                node,
+                keyframes: vec![kf],
+            });
+        }
+    }
+
+    /// Samples every per-node transform track at `time_secs`.
+    pub fn sample_node_transforms(&self, time_secs: f32) -> Vec<(NodeId, Keyframe)> {
+        let mut out = Vec::with_capacity(self.node_transform_tracks.len());
+        for track in &self.node_transform_tracks {
+            let Some(&first) = track.keyframes.first() else {
+                continue;
+            };
+            if track.keyframes.len() == 1 || time_secs <= first.time_secs {
+                out.push((track.node, first));
+                continue;
+            }
+            let last = track.keyframes.last().copied().unwrap_or(first);
+            if time_secs >= last.time_secs {
+                out.push((track.node, last));
+                continue;
+            }
+            let mut sampled = last;
+            for pair in track.keyframes.windows(2) {
+                let (a, b) = (pair[0], pair[1]);
+                if time_secs >= a.time_secs && time_secs <= b.time_secs {
+                    let span = (b.time_secs - a.time_secs).max(1e-5);
+                    let alpha = ((time_secs - a.time_secs) / span).clamp(0.0, 1.0);
+                    let eased = a.interpolation.apply(alpha);
+                    sampled = Keyframe {
+                        time_secs,
+                        translation: a.translation.lerp(b.translation, eased),
+                        rotation: a.rotation.slerp(b.rotation, eased),
+                        scale: a.scale.lerp(b.scale, eased),
+                        interpolation: a.interpolation,
+                    };
+                    break;
+                }
+            }
+            out.push((track.node, sampled));
+        }
+        out
+    }
+
     /// Returns deduplicated sorted keyframe timestamps for a specific bone or the whole clip.
     pub fn keyframe_times(&self, bone_id: Option<BoneId>) -> Vec<f32> {
         let mut times: Vec<f32> = self
@@ -504,6 +590,7 @@ impl AnimationClip {
             morph_tracks: Vec::new(),
             visibility_tracks: Vec::new(),
             parent_switch_tracks: Vec::new(),
+            node_transform_tracks: Vec::new(),
             channels: vec![BoneChannel {
                 bone_id: BoneId(1), // Torso subtle breathing
                 keyframes: vec![
@@ -542,6 +629,7 @@ impl AnimationClip {
             morph_tracks: Vec::new(),
             visibility_tracks: Vec::new(),
             parent_switch_tracks: Vec::new(),
+            node_transform_tracks: Vec::new(),
             channels: vec![
                 BoneChannel {
                     bone_id: BoneId(3), // LeftArm

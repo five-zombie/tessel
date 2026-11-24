@@ -45,6 +45,25 @@ pub fn scrub_x_to_time(x: f32, rect_left: f32, rect_width: f32, duration_secs: f
 }
 
 pub fn show_timeline(ctx: &egui::Context, scene: &mut SceneState, history: &mut HistoryStack) {
+    // Advance live character/rig animation in every 3D mode (not only Character mode)
+    // so playback started via MCP or timeline stays animated in Low-Poly / Voxel views.
+    if scene.active_mode != AppMode::Pixel {
+        let prefs_id = egui::Id::new("tessel_timeline_prefs");
+        let timescale = ctx
+            .data(|d| d.get_temp::<TimelineViewPrefs>(prefs_id))
+            .unwrap_or_default()
+            .timescale;
+        if let Some(rig) = scene.character_rig.as_mut() {
+            if rig.playing {
+                let dt = ctx.input(|i| i.stable_dt).min(0.05) * timescale;
+                rig.playback_time += dt;
+                rig.apply_active_animation();
+                scene.mark_modified();
+                ctx.request_repaint();
+            }
+        }
+    }
+
     match scene.active_mode {
         AppMode::Pixel => show_pixel_timeline(ctx, scene, history),
         AppMode::Character => show_character_timeline(ctx, scene, history),
@@ -175,15 +194,6 @@ fn show_character_timeline(
         d.get_temp::<TimelineViewPrefs>(prefs_id)
             .unwrap_or_default()
     });
-
-    if let Some(rig) = scene.character_rig.as_mut() {
-        if rig.playing {
-            let dt = ctx.input(|i| i.stable_dt).min(0.05) * prefs.timescale;
-            rig.playback_time += dt;
-            rig.apply_active_animation();
-            scene.mark_modified();
-        }
-    }
 
     let mut modified = false;
     let mut pending_cmd: Option<Command> = None;

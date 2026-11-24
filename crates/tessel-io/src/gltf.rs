@@ -11,13 +11,47 @@ use crate::error::IoError;
 use crate::ExportPreset;
 
 fn node_world_matrices(scene: &SceneState, node_id: tessel_core::NodeId) -> (Mat4, Mat4) {
-    let mat = scene.node_world_matrix(node_id);
+    let mat = scene.node_rest_world_matrix(node_id);
     let normal_mat = if mat.determinant().abs() > 1e-8 {
         mat.inverse().transpose()
     } else {
         mat
     };
     (mat, normal_mat)
+}
+
+fn has_group_ancestor(scene: &SceneState, node_id: tessel_core::NodeId) -> bool {
+    let mut curr = scene.nodes.get(&node_id).and_then(|n| n.parent);
+    let mut hops = 0usize;
+    while let Some(pid) = curr {
+        if hops >= 16 {
+            break;
+        }
+        hops += 1;
+        let Some(pnode) = scene.nodes.get(&pid) else {
+            break;
+        };
+        if pnode.kind == tessel_core::NodeKind::Group {
+            return true;
+        }
+        curr = pnode.parent;
+    }
+    false
+}
+
+fn collect_node_transform_animated(
+    scene: &SceneState,
+) -> std::collections::BTreeSet<tessel_core::NodeId> {
+    scene
+        .character_rig
+        .as_ref()
+        .map(|rig| {
+            rig.animations
+                .iter()
+                .flat_map(|c| c.node_transform_tracks.iter().map(|t| t.node))
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// Collects all visible 3D geometry (voxels + low-poly meshes) into flat indexed buffers
@@ -86,13 +120,17 @@ impl CollectedMesh {
             })
             .unwrap_or_default();
 
+        let node_trs_animated = collect_node_transform_animated(scene);
+
         for (node_id, mesh) in &scene.lowpoly_meshes {
             let visible = scene.nodes.get(node_id).map(|n| n.visible).unwrap_or(true);
             let is_custom = mesh.texture.is_some()
                 || mesh.normal_map.is_some()
                 || mesh.material != tessel_core::MeshMaterial::default()
                 || !mesh.morphs.is_empty()
-                || vis_animated.contains(node_id);
+                || vis_animated.contains(node_id)
+                || node_trs_animated.contains(node_id)
+                || has_group_ancestor(scene, *node_id);
             if !visible || mesh.faces.is_empty() || is_custom {
                 continue;
             }
@@ -408,22 +446,43 @@ pub fn export_glb_bytes(
                 .collect()
         })
         .unwrap_or_default();
+    let node_trs_animated = collect_node_transform_animated(scene);
+    let group_order: Vec<tessel_core::NodeId> = scene
+        .nodes
+        .iter()
+        .filter(|(_, n)| n.visible && n.kind == tessel_core::NodeKind::Group)
+        .map(|(id, _)| *id)
+        .collect();
     let morphed_order: Vec<tessel_core::NodeId> = scene
         .lowpoly_meshes
         .iter()
         .filter(|(id, m)| {
             scene.nodes.get(id).map(|n| n.visible).unwrap_or(true)
                 && !m.faces.is_empty()
-                && (!m.morphs.is_empty() || vis_animated_nodes.contains(id))
+                && (!m.morphs.is_empty()
+                    || vis_animated_nodes.contains(id)
+                    || node_trs_animated.contains(id)
+                    || has_group_ancestor(scene, **id))
                 && !m.to_triangulated_flat().vertices.is_empty()
         })
         .map(|(id, _)| *id)
         .collect();
-    let morph_base_node = 1 + scene
+    let group_base_node = 1 + scene
         .character_rig
         .as_ref()
         .map(|r| r.bones.len())
         .unwrap_or(0);
+    let morph_base_node = group_base_node + group_order.len();
+    let mut group_to_gltf: BTreeMap<tessel_core::NodeId, usize> = BTreeMap::new();
+    let mut scene_node_to_gltf: BTreeMap<tessel_core::NodeId, usize> = BTreeMap::new();
+    for (gi, &gid) in group_order.iter().enumerate() {
+        let gidx = group_base_node + gi;
+        group_to_gltf.insert(gid, gidx);
+        scene_node_to_gltf.insert(gid, gidx);
+    }
+    for (mi, &mid) in morphed_order.iter().enumerate() {
+        scene_node_to_gltf.insert(mid, morph_base_node + mi);
+    }
 
     if let Some(rig) = &scene.character_rig {
         let mut bone_to_node: BTreeMap<tessel_core::BoneId, usize> = BTreeMap::new();
@@ -898,6 +957,135 @@ pub fn export_glb_bytes(
                 }
             }
 
+            // Export per-node local TRS tracks (`node_transform_tracks`) as standard glTF 2.0 TRS channels.
+            for nt_track in &clip.node_transform_tracks {
+                if nt_track.keyframes.is_empty() {
+                    continue;
+                }
+                let Some(&target_gltf_node) = scene_node_to_gltf.get(&nt_track.node) else {
+                    continue;
+                };
+                let base_tr = scene
+                    .nodes
+                    .get(&nt_track.node)
+                    .map(|n| n.transform)
+                    .unwrap_or_default();
+                let times: Vec<f32> = nt_track.keyframes.iter().map(|k| k.time_secs).collect();
+                let min_t = times.iter().copied().fold(f32::INFINITY, f32::min);
+                let max_t = times.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+                let time_bv = push_view(
+                    &mut bin,
+                    &mut buffer_views,
+                    bytemuck::cast_slice(&times),
+                    None,
+                );
+                let time_acc = accessors.len();
+                accessors.push(json!({
+                    "bufferView": time_bv,
+                    "componentType": 5126,
+                    "count": times.len(),
+                    "type": "SCALAR",
+                    "min": [min_t],
+                    "max": [max_t]
+                }));
+                let interp_mode = if nt_track
+                    .keyframes
+                    .iter()
+                    .all(|k| k.interpolation == tessel_core::KeyframeInterpolation::Step)
+                {
+                    "STEP"
+                } else {
+                    "LINEAR"
+                };
+
+                let trans_out: Vec<[f32; 3]> = nt_track
+                    .keyframes
+                    .iter()
+                    .map(|k| ((base_tr.translation + k.translation) * scale).to_array())
+                    .collect();
+                let t_bv = push_view(
+                    &mut bin,
+                    &mut buffer_views,
+                    bytemuck::cast_slice(&trans_out),
+                    None,
+                );
+                let t_acc = accessors.len();
+                accessors.push(json!({
+                    "bufferView": t_bv,
+                    "componentType": 5126,
+                    "count": trans_out.len(),
+                    "type": "VEC3"
+                }));
+                let t_sampler = samplers.len();
+                samplers.push(json!({
+                    "input": time_acc,
+                    "interpolation": interp_mode,
+                    "output": t_acc
+                }));
+                channels.push(json!({
+                    "sampler": t_sampler,
+                    "target": { "node": target_gltf_node, "path": "translation" }
+                }));
+
+                let rot_out: Vec<[f32; 4]> = nt_track
+                    .keyframes
+                    .iter()
+                    .map(|k| (base_tr.rotation * k.rotation).normalize().to_array())
+                    .collect();
+                let r_bv = push_view(
+                    &mut bin,
+                    &mut buffer_views,
+                    bytemuck::cast_slice(&rot_out),
+                    None,
+                );
+                let r_acc = accessors.len();
+                accessors.push(json!({
+                    "bufferView": r_bv,
+                    "componentType": 5126,
+                    "count": rot_out.len(),
+                    "type": "VEC4"
+                }));
+                let r_sampler = samplers.len();
+                samplers.push(json!({
+                    "input": time_acc,
+                    "interpolation": interp_mode,
+                    "output": r_acc
+                }));
+                channels.push(json!({
+                    "sampler": r_sampler,
+                    "target": { "node": target_gltf_node, "path": "rotation" }
+                }));
+
+                let scale_out: Vec<[f32; 3]> = nt_track
+                    .keyframes
+                    .iter()
+                    .map(|k| (base_tr.scale * k.scale).to_array())
+                    .collect();
+                let s_bv = push_view(
+                    &mut bin,
+                    &mut buffer_views,
+                    bytemuck::cast_slice(&scale_out),
+                    None,
+                );
+                let s_acc = accessors.len();
+                accessors.push(json!({
+                    "bufferView": s_bv,
+                    "componentType": 5126,
+                    "count": scale_out.len(),
+                    "type": "VEC3"
+                }));
+                let s_sampler = samplers.len();
+                samplers.push(json!({
+                    "input": time_acc,
+                    "interpolation": interp_mode,
+                    "output": s_acc
+                }));
+                channels.push(json!({
+                    "sampler": s_sampler,
+                    "target": { "node": target_gltf_node, "path": "scale" }
+                }));
+            }
+
             if !channels.is_empty() {
                 animations.push(json!({
                     "name": clip.name,
@@ -908,12 +1096,51 @@ pub fn export_glb_bytes(
         }
     }
 
+    // Emit dedicated glTF empty nodes for `NodeKind::Group` folders right after bone nodes.
+    for &gid in &group_order {
+        let Some(gnode) = scene.nodes.get(&gid) else {
+            continue;
+        };
+        let mut children: Vec<usize> = Vec::new();
+        for &child_gid in &group_order {
+            if scene.nodes.get(&child_gid).and_then(|n| n.parent) == Some(gid) {
+                if let Some(&cidx) = group_to_gltf.get(&child_gid) {
+                    children.push(cidx);
+                }
+            }
+        }
+        for &child_mid in &morphed_order {
+            if scene.nodes.get(&child_mid).and_then(|n| n.parent) == Some(gid) {
+                if let Some(&cidx) = scene_node_to_gltf.get(&child_mid) {
+                    children.push(cidx);
+                }
+            }
+        }
+        let mut gjson = json!({
+            "name": gnode.name,
+            "translation": (gnode.transform.translation * scale).to_array(),
+            "rotation": gnode.transform.rotation.normalize().to_array(),
+            "scale": gnode.transform.scale.to_array()
+        });
+        if !children.is_empty() {
+            gjson["children"] = json!(children);
+        }
+        let gidx = nodes.len();
+        nodes.push(gjson);
+        let parent_is_group = gnode
+            .parent
+            .is_some_and(|pid| group_to_gltf.contains_key(&pid));
+        if !parent_is_group {
+            root_nodes.push(gidx);
+        }
+    }
+
     // Export any Low-Poly meshes with custom RGBA texture, PBR material, or
     // morph targets as dedicated primitives (morphs need per-mesh targets,
     // which the merged palette mesh cannot carry).
     let mut palette_tex_index: Option<usize> = if has_palette_prim { Some(0) } else { None };
     // Deduplicate identical PBR materials across nodes so multi-part assets avoid redundant draw calls.
-    type MaterialKey = (usize, Option<usize>, u32, u32, [u32; 3]);
+    type MaterialKey = (usize, Option<usize>, u32, u32, [u32; 3], bool);
     let mut material_cache: BTreeMap<MaterialKey, usize> = BTreeMap::new();
     if has_palette_prim {
         material_cache.insert(
@@ -923,6 +1150,7 @@ pub fn export_glb_bytes(
                 0.0_f32.to_bits(),
                 0.85_f32.to_bits(),
                 [0.0_f32.to_bits(); 3],
+                false,
             ),
             0,
         );
@@ -930,15 +1158,22 @@ pub fn export_glb_bytes(
     let mut morphed: Vec<(tessel_core::NodeId, Value, Vec<f64>)> = Vec::new();
     for (node_id, lp_mesh) in &scene.lowpoly_meshes {
         let visible = scene.nodes.get(node_id).map(|n| n.visible).unwrap_or(true);
+        let is_local_trs_node =
+            node_trs_animated.contains(node_id) || has_group_ancestor(scene, *node_id);
         let has_custom = lp_mesh.texture.is_some()
             || lp_mesh.normal_map.is_some()
             || lp_mesh.material != tessel_core::MeshMaterial::default()
             || !lp_mesh.morphs.is_empty()
-            || vis_animated_nodes.contains(node_id);
+            || vis_animated_nodes.contains(node_id)
+            || is_local_trs_node;
         if !visible || lp_mesh.faces.is_empty() || !has_custom {
             continue;
         }
-        let (node_mat, normal_mat) = node_world_matrices(scene, *node_id);
+        let (node_mat, normal_mat) = if is_local_trs_node {
+            (Mat4::IDENTITY, Mat4::IDENTITY)
+        } else {
+            node_world_matrices(scene, *node_id)
+        };
         let tri = lp_mesh.to_triangulated_flat();
         if tri.vertices.is_empty() || tri.indices.is_empty() {
             continue;
@@ -1050,6 +1285,7 @@ pub fn export_glb_bytes(
                 lp_mesh.material.emissive[1].to_bits(),
                 lp_mesh.material.emissive[2].to_bits(),
             ],
+            lp_mesh.material.double_sided,
         );
         let mat_idx = if let Some(&existing) = material_cache.get(&mat_key) {
             existing
@@ -1065,6 +1301,9 @@ pub fn export_glb_bytes(
             });
             if lp_mesh.material.emissive.iter().any(|&c| c > 0.0) {
                 mat_json["emissiveFactor"] = json!(lp_mesh.material.emissive);
+            }
+            if lp_mesh.material.double_sided {
+                mat_json["doubleSided"] = json!(true);
             }
             if let Some(n_tex_idx) = norm_tex_idx {
                 mat_json["normalTexture"] = json!({ "index": n_tex_idx });
@@ -1156,7 +1395,7 @@ pub fn export_glb_bytes(
             });
             prim_json["targets"] = Value::Array(targets);
             morphed.push((*node_id, prim_json, morph_weights));
-        } else if vis_animated_nodes.contains(node_id) {
+        } else if vis_animated_nodes.contains(node_id) || is_local_trs_node {
             let prim_json = json!({
                 "attributes": custom_attrs,
                 "indices": i_acc,
@@ -1212,11 +1451,27 @@ pub fn export_glb_bytes(
             "name": node_name,
             "mesh": mesh_idx
         });
-        if has_skin {
+        let is_local_trs_node =
+            node_trs_animated.contains(&mnode) || has_group_ancestor(scene, mnode);
+        if is_local_trs_node {
+            if let Some(snode) = scene.nodes.get(&mnode) {
+                mnode_json["translation"] = json!((snode.transform.translation * scale).to_array());
+                mnode_json["rotation"] = json!(snode.transform.rotation.normalize().to_array());
+                mnode_json["scale"] = json!(snode.transform.scale.to_array());
+            }
+        }
+        if has_skin && !is_local_trs_node {
             mnode_json["skin"] = json!(0);
         }
         nodes.push(mnode_json);
-        root_nodes.push(node_idx);
+        let parent_is_group = scene
+            .nodes
+            .get(&mnode)
+            .and_then(|n| n.parent)
+            .is_some_and(|pid| group_to_gltf.contains_key(&pid));
+        if !parent_is_group {
+            root_nodes.push(node_idx);
+        }
     }
 
     let mut gltf_json = json!({
@@ -1301,13 +1556,14 @@ mod tests {
         assert_eq!(parsed.images().count(), 1);
         assert_eq!(parsed.materials().count(), 1);
 
-        // Verify PBR metallic, roughness, and emissive factors export cleanly into glTF 2.0
+        // Verify PBR metallic, roughness, emissive, and doubleSided factors export cleanly into glTF 2.0
         Command::SetMeshMaterial {
             node_id,
             material: tessel_core::MeshMaterial {
                 metallic: 0.9,
                 roughness: 0.2,
                 emissive: [0.1, 0.5, 0.8],
+                double_sided: true,
             },
         }
         .apply(&mut scene)
@@ -1316,6 +1572,7 @@ mod tests {
         let parsed_pbr = gltf::Gltf::from_slice(&glb_pbr).unwrap();
         let mat = parsed_pbr.materials().next().unwrap();
         assert!((mat.pbr_metallic_roughness().metallic_factor() - 0.9).abs() < 1e-4);
+        assert!(mat.double_sided());
         assert!((mat.pbr_metallic_roughness().roughness_factor() - 0.2).abs() < 1e-4);
         assert!((mat.emissive_factor()[2] - 0.8).abs() < 1e-4);
 
@@ -1720,6 +1977,7 @@ mod tests {
             metallic: 0.45,
             roughness: 0.5,
             emissive: [0.0; 3],
+            double_sided: false,
         };
         for i in 0..4 {
             Command::CreatePrimitiveMesh {

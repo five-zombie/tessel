@@ -3,7 +3,8 @@ use std::collections::BTreeMap;
 use glam::{Mat4, Vec3};
 use serde::{Deserialize, Serialize};
 
-use crate::scene::NodeId;
+use crate::scene::{NodeId, SceneState};
+use crate::voxel::greedy_mesh_volume;
 
 use super::nano::BoneId;
 use super::rig::CharacterRig;
@@ -278,6 +279,136 @@ fn point_to_segment_distance(p: Vec3, a: Vec3, b: Vec3) -> f32 {
     p.distance(a + ab * t)
 }
 
+#[derive(Debug, Clone, Copy)]
+struct SkinnedVertexSample {
+    rest_world_pos: Vec3,
+    weights: VertexSkinWeights,
+    dominant_joint: u16,
+}
+
+/// Precomputed rest-pose vertices and skinning weights from visible scene meshes for
+/// fast, allocation-free per-frame skinned Y-bounds evaluation (e.g. floor grounding).
+#[derive(Debug, Clone)]
+pub struct SkinnedBoundsCache {
+    solver: AutoSkinSolver,
+    samples: Vec<SkinnedVertexSample>,
+}
+
+impl SkinnedBoundsCache {
+    /// Builds a skinned bounds cache for `rig` from all visible, non-overridden low-poly
+    /// and voxel meshes in `scene`.
+    pub fn from_scene(scene: &SceneState, rig: &CharacterRig) -> Option<Self> {
+        let solver = AutoSkinSolver::from_rig(rig, 1.0)?;
+        let mut samples = Vec::new();
+
+        let is_skinned_visible = |node_id: NodeId| -> bool {
+            if rig.node_parent_overrides.contains_key(&node_id) {
+                return false;
+            }
+            rig.node_visibility
+                .get(&node_id)
+                .copied()
+                .unwrap_or_else(|| scene.nodes.get(&node_id).map(|n| n.visible).unwrap_or(true))
+        };
+
+        for (&node_id, mesh) in &scene.lowpoly_meshes {
+            if !is_skinned_visible(node_id) || mesh.vertices.is_empty() {
+                continue;
+            }
+            let node_mat = scene.node_world_matrix(node_id);
+            samples.reserve(mesh.vertices.len());
+            for &v in &mesh.vertices {
+                let wp = node_mat.transform_point3(v);
+                let weights = solver.weights_for_vertex(Some(node_id), wp);
+                samples.push(SkinnedVertexSample {
+                    rest_world_pos: wp,
+                    weights,
+                    dominant_joint: weights.joints[0],
+                });
+            }
+        }
+
+        for (&node_id, vol) in &scene.voxel_volumes {
+            if !is_skinned_visible(node_id) || vol.is_empty() {
+                continue;
+            }
+            let node_mat = scene.node_world_matrix(node_id);
+            let mesh = greedy_mesh_volume(vol, scene.unit_scale);
+            samples.reserve(mesh.vertices.len());
+            for v in mesh.vertices {
+                let wp = node_mat.transform_point3(Vec3::from_array(v.position));
+                let weights = solver.weights_for_vertex(Some(node_id), wp);
+                samples.push(SkinnedVertexSample {
+                    rest_world_pos: wp,
+                    weights,
+                    dominant_joint: weights.joints[0],
+                });
+            }
+        }
+
+        Some(Self { solver, samples })
+    }
+
+    /// Evaluates the minimum world-space Y coordinate among all skinned vertices whose
+    /// dominant bone belongs to `bone_prefix`. Returns `None` if no vertices belong to
+    /// that sub-skeleton (callers should fall back to joint positions).
+    pub fn sub_skeleton_min_y(&self, rig: &CharacterRig, bone_prefix: &str) -> Option<f32> {
+        if self.samples.is_empty() {
+            return None;
+        }
+        let mut in_sub = vec![false; rig.bones.len()];
+        let mut any_bone = false;
+        for (idx, b) in rig.bones.iter().enumerate() {
+            let matches = if bone_prefix.is_empty() {
+                !b.name.contains('_')
+            } else {
+                b.name.starts_with(bone_prefix)
+            };
+            if matches {
+                in_sub[idx] = true;
+                any_bone = true;
+            }
+        }
+        if !any_bone {
+            return None;
+        }
+
+        let skin_mats = self.solver.skin_matrices(rig);
+        let mut min_y = f32::INFINITY;
+        for sample in &self.samples {
+            if !in_sub
+                .get(usize::from(sample.dominant_joint))
+                .copied()
+                .unwrap_or(false)
+            {
+                continue;
+            }
+            let mut y = 0.0f32;
+            let mut w_sum = 0.0f32;
+            for k in 0..4 {
+                let w = sample.weights.weights[k];
+                if w <= 0.0 {
+                    continue;
+                }
+                if let Some(&mat) = skin_mats.get(usize::from(sample.weights.joints[k])) {
+                    y += mat.transform_point3(sample.rest_world_pos).y * w;
+                    w_sum += w;
+                }
+            }
+            let deformed_y = if w_sum <= 1e-6 {
+                sample.rest_world_pos.y
+            } else {
+                y
+            };
+            if deformed_y.is_finite() {
+                min_y = min_y.min(deformed_y);
+            }
+        }
+
+        min_y.is_finite().then_some(min_y)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -358,5 +489,54 @@ mod tests {
                 assert_ne!(w.joints[k], 12);
             }
         }
+    }
+
+    #[test]
+    fn skinned_bounds_cache_grounds_protruding_boot_sole_and_falls_back_when_empty() {
+        let mut scene = SceneState::new();
+        let node_id = scene.allocate_node_id();
+        // Boot mesh with bottom sole at y = -0.05 (below humanoid LeftFoot joint at y ~ 0.08).
+        let mut mesh = crate::mesh::LowPolyMesh::new();
+        mesh.vertices = vec![
+            Vec3::new(0.05, -0.05, -0.08),
+            Vec3::new(0.17, -0.05, 0.12),
+            Vec3::new(0.11, 0.10, 0.0),
+        ];
+        scene.nodes.insert(
+            node_id,
+            crate::scene::SceneNode {
+                id: node_id,
+                name: "LeftBoot".into(),
+                kind: crate::scene::NodeKind::LowPolyMesh,
+                visible: true,
+                parent: None,
+                transform: crate::scene::Transform::default(),
+            },
+        );
+        scene.lowpoly_meshes.insert(node_id, mesh);
+
+        let mut rig = CharacterRig::humanoid_template();
+        let cache = SkinnedBoundsCache::from_scene(&scene, &rig).unwrap();
+
+        let min_y_before = cache.sub_skeleton_min_y(&rig, "").unwrap();
+        assert!(
+            (min_y_before - (-0.05)).abs() < 1e-4,
+            "expected boot sole min_y = -0.05, got {min_y_before}"
+        );
+
+        let (_, reported_min, delta_y) = rig
+            .clamp_sub_skeleton_to_floor_with_bounds("", 0.0, Some(&cache))
+            .unwrap();
+        assert!((reported_min - (-0.05)).abs() < 1e-4);
+        assert!((delta_y - 0.05).abs() < 1e-4);
+
+        let min_y_after = cache.sub_skeleton_min_y(&rig, "").unwrap();
+        assert!(
+            min_y_after.abs() < 1e-4,
+            "expected clamped boot sole min_y ~ 0.0, got {min_y_after}"
+        );
+
+        // Unknown / unmeshed sub-skeleton returns None so callers fall back to joints.
+        assert!(cache.sub_skeleton_min_y(&rig, "P2_").is_none());
     }
 }

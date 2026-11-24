@@ -60,6 +60,10 @@ pub struct CharacterRig {
     /// refreshed by `apply_active_animation` from `parent_switch_tracks`.
     #[serde(default)]
     pub node_parent_overrides: BTreeMap<NodeId, super::anim::ParentSwitchKey>,
+    /// Live sampled per-node local TRS delta overrides `node_id -> Keyframe`,
+    /// refreshed by `apply_active_animation` from `node_transform_tracks`.
+    #[serde(default)]
+    pub node_transform_overrides: BTreeMap<NodeId, super::nano::Keyframe>,
     /// Optional per-prefix clip layers evaluated on top of `active_animation`.
     #[serde(default)]
     pub clip_layers: Vec<ClipLayer>,
@@ -103,6 +107,7 @@ impl CharacterRig {
             node_bone_masks: BTreeMap::new(),
             node_visibility: BTreeMap::new(),
             node_parent_overrides: BTreeMap::new(),
+            node_transform_overrides: BTreeMap::new(),
             clip_layers: Vec::new(),
         }
     }
@@ -162,6 +167,7 @@ impl CharacterRig {
             node_bone_masks: BTreeMap::new(),
             node_visibility: BTreeMap::new(),
             node_parent_overrides: BTreeMap::new(),
+            node_transform_overrides: BTreeMap::new(),
             clip_layers: Vec::new(),
         }
     }
@@ -282,6 +288,10 @@ impl CharacterRig {
         for (node, key) in clip.sample_parent_switches(t) {
             self.node_parent_overrides.insert(node, key);
         }
+        self.node_transform_overrides.clear();
+        for (node, kf) in clip.sample_node_transforms(t) {
+            self.node_transform_overrides.insert(node, kf);
+        }
 
         // Apply optional per-prefix clip layers on top of the active clip.
         let layers = self.clip_layers.clone();
@@ -315,6 +325,9 @@ impl CharacterRig {
             }
             for (node, key) in layer_clip.sample_parent_switches(lt) {
                 self.node_parent_overrides.insert(node, key);
+            }
+            for (node, kf) in layer_clip.sample_node_transforms(lt) {
+                self.node_transform_overrides.insert(node, kf);
             }
         }
     }
@@ -365,14 +378,33 @@ impl CharacterRig {
         bone_prefix: &str,
         floor_y: f32,
     ) -> Option<(BoneId, f32, f32)> {
+        self.clamp_sub_skeleton_to_floor_with_bounds(bone_prefix, floor_y, None)
+    }
+
+    /// Shifts the sub-skeleton's root bone Y translation so its lowest skinned mesh vertex
+    /// (when `bounds` has vertices for this sub-skeleton) or lowest joint sits at `floor_y`.
+    /// Returns `(root_id, min_y_before, delta_y)`.
+    pub fn clamp_sub_skeleton_to_floor_with_bounds(
+        &mut self,
+        bone_prefix: &str,
+        floor_y: f32,
+        bounds: Option<&super::skin::SkinnedBoundsCache>,
+    ) -> Option<(BoneId, f32, f32)> {
         let (root_id, bone_ids) = self.sub_skeleton_root_and_bones(bone_prefix)?;
-        let world_mats = self.world_pose_matrices();
-        let mut min_y = f32::INFINITY;
-        for id in &bone_ids {
-            if let Some(mat) = world_mats.get(id) {
-                min_y = min_y.min(mat.transform_point3(Vec3::ZERO).y);
+        let min_y = if let Some(skinned_min_y) =
+            bounds.and_then(|cache| cache.sub_skeleton_min_y(self, bone_prefix))
+        {
+            skinned_min_y
+        } else {
+            let world_mats = self.world_pose_matrices();
+            let mut joint_min_y = f32::INFINITY;
+            for id in &bone_ids {
+                if let Some(mat) = world_mats.get(id) {
+                    joint_min_y = joint_min_y.min(mat.transform_point3(Vec3::ZERO).y);
+                }
             }
-        }
+            joint_min_y
+        };
         if !min_y.is_finite() {
             return None;
         }
@@ -390,6 +422,20 @@ impl CharacterRig {
         fps: f32,
         duration_override: Option<f32>,
         clamp_floor_y: Option<f32>,
+    ) -> Option<AnimationClip> {
+        self.bake_clip_layers_with_bounds(name, fps, duration_override, clamp_floor_y, None)
+    }
+
+    /// Bakes the current `clip_layers` composition into a standalone `AnimationClip`,
+    /// optionally clamping each sub-skeleton to `clamp_floor_y` using skinned mesh vertices
+    /// when `bounds` is provided.
+    pub fn bake_clip_layers_with_bounds(
+        &self,
+        name: String,
+        fps: f32,
+        duration_override: Option<f32>,
+        clamp_floor_y: Option<f32>,
+        bounds: Option<&super::skin::SkinnedBoundsCache>,
     ) -> Option<AnimationClip> {
         if self.bones.is_empty() || self.animations.is_empty() {
             return None;
@@ -445,7 +491,7 @@ impl CharacterRig {
             sim.apply_active_animation();
             if let Some(fy) = clamp_floor_y {
                 for pfx in &prefixes {
-                    let _ = sim.clamp_sub_skeleton_to_floor(pfx, fy);
+                    let _ = sim.clamp_sub_skeleton_to_floor_with_bounds(pfx, fy, bounds);
                 }
             }
             for b in &sim.bones {
@@ -497,6 +543,15 @@ impl CharacterRig {
                     },
                 );
             }
+            for (&node_id, &nt_kf) in &sim.node_transform_overrides {
+                baked.upsert_node_transform_key(
+                    node_id,
+                    super::nano::Keyframe {
+                        time_secs: t,
+                        ..nt_kf
+                    },
+                );
+            }
         }
         Some(baked)
     }
@@ -509,6 +564,20 @@ impl CharacterRig {
         bone_prefix: &str,
         floor_y: f32,
         fps: f32,
+    ) -> Option<AnimationClip> {
+        self.clamp_clip_to_floor_with_bounds(clip_index, bone_prefix, floor_y, fps, None)
+    }
+
+    /// Samples in-between frames of `clip_index` at `fps` and adjusts the sub-skeleton's
+    /// root bone Y translation keyframes so the lowest skinned mesh vertex (or joint fallback)
+    /// sits flush on `floor_y`.
+    pub fn clamp_clip_to_floor_with_bounds(
+        &self,
+        clip_index: usize,
+        bone_prefix: &str,
+        floor_y: f32,
+        fps: f32,
+        bounds: Option<&super::skin::SkinnedBoundsCache>,
     ) -> Option<AnimationClip> {
         let mut clip = self.animations.get(clip_index)?.clone();
         let (root_id, _) = self.sub_skeleton_root_and_bones(bone_prefix)?;
@@ -531,7 +600,7 @@ impl CharacterRig {
                 t
             };
             sim.apply_active_animation();
-            let _ = sim.clamp_sub_skeleton_to_floor(bone_prefix, floor_y);
+            let _ = sim.clamp_sub_skeleton_to_floor_with_bounds(bone_prefix, floor_y, bounds);
             if let Some(root) = sim.bones.iter().find(|b| b.id == root_id) {
                 let rot_delta = root.rest_local.rotation.inverse() * root.pose_local.rotation;
                 let trans_delta = root.pose_local.translation - root.rest_local.translation;

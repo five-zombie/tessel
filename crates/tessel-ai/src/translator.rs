@@ -451,6 +451,191 @@ pub fn execute_tool_call(
                 "results": results
             }))
         }
+        "scene_create_group" => {
+            let name = args
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or("Group")
+                .to_string();
+            let mut transform = tessel_core::Transform::default();
+            if let Some(pos) = parse_opt_vec3(args, "position")? {
+                transform.translation = pos;
+            }
+            if args.get("rotation_deg").is_some() {
+                transform.rotation = parse_rotation_deg(args)?;
+            }
+            if let Some(sc) = parse_opt_vec3(args, "scale")? {
+                transform.scale = sc;
+            }
+            let parent = args
+                .get("parent_node_id")
+                .and_then(Value::as_u64)
+                .map(NodeId);
+            history.execute(
+                scene,
+                Command::CreateGroupNode {
+                    name: name.clone(),
+                    transform,
+                    parent,
+                },
+            )?;
+            let id = scene.selected_node.ok_or_else(|| {
+                AiError::InvalidArguments("group creation produced no node".into())
+            })?;
+            Ok(json!({
+                "ok": true,
+                "node_id": id.0,
+                "name": name,
+                "parent_node_id": parent.map(|p| p.0)
+            }))
+        }
+        "scene_set_node_keyframe" => {
+            let parse_interp = |obj: &Value| -> Result<tessel_core::KeyframeInterpolation, AiError> {
+                match obj
+                    .get("interpolation")
+                    .and_then(Value::as_str)
+                    .unwrap_or("linear")
+                {
+                    "linear" => Ok(tessel_core::KeyframeInterpolation::Linear),
+                    "step" => Ok(tessel_core::KeyframeInterpolation::Step),
+                    "ease_in" => Ok(tessel_core::KeyframeInterpolation::EaseIn),
+                    "ease_out" => Ok(tessel_core::KeyframeInterpolation::EaseOut),
+                    "ease_in_out" => Ok(tessel_core::KeyframeInterpolation::EaseInOut),
+                    other => Err(AiError::InvalidArguments(format!(
+                        "unsupported interpolation '{other}'"
+                    ))),
+                }
+            };
+            let parse_entry = |obj: &Value| -> Result<(NodeId, Keyframe), AiError> {
+                let node_id = obj
+                    .get("node_id")
+                    .and_then(Value::as_u64)
+                    .map(NodeId)
+                    .ok_or_else(|| AiError::InvalidArguments("missing 'node_id'".into()))?;
+                let time_secs = obj
+                    .get("time_secs")
+                    .and_then(Value::as_f64)
+                    .ok_or_else(|| AiError::InvalidArguments("missing 'time_secs'".into()))?
+                    as f32;
+                let rotation = if obj.get("rotation_deg").is_some() {
+                    parse_rotation_deg(obj)?
+                } else {
+                    glam::Quat::IDENTITY
+                };
+                let translation = parse_opt_vec3(obj, "translation")?.unwrap_or(glam::Vec3::ZERO);
+                let scale = parse_opt_vec3(obj, "scale")?.unwrap_or(glam::Vec3::ONE);
+                let interpolation = parse_interp(obj)?;
+                Ok((
+                    node_id,
+                    Keyframe {
+                        time_secs,
+                        translation,
+                        rotation,
+                        scale,
+                        interpolation,
+                    },
+                ))
+            };
+
+            let bulk_entries: Option<Vec<(NodeId, Keyframe)>> =
+                if let Some(arr) = args.get("keyframes") {
+                    let list = arr.as_array().ok_or_else(|| {
+                        AiError::InvalidArguments("'keyframes' must be an array".into())
+                    })?;
+                    if list.is_empty() || list.len() > 2048 {
+                        return Err(AiError::InvalidArguments(
+                            "'keyframes' must contain between 1 and 2048 entries".into(),
+                        ));
+                    }
+                    let mut parsed = Vec::with_capacity(list.len());
+                    for item in list {
+                        parsed.push(parse_entry(item)?);
+                    }
+                    Some(parsed)
+                } else {
+                    None
+                };
+
+            let single_entry = if bulk_entries.is_none() {
+                Some(parse_entry(args)?)
+            } else {
+                None
+            };
+
+            let clip_index = if let Some(idx) = args.get("clip_index").and_then(Value::as_u64) {
+                idx as usize
+            } else if let Some(name) = args.get("clip_name").and_then(Value::as_str) {
+                let existing = scene
+                    .character_rig
+                    .as_ref()
+                    .and_then(|r| r.animations.iter().position(|c| c.name == name));
+                if let Some(i) = existing {
+                    i
+                } else {
+                    let duration_secs = args
+                        .get("duration_secs")
+                        .and_then(Value::as_f64)
+                        .unwrap_or(2.0) as f32;
+                    history.execute(
+                        scene,
+                        Command::AddAnimationClip {
+                            name: name.to_string(),
+                            duration_secs,
+                        },
+                    )?;
+                    scene
+                        .character_rig
+                        .as_ref()
+                        .map_or(0, |r| r.animations.len().saturating_sub(1))
+                }
+            } else {
+                scene
+                    .character_rig
+                    .as_ref()
+                    .map_or(0, |r| r.active_animation)
+            };
+
+            if let Some(entries) = bulk_entries {
+                let count = entries.len();
+                let cmds: Vec<Command> = entries
+                    .into_iter()
+                    .map(|(node_id, keyframe)| Command::SetNodeTransformKeyframe {
+                        clip_index,
+                        node_id,
+                        keyframe,
+                    })
+                    .collect();
+                history.execute(scene, Command::Transaction(cmds))?;
+                return Ok(json!({
+                    "ok": true,
+                    "clip_index": clip_index,
+                    "count": count
+                }));
+            }
+
+            let Some((node_id, keyframe)) = single_entry else {
+                return Err(AiError::InvalidArguments("missing keyframe payload".into()));
+            };
+            let time_secs = keyframe.time_secs;
+            let translation = keyframe.translation;
+            let scale = keyframe.scale;
+            history.execute(
+                scene,
+                Command::SetNodeTransformKeyframe {
+                    clip_index,
+                    node_id,
+                    keyframe,
+                },
+            )?;
+            Ok(json!({
+                "ok": true,
+                "clip_index": clip_index,
+                "node_id": node_id.0,
+                "time_secs": time_secs,
+                "translation": translation.to_array(),
+                "scale": scale.to_array()
+            }))
+        }
         "scene_set_node_transform" | "set_node_transform" => {
             let node_id = args
                 .get("node_id")
@@ -2484,6 +2669,9 @@ pub fn execute_tool_call(
                     arr[2].as_f64().unwrap_or(0.0) as f32,
                 ];
             }
+            if let Some(ds) = args.get("double_sided").and_then(Value::as_bool) {
+                mat.double_sided = ds;
+            }
             history.execute(
                 scene,
                 Command::SetMeshMaterial {
@@ -2496,7 +2684,8 @@ pub fn execute_tool_call(
                 "node_id": node_id.0,
                 "metallic": mat.metallic,
                 "roughness": mat.roughness,
-                "emissive": mat.emissive
+                "emissive": mat.emissive,
+                "double_sided": mat.double_sided
             }))
         }
         "character_apply_biped_rig" => {
@@ -2857,8 +3046,15 @@ pub fn execute_tool_call(
                 .character_rig
                 .as_ref()
                 .ok_or_else(|| AiError::InvalidArguments("no character rig applied".into()))?;
+            let bounds = tessel_core::SkinnedBoundsCache::from_scene(scene, rig);
             let baked = rig
-                .bake_clip_layers(name.clone(), fps, duration_override, clamp_floor_y)
+                .bake_clip_layers_with_bounds(
+                    name.clone(),
+                    fps,
+                    duration_override,
+                    clamp_floor_y,
+                    bounds.as_ref(),
+                )
                 .ok_or_else(|| {
                     AiError::InvalidArguments("rig has no bones or animations to bake".into())
                 })?;
@@ -2914,8 +3110,15 @@ pub fn execute_tool_call(
             } else {
                 rig.active_animation
             };
+            let bounds = tessel_core::SkinnedBoundsCache::from_scene(scene, rig);
             let clamped = rig
-                .clamp_clip_to_floor(clip_index, bone_prefix, floor_y, fps)
+                .clamp_clip_to_floor_with_bounds(
+                    clip_index,
+                    bone_prefix,
+                    floor_y,
+                    fps,
+                    bounds.as_ref(),
+                )
                 .ok_or_else(|| {
                     AiError::InvalidArguments(format!(
                         "unable to clamp clip {clip_index} for prefix '{bone_prefix}'"
@@ -2952,42 +3155,19 @@ pub fn execute_tool_call(
                 .character_rig
                 .as_ref()
                 .ok_or_else(|| AiError::InvalidArguments("no character rig applied".into()))?;
-            let matching_bones: Vec<&tessel_core::Bone> = rig
-                .bones
-                .iter()
-                .filter(|b| {
-                    if bone_prefix.is_empty() {
-                        !b.name.contains('_')
-                    } else {
-                        b.name.starts_with(bone_prefix)
-                    }
-                })
-                .collect();
-            let root_bone = matching_bones
-                .iter()
-                .find(|b| b.parent.is_none())
-                .copied()
+            let bounds = tessel_core::SkinnedBoundsCache::from_scene(scene, rig);
+            let mut sim = rig.clone();
+            let (root_id, min_y, delta_y) = sim
+                .clamp_sub_skeleton_to_floor_with_bounds(bone_prefix, floor_y, bounds.as_ref())
                 .ok_or_else(|| {
                     AiError::InvalidArguments(format!(
-                        "no root bone found for prefix '{bone_prefix}'"
+                        "no root bone found or unable to compute bounds for prefix '{bone_prefix}'"
                     ))
                 })?;
-            let world_mats = rig.world_pose_matrices();
-            let mut min_y = f32::INFINITY;
-            for b in &matching_bones {
-                if let Some(mat) = world_mats.get(&b.id) {
-                    min_y = min_y.min(mat.transform_point3(glam::Vec3::ZERO).y);
-                }
-            }
-            if !min_y.is_finite() {
-                return Err(AiError::InvalidArguments(
-                    "unable to compute character world bounds".into(),
-                ));
-            }
-            let delta_y = floor_y - min_y;
-            let mut next_trans = root_bone.pose_local.translation;
-            next_trans.y += delta_y;
-            let root_id = root_bone.id;
+            let next_trans = sim
+                .bone(root_id)
+                .map(|b| b.pose_local.translation)
+                .ok_or_else(|| AiError::InvalidArguments("root bone not found".into()))?;
             history.execute(
                 scene,
                 Command::SetBoneTranslation {
@@ -3164,38 +3344,77 @@ pub fn execute_tool_call(
             }))
         }
         "character_set_keyframe" => {
-            let raw_id = args
-                .get("bone_id")
-                .and_then(Value::as_u64)
-                .ok_or_else(|| AiError::InvalidArguments("missing 'bone_id'".into()))?;
-            let bone_id = BoneId(
-                u32::try_from(raw_id)
-                    .map_err(|_| AiError::InvalidArguments("bone_id overflow".into()))?,
-            );
-            let time_secs = args
-                .get("time_secs")
-                .and_then(Value::as_f64)
-                .ok_or_else(|| AiError::InvalidArguments("missing 'time_secs'".into()))?
-                as f32;
-            let rotation = parse_rotation_deg(args)?;
-            let translation = parse_opt_vec3(args, "translation")?.unwrap_or(glam::Vec3::ZERO);
-            let scale = parse_opt_vec3(args, "scale")?.unwrap_or(glam::Vec3::ONE);
-            let interpolation = match args
-                .get("interpolation")
-                .and_then(Value::as_str)
-                .unwrap_or("linear")
-            {
-                "linear" => tessel_core::KeyframeInterpolation::Linear,
-                "step" => tessel_core::KeyframeInterpolation::Step,
-                "ease_in" => tessel_core::KeyframeInterpolation::EaseIn,
-                "ease_out" => tessel_core::KeyframeInterpolation::EaseOut,
-                "ease_in_out" => tessel_core::KeyframeInterpolation::EaseInOut,
-                other => {
-                    return Err(AiError::InvalidArguments(format!(
+            let parse_interp = |obj: &Value| -> Result<tessel_core::KeyframeInterpolation, AiError> {
+                match obj
+                    .get("interpolation")
+                    .and_then(Value::as_str)
+                    .unwrap_or("linear")
+                {
+                    "linear" => Ok(tessel_core::KeyframeInterpolation::Linear),
+                    "step" => Ok(tessel_core::KeyframeInterpolation::Step),
+                    "ease_in" => Ok(tessel_core::KeyframeInterpolation::EaseIn),
+                    "ease_out" => Ok(tessel_core::KeyframeInterpolation::EaseOut),
+                    "ease_in_out" => Ok(tessel_core::KeyframeInterpolation::EaseInOut),
+                    other => Err(AiError::InvalidArguments(format!(
                         "unsupported interpolation '{other}'"
-                    )));
+                    ))),
                 }
             };
+            let parse_kf_entry = |obj: &Value| -> Result<(BoneId, Keyframe), AiError> {
+                let raw_id = obj
+                    .get("bone_id")
+                    .and_then(Value::as_u64)
+                    .ok_or_else(|| AiError::InvalidArguments("missing 'bone_id'".into()))?;
+                let bone_id = BoneId(
+                    u32::try_from(raw_id)
+                        .map_err(|_| AiError::InvalidArguments("bone_id overflow".into()))?,
+                );
+                let time_secs = obj
+                    .get("time_secs")
+                    .and_then(Value::as_f64)
+                    .ok_or_else(|| AiError::InvalidArguments("missing 'time_secs'".into()))?
+                    as f32;
+                let rotation = parse_rotation_deg(obj)?;
+                let translation = parse_opt_vec3(obj, "translation")?.unwrap_or(glam::Vec3::ZERO);
+                let scale = parse_opt_vec3(obj, "scale")?.unwrap_or(glam::Vec3::ONE);
+                let interpolation = parse_interp(obj)?;
+                Ok((
+                    bone_id,
+                    Keyframe {
+                        time_secs,
+                        translation,
+                        rotation,
+                        scale,
+                        interpolation,
+                    },
+                ))
+            };
+
+            let bulk_entries: Option<Vec<(BoneId, Keyframe)>> =
+                if let Some(arr) = args.get("keyframes") {
+                    let list = arr.as_array().ok_or_else(|| {
+                        AiError::InvalidArguments("'keyframes' must be an array".into())
+                    })?;
+                    if list.is_empty() || list.len() > 2048 {
+                        return Err(AiError::InvalidArguments(
+                            "'keyframes' must contain between 1 and 2048 entries".into(),
+                        ));
+                    }
+                    let mut parsed = Vec::with_capacity(list.len());
+                    for item in list {
+                        parsed.push(parse_kf_entry(item)?);
+                    }
+                    Some(parsed)
+                } else {
+                    None
+                };
+
+            let single_entry = if bulk_entries.is_none() {
+                Some(parse_kf_entry(args)?)
+            } else {
+                None
+            };
+
             let clip_index = if let Some(idx) = args.get("clip_index").and_then(Value::as_u64) {
                 idx as usize
             } else if let Some(name) = args.get("clip_name").and_then(Value::as_str) {
@@ -3229,18 +3448,36 @@ pub fn execute_tool_call(
                     .map_or(0, |r| r.active_animation)
             };
 
+            if let Some(entries) = bulk_entries {
+                let count = entries.len();
+                let cmds: Vec<Command> = entries
+                    .into_iter()
+                    .map(|(bone_id, keyframe)| Command::SetAnimationKeyframe {
+                        clip_index,
+                        bone_id,
+                        keyframe,
+                    })
+                    .collect();
+                history.execute(scene, Command::Transaction(cmds))?;
+                return Ok(json!({
+                    "ok": true,
+                    "clip_index": clip_index,
+                    "count": count
+                }));
+            }
+
+            let Some((bone_id, keyframe)) = single_entry else {
+                return Err(AiError::InvalidArguments("missing keyframe payload".into()));
+            };
+            let time_secs = keyframe.time_secs;
+            let translation = keyframe.translation;
+            let scale = keyframe.scale;
             history.execute(
                 scene,
                 Command::SetAnimationKeyframe {
                     clip_index,
                     bone_id,
-                    keyframe: Keyframe {
-                        time_secs,
-                        translation,
-                        rotation,
-                        scale,
-                        interpolation,
-                    },
+                    keyframe,
                 },
             )?;
             Ok(json!({
@@ -3772,26 +4009,37 @@ pub fn execute_tool_call(
             } else {
                 None
             };
-            let time_secs = args
-                .get("time_secs")
-                .and_then(Value::as_f64)
-                .ok_or_else(|| AiError::InvalidArguments("missing 'time_secs'".into()))?
-                as f32;
+            let playing = args.get("playing").and_then(Value::as_bool);
+            let time_secs = if let Some(t) = args.get("time_secs").and_then(Value::as_f64) {
+                t as f32
+            } else if playing.is_some() {
+                scene
+                    .character_rig
+                    .as_ref()
+                    .map_or(0.0, |r| r.playback_time)
+            } else {
+                return Err(AiError::InvalidArguments(
+                    "missing 'time_secs' or 'playing'".into(),
+                ));
+            };
             history.execute(
                 scene,
                 Command::SetAnimationPlaybackTime {
                     clip_index,
                     time_secs,
+                    playing,
                 },
             )?;
             let active_idx = scene
                 .character_rig
                 .as_ref()
                 .map_or(0, |r| r.active_animation);
+            let playing_now = scene.character_rig.as_ref().is_some_and(|r| r.playing);
             Ok(json!({
                 "ok": true,
                 "clip_index": active_idx,
-                "time_secs": time_secs
+                "time_secs": time_secs,
+                "playing": playing_now
             }))
         }
         "character_reset_pose" => {
@@ -3863,11 +4111,54 @@ pub fn execute_tool_call(
                 .or_else(|| scene.active_lowpoly_node())
                 .ok_or_else(|| AiError::InvalidArguments("no node found".into()))?;
             let name = args.get("name").and_then(Value::as_str).map(str::to_string);
-            history.execute(scene, Command::DuplicateNode { node_id, name })?;
-            let new_id = scene.selected_node.ok_or_else(|| {
-                AiError::InvalidArguments("duplicate produced no node".into())
-            })?;
-            Ok(json!({ "ok": true, "node_id": new_id.0 }))
+            let pos_override = parse_opt_vec3(args, "position")?;
+            let rot_override = if args.get("rotation_deg").is_some() {
+                Some(parse_rotation_deg(args)?)
+            } else {
+                None
+            };
+            let scale_override = parse_opt_vec3(args, "scale")?;
+            let has_transform =
+                pos_override.is_some() || rot_override.is_some() || scale_override.is_some();
+
+            if has_transform {
+                let mut transform = scene
+                    .nodes
+                    .get(&node_id)
+                    .ok_or_else(|| {
+                        AiError::InvalidArguments(format!("node {} not found", node_id.0))
+                    })?
+                    .transform;
+                if let Some(p) = pos_override {
+                    transform.translation = p;
+                } else {
+                    transform.translation += glam::Vec3::new(0.5, 0.0, 0.0);
+                }
+                if let Some(r) = rot_override {
+                    transform.rotation = r;
+                }
+                if let Some(s) = scale_override {
+                    transform.scale = s;
+                }
+                history.execute(scene, Command::DuplicateNode { node_id, name })?;
+                let new_id = scene.selected_node.ok_or_else(|| {
+                    AiError::InvalidArguments("duplicate produced no node".into())
+                })?;
+                history.execute(
+                    scene,
+                    Command::SetNodeTransform {
+                        node_id: new_id,
+                        transform,
+                    },
+                )?;
+                Ok(json!({ "ok": true, "node_id": new_id.0 }))
+            } else {
+                history.execute(scene, Command::DuplicateNode { node_id, name })?;
+                let new_id = scene.selected_node.ok_or_else(|| {
+                    AiError::InvalidArguments("duplicate produced no node".into())
+                })?;
+                Ok(json!({ "ok": true, "node_id": new_id.0 }))
+            }
         }
         "scene_set_node_visibility" => {
             let node_id = args
@@ -6862,5 +7153,326 @@ mod tests {
         assert!(glb_json.contains("\"WeaponDrop\""));
         assert!(glb_json.contains("\"translation\""));
         assert!(glb_json.contains("\"rotation\""));
+    }
+
+    #[test]
+    fn floor_clamp_uses_lowest_skinned_mesh_vertex_below_foot_joint() {
+        let mut scene = SceneState::new();
+        let mut history = HistoryStack::new();
+        let dir = std::env::temp_dir();
+
+        // Create a boot mesh whose sole sits at y = -0.06 (below humanoid foot joint).
+        let boot = execute_tool_call(
+            "mesh_create_primitive",
+            &json!({ "name": "LeftBoot", "kind": "cube", "size": [0.18, 0.14, 0.28] }),
+            &mut scene,
+            &mut history,
+            &dir,
+        )
+        .unwrap();
+        let boot_id = boot["node_id"].as_u64().unwrap();
+        execute_tool_call(
+            "scene_set_node_transform",
+            &json!({ "node_id": boot_id, "position": [0.11, -0.06, 0.0] }),
+            &mut scene,
+            &mut history,
+            &dir,
+        )
+        .unwrap();
+
+        execute_tool_call(
+            "character_apply_biped_rig",
+            &json!({ "preset": "humanoid" }),
+            &mut scene,
+            &mut history,
+            &dir,
+        )
+        .unwrap();
+
+        // 1. Live pose floor clamp lifts Root by +0.06 so boot sole sits at y = 0.0.
+        let clamp = execute_tool_call(
+            "character_clamp_to_floor",
+            &json!({ "floor_y": 0.0 }),
+            &mut scene,
+            &mut history,
+            &dir,
+        )
+        .unwrap();
+        assert_eq!(clamp["ok"], true);
+        let min_y_before = clamp["min_y_before"].as_f64().unwrap() as f32;
+        assert!(
+            (min_y_before - (-0.06)).abs() < 1e-3,
+            "expected skinned boot sole min_y_before = -0.06, got {min_y_before}"
+        );
+        let cache = tessel_core::SkinnedBoundsCache::from_scene(
+            &scene,
+            scene.character_rig.as_ref().unwrap(),
+        )
+        .unwrap();
+        let min_y_after = cache
+            .sub_skeleton_min_y(scene.character_rig.as_ref().unwrap(), "")
+            .unwrap();
+        assert!(
+            min_y_after.abs() < 1e-3,
+            "expected skinned boot sole min_y_after ~ 0.0, got {min_y_after}"
+        );
+
+        // 2. Clip floor clamp keeps skinned boot sole flush on y = 0.0 across Walk frames.
+        let clip_clamp = execute_tool_call(
+            "character_clamp_clip_to_floor",
+            &json!({ "clip_name": "Walk", "floor_y": 0.0, "fps": 12 }),
+            &mut scene,
+            &mut history,
+            &dir,
+        )
+        .unwrap();
+        assert_eq!(clip_clamp["ok"], true);
+        execute_tool_call(
+            "character_set_playback_time",
+            &json!({ "clip_name": "Walk", "time_secs": 0.25 }),
+            &mut scene,
+            &mut history,
+            &dir,
+        )
+        .unwrap();
+        let walk_min_y = cache
+            .sub_skeleton_min_y(scene.character_rig.as_ref().unwrap(), "")
+            .unwrap();
+        assert!(
+            walk_min_y.abs() < 0.02,
+            "expected clamped Walk skinned boot sole min_y ~ 0.0, got {walk_min_y}"
+        );
+    }
+
+    #[test]
+    fn mcp_quick_wins_batch_schema_double_sided_duplicate_bulk_keyframes_and_playing() {
+        let mut scene = SceneState::new();
+        let mut history = HistoryStack::new();
+        let dir = std::env::temp_dir();
+
+        // 1. scene_batch schema maxItems is synchronized to 512
+        let batch_def = crate::tools::tool_definitions()
+            .into_iter()
+            .find(|t| t["name"] == "scene_batch")
+            .unwrap();
+        assert_eq!(
+            batch_def["inputSchema"]["properties"]["calls"]["maxItems"],
+            512
+        );
+
+        // 2. mesh_set_material supports double_sided and exports glTF doubleSided: true
+        let grass = execute_tool_call(
+            "mesh_create_primitive",
+            &json!({ "name": "GrassBlade", "kind": "plane", "size": 0.4 }),
+            &mut scene,
+            &mut history,
+            &dir,
+        )
+        .unwrap();
+        let grass_id = grass["node_id"].as_u64().unwrap();
+        let mat_res = execute_tool_call(
+            "mesh_set_material",
+            &json!({ "node_id": grass_id, "double_sided": true, "roughness": 0.9 }),
+            &mut scene,
+            &mut history,
+            &dir,
+        )
+        .unwrap();
+        assert_eq!(mat_res["double_sided"], true);
+        assert!(
+            scene.lowpoly_meshes[&NodeId(grass_id)]
+                .material
+                .double_sided
+        );
+
+        // 3. scene_duplicate_node accepts position, rotation_deg, scale directly
+        let dup = execute_tool_call(
+            "scene_duplicate_node",
+            &json!({
+                "node_id": grass_id,
+                "name": "GrassBlade_2",
+                "position": [1.5, 0.0, -2.0],
+                "rotation_deg": [0.0, 45.0, 0.0],
+                "scale": [1.2, 1.5, 1.2]
+            }),
+            &mut scene,
+            &mut history,
+            &dir,
+        )
+        .unwrap();
+        let dup_id = NodeId(dup["node_id"].as_u64().unwrap());
+        let dup_tr = scene.nodes[&dup_id].transform;
+        assert!((dup_tr.translation - glam::Vec3::new(1.5, 0.0, -2.0)).length() < 1e-4);
+        assert!((dup_tr.scale - glam::Vec3::new(1.2, 1.5, 1.2)).length() < 1e-4);
+
+        // 4. character_set_keyframe supports bulk keyframes in 1 atomic call
+        execute_tool_call(
+            "character_apply_biped_rig",
+            &json!({ "preset": "starter" }),
+            &mut scene,
+            &mut history,
+            &dir,
+        )
+        .unwrap();
+        let bulk = execute_tool_call(
+            "character_set_keyframe",
+            &json!({
+                "clip_name": "WindSway",
+                "duration_secs": 2.0,
+                "keyframes": [
+                    { "bone_id": 1, "time_secs": 0.0, "rotation_deg": [0.0, 0.0, 0.0] },
+                    { "bone_id": 1, "time_secs": 1.0, "rotation_deg": [0.0, 0.0, 12.0] },
+                    { "bone_id": 2, "time_secs": 0.0, "rotation_deg": [0.0, 0.0, 0.0] },
+                    { "bone_id": 2, "time_secs": 1.0, "rotation_deg": [0.0, 0.0, -8.0] }
+                ]
+            }),
+            &mut scene,
+            &mut history,
+            &dir,
+        )
+        .unwrap();
+        assert_eq!(bulk["ok"], true);
+        assert_eq!(bulk["count"], 4);
+
+        // 5. character_set_playback_time supports playing: true/false even while in Low-Poly mode
+        execute_tool_call(
+            "scene_set_mode",
+            &json!({ "mode": "lowpoly" }),
+            &mut scene,
+            &mut history,
+            &dir,
+        )
+        .unwrap();
+        let play_res = execute_tool_call(
+            "character_set_playback_time",
+            &json!({ "clip_name": "WindSway", "time_secs": 1.0, "playing": true }),
+            &mut scene,
+            &mut history,
+            &dir,
+        )
+        .unwrap();
+        assert_eq!(play_res["playing"], true);
+        assert!(scene.character_rig.as_ref().unwrap().playing);
+        let pause_res = execute_tool_call(
+            "character_set_playback_time",
+            &json!({ "playing": false }),
+            &mut scene,
+            &mut history,
+            &dir,
+        )
+        .unwrap();
+        assert_eq!(pause_res["playing"], false);
+        assert!(!scene.character_rig.as_ref().unwrap().playing);
+    }
+
+    #[test]
+    fn scene_group_and_per_node_transform_animation_without_bones_exports_valid_glb() {
+        let mut scene = SceneState::new();
+        let mut history = HistoryStack::new();
+        let dir = std::env::temp_dir();
+
+        // 1. Create an empty Group folder "Trees" at [2, 0, 0]
+        let grp = execute_tool_call(
+            "scene_create_group",
+            &json!({ "name": "Trees", "position": [2.0, 0.0, 0.0] }),
+            &mut scene,
+            &mut history,
+            &dir,
+        )
+        .unwrap();
+        let grp_id = grp["node_id"].as_u64().unwrap();
+        assert_eq!(
+            scene.nodes[&NodeId(grp_id)].kind,
+            tessel_core::NodeKind::Group
+        );
+
+        // 2. Create a Pine mesh under "Trees" and a static Rock at origin
+        let pine = execute_tool_call(
+            "mesh_create_primitive",
+            &json!({ "name": "Pine_1", "kind": "cone", "size": 1.0, "position": [0.5, 0.0, 0.0] }),
+            &mut scene,
+            &mut history,
+            &dir,
+        )
+        .unwrap();
+        let pine_id = pine["node_id"].as_u64().unwrap();
+        execute_tool_call(
+            "scene_set_parent",
+            &json!({ "node_id": pine_id, "parent_node_id": grp_id }),
+            &mut scene,
+            &mut history,
+            &dir,
+        )
+        .unwrap();
+        let rock = execute_tool_call(
+            "mesh_create_primitive",
+            &json!({ "name": "Rock_Static", "kind": "cube", "size": 0.6 }),
+            &mut scene,
+            &mut history,
+            &dir,
+        )
+        .unwrap();
+        let rock_id = rock["node_id"].as_u64().unwrap();
+
+        // 3. Animate the Group and Pine directly via scene_set_node_keyframe (0 bones!)
+        let kf_res = execute_tool_call(
+            "scene_set_node_keyframe",
+            &json!({
+                "clip_name": "WindBreeze",
+                "duration_secs": 2.0,
+                "keyframes": [
+                    { "node_id": grp_id, "time_secs": 0.0, "translation": [0.0, 0.0, 0.0] },
+                    { "node_id": grp_id, "time_secs": 1.0, "translation": [0.0, 0.5, 0.0] },
+                    { "node_id": pine_id, "time_secs": 0.0, "rotation_deg": [0.0, 0.0, 0.0] },
+                    { "node_id": pine_id, "time_secs": 1.0, "rotation_deg": [0.0, 0.0, 15.0] }
+                ]
+            }),
+            &mut scene,
+            &mut history,
+            &dir,
+        )
+        .unwrap();
+        assert_eq!(kf_res["ok"], true);
+        assert_eq!(kf_res["count"], 4);
+        assert!(scene.character_rig.as_ref().unwrap().bones.is_empty());
+
+        // 4. Scrub to t=1.0: Pine world Y lifts by +0.5 from parent Group; Rock stays at Y=0
+        execute_tool_call(
+            "character_set_playback_time",
+            &json!({ "clip_name": "WindBreeze", "time_secs": 1.0 }),
+            &mut scene,
+            &mut history,
+            &dir,
+        )
+        .unwrap();
+        let pine_world = scene
+            .node_world_matrix(NodeId(pine_id))
+            .transform_point3(glam::Vec3::ZERO);
+        assert!((pine_world.x - 2.5).abs() < 1e-3);
+        assert!((pine_world.y - 0.5).abs() < 1e-3);
+        let rock_world = scene
+            .node_world_matrix(NodeId(rock_id))
+            .transform_point3(glam::Vec3::ZERO);
+        assert!(rock_world.length() < 1e-4);
+
+        // 5. Export .glb and validate Group hierarchy + WindBreeze animation channels
+        let (glb, _) =
+            tessel_io::export_glb_bytes(&scene, tessel_io::ExportPreset::Godot4).unwrap();
+        assert!(glb.starts_with(b"glTF"));
+        let json_len = u32::from_le_bytes([glb[12], glb[13], glb[14], glb[15]]) as usize;
+        let glb_json: Value = serde_json::from_slice(&glb[20..20 + json_len]).unwrap();
+        let nodes = glb_json["nodes"].as_array().unwrap();
+        let trees_node = nodes.iter().find(|n| n["name"] == "Trees").unwrap();
+        let pine_idx = nodes.iter().position(|n| n["name"] == "Pine_1").unwrap();
+        let trees_children = trees_node["children"].as_array().unwrap();
+        assert!(
+            trees_children
+                .iter()
+                .any(|c| c.as_u64() == Some(pine_idx as u64)),
+            "Trees group must parent Pine_1 in glTF"
+        );
+        let anims = glb_json["animations"].as_array().unwrap();
+        let wind = anims.iter().find(|a| a["name"] == "WindBreeze").unwrap();
+        assert!(wind["channels"].as_array().unwrap().len() >= 6);
     }
 }

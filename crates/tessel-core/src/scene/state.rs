@@ -150,8 +150,19 @@ impl SceneState {
         self.lowpoly_meshes.keys().next().copied()
     }
 
-    /// Computes the world-space transform matrix for `id` by walking its `parent` hierarchy.
+    /// Computes the live world-space transform matrix for `id` by walking its `parent` hierarchy
+    /// and applying any active per-node transform animation overrides (`node_transform_overrides`).
     pub fn node_world_matrix(&self, id: NodeId) -> glam::Mat4 {
+        self.compute_node_world_matrix(id, true)
+    }
+
+    /// Computes the rest-pose world-space transform matrix for `id` ignoring live animation overrides
+    /// (used by exporters and rest-pose skinning).
+    pub fn node_rest_world_matrix(&self, id: NodeId) -> glam::Mat4 {
+        self.compute_node_world_matrix(id, false)
+    }
+
+    fn compute_node_world_matrix(&self, id: NodeId, apply_anim_overrides: bool) -> glam::Mat4 {
         let mut chain = Vec::new();
         let mut curr = Some(id);
         while let Some(nid) = curr {
@@ -167,10 +178,22 @@ impl SceneState {
         let mut mat = glam::Mat4::IDENTITY;
         for nid in chain.into_iter().rev() {
             if let Some(node) = self.nodes.get(&nid) {
+                let mut tr = node.transform;
+                if apply_anim_overrides {
+                    if let Some(delta) = self
+                        .character_rig
+                        .as_ref()
+                        .and_then(|r| r.node_transform_overrides.get(&nid))
+                    {
+                        tr.translation += delta.translation;
+                        tr.rotation = (tr.rotation * delta.rotation).normalize();
+                        tr.scale *= delta.scale;
+                    }
+                }
                 mat *= glam::Mat4::from_scale_rotation_translation(
-                    node.transform.scale,
-                    node.transform.rotation,
-                    node.transform.translation,
+                    tr.scale,
+                    tr.rotation,
+                    tr.translation,
                 );
             }
         }

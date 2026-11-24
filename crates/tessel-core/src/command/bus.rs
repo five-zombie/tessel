@@ -355,6 +355,16 @@ pub enum Command {
     RemoveBone {
         bone_id: BoneId,
     },
+    CreateGroupNode {
+        name: String,
+        transform: Transform,
+        parent: Option<NodeId>,
+    },
+    SetNodeTransformKeyframe {
+        clip_index: usize,
+        node_id: NodeId,
+        keyframe: Keyframe,
+    },
     DuplicateNode {
         node_id: NodeId,
         name: Option<String>,
@@ -371,6 +381,7 @@ pub enum Command {
     SetAnimationPlaybackTime {
         clip_index: Option<usize>,
         time_secs: f32,
+        playing: Option<bool>,
     },
     ResetCharacterPose,
     ClearMeshTexture {
@@ -1422,6 +1433,7 @@ impl Command {
                         material.emissive[1].clamp(0.0, 1.0),
                         material.emissive[2].clamp(0.0, 1.0),
                     ],
+                    double_sided: material.double_sided,
                 };
                 let mesh = scene
                     .lowpoly_meshes
@@ -1824,10 +1836,11 @@ impl Command {
                 name,
                 duration_secs,
             } => {
+                let prev_rig = scene.character_rig.clone();
+                let had_rig = scene.character_rig.is_some();
                 let rig = scene
                     .character_rig
-                    .as_mut()
-                    .ok_or(CoreError::CharacterRigNotFound)?;
+                    .get_or_insert_with(CharacterRig::default);
                 let previous_active = rig.active_animation;
                 let previous_time = rig.playback_time;
                 rig.animations
@@ -1835,9 +1848,13 @@ impl Command {
                 rig.active_animation = rig.animations.len().saturating_sub(1);
                 rig.playback_time = 0.0;
                 rig.playing = false;
-                UndoDelta::PopAnimationClip {
-                    previous_active,
-                    previous_time,
+                if had_rig {
+                    UndoDelta::PopAnimationClip {
+                        previous_active,
+                        previous_time,
+                    }
+                } else {
+                    UndoDelta::RestoreCharacterRig(prev_rig)
                 }
             }
             Self::SetAnimationKeyframe {
@@ -2052,6 +2069,7 @@ impl Command {
                 }
                 rig.active_animation = *clip_index;
                 rig.playback_time = 0.0;
+                rig.apply_active_animation();
                 UndoDelta::RestoreCharacterRig(previous)
             }
             Self::RemoveAnimationClip { clip_index } => {
@@ -2103,6 +2121,68 @@ impl Command {
                     clip.channels.retain(|c| !removed.contains(&c.bone_id));
                 }
                 UndoDelta::RestoreCharacterRig(previous)
+            }
+            Self::CreateGroupNode {
+                name,
+                transform,
+                parent,
+            } => {
+                if let Some(pid) = *parent {
+                    if !scene.nodes.contains_key(&pid) {
+                        return Err(CoreError::NodeNotFound(pid));
+                    }
+                }
+                let id = scene.allocate_node_id();
+                let previous_selection = scene.selected_node;
+                scene.nodes.insert(
+                    id,
+                    SceneNode {
+                        id,
+                        name: name.clone(),
+                        kind: NodeKind::Group,
+                        visible: true,
+                        parent: *parent,
+                        transform: *transform,
+                    },
+                );
+                scene.selected_node = Some(id);
+                UndoDelta::RemoveNode {
+                    id,
+                    previous_selection,
+                }
+            }
+            Self::SetNodeTransformKeyframe {
+                clip_index,
+                node_id,
+                keyframe,
+            } => {
+                if !scene.nodes.contains_key(node_id) {
+                    return Err(CoreError::NodeNotFound(*node_id));
+                }
+                if !keyframe.time_secs.is_finite()
+                    || keyframe.time_secs < 0.0
+                    || !keyframe.translation.is_finite()
+                    || !keyframe.rotation.is_finite()
+                    || !keyframe.scale.is_finite()
+                {
+                    return Err(CoreError::OutOfBounds);
+                }
+                let prev = scene.character_rig.clone();
+                let rig = scene
+                    .character_rig
+                    .get_or_insert_with(CharacterRig::default);
+                if rig.animations.is_empty() && *clip_index == 0 {
+                    rig.animations.push(AnimationClip::new_empty(
+                        "SceneAnim",
+                        keyframe.time_secs.max(1.0),
+                    ));
+                }
+                let clip = rig
+                    .animations
+                    .get_mut(*clip_index)
+                    .ok_or(CoreError::OutOfBounds)?;
+                clip.upsert_node_transform_key(*node_id, *keyframe);
+                UndoDelta::RestoreCharacterRig(prev)
             }
             Self::DuplicateNode { node_id, name } => {
                 let source = scene
@@ -2193,6 +2273,7 @@ impl Command {
             Self::SetAnimationPlaybackTime {
                 clip_index,
                 time_secs,
+                playing,
             } => {
                 if !time_secs.is_finite() || *time_secs < 0.0 {
                     return Err(CoreError::OutOfBounds);
@@ -2210,7 +2291,7 @@ impl Command {
                     rig.active_animation = idx;
                 }
                 rig.playback_time = *time_secs;
-                rig.playing = false;
+                rig.playing = playing.unwrap_or(false);
                 rig.apply_active_animation();
                 UndoDelta::RestoreCharacterRig(prev)
             }
@@ -2224,6 +2305,7 @@ impl Command {
                     bone.pose_local = bone.rest_local;
                 }
                 rig.morph_weights.clear();
+                rig.node_transform_overrides.clear();
                 rig.playback_time = 0.0;
                 rig.playing = false;
                 UndoDelta::RestoreCharacterRig(prev)

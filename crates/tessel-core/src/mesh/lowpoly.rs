@@ -33,6 +33,8 @@ pub struct MeshMaterial {
     pub metallic: f32,
     pub roughness: f32,
     pub emissive: [f32; 3],
+    #[serde(default)]
+    pub double_sided: bool,
 }
 
 impl Default for MeshMaterial {
@@ -41,6 +43,7 @@ impl Default for MeshMaterial {
             metallic: 0.0,
             roughness: 0.85,
             emissive: [0.0, 0.0, 0.0],
+            double_sided: false,
         }
     }
 }

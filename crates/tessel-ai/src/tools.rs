@@ -70,7 +70,7 @@ pub fn tool_definitions() -> Vec<Value> {
                     "calls": {
                         "type": "array",
                         "minItems": 1,
-                        "maxItems": 128,
+                        "maxItems": 512,
                         "items": {
                             "type": "object",
                             "properties": {
@@ -82,6 +82,56 @@ pub fn tool_definitions() -> Vec<Value> {
                     }
                 },
                 "required": ["calls"]
+            }
+        }),
+        json!({
+            "name": "scene_create_group",
+            "description": "Create an empty Group / folder node for organizing scene hierarchies (e.g. Trees, Grass, Props) and animating entire subtrees without bones. Exports as a standard glTF 2.0 parent node.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "name": { "type": "string", "description": "Display name for the group node (default 'Group')" },
+                    "position": { "type": "array", "items": { "type": "number" }, "minItems": 3, "maxItems": 3 },
+                    "rotation_deg": { "type": "array", "items": { "type": "number" }, "minItems": 3, "maxItems": 3 },
+                    "scale": { "type": "array", "items": { "type": "number" }, "minItems": 3, "maxItems": 3 },
+                    "parent_node_id": { "type": ["integer", "null"], "minimum": 1 }
+                }
+            }
+        }),
+        json!({
+            "name": "scene_set_node_keyframe",
+            "description": "Animate any scene node's local TRS (position/rotation/scale delta relative to its base transform) directly in an animation clip WITHOUT needing any CharacterRig bones (prevents auto-skinning static props). Supports single keyframe OR bulk 'keyframes': [{ node_id, time_secs, translation?, rotation_deg?, scale?, interpolation? }, ...] in 1 atomic transaction. Works on meshes, voxels, and Group folders; exports as standard glTF 2.0 TRS channels.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "clip_index": { "type": "integer", "minimum": 0 },
+                    "clip_name": { "type": "string" },
+                    "duration_secs": { "type": "number", "minimum": 0.1 },
+                    "node_id": { "type": "integer", "minimum": 1 },
+                    "time_secs": { "type": "number", "minimum": 0.0 },
+                    "translation": { "type": "array", "items": { "type": "number" }, "minItems": 3, "maxItems": 3 },
+                    "rotation_deg": { "type": "array", "items": { "type": "number" }, "minItems": 3, "maxItems": 3 },
+                    "scale": { "type": "array", "items": { "type": "number" }, "minItems": 3, "maxItems": 3 },
+                    "interpolation": { "type": "string", "enum": ["linear", "step", "ease_in", "ease_out", "ease_in_out"] },
+                    "keyframes": {
+                        "type": "array",
+                        "minItems": 1,
+                        "maxItems": 2048,
+                        "description": "Optional bulk list of per-node TRS keyframes to upsert atomically into the target clip",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "node_id": { "type": "integer", "minimum": 1 },
+                                "time_secs": { "type": "number", "minimum": 0.0 },
+                                "translation": { "type": "array", "items": { "type": "number" }, "minItems": 3, "maxItems": 3 },
+                                "rotation_deg": { "type": "array", "items": { "type": "number" }, "minItems": 3, "maxItems": 3 },
+                                "scale": { "type": "array", "items": { "type": "number" }, "minItems": 3, "maxItems": 3 },
+                                "interpolation": { "type": "string", "enum": ["linear", "step", "ease_in", "ease_out", "ease_in_out"] }
+                            },
+                            "required": ["node_id", "time_secs"]
+                        }
+                    }
+                }
             }
         }),
         json!({
@@ -761,14 +811,15 @@ pub fn tool_definitions() -> Vec<Value> {
         }),
         json!({
             "name": "mesh_set_material",
-            "description": "Set PBR material properties (metallic 0..1, roughness 0.05..1, emissive [r,g,b] 0..1) on a Low-Poly mesh.",
+            "description": "Set PBR material properties (metallic 0..1, roughness 0.05..1, emissive [r,g,b] 0..1, double_sided bool) on a Low-Poly mesh.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "node_id": { "type": "integer" },
                     "metallic": { "type": "number", "minimum": 0.0, "maximum": 1.0 },
                     "roughness": { "type": "number", "minimum": 0.05, "maximum": 1.0 },
-                    "emissive": { "type": "array", "items": { "type": "number" }, "minItems": 3, "maxItems": 3 }
+                    "emissive": { "type": "array", "items": { "type": "number" }, "minItems": 3, "maxItems": 3 },
+                    "double_sided": { "type": "boolean", "description": "Disable back-face culling on export (glTF doubleSided: true; ideal for thin grass blades, foliage, cloth)" }
                 }
             }
         }),
@@ -940,7 +991,7 @@ pub fn tool_definitions() -> Vec<Value> {
         }),
         json!({
             "name": "character_set_keyframe",
-            "description": "Insert or update a bone TRS keyframe in an animation clip (creates clip if clip_name is new). rotation_deg is required (+X pitch tilts FORWARD, -X tilts BACKWARD in character-local space); translation defaults to [0,0,0], scale defaults to [1,1,1], interpolation defaults to 'linear' ('linear'|'step'|'ease_in'|'ease_out'|'ease_in_out').",
+            "description": "Insert or update one or many bone TRS keyframes in an animation clip (creates clip if clip_name is new). Pass either a single keyframe (bone_id, time_secs, rotation_deg) OR bulk 'keyframes': [{ bone_id, time_secs, rotation_deg, translation?, scale?, interpolation? }, ...] in one atomic transaction. +X pitch tilts FORWARD, -X tilts BACKWARD in character-local space.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -952,9 +1003,26 @@ pub fn tool_definitions() -> Vec<Value> {
                     "rotation_deg": { "type": "array", "items": { "type": "number" }, "minItems": 3, "maxItems": 3 },
                     "translation": { "type": "array", "items": { "type": "number" }, "minItems": 3, "maxItems": 3 },
                     "scale": { "type": "array", "items": { "type": "number" }, "minItems": 3, "maxItems": 3 },
-                    "interpolation": { "type": "string", "enum": ["linear", "step", "ease_in", "ease_out", "ease_in_out"] }
-                },
-                "required": ["bone_id", "time_secs", "rotation_deg"]
+                    "interpolation": { "type": "string", "enum": ["linear", "step", "ease_in", "ease_out", "ease_in_out"] },
+                    "keyframes": {
+                        "type": "array",
+                        "minItems": 1,
+                        "maxItems": 2048,
+                        "description": "Optional bulk list of keyframes to upsert atomically into the target clip",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "bone_id": { "type": "integer", "minimum": 0 },
+                                "time_secs": { "type": "number", "minimum": 0.0 },
+                                "rotation_deg": { "type": "array", "items": { "type": "number" }, "minItems": 3, "maxItems": 3 },
+                                "translation": { "type": "array", "items": { "type": "number" }, "minItems": 3, "maxItems": 3 },
+                                "scale": { "type": "array", "items": { "type": "number" }, "minItems": 3, "maxItems": 3 },
+                                "interpolation": { "type": "string", "enum": ["linear", "step", "ease_in", "ease_out", "ease_in_out"] }
+                            },
+                            "required": ["bone_id", "time_secs", "rotation_deg"]
+                        }
+                    }
+                }
             }
         }),
         json!({
@@ -1075,15 +1143,15 @@ pub fn tool_definitions() -> Vec<Value> {
         }),
         json!({
             "name": "character_set_playback_time",
-            "description": "Scrub an animation clip to time_secs and immediately apply its bone poses and morph weights to the live viewport for visual inspection or viewport_screenshot.",
+            "description": "Scrub an animation clip to time_secs and/or toggle live viewport play/pause (playing: true/false). Immediately applies bone poses and morph weights in all 3D modes (lowpoly, voxel, character) for live playback or viewport_screenshot.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "clip_index": { "type": "integer", "minimum": 0 },
                     "clip_name": { "type": "string" },
-                    "time_secs": { "type": "number", "minimum": 0.0 }
-                },
-                "required": ["time_secs"]
+                    "time_secs": { "type": "number", "minimum": 0.0 },
+                    "playing": { "type": "boolean", "description": "Optional live viewport play/pause state (defaults to false when scrubbing)" }
+                }
             }
         }),
         json!({
@@ -1129,12 +1197,15 @@ pub fn tool_definitions() -> Vec<Value> {
         }),
         json!({
             "name": "scene_duplicate_node",
-            "description": "Duplicate a scene node (mesh/voxel/pixel payload plus material, inheriting rig bindings) with a +0.5 x offset. Selects the copy.",
+            "description": "Duplicate a scene node (mesh/voxel/pixel payload plus material, inheriting rig bindings). Defaults to a +0.5 X offset unless position is provided; supports optional position, rotation_deg, and scale in one atomic call. Selects the copy.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "node_id": { "type": "integer", "minimum": 1 },
-                    "name": { "type": "string" }
+                    "name": { "type": "string" },
+                    "position": { "type": "array", "items": { "type": "number" }, "minItems": 3, "maxItems": 3 },
+                    "rotation_deg": { "type": "array", "items": { "type": "number" }, "minItems": 3, "maxItems": 3 },
+                    "scale": { "type": "array", "items": { "type": "number" }, "minItems": 3, "maxItems": 3 }
                 }
             }
         }),

@@ -916,6 +916,7 @@ fn show_transform_and_lighting_section(
                     );
                     changed |= ui.color_edit_button_rgb(&mut mat.emissive).changed();
                 });
+                changed |= ui.checkbox(&mut mat.double_sided, "Double Sided").changed();
                 if changed {
                     let _ = history.execute(
                         scene,
