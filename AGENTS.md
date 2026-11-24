@@ -1,3 +1,41 @@
+# Tessel — Project Rules
+
+**Tessel** is a cross-platform desktop application (Linux, Windows, macOS) built in **Pure Rust** (`wgpu`, `winit`, `egui`, `glam`, `tokio`) for creating **Pixel, Voxel, Low-Poly, and Character** assets, exporting **`.glb`** (as well as other 2D/3D formats), with **Direct AI** and **MCP** integration.
+
+Full architecture references, PRDs, and plans live in `.knowledges/` (see `.knowledges/README.md` and `.knowledges/docs/conventions.md`).
+
+---
+
+## Mandatory Engineering Principles
+
+### 1. SRP (Single Responsibility Principle) — MANDATORY
+- Every crate, file, `struct`, `trait`, and function must have **1 single responsibility** and **1 reason to change**.
+- Apply the **Anchoring Object Type** pattern (`Unit` → `Sub-Unit` → `Nano-Unit`) across all domains:
+  - **Nano-Unit (`nano.rs`)**: Atomic newtypes / value objects (`NodeId`, `PaletteIndex`, `VoxelCoord`, `PixelCoord`).
+  - **Sub-Unit (`<sub_unit>.rs`)**: Isolated internal components (`VoxelChunk`, `PixelLayer`, `Bone`).
+  - **Unit Anchor (`<unit>.rs`)**: Domain aggregates that anchor Sub-Units and enforce invariants (`VoxelVolume`, `PixelCanvas`, `LowPolyMesh`, `CharacterRig`).
+  - **Transforms & Mutations**: Separate pure algorithms in `ops.rs` from state mutations and undo logic in `commands.rs`.
+- Extend cross-crate behavior using `trait`s / adapters in consumer crates (`tessel-render`, `tessel-io`, `tessel-ai`) without cluttering source files in `tessel-core`.
+
+### 2. KISS (Keep It Simple, Stupid) — MANDATORY
+- Choose the simplest, flattest, and most explicit design that cleanly solves the problem.
+- Avoid deeply layered abstraction hierarchies, unnecessary over-genericization, or overly clever patterns that hurt Rust readability.
+- Leverage built-in Rust features (`struct`, `enum`, `trait`, `#[derive(...)]`) to minimize boilerplate.
+
+### 3. YAGNI (You Aren't Gonna Need It) — MANDATORY
+- Write only the code, types, traits, and features **actually needed right now**.
+- Do not introduce speculative abstractions, empty hooks, unused configuration, or "just-in-case" features.
+
+---
+
+## Rust Reliability Rules
+- **Zero `unwrap()` / `expect()`** in production code; return `Result<T, E>` using `thiserror` (`unwrap()` is only permitted inside `#[cfg(test)]`).
+- **Headless Core**: `tessel-core` must never depend on `wgpu`, `winit`, `egui`, `tokio`, or `reqwest`.
+- **Single Command Bus**: All scene mutations (UI, Direct AI, MCP) must go through `Command` to remain deterministic and support unified Undo/Redo.
+- **Build Quality**: `cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D warnings`, and `cargo test --workspace` must all pass.
+
+---
+
 <!-- knl-view:start -->
 # Knowledge graph tools
 - KNL-View is the primary graph tool. For `.knowledges`, source graphs, external module graphs, and project graph questions, read the project's `knl-view` skill and use the relevant KNL-View feature first.

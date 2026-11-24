@@ -136,10 +136,18 @@ impl ViewportRenderer {
             .zip(scene.character_rig.as_ref())
             .map(|(solver, rig)| solver.skin_matrices(rig));
 
+        let is_visible = |node_id: tessel_core::NodeId| -> bool {
+            scene
+                .character_rig
+                .as_ref()
+                .and_then(|r| r.node_visibility.get(&node_id).copied())
+                .unwrap_or_else(|| scene.nodes.get(&node_id).map(|n| n.visible).unwrap_or(true))
+        };
+
         let mut vertices = Vec::new();
         let mut indices = Vec::new();
         for (node_id, vol) in &scene.voxel_volumes {
-            let visible = scene.nodes.get(node_id).map(|n| n.visible).unwrap_or(true);
+            let visible = is_visible(*node_id);
             if !visible || vol.is_empty() {
                 continue;
             }
@@ -172,7 +180,7 @@ impl ViewportRenderer {
 
         let mut custom_items = Vec::new();
         for (node_id, mesh) in &scene.lowpoly_meshes {
-            let visible = scene.nodes.get(node_id).map(|n| n.visible).unwrap_or(true);
+            let visible = is_visible(*node_id);
             if !visible || mesh.faces.is_empty() {
                 continue;
             }
@@ -318,6 +326,32 @@ impl ViewportRenderer {
         pixels_per_point: f32,
         render_preview: bool,
     ) {
+        self.render_with_light(
+            queue,
+            encoder,
+            scene,
+            camera_3d,
+            camera_2d,
+            pixels_per_point,
+            render_preview,
+            scene.light_azimuth,
+            scene.light_elevation,
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn render_with_light(
+        &self,
+        queue: &wgpu::Queue,
+        encoder: &mut wgpu::CommandEncoder,
+        scene: &SceneState,
+        camera_3d: &OrbitCamera,
+        camera_2d: &PixelCamera2D,
+        pixels_per_point: f32,
+        render_preview: bool,
+        light_azimuth: f32,
+        light_elevation: f32,
+    ) {
         match scene.active_mode {
             AppMode::Pixel => {
                 self.pixel_pass
@@ -340,8 +374,7 @@ impl ViewportRenderer {
             }
             AppMode::Voxel | AppMode::LowPoly | AppMode::Character => {
                 let aspect = self.size.0 as f32 / self.size.1.max(1) as f32;
-                let uniform =
-                    camera_3d.to_uniform(aspect, scene.light_azimuth, scene.light_elevation);
+                let uniform = camera_3d.to_uniform(aspect, light_azimuth, light_elevation);
                 self.grid_pass.update_camera(queue, &uniform);
                 self.shadow_pass.update_camera(queue, &uniform);
                 self.mesh_pass.update_camera(queue, &uniform);
@@ -368,11 +401,10 @@ impl ViewportRenderer {
                     occlusion_query_set: None,
                     timestamp_writes: None,
                 });
-                if render_preview {
-                    self.shadow_pass.draw(&mut pass);
-                } else {
+                if !render_preview {
                     self.grid_pass.draw(&mut pass);
                 }
+                self.shadow_pass.draw(&mut pass);
                 self.mesh_pass.draw(&mut pass);
                 if !render_preview {
                     self.overlay_pass.draw(&mut pass);

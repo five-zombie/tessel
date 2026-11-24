@@ -25,6 +25,16 @@ pub struct SampledBonePose {
     pub local_rotation: Quat,
 }
 
+/// Independent animation clip layer applied to bones matching `bone_prefix`
+/// (enables simultaneous per-character playback, e.g. P1 `Walk` + P2 `ShotFall`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ClipLayer {
+    pub clip_index: usize,
+    pub bone_prefix: String,
+    #[serde(default)]
+    pub time_offset: f32,
+}
+
 /// Unit Anchor: Hierarchical humanoid/custom character rig with starter animations.
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 pub struct CharacterRig {
@@ -42,6 +52,13 @@ pub struct CharacterRig {
     /// (e.g. isolate leg/pelvis meshes from hanging arm bones).
     #[serde(default)]
     pub node_bone_masks: BTreeMap<NodeId, Vec<BoneId>>,
+    /// Live sampled visibility overrides `node_id -> visible`, refreshed by
+    /// `apply_active_animation` from the active clip's `visibility_tracks`.
+    #[serde(default)]
+    pub node_visibility: BTreeMap<NodeId, bool>,
+    /// Optional per-prefix clip layers evaluated on top of `active_animation`.
+    #[serde(default)]
+    pub clip_layers: Vec<ClipLayer>,
 }
 
 impl CharacterRig {
@@ -80,6 +97,8 @@ impl CharacterRig {
             playing: false,
             morph_weights: BTreeMap::new(),
             node_bone_masks: BTreeMap::new(),
+            node_visibility: BTreeMap::new(),
+            clip_layers: Vec::new(),
         }
     }
 
@@ -136,6 +155,8 @@ impl CharacterRig {
             playing: false,
             morph_weights: BTreeMap::new(),
             node_bone_masks: BTreeMap::new(),
+            node_visibility: BTreeMap::new(),
+            clip_layers: Vec::new(),
         }
     }
 
@@ -229,6 +250,253 @@ impl CharacterRig {
                 self.morph_weights.insert((node, target), weight);
             }
         }
+        self.node_visibility.clear();
+        for (node, visible) in clip.sample_node_visibility(t) {
+            self.node_visibility.insert(node, visible);
+        }
+
+        // Apply optional per-prefix clip layers on top of the active clip.
+        let layers = self.clip_layers.clone();
+        for layer in layers {
+            let Some(layer_clip) = self.animations.get(layer.clip_index).cloned() else {
+                continue;
+            };
+            let lt = if layer_clip.duration_secs > 0.0 {
+                (self.playback_time + layer.time_offset).rem_euclid(layer_clip.duration_secs)
+            } else {
+                0.0
+            };
+            for bone in &mut self.bones {
+                if !layer.bone_prefix.is_empty() && !bone.name.starts_with(&layer.bone_prefix) {
+                    continue;
+                }
+                bone.pose_local = bone.rest_local;
+                if let Some(sampled) = layer_clip.sample_bone(bone.id, lt) {
+                    bone.pose_local.translation = bone.rest_local.translation + sampled.translation;
+                    bone.pose_local.rotation = bone.rest_local.rotation * sampled.rotation;
+                    bone.pose_local.scale = bone.rest_local.scale * sampled.scale;
+                }
+            }
+            for (node, target, weight) in layer_clip.sample_morph_weights(lt) {
+                if weight.is_finite() {
+                    self.morph_weights.insert((node, target), weight);
+                }
+            }
+            for (node, visible) in layer_clip.sample_node_visibility(lt) {
+                self.node_visibility.insert(node, visible);
+            }
+        }
+    }
+
+    /// Finds the root bone and all bone IDs belonging to `bone_prefix`
+    /// (`""` matches primary bones without `'_'`; otherwise matches `name.starts_with(bone_prefix)`).
+    pub fn sub_skeleton_root_and_bones(&self, bone_prefix: &str) -> Option<(BoneId, Vec<BoneId>)> {
+        let mut root_id = None;
+        let mut ids = Vec::new();
+        for b in &self.bones {
+            let matches = if bone_prefix.is_empty() {
+                !b.name.contains('_')
+            } else {
+                b.name.starts_with(bone_prefix)
+            };
+            if matches {
+                if b.parent.is_none() && root_id.is_none() {
+                    root_id = Some(b.id);
+                }
+                ids.push(b.id);
+            }
+        }
+        root_id.map(|r| (r, ids))
+    }
+
+    /// Shifts the sub-skeleton's root bone Y translation so its lowest joint sits at `floor_y`.
+    /// Returns `(root_id, min_y_before, delta_y)`.
+    pub fn clamp_sub_skeleton_to_floor(
+        &mut self,
+        bone_prefix: &str,
+        floor_y: f32,
+    ) -> Option<(BoneId, f32, f32)> {
+        let (root_id, bone_ids) = self.sub_skeleton_root_and_bones(bone_prefix)?;
+        let world_mats = self.world_pose_matrices();
+        let mut min_y = f32::INFINITY;
+        for id in &bone_ids {
+            if let Some(mat) = world_mats.get(id) {
+                min_y = min_y.min(mat.transform_point3(Vec3::ZERO).y);
+            }
+        }
+        if !min_y.is_finite() {
+            return None;
+        }
+        let delta_y = floor_y - min_y;
+        let root = self.bones.iter_mut().find(|b| b.id == root_id)?;
+        root.pose_local.translation.y += delta_y;
+        Some((root_id, min_y, delta_y))
+    }
+
+    /// Bakes the current `clip_layers` composition (or active clip if `clip_layers` is empty)
+    /// into a standalone `AnimationClip` ready for `.glb` / `.gif` export.
+    pub fn bake_clip_layers(
+        &self,
+        name: String,
+        fps: f32,
+        duration_override: Option<f32>,
+        clamp_floor_y: Option<f32>,
+    ) -> Option<AnimationClip> {
+        if self.bones.is_empty() || self.animations.is_empty() {
+            return None;
+        }
+        let duration_secs = if let Some(d) = duration_override {
+            d.max(0.05)
+        } else if !self.clip_layers.is_empty() {
+            self.clip_layers
+                .iter()
+                .filter_map(|l| self.animations.get(l.clip_index).map(|c| c.duration_secs))
+                .fold(0.0_f32, f32::max)
+                .max(0.1)
+        } else {
+            self.animations
+                .get(self.active_animation)
+                .map(|c| c.duration_secs)
+                .unwrap_or(1.0)
+                .max(0.1)
+        };
+        let steps = ((duration_secs * fps.clamp(1.0, 120.0)).round() as usize).max(1);
+
+        // Collect all sub-skeleton prefixes present in the rig for optional floor clamping.
+        let mut prefixes: Vec<String> = Vec::new();
+        for b in &self.bones {
+            if b.parent.is_none() {
+                let pfx = match b.name.find('_') {
+                    Some(pos) => b.name[..=pos].to_string(),
+                    None => String::new(),
+                };
+                if !prefixes.contains(&pfx) {
+                    prefixes.push(pfx);
+                }
+            }
+        }
+
+        let mut baked = AnimationClip::new_empty(name, duration_secs);
+        let mut sim = self.clone();
+        let mut last_vis: std::collections::BTreeMap<NodeId, bool> =
+            std::collections::BTreeMap::new();
+
+        for step in 0..=steps {
+            let t = if step == steps {
+                duration_secs
+            } else {
+                (step as f32 / steps as f32) * duration_secs
+            };
+            // Avoid modulo wrap to 0.0 on the final frame by clamping slightly below duration.
+            sim.playback_time = if step == steps {
+                (duration_secs - 1e-4).max(0.0)
+            } else {
+                t
+            };
+            sim.apply_active_animation();
+            if let Some(fy) = clamp_floor_y {
+                for pfx in &prefixes {
+                    let _ = sim.clamp_sub_skeleton_to_floor(pfx, fy);
+                }
+            }
+            for b in &sim.bones {
+                let rot_delta = b.rest_local.rotation.inverse() * b.pose_local.rotation;
+                let trans_delta = b.pose_local.translation - b.rest_local.translation;
+                let scale_delta = Vec3::new(
+                    if b.rest_local.scale.x.abs() > 1e-6 {
+                        b.pose_local.scale.x / b.rest_local.scale.x
+                    } else {
+                        1.0
+                    },
+                    if b.rest_local.scale.y.abs() > 1e-6 {
+                        b.pose_local.scale.y / b.rest_local.scale.y
+                    } else {
+                        1.0
+                    },
+                    if b.rest_local.scale.z.abs() > 1e-6 {
+                        b.pose_local.scale.z / b.rest_local.scale.z
+                    } else {
+                        1.0
+                    },
+                );
+                baked.upsert_keyframe(
+                    b.id,
+                    crate::character::Keyframe {
+                        time_secs: t,
+                        translation: trans_delta,
+                        rotation: rot_delta,
+                        scale: scale_delta,
+                        interpolation: crate::character::KeyframeInterpolation::Linear,
+                    },
+                );
+            }
+            for ((node_id, target), &weight) in &sim.morph_weights {
+                baked.upsert_morph_weight(*node_id, target, t, weight);
+            }
+            for (&node_id, &visible) in &sim.node_visibility {
+                if step == 0 || last_vis.get(&node_id).copied() != Some(visible) {
+                    baked.upsert_visibility_key(node_id, t, visible);
+                    last_vis.insert(node_id, visible);
+                }
+            }
+        }
+        Some(baked)
+    }
+
+    /// Samples in-between frames of `clip_index` at `fps` and adjusts the sub-skeleton's
+    /// root bone Y translation keyframes so the character never penetrates or floats above `floor_y`.
+    pub fn clamp_clip_to_floor(
+        &self,
+        clip_index: usize,
+        bone_prefix: &str,
+        floor_y: f32,
+        fps: f32,
+    ) -> Option<AnimationClip> {
+        let mut clip = self.animations.get(clip_index)?.clone();
+        let (root_id, _) = self.sub_skeleton_root_and_bones(bone_prefix)?;
+        let duration = clip.duration_secs.max(0.05);
+        let steps = ((duration * fps.clamp(1.0, 120.0)).round() as usize).max(1);
+
+        let mut sim = self.clone();
+        sim.clip_layers.clear();
+        sim.active_animation = clip_index;
+
+        for step in 0..=steps {
+            let t = if step == steps {
+                duration
+            } else {
+                (step as f32 / steps as f32) * duration
+            };
+            sim.playback_time = if step == steps {
+                (duration - 1e-4).max(0.0)
+            } else {
+                t
+            };
+            sim.apply_active_animation();
+            let _ = sim.clamp_sub_skeleton_to_floor(bone_prefix, floor_y);
+            if let Some(root) = sim.bones.iter().find(|b| b.id == root_id) {
+                let rot_delta = root.rest_local.rotation.inverse() * root.pose_local.rotation;
+                let trans_delta = root.pose_local.translation - root.rest_local.translation;
+                let existing_interp = clip
+                    .channels
+                    .iter()
+                    .find(|c| c.bone_id == root_id)
+                    .and_then(|c| c.keyframes.iter().find(|k| (k.time_secs - t).abs() <= 1e-3))
+                    .map(|k| k.interpolation)
+                    .unwrap_or(crate::character::KeyframeInterpolation::Linear);
+                clip.upsert_keyframe(
+                    root_id,
+                    crate::character::Keyframe {
+                        time_secs: t,
+                        translation: trans_delta,
+                        rotation: rot_delta,
+                        scale: Vec3::ONE,
+                        interpolation: existing_interp,
+                    },
+                );
+            }
+        }
+        Some(clip)
     }
 
     /// Picks the closest bone joint within `pick_radius` of a world-space ray.

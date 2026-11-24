@@ -73,19 +73,31 @@ fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
     let floor_radius = max(rx, rz) * 4.2 + height * 0.75;
     let floor_dist = length(rel) / max(floor_radius, 0.5);
     let floor_falloff = (1.0 - smoothstep(0.0, 1.0, floor_dist));
-    let floor_alpha = floor_falloff * floor_falloff * 0.42;
+    let floor_alpha = floor_falloff * floor_falloff * 0.22;
 
     // Tight elliptical contact AO shadow directly under the asset footprint
-    let contact_d = length(vec2<f32>(rel.x / (rx * 1.15), rel.y / (rz * 1.15)));
-    let contact_shadow = exp(-contact_d * contact_d * 2.2) * 0.72;
+    let contact_d = length(vec2<f32>(rel.x / (rx * 1.12), rel.y / (rz * 1.12)));
+    let contact_shadow = exp(-contact_d * contact_d * 2.4) * 0.70;
 
-    // Soft directional cast shadow projected opposite the studio key light
+    // Directional cast shadow projected opposite the studio key light and stretched by sun elevation
     let light = normalize(camera.light_dir.xyz);
-    let light_y = max(light.y, 0.35);
-    let shift = -(light.xz / light_y) * (height * 0.32);
+    let light_y = max(light.y, 0.18);
+    let horiz = light.xz;
+    let horiz_len = length(horiz);
+    let proj_dir = select(vec2<f32>(1.0, 0.0), -horiz / horiz_len, horiz_len > 0.001);
+    let perp_dir = vec2<f32>(-proj_dir.y, proj_dir.x);
+
+    let shadow_len = clamp((horiz_len / light_y) * height, 0.0, height * 3.8);
+    let shift = proj_dir * (shadow_len * 0.55);
     let cast_rel = rel - shift;
-    let cast_d = length(vec2<f32>(cast_rel.x / (rx * 1.45), cast_rel.y / (rz * 1.45)));
-    let cast_shadow = exp(-cast_d * cast_d * 1.6) * 0.52;
+
+    let along = dot(cast_rel, proj_dir);
+    let across = dot(cast_rel, perp_dir);
+    let base_r = max(rx, rz);
+    let r_along = base_r * 1.15 + shadow_len * 0.52;
+    let r_across = base_r * 1.18;
+    let cast_d = length(vec2<f32>(along / max(r_along, 0.2), across / max(r_across, 0.2)));
+    let cast_shadow = exp(-cast_d * cast_d * 2.1) * 0.68;
 
     let shadow_mask = clamp(max(contact_shadow, cast_shadow) * opacity, 0.0, 0.92);
 
@@ -93,7 +105,7 @@ fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
     let floor_color = vec3<f32>(0.065, 0.075, 0.095);
     let shadow_color = vec3<f32>(0.001, 0.0015, 0.0025);
     let color = mix(floor_color, shadow_color, shadow_mask);
-    let final_alpha = clamp(max(floor_alpha, shadow_mask * 0.85), 0.0, 0.92);
+    let final_alpha = clamp(max(floor_alpha, shadow_mask * 0.88), 0.0, 0.92);
 
     if final_alpha <= 0.002 {
         discard;

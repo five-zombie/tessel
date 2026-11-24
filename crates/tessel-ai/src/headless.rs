@@ -133,15 +133,29 @@ pub fn render_turntable_gif_with_renderer(
 
     let mut work_scene = scene.clone();
     let active_clip_duration: Option<f32> = work_scene.character_rig.as_mut().and_then(|rig| {
-        let idx = if let Some(ci) = parsed.clip_index {
-            (ci < rig.animations.len()).then_some(ci)
-        } else if let Some(ref cname) = parsed.clip_name {
-            rig.animations.iter().position(|c| c.name == *cname)
-        } else {
-            None
-        }?;
-        rig.active_animation = idx;
-        Some(rig.animations[idx].duration_secs)
+        if let Some(ci) = parsed.clip_index {
+            if ci < rig.animations.len() {
+                rig.active_animation = ci;
+                return Some(rig.animations[ci].duration_secs);
+            }
+            return None;
+        }
+        if let Some(ref cname) = parsed.clip_name {
+            let idx = rig.animations.iter().position(|c| c.name == *cname)?;
+            rig.active_animation = idx;
+            return Some(rig.animations[idx].duration_secs);
+        }
+        if !rig.clip_layers.is_empty() {
+            let dur = rig
+                .clip_layers
+                .iter()
+                .filter_map(|l| rig.animations.get(l.clip_index).map(|c| c.duration_secs))
+                .fold(0.0_f32, f32::max);
+            if dur > 0.0 {
+                return Some(dur);
+            }
+        }
+        None
     });
 
     viewport.resize(device, parsed.width, parsed.height);

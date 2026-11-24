@@ -41,9 +41,15 @@ struct StudioState {
     scene: SceneState,
     history: HistoryStack,
     camera_3d: OrbitCamera,
+    camera_3d_target: Option<OrbitCamera>,
+    showcase_camera: OrbitCamera,
+    showcase_camera_target: Option<OrbitCamera>,
+    display_light_azimuth: f32,
+    display_light_elevation: f32,
     camera_2d: PixelCamera2D,
     pixel_drag_start: Option<PixelCoord>,
     gizmo_drag: Option<ui::viewport::GizmoDragState>,
+    scene_gadget_drag: Option<ui::viewport::SceneGadgetDrag>,
     free_view: bool,
     render_preview: bool,
     export_dialog: ui::export_dialog::ExportDialogState,
@@ -110,17 +116,126 @@ fn read_finite(args: &serde_json::Value, key: &str) -> Result<f32, tessel_ai::Ai
         .ok_or_else(|| AiError::InvalidArguments(format!("missing finite number '{key}'")))
 }
 
+pub fn shortest_angle_delta(from: f32, to: f32) -> f32 {
+    (to - from + std::f32::consts::PI).rem_euclid(std::f32::consts::TAU) - std::f32::consts::PI
+}
+
+/// Exponentially eases `current` toward `target`. Returns `true` while still moving.
+pub fn smooth_step_camera(current: &mut OrbitCamera, target: OrbitCamera, dt: f32) -> bool {
+    let alpha = 1.0 - (-12.0 * dt.clamp(0.001, 0.05)).exp();
+    let dyaw = shortest_angle_delta(current.yaw, target.yaw);
+    let dpitch = target.pitch - current.pitch;
+    let ddist = target.distance - current.distance;
+    let dtarget = target.target - current.target;
+    if dtarget.length() < 1e-4 && dyaw.abs() < 1e-4 && dpitch.abs() < 1e-4 && ddist.abs() < 1e-4 {
+        *current = target;
+        return false;
+    }
+    current.target = current.target.lerp(target.target, alpha);
+    current.yaw += dyaw * alpha;
+    current.pitch += dpitch * alpha;
+    current.distance += ddist * alpha;
+    true
+}
+
+/// Exponentially eases display light angles toward target angles. Returns `true` while still moving.
+pub fn smooth_step_light(
+    cur_az: &mut f32,
+    cur_el: &mut f32,
+    target_az: f32,
+    target_el: f32,
+    dt: f32,
+) -> bool {
+    let alpha = 1.0 - (-12.0 * dt.clamp(0.001, 0.05)).exp();
+    let daz = shortest_angle_delta(*cur_az, target_az);
+    let del = target_el - *cur_el;
+    if daz.abs() < 1e-4 && del.abs() < 1e-4 {
+        *cur_az = target_az;
+        *cur_el = target_el;
+        return false;
+    }
+    *cur_az = (*cur_az + daz * alpha).rem_euclid(std::f32::consts::TAU);
+    *cur_el += del * alpha;
+    true
+}
+
+fn select_camera_target(args: &serde_json::Value) -> Result<bool, tessel_ai::AiError> {
+    match args.get("camera").and_then(serde_json::Value::as_str) {
+        None | Some("viewport") => Ok(false),
+        Some("scene") => Ok(true),
+        Some(_) => Err(tessel_ai::AiError::InvalidArguments(
+            "'camera' must be 'viewport' or 'scene'".into(),
+        )),
+    }
+}
+
 fn handle_camera_tool_call(
     tool_name: &str,
     args: &serde_json::Value,
-    cam: &mut OrbitCamera,
+    viewport_cam: &mut OrbitCamera,
+    scene_cam: &mut OrbitCamera,
 ) -> Result<serde_json::Value, tessel_ai::AiError> {
     use tessel_ai::AiError;
+    let is_scene = select_camera_target(args)?;
+    let cam_label = if is_scene { "scene" } else { "viewport" };
+    if tool_name == "camera_get" {
+        let selected: &OrbitCamera = if is_scene { scene_cam } else { viewport_cam };
+        return Ok(serde_json::json!({
+            "ok": true,
+            "target_camera": cam_label,
+            "camera": camera_state_json(selected),
+            "viewport": camera_state_json(viewport_cam),
+            "scene": camera_state_json(scene_cam),
+        }));
+    }
+    let cam = if is_scene { scene_cam } else { viewport_cam };
     match tool_name {
-        "camera_get" => Ok(serde_json::json!({ "ok": true, "camera": camera_state_json(cam) })),
+        "camera_set_pose" => {
+            let mut any = false;
+            if args.get("target").is_some() {
+                cam.target = read_vec3(args, "target")?;
+                any = true;
+            }
+            if args.get("yaw_deg").is_some() {
+                cam.yaw = read_finite(args, "yaw_deg")?.to_radians();
+                any = true;
+            } else if args.get("yaw").is_some() {
+                cam.yaw = read_finite(args, "yaw")?;
+                any = true;
+            }
+            if args.get("pitch_deg").is_some() {
+                cam.pitch = read_finite(args, "pitch_deg")?
+                    .to_radians()
+                    .clamp(-1.52, 1.52);
+                any = true;
+            } else if args.get("pitch").is_some() {
+                cam.pitch = read_finite(args, "pitch")?.clamp(-1.52, 1.52);
+                any = true;
+            }
+            if args.get("distance").is_some() {
+                let d = read_finite(args, "distance")?;
+                if d <= 0.0 {
+                    return Err(AiError::InvalidArguments(
+                        "'distance' must be a finite number > 0".into(),
+                    ));
+                }
+                cam.distance = d.clamp(0.25, 120.0);
+                any = true;
+            }
+            if !any {
+                return Err(AiError::InvalidArguments(
+                    "camera_set_pose needs at least one of target, yaw_deg/yaw, pitch_deg/pitch, distance".into(),
+                ));
+            }
+            Ok(
+                serde_json::json!({ "ok": true, "target_camera": cam_label, "camera": camera_state_json(cam) }),
+            )
+        }
         "camera_look_at" => {
             cam.target = read_vec3(args, "target")?;
-            Ok(serde_json::json!({ "ok": true, "camera": camera_state_json(cam) }))
+            Ok(
+                serde_json::json!({ "ok": true, "target_camera": cam_label, "camera": camera_state_json(cam) }),
+            )
         }
         "camera_zoom" => {
             if let Some(f) = args.get("factor").and_then(serde_json::Value::as_f64) {
@@ -144,21 +259,33 @@ fn handle_camera_tool_call(
                     "camera_zoom needs 'factor' or 'distance'".into(),
                 ));
             }
-            Ok(serde_json::json!({ "ok": true, "camera": camera_state_json(cam) }))
+            Ok(
+                serde_json::json!({ "ok": true, "target_camera": cam_label, "camera": camera_state_json(cam) }),
+            )
         }
         "camera_orbit" => {
             let (dx, dy) = (read_finite(args, "dx")?, read_finite(args, "dy")?);
             cam.orbit(dx, dy);
-            Ok(serde_json::json!({ "ok": true, "camera": camera_state_json(cam) }))
+            Ok(
+                serde_json::json!({ "ok": true, "target_camera": cam_label, "camera": camera_state_json(cam) }),
+            )
         }
         "camera_pan" => {
             let (dx, dy) = (read_finite(args, "dx")?, read_finite(args, "dy")?);
             cam.pan(dx, dy);
-            Ok(serde_json::json!({ "ok": true, "camera": camera_state_json(cam) }))
+            Ok(
+                serde_json::json!({ "ok": true, "target_camera": cam_label, "camera": camera_state_json(cam) }),
+            )
         }
         "camera_reset" => {
-            cam.reset();
-            Ok(serde_json::json!({ "ok": true, "camera": camera_state_json(cam) }))
+            if is_scene {
+                *cam = default_showcase_camera();
+            } else {
+                cam.reset();
+            }
+            Ok(
+                serde_json::json!({ "ok": true, "target_camera": cam_label, "camera": camera_state_json(cam) }),
+            )
         }
         "camera_preset" => {
             let name = args
@@ -179,7 +306,9 @@ fn handle_camera_tool_call(
                 }
             };
             cam.set_preset(preset);
-            Ok(serde_json::json!({ "ok": true, "camera": camera_state_json(cam) }))
+            Ok(
+                serde_json::json!({ "ok": true, "target_camera": cam_label, "camera": camera_state_json(cam) }),
+            )
         }
         other => Err(AiError::UnknownTool(other.to_string())),
     }
@@ -243,11 +372,27 @@ impl StudioState {
                     .get("arguments")
                     .cloned()
                     .unwrap_or(serde_json::Value::Null);
-                let result = match handle_camera_tool_call(call_name, &args, &mut self.camera_3d) {
-                    Ok(val) => serde_json::json!({
-                        "content": [{ "type": "text", "text": val.to_string() }],
-                        "isError": false
-                    }),
+                let mut vp_goal = self.camera_3d_target.unwrap_or(self.camera_3d);
+                let mut sc_goal = self.showcase_camera_target.unwrap_or(self.showcase_camera);
+                let result = match handle_camera_tool_call(
+                    call_name,
+                    &args,
+                    &mut vp_goal,
+                    &mut sc_goal,
+                ) {
+                    Ok(val) => {
+                        if call_name != "camera_get" {
+                            if select_camera_target(&args).unwrap_or(false) {
+                                self.showcase_camera_target = Some(sc_goal);
+                            } else {
+                                self.camera_3d_target = Some(vp_goal);
+                            }
+                        }
+                        serde_json::json!({
+                            "content": [{ "type": "text", "text": val.to_string() }],
+                            "isError": false
+                        })
+                    }
                     Err(err) => serde_json::json!({
                         "content": [{ "type": "text", "text": err.to_structured_json().to_string() }],
                         "isError": true
@@ -369,6 +514,14 @@ impl StudioState {
     }
 }
 
+fn default_showcase_camera() -> OrbitCamera {
+    let mut cam = OrbitCamera::new();
+    cam.yaw = -0.65;
+    cam.pitch = 0.28;
+    cam.distance = 4.2;
+    cam
+}
+
 impl Default for StudioState {
     fn default() -> Self {
         let paths = AppPaths::resolve();
@@ -413,13 +566,22 @@ impl Default for StudioState {
         ai_state.config.base_url = settings.ai_base_url.clone();
         ai_state.config.api_key = load_api_key_from_keyring(settings.ai_provider);
 
+        let display_light_azimuth = scene.light_azimuth;
+        let display_light_elevation = scene.light_elevation;
+
         Self {
             scene,
             history: HistoryStack::new(),
             camera_3d: OrbitCamera::new(),
+            camera_3d_target: None,
+            showcase_camera: default_showcase_camera(),
+            showcase_camera_target: None,
+            display_light_azimuth,
+            display_light_elevation,
             camera_2d: PixelCamera2D::new(),
             pixel_drag_start: None,
             gizmo_drag: None,
+            scene_gadget_drag: None,
             free_view: true,
             render_preview: false,
             export_dialog,
@@ -631,6 +793,37 @@ impl GpuState {
         let mut export_action = ui::export_dialog::ExportAction::None;
 
         let full_output = self.egui_ctx.run(raw_input, |ctx| {
+            let dt = ctx.input(|i| i.unstable_dt).clamp(0.001, 0.05);
+            if let Some(goal) = studio.camera_3d_target {
+                if smooth_step_camera(&mut studio.camera_3d, goal, dt) {
+                    ctx.request_repaint();
+                } else {
+                    studio.camera_3d_target = None;
+                }
+            }
+            if let Some(goal) = studio.showcase_camera_target {
+                if smooth_step_camera(&mut studio.showcase_camera, goal, dt) {
+                    ctx.request_repaint();
+                } else {
+                    studio.showcase_camera_target = None;
+                }
+            }
+            if matches!(
+                studio.scene_gadget_drag,
+                Some(ui::viewport::SceneGadgetDrag::Sun { .. })
+            ) {
+                studio.display_light_azimuth = studio.scene.light_azimuth;
+                studio.display_light_elevation = studio.scene.light_elevation;
+            } else if smooth_step_light(
+                &mut studio.display_light_azimuth,
+                &mut studio.display_light_elevation,
+                studio.scene.light_azimuth,
+                studio.scene.light_elevation,
+                dt,
+            ) {
+                ctx.request_repaint();
+            }
+
             handle_global_shortcuts(
                 ctx,
                 &mut studio.scene,
@@ -698,9 +891,14 @@ impl GpuState {
                 &mut studio.scene,
                 &mut studio.history,
                 &mut studio.camera_3d,
+                &mut studio.camera_3d_target,
+                &mut studio.showcase_camera,
+                &mut studio.showcase_camera_target,
+                (studio.display_light_azimuth, studio.display_light_elevation),
                 &mut studio.camera_2d,
                 &mut studio.pixel_drag_start,
                 &mut studio.gizmo_drag,
+                &mut studio.scene_gadget_drag,
                 &mut studio.free_view,
                 &mut studio.render_preview,
             );
@@ -987,9 +1185,15 @@ impl GpuState {
             studio.scene = SceneState::new();
             studio.history = HistoryStack::new();
             studio.camera_3d.reset();
+            studio.camera_3d_target = None;
+            studio.showcase_camera = default_showcase_camera();
+            studio.showcase_camera_target = None;
+            studio.display_light_azimuth = studio.scene.light_azimuth;
+            studio.display_light_elevation = studio.scene.light_elevation;
             studio.camera_2d.reset();
             studio.pixel_drag_start = None;
             studio.gizmo_drag = None;
+            studio.scene_gadget_drag = None;
             studio.export_dialog.status_message = None;
             studio.project_files.current_path = None;
             studio
@@ -1051,7 +1255,7 @@ impl GpuState {
                 label: Some("tessel-frame-encoder"),
             });
 
-        self.viewport_renderer.render(
+        self.viewport_renderer.render_with_light(
             &self.queue,
             &mut encoder,
             &studio.scene,
@@ -1059,6 +1263,8 @@ impl GpuState {
             &studio.camera_2d,
             self.window.scale_factor() as f32,
             studio.render_preview,
+            studio.display_light_azimuth,
+            studio.display_light_elevation,
         );
 
         let screen_descriptor = egui_wgpu::ScreenDescriptor {
@@ -1224,6 +1430,7 @@ mod tests {
     #[test]
     fn camera_tools_drive_viewport_state() {
         let mut cam = OrbitCamera::new();
+        let mut scene_cam = default_showcase_camera();
         assert!((cam.distance - 9.0).abs() < 1e-6);
 
         // Absolute zoom + readback.
@@ -1231,6 +1438,7 @@ mod tests {
             "camera_zoom",
             &serde_json::json!({ "distance": 3.0 }),
             &mut cam,
+            &mut scene_cam,
         )
         .unwrap();
         assert!((res["camera"]["distance"].as_f64().unwrap() - 3.0).abs() < 1e-4);
@@ -1240,6 +1448,7 @@ mod tests {
             "camera_zoom",
             &serde_json::json!({ "factor": 0.5 }),
             &mut cam,
+            &mut scene_cam,
         )
         .unwrap();
         assert!((cam.distance - 1.5).abs() < 1e-4);
@@ -1249,6 +1458,7 @@ mod tests {
             "camera_look_at",
             &serde_json::json!({ "target": [1.0, 0.5, -2.0] }),
             &mut cam,
+            &mut scene_cam,
         )
         .unwrap();
         assert_eq!(cam.target, glam::Vec3::new(1.0, 0.5, -2.0));
@@ -1257,6 +1467,7 @@ mod tests {
             "camera_orbit",
             &serde_json::json!({ "dx": 40.0, "dy": -15.0 }),
             &mut cam,
+            &mut scene_cam,
         )
         .unwrap();
         assert!((cam.yaw - before.0).abs() > 1e-6);
@@ -1266,6 +1477,7 @@ mod tests {
             "camera_pan",
             &serde_json::json!({ "dx": 30.0, "dy": 10.0 }),
             &mut cam,
+            &mut scene_cam,
         )
         .unwrap();
         assert!((cam.target - target_before).length() > 1e-6);
@@ -1275,16 +1487,75 @@ mod tests {
             "camera_preset",
             &serde_json::json!({ "name": "front" }),
             &mut cam,
+            &mut scene_cam,
         )
         .unwrap();
         assert!(cam.yaw.abs() < 1e-6);
-        handle_camera_tool_call("camera_reset", &serde_json::json!({}), &mut cam).unwrap();
+        handle_camera_tool_call(
+            "camera_reset",
+            &serde_json::json!({}),
+            &mut cam,
+            &mut scene_cam,
+        )
+        .unwrap();
         assert!((cam.distance - 9.0).abs() < 1e-6);
+
+        // Scene/projector camera routing + camera_set_pose.
+        let pose_res = handle_camera_tool_call(
+            "camera_set_pose",
+            &serde_json::json!({
+                "camera": "scene",
+                "target": [0.0, 1.2, 0.0],
+                "yaw_deg": 90.0,
+                "pitch_deg": 20.0,
+                "distance": 5.0
+            }),
+            &mut cam,
+            &mut scene_cam,
+        )
+        .unwrap();
+        assert_eq!(pose_res["target_camera"], "scene");
+        assert!((scene_cam.yaw - 90.0_f32.to_radians()).abs() < 1e-5);
+        assert!((scene_cam.distance - 5.0).abs() < 1e-5);
+        // Viewport camera remained untouched.
+        assert!((cam.distance - 9.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn smooth_step_camera_and_light_converge() {
+        let mut cam = OrbitCamera::new();
+        let mut goal = OrbitCamera::new();
+        goal.yaw = 2.4;
+        goal.pitch = 0.8;
+        goal.distance = 4.0;
+        goal.target = glam::Vec3::new(1.0, 1.5, -0.5);
+        let mut moving = true;
+        for _ in 0..120 {
+            moving = smooth_step_camera(&mut cam, goal, 0.016);
+            if !moving {
+                break;
+            }
+        }
+        assert!(!moving);
+        assert!((cam.distance - goal.distance).abs() < 1e-4);
+
+        let mut az = 0.1_f32;
+        let mut el = 0.4_f32;
+        let mut light_moving = true;
+        for _ in 0..120 {
+            light_moving = smooth_step_light(&mut az, &mut el, 5.9, 1.1, 0.016);
+            if !light_moving {
+                break;
+            }
+        }
+        assert!(!light_moving);
+        assert!((el - 1.1).abs() < 1e-4);
     }
 
     #[test]
     fn camera_tools_reject_bad_input() {
         let mut cam = OrbitCamera::new();
+        let mut scene_cam = default_showcase_camera();
         for (name, v) in [
             ("camera_zoom", serde_json::json!({})),
             ("camera_zoom", serde_json::json!({ "factor": -1.0 })),
@@ -1299,10 +1570,13 @@ mod tests {
                 serde_json::json!({ "name": "upside-down" }),
             ),
             ("camera_preset", serde_json::json!({})),
+            ("camera_set_pose", serde_json::json!({})),
+            ("camera_set_pose", serde_json::json!({ "distance": 0.0 })),
+            ("camera_get", serde_json::json!({ "camera": "invalid" })),
             ("camera_nope", serde_json::json!({})),
         ] {
             assert!(
-                handle_camera_tool_call(name, &v, &mut cam).is_err(),
+                handle_camera_tool_call(name, &v, &mut cam, &mut scene_cam).is_err(),
                 "{name} should be rejected"
             );
         }

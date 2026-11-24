@@ -70,12 +70,24 @@ impl CollectedMesh {
             indices.extend(mesh.indices.into_iter().map(|i| i + base));
         }
 
+        let vis_animated: std::collections::BTreeSet<tessel_core::NodeId> = scene
+            .character_rig
+            .as_ref()
+            .map(|rig| {
+                rig.animations
+                    .iter()
+                    .flat_map(|c| c.visibility_tracks.iter().map(|t| t.node))
+                    .collect()
+            })
+            .unwrap_or_default();
+
         for (node_id, mesh) in &scene.lowpoly_meshes {
             let visible = scene.nodes.get(node_id).map(|n| n.visible).unwrap_or(true);
             let is_custom = mesh.texture.is_some()
                 || mesh.normal_map.is_some()
                 || mesh.material != tessel_core::MeshMaterial::default()
-                || !mesh.morphs.is_empty();
+                || !mesh.morphs.is_empty()
+                || vis_animated.contains(node_id);
             if !visible || mesh.faces.is_empty() || is_custom {
                 continue;
             }
@@ -372,17 +384,27 @@ pub fn export_glb_bytes(
     let mut animations: Vec<Value> = Vec::new();
     let mut skins: Vec<Value> = Vec::new();
 
-    // Morphed meshes get dedicated export nodes appended after the bone
-    // nodes by the custom-primitive pass below. Precompute their order
-    // here (same BTreeMap order and same skip filters) so morph weight
-    // channels and node indices agree.
+    // Morphed and visibility-animated meshes get dedicated export nodes appended
+    // after the bone nodes by the custom-primitive pass below. Precompute their
+    // order here (same BTreeMap order and same skip filters) so animation channels
+    // and node indices agree.
+    let vis_animated_nodes: std::collections::BTreeSet<tessel_core::NodeId> = scene
+        .character_rig
+        .as_ref()
+        .map(|rig| {
+            rig.animations
+                .iter()
+                .flat_map(|c| c.visibility_tracks.iter().map(|t| t.node))
+                .collect()
+        })
+        .unwrap_or_default();
     let morphed_order: Vec<tessel_core::NodeId> = scene
         .lowpoly_meshes
         .iter()
         .filter(|(id, m)| {
             scene.nodes.get(id).map(|n| n.visible).unwrap_or(true)
                 && !m.faces.is_empty()
-                && !m.morphs.is_empty()
+                && (!m.morphs.is_empty() || vis_animated_nodes.contains(id))
                 && !m.to_triangulated_flat().vertices.is_empty()
         })
         .map(|(id, _)| *id)
@@ -508,10 +530,20 @@ pub fn export_glb_bytes(
                     "type": "VEC4"
                 }));
 
+                let interp_mode = if ch
+                    .keyframes
+                    .iter()
+                    .all(|k| k.interpolation == tessel_core::KeyframeInterpolation::Step)
+                {
+                    "STEP"
+                } else {
+                    "LINEAR"
+                };
+
                 let sampler_idx = samplers.len();
                 samplers.push(json!({
                     "input": time_acc,
-                    "interpolation": "LINEAR",
+                    "interpolation": interp_mode,
                     "output": rot_acc
                 }));
                 channels.push(json!({
@@ -672,6 +704,68 @@ pub fn export_glb_bytes(
                 }));
             }
 
+            // Export per-node visibility tracks as STEP-interpolated scale [0,0,0] / [1,1,1].
+            for vis_track in &clip.visibility_tracks {
+                if vis_track.keys.is_empty() {
+                    continue;
+                }
+                let Some(pos) = morphed_order.iter().position(|id| *id == vis_track.node) else {
+                    continue;
+                };
+                let times: Vec<f32> = vis_track.keys.iter().map(|k| k.time_secs).collect();
+                let scales: Vec<[f32; 3]> = vis_track
+                    .keys
+                    .iter()
+                    .map(|k| {
+                        if k.visible {
+                            [1.0, 1.0, 1.0]
+                        } else {
+                            [0.0, 0.0, 0.0]
+                        }
+                    })
+                    .collect();
+                let min_t = times.iter().copied().fold(f32::INFINITY, f32::min);
+                let max_t = times.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+                let time_bv = push_view(
+                    &mut bin,
+                    &mut buffer_views,
+                    bytemuck::cast_slice(&times),
+                    None,
+                );
+                let time_acc = accessors.len();
+                accessors.push(json!({
+                    "bufferView": time_bv,
+                    "componentType": 5126,
+                    "count": times.len(),
+                    "type": "SCALAR",
+                    "min": [min_t],
+                    "max": [max_t]
+                }));
+                let scale_bv = push_view(
+                    &mut bin,
+                    &mut buffer_views,
+                    bytemuck::cast_slice(&scales),
+                    None,
+                );
+                let scale_acc = accessors.len();
+                accessors.push(json!({
+                    "bufferView": scale_bv,
+                    "componentType": 5126,
+                    "count": scales.len(),
+                    "type": "VEC3"
+                }));
+                let sampler_idx = samplers.len();
+                samplers.push(json!({
+                    "input": time_acc,
+                    "interpolation": "STEP",
+                    "output": scale_acc
+                }));
+                channels.push(json!({
+                    "sampler": sampler_idx,
+                    "target": { "node": morph_base_node + pos, "path": "scale" }
+                }));
+            }
+
             if !channels.is_empty() {
                 animations.push(json!({
                     "name": clip.name,
@@ -707,7 +801,8 @@ pub fn export_glb_bytes(
         let has_custom = lp_mesh.texture.is_some()
             || lp_mesh.normal_map.is_some()
             || lp_mesh.material != tessel_core::MeshMaterial::default()
-            || !lp_mesh.morphs.is_empty();
+            || !lp_mesh.morphs.is_empty()
+            || vis_animated_nodes.contains(node_id);
         if !visible || lp_mesh.faces.is_empty() || !has_custom {
             continue;
         }
@@ -929,6 +1024,13 @@ pub fn export_glb_bytes(
             });
             prim_json["targets"] = Value::Array(targets);
             morphed.push((*node_id, prim_json, morph_weights));
+        } else if vis_animated_nodes.contains(node_id) {
+            let prim_json = json!({
+                "attributes": custom_attrs,
+                "indices": i_acc,
+                "material": mat_idx
+            });
+            morphed.push((*node_id, prim_json, Vec::new()));
         } else {
             primitives.push(json!({
                 "attributes": custom_attrs,
@@ -960,11 +1062,14 @@ pub fn export_glb_bytes(
         .eq(morphed_order.iter().copied()));
     for (mnode, prim, weights) in morphed {
         let mesh_idx = meshes.len();
-        meshes.push(json!({
+        let mut mesh_json = json!({
             "name": format!("TesselMesh_{}", mnode.0),
-            "primitives": [prim],
-            "weights": weights
-        }));
+            "primitives": [prim]
+        });
+        if !weights.is_empty() {
+            mesh_json["weights"] = json!(weights);
+        }
+        meshes.push(mesh_json);
         let node_idx = nodes.len();
         let node_name = scene
             .nodes
@@ -1185,6 +1290,7 @@ mod tests {
                 translation: Vec3::new(0.0, 0.1, 0.0),
                 rotation: glam::Quat::IDENTITY,
                 scale: Vec3::new(1.0, 1.0, 2.0),
+                interpolation: Default::default(),
             },
         }
         .apply(&mut scene)
@@ -1504,5 +1610,49 @@ mod tests {
         let parsed = gltf::Gltf::from_slice(&glb).unwrap();
         // All 4 parts share identical PBR parameters + palette texture -> deduplicated to 1 material!
         assert_eq!(parsed.materials().count(), 1);
+    }
+
+    #[test]
+    fn glb_export_writes_step_scale_channels_for_visibility_keyframes() {
+        let mut scene = SceneState::new();
+        Command::CreatePrimitiveMesh {
+            name: "MuzzleFlash".into(),
+            kind: PrimitiveKind::Sphere,
+            size: 0.1,
+            material: PaletteIndex::new(6).unwrap(),
+        }
+        .apply(&mut scene)
+        .unwrap();
+        let flash_id = scene.active_lowpoly_node().unwrap();
+        Command::ApplyHumanoidRig.apply(&mut scene).unwrap();
+        Command::SetVisibilityKeyframe {
+            clip_index: 0,
+            node_id: flash_id,
+            time_secs: 0.0,
+            visible: false,
+        }
+        .apply(&mut scene)
+        .unwrap();
+        Command::SetVisibilityKeyframe {
+            clip_index: 0,
+            node_id: flash_id,
+            time_secs: 0.25,
+            visible: true,
+        }
+        .apply(&mut scene)
+        .unwrap();
+
+        let (glb, _) = export_glb_bytes(&scene, ExportPreset::Godot4).unwrap();
+        let parsed = gltf::Gltf::from_slice(&glb).unwrap();
+        let idle = parsed.animations().next().expect("Idle clip must export");
+        let vis_chan = idle
+            .channels()
+            .find(|c| {
+                c.target().property() == gltf::animation::Property::Scale
+                    && c.sampler().interpolation() == gltf::animation::Interpolation::Step
+            })
+            .expect("visibility track should export as STEP scale channel");
+        // Node 0 = merged mesh, nodes 1..=19 = 19 humanoid bones, node 20 = dedicated MuzzleFlash
+        assert_eq!(vis_chan.target().node().index(), 20);
     }
 }

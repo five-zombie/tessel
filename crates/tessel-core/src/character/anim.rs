@@ -26,13 +26,29 @@ pub struct MorphWeightTrack {
     pub keys: Vec<MorphWeightKey>,
 }
 
-/// Keyframe animation clip supporting linear translation/scale & SLERP rotation.
+/// Single step visibility keyframe for a scene node.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct VisibilityKey {
+    pub time_secs: f32,
+    pub visible: bool,
+}
+
+/// Step-interpolated visibility animation track for one scene node.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct VisibilityTrack {
+    pub node: NodeId,
+    pub keys: Vec<VisibilityKey>,
+}
+
+/// Keyframe animation clip supporting linear translation/scale, SLERP rotation, morph weights & node visibility.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AnimationClip {
     pub name: String,
     pub duration_secs: f32,
     pub channels: Vec<BoneChannel>,
     pub morph_tracks: Vec<MorphWeightTrack>,
+    #[serde(default)]
+    pub visibility_tracks: Vec<VisibilityTrack>,
 }
 
 impl AnimationClip {
@@ -42,6 +58,7 @@ impl AnimationClip {
             duration_secs: duration_secs.max(0.1),
             channels: Vec::new(),
             morph_tracks: Vec::new(),
+            visibility_tracks: Vec::new(),
         }
     }
 
@@ -277,6 +294,59 @@ impl AnimationClip {
         out
     }
 
+    /// Inserts or replaces a step visibility keyframe (within 1ms tolerance) for `node`.
+    pub fn upsert_visibility_key(&mut self, node: NodeId, time_secs: f32, visible: bool) {
+        let time = time_secs.max(0.0);
+        if time > self.duration_secs {
+            self.duration_secs = time;
+        }
+        if let Some(track) = self.visibility_tracks.iter_mut().find(|t| t.node == node) {
+            if let Some(existing) = track
+                .keys
+                .iter_mut()
+                .find(|k| (k.time_secs - time).abs() <= 1e-3)
+            {
+                existing.visible = visible;
+            } else {
+                track.keys.push(VisibilityKey {
+                    time_secs: time,
+                    visible,
+                });
+                track
+                    .keys
+                    .sort_by(|a, b| a.time_secs.total_cmp(&b.time_secs));
+            }
+        } else {
+            self.visibility_tracks.push(VisibilityTrack {
+                node,
+                keys: vec![VisibilityKey {
+                    time_secs: time,
+                    visible,
+                }],
+            });
+        }
+    }
+
+    /// Samples every node visibility track at `time_secs` (step hold from latest key <= time_secs).
+    pub fn sample_node_visibility(&self, time_secs: f32) -> Vec<(NodeId, bool)> {
+        let mut out = Vec::with_capacity(self.visibility_tracks.len());
+        for track in &self.visibility_tracks {
+            let Some(first) = track.keys.first() else {
+                continue;
+            };
+            let mut val = first.visible;
+            for k in &track.keys {
+                if k.time_secs <= time_secs + 1e-4 {
+                    val = k.visible;
+                } else {
+                    break;
+                }
+            }
+            out.push((track.node, val));
+        }
+        out
+    }
+
     /// Returns deduplicated sorted keyframe timestamps for a specific bone or the whole clip.
     pub fn keyframe_times(&self, bone_id: Option<BoneId>) -> Vec<f32> {
         let mut times: Vec<f32> = self
@@ -309,11 +379,13 @@ impl AnimationClip {
             if time_secs >= a.time_secs && time_secs <= b.time_secs {
                 let span = (b.time_secs - a.time_secs).max(1e-5);
                 let alpha = ((time_secs - a.time_secs) / span).clamp(0.0, 1.0);
+                let eased = a.interpolation.apply(alpha);
                 return Some(Keyframe {
                     time_secs,
-                    translation: a.translation.lerp(b.translation, alpha),
-                    rotation: a.rotation.slerp(b.rotation, alpha),
-                    scale: a.scale.lerp(b.scale, alpha),
+                    translation: a.translation.lerp(b.translation, eased),
+                    rotation: a.rotation.slerp(b.rotation, eased),
+                    scale: a.scale.lerp(b.scale, eased),
+                    interpolation: a.interpolation,
                 });
             }
         }
@@ -325,6 +397,7 @@ impl AnimationClip {
             name: "Idle".into(),
             duration_secs: 2.0,
             morph_tracks: Vec::new(),
+            visibility_tracks: Vec::new(),
             channels: vec![BoneChannel {
                 bone_id: BoneId(1), // Torso subtle breathing
                 keyframes: vec![
@@ -333,18 +406,21 @@ impl AnimationClip {
                         translation: Vec3::ZERO,
                         rotation: Quat::IDENTITY,
                         scale: Vec3::ONE,
+                        interpolation: Default::default(),
                     },
                     Keyframe {
                         time_secs: 1.0,
                         translation: Vec3::new(0.0, 0.03, 0.0),
                         rotation: Quat::IDENTITY,
                         scale: Vec3::ONE,
+                        interpolation: Default::default(),
                     },
                     Keyframe {
                         time_secs: 2.0,
                         translation: Vec3::ZERO,
                         rotation: Quat::IDENTITY,
                         scale: Vec3::ONE,
+                        interpolation: Default::default(),
                     },
                 ],
             }],
@@ -358,6 +434,7 @@ impl AnimationClip {
             name: "Walk".into(),
             duration_secs: 1.0,
             morph_tracks: Vec::new(),
+            visibility_tracks: Vec::new(),
             channels: vec![
                 BoneChannel {
                     bone_id: BoneId(3), // LeftArm

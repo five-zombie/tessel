@@ -1,7 +1,9 @@
 use glam::Quat;
 use serde::{Deserialize, Serialize};
 
-use crate::character::{AnimationClip, Bone, BoneId, CharacterRig, Keyframe, SkinBinding};
+use crate::character::{
+    AnimationClip, Bone, BoneId, CharacterRig, ClipLayer, Keyframe, SkinBinding,
+};
 use crate::error::CoreError;
 use crate::mesh::{
     ops as mesh_ops, FaceId, LowPolyMesh, MeshMaterial, MeshTexture, PrimitiveKind, UvProjection,
@@ -272,9 +274,17 @@ pub enum Command {
         bone_id: BoneId,
         position: glam::Vec3,
     },
+    SetBoneRestRotation {
+        bone_id: BoneId,
+        rotation: Quat,
+    },
     SetBoneRotation {
         bone_id: BoneId,
         rotation: Quat,
+    },
+    SetBoneTranslation {
+        bone_id: BoneId,
+        translation: glam::Vec3,
     },
     SolveTwoBoneIk {
         root_bone: BoneId,
@@ -317,6 +327,19 @@ pub enum Command {
         node_id: NodeId,
         target: String,
         time_secs: f32,
+    },
+    SetVisibilityKeyframe {
+        clip_index: usize,
+        node_id: NodeId,
+        time_secs: f32,
+        visible: bool,
+    },
+    SetClipLayers {
+        layers: Vec<ClipLayer>,
+    },
+    UpsertAnimationClip {
+        clip: AnimationClip,
+        activate: bool,
     },
     SetActiveAnimationClip {
         clip_index: usize,
@@ -445,11 +468,21 @@ pub enum UndoDelta {
         bone_id: BoneId,
         previous: Quat,
     },
+    RestoreBoneTranslation {
+        bone_id: BoneId,
+        previous: glam::Vec3,
+    },
     RestoreBoneRestPosition {
         bone_id: BoneId,
         previous_rest: glam::Vec3,
         previous_pose: glam::Vec3,
     },
+    RestoreBoneRestRotation {
+        bone_id: BoneId,
+        previous_rest: Quat,
+        previous_pose: Quat,
+    },
+    RestoreClipLayers(Vec<ClipLayer>),
     RestoreNodeBoneBinding {
         node_id: NodeId,
         previous: Option<BoneId>,
@@ -1640,6 +1673,25 @@ impl Command {
                     previous,
                 }
             }
+            Self::SetBoneTranslation {
+                bone_id,
+                translation,
+            } => {
+                if !translation.is_finite() {
+                    return Err(CoreError::OutOfBounds);
+                }
+                let rig = scene
+                    .character_rig
+                    .as_mut()
+                    .ok_or(CoreError::CharacterRigNotFound)?;
+                let bone = rig.bone_mut(*bone_id).ok_or(CoreError::OutOfBounds)?;
+                let previous = bone.pose_local.translation;
+                bone.pose_local.translation = *translation;
+                UndoDelta::RestoreBoneTranslation {
+                    bone_id: *bone_id,
+                    previous,
+                }
+            }
             Self::SetBoneRestPosition { bone_id, position } => {
                 if !position.is_finite() {
                     return Err(CoreError::OutOfBounds);
@@ -1654,6 +1706,25 @@ impl Command {
                 bone.rest_local.translation = *position;
                 bone.pose_local.translation = *position;
                 UndoDelta::RestoreBoneRestPosition {
+                    bone_id: *bone_id,
+                    previous_rest,
+                    previous_pose,
+                }
+            }
+            Self::SetBoneRestRotation { bone_id, rotation } => {
+                if !rotation.is_finite() {
+                    return Err(CoreError::OutOfBounds);
+                }
+                let rig = scene
+                    .character_rig
+                    .as_mut()
+                    .ok_or(CoreError::CharacterRigNotFound)?;
+                let bone = rig.bone_mut(*bone_id).ok_or(CoreError::OutOfBounds)?;
+                let previous_rest = bone.rest_local.rotation;
+                let previous_pose = bone.pose_local.rotation;
+                bone.rest_local.rotation = *rotation;
+                bone.pose_local.rotation = *rotation;
+                UndoDelta::RestoreBoneRestRotation {
                     bone_id: *bone_id,
                     previous_rest,
                     previous_pose,
@@ -1845,6 +1916,71 @@ impl Command {
                 UndoDelta::RestoreAnimationClip {
                     clip_index: *clip_index,
                     previous,
+                }
+            }
+            Self::SetVisibilityKeyframe {
+                clip_index,
+                node_id,
+                time_secs,
+                visible,
+            } => {
+                if !time_secs.is_finite() || *time_secs < 0.0 {
+                    return Err(CoreError::OutOfBounds);
+                }
+                if !scene.nodes.contains_key(node_id) {
+                    return Err(CoreError::NodeNotFound(*node_id));
+                }
+                let rig = scene
+                    .character_rig
+                    .as_mut()
+                    .ok_or(CoreError::CharacterRigNotFound)?;
+                let clip = rig
+                    .animations
+                    .get_mut(*clip_index)
+                    .ok_or(CoreError::OutOfBounds)?;
+                let previous = clip.clone();
+                clip.upsert_visibility_key(*node_id, *time_secs, *visible);
+                UndoDelta::RestoreAnimationClip {
+                    clip_index: *clip_index,
+                    previous,
+                }
+            }
+            Self::SetClipLayers { layers } => {
+                let rig = scene
+                    .character_rig
+                    .as_mut()
+                    .ok_or(CoreError::CharacterRigNotFound)?;
+                let previous = std::mem::replace(&mut rig.clip_layers, layers.clone());
+                rig.apply_active_animation();
+                UndoDelta::RestoreClipLayers(previous)
+            }
+            Self::UpsertAnimationClip { clip, activate } => {
+                let rig = scene
+                    .character_rig
+                    .as_mut()
+                    .ok_or(CoreError::CharacterRigNotFound)?;
+                if let Some(idx) = rig.animations.iter().position(|c| c.name == clip.name) {
+                    let previous = std::mem::replace(&mut rig.animations[idx], clip.clone());
+                    if *activate {
+                        rig.active_animation = idx;
+                    }
+                    rig.apply_active_animation();
+                    UndoDelta::RestoreAnimationClip {
+                        clip_index: idx,
+                        previous,
+                    }
+                } else {
+                    let previous_active = rig.active_animation;
+                    let previous_time = rig.playback_time;
+                    rig.animations.push(clip.clone());
+                    if *activate {
+                        rig.active_animation = rig.animations.len().saturating_sub(1);
+                    }
+                    rig.apply_active_animation();
+                    UndoDelta::PopAnimationClip {
+                        previous_active,
+                        previous_time,
+                    }
                 }
             }
             Self::RemoveMorphWeightKeyframe {
@@ -2332,6 +2468,14 @@ impl UndoDelta {
                 let bone = rig.bone_mut(*bone_id).ok_or(CoreError::OutOfBounds)?;
                 bone.pose_local.rotation = *previous;
             }
+            Self::RestoreBoneTranslation { bone_id, previous } => {
+                let rig = scene
+                    .character_rig
+                    .as_mut()
+                    .ok_or(CoreError::CharacterRigNotFound)?;
+                let bone = rig.bone_mut(*bone_id).ok_or(CoreError::OutOfBounds)?;
+                bone.pose_local.translation = *previous;
+            }
             Self::RestoreBoneRestPosition {
                 bone_id,
                 previous_rest,
@@ -2344,6 +2488,27 @@ impl UndoDelta {
                 let bone = rig.bone_mut(*bone_id).ok_or(CoreError::OutOfBounds)?;
                 bone.rest_local.translation = *previous_rest;
                 bone.pose_local.translation = *previous_pose;
+            }
+            Self::RestoreBoneRestRotation {
+                bone_id,
+                previous_rest,
+                previous_pose,
+            } => {
+                let rig = scene
+                    .character_rig
+                    .as_mut()
+                    .ok_or(CoreError::CharacterRigNotFound)?;
+                let bone = rig.bone_mut(*bone_id).ok_or(CoreError::OutOfBounds)?;
+                bone.rest_local.rotation = *previous_rest;
+                bone.pose_local.rotation = *previous_pose;
+            }
+            Self::RestoreClipLayers(previous) => {
+                let rig = scene
+                    .character_rig
+                    .as_mut()
+                    .ok_or(CoreError::CharacterRigNotFound)?;
+                rig.clip_layers = previous.clone();
+                rig.apply_active_animation();
             }
             Self::RestoreNodeBoneBinding { node_id, previous } => {
                 let rig = scene

@@ -100,6 +100,17 @@ pub fn save_tessel_project_with_thumbnail(
         file.sync_all()?;
     }
     fs::rename(&tmp_path, path)?;
+    #[cfg(unix)]
+    if let Some(parent) = path.parent() {
+        let dir_path = if parent.as_os_str().is_empty() {
+            Path::new(".")
+        } else {
+            parent
+        };
+        if let Ok(dir) = fs::File::open(dir_path) {
+            let _ = dir.sync_all();
+        }
+    }
     Ok(())
 }
 

@@ -62,6 +62,13 @@ cargo test --workspace
 
 ---
 
+## AI Model Notes
+
+- This project is built with **Gemini Neon** and **Muse Spark**.
+- For generating **Low-Poly** assets via MCP, the **Gemini Neon** model delivers better results overall. **Muse Spark** works well for inanimate objects and props (such as backpacks or other hard-surface items), but is not recommended for living/organic subjects such as animals (e.g., cats) or human characters.
+
+---
+
 ## Third-Party Notices
 
 - **Phosphor Icons** (toolbar glyphs, via the `egui-phosphor` crate) — Copyright Helena Zhang and Tobias Fried, [MIT License](https://github.com/phosphor-icons/home/blob/main/LICENSE). Glyph names and codepoints © their authors.
