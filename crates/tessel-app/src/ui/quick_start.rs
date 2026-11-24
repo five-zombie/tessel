@@ -48,7 +48,7 @@ pub fn show_quick_start(
             if state.has_recovery {
                 egui::Frame::NONE
                     .fill(tokens::SURFACE_HIGH)
-                    .stroke(Stroke::new(1.0, tokens::PRIMARY))
+                    .stroke(Stroke::new(1.0_f32, tokens::PRIMARY))
                     .corner_radius(CornerRadius::same(4))
                     .inner_margin(egui::Margin::same(8))
                     .show(ui, |ui| {

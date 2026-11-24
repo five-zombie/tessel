@@ -8,3 +8,7 @@ license.workspace = true
 glam.workspace = true
 serde.workspace = true
 thiserror.workspace = true
+
+[[bench]]
+name = "perf_budget"
+harness = false

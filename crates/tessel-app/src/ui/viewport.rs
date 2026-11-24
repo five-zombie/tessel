@@ -21,6 +21,15 @@ pub struct GizmoDragState {
     pub start_axis_t: f32,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum SceneGadgetDrag {
+    Sun {
+        start_azimuth: f32,
+        start_elevation: f32,
+    },
+    Camera,
+}
+
 /// Displays the offscreen wgpu viewport texture, routes 2D/3D viewport input,
 /// renders the floating Zoom & Camera Preset HUD, and returns `(desired_physical_size, hover_voxel, hovered_gizmo_axis)`.
 #[allow(clippy::too_many_arguments)]
@@ -30,9 +39,14 @@ pub fn show_viewport(
     scene: &mut SceneState,
     history: &mut HistoryStack,
     camera_3d: &mut OrbitCamera,
+    camera_3d_target: &mut Option<OrbitCamera>,
+    showcase_camera: &mut OrbitCamera,
+    showcase_camera_target: &mut Option<OrbitCamera>,
+    display_light: (f32, f32),
     camera_2d: &mut PixelCamera2D,
     pixel_drag_start: &mut Option<PixelCoord>,
     gizmo_drag: &mut Option<GizmoDragState>,
+    scene_gadget_drag: &mut Option<SceneGadgetDrag>,
     free_view: &mut bool,
     render_preview: &mut bool,
 ) -> ((u32, u32), Option<VoxelCoord>, Option<GizmoAxis>) {
@@ -69,7 +83,25 @@ pub fn show_viewport(
                 pixel_drag_start,
             );
         } else {
-            let gizmo_consumed = if *free_view {
+            let gadget_consumed = if *render_preview {
+                *scene_gadget_drag = None;
+                false
+            } else {
+                handle_scene_gadget_input(
+                    ui,
+                    rect,
+                    &response,
+                    scene,
+                    history,
+                    camera_3d,
+                    camera_3d_target,
+                    showcase_camera,
+                    showcase_camera_target,
+                    display_light,
+                    scene_gadget_drag,
+                )
+            };
+            let gizmo_consumed = if *free_view || gadget_consumed {
                 *gizmo_drag = None;
                 active_gizmo_axis = None;
                 false
@@ -84,12 +116,21 @@ pub fn show_viewport(
                     &mut active_gizmo_axis,
                 )
             };
+            let any_gadget_consumed = gadget_consumed || gizmo_consumed;
             let allow_primary_orbit = *free_view
-                && !gizmo_consumed
+                && !any_gadget_consumed
                 && !(scene.active_mode == AppMode::LowPoly && scene.lowpoly_paint_mode);
-            handle_3d_viewport_input(ui, &response, camera_3d, allow_primary_orbit);
+            if !gadget_consumed {
+                handle_3d_viewport_input(
+                    ui,
+                    &response,
+                    camera_3d,
+                    camera_3d_target,
+                    allow_primary_orbit,
+                );
+            }
 
-            if !gizmo_consumed && !*free_view {
+            if !any_gadget_consumed && !*free_view {
                 match scene.active_mode {
                     AppMode::Voxel => {
                         hover_voxel = compute_hover_voxel(rect, &response, scene, camera_3d);
@@ -237,6 +278,15 @@ pub fn show_viewport(
 
         if scene.active_mode != AppMode::Pixel && !*render_preview {
             draw_selection_brackets(ui, rect, scene, camera_3d);
+            draw_scene_gadgets(
+                ui,
+                rect,
+                &response,
+                display_light,
+                camera_3d,
+                showcase_camera,
+                *scene_gadget_drag,
+            );
         }
 
         show_viewport_hud(
@@ -244,6 +294,8 @@ pub fn show_viewport(
             rect,
             scene.active_mode,
             camera_3d,
+            camera_3d_target,
+            showcase_camera,
             camera_2d,
             free_view,
             render_preview,
@@ -269,7 +321,7 @@ fn draw_camera_compass(ui: &egui::Ui, rect: egui::Rect, camera: &OrbitCamera) {
     painter.circle_stroke(
         center,
         radius + 6.0,
-        Stroke::new(1.0, tokens::OUTLINE_VARIANT),
+        Stroke::new(1.0_f32, tokens::OUTLINE_VARIANT),
     );
 
     let view = glam::Mat4::look_at_rh(camera.position(), camera.target, glam::Vec3::Y);
@@ -287,7 +339,7 @@ fn draw_camera_compass(ui: &egui::Ui, rect: egui::Rect, camera: &OrbitCamera) {
 
     for (label, v, col) in projected {
         let end = center + egui::vec2(v.x * radius, -v.y * radius);
-        painter.line_segment([center, end], Stroke::new(2.0, col));
+        painter.line_segment([center, end], Stroke::new(2.0_f32, col));
         painter.text(
             end + egui::vec2(v.x * 7.0, -v.y * 7.0),
             egui::Align2::CENTER_CENTER,
@@ -394,11 +446,14 @@ fn handle_gizmo_drag_input(
     false
 }
 
+#[allow(clippy::too_many_arguments)]
 fn show_viewport_hud(
     ui: &mut egui::Ui,
     rect: egui::Rect,
     mode: AppMode,
     camera_3d: &mut OrbitCamera,
+    camera_3d_target: &mut Option<OrbitCamera>,
+    showcase_camera: &OrbitCamera,
     camera_2d: &mut PixelCamera2D,
     free_view: &mut bool,
     render_preview: &mut bool,
@@ -412,7 +467,7 @@ fn show_viewport_hud(
         .show(ui.ctx(), |ui| {
             Frame::NONE
                 .fill(tokens::SURFACE_LOW)
-                .stroke(Stroke::new(1.0, tokens::OUTLINE_VARIANT))
+                .stroke(Stroke::new(1.0_f32, tokens::OUTLINE_VARIANT))
                 .corner_radius(CornerRadius::same(4))
                 .inner_margin(Margin::symmetric(6, 4))
                 .show(ui, |ui| {
@@ -420,7 +475,10 @@ fn show_viewport_hud(
                         if icons::hud_icon_button(ui, ToolIcon::ZoomOut, "Zoom Out", false) {
                             match mode {
                                 AppMode::Pixel => camera_2d.zoom_step(0.8),
-                                _ => camera_3d.zoom_step(1.2),
+                                _ => {
+                                    *camera_3d_target = None;
+                                    camera_3d.zoom_step(1.2);
+                                }
                             }
                         }
                         if icons::hud_icon_button(
@@ -431,13 +489,16 @@ fn show_viewport_hud(
                         ) {
                             match mode {
                                 AppMode::Pixel => camera_2d.reset(),
-                                _ => camera_3d.reset(),
+                                _ => *camera_3d_target = Some(OrbitCamera::new()),
                             }
                         }
                         if icons::hud_icon_button(ui, ToolIcon::ZoomIn, "Zoom In", false) {
                             match mode {
                                 AppMode::Pixel => camera_2d.zoom_step(1.25),
-                                _ => camera_3d.zoom_step(0.82),
+                                _ => {
+                                    *camera_3d_target = None;
+                                    camera_3d.zoom_step(0.82);
+                                }
                             }
                         }
 
@@ -475,8 +536,18 @@ fn show_viewport_hud(
                             ];
                             for (icon, tip, preset) in presets {
                                 if icons::hud_icon_button(ui, icon, tip, false) {
-                                    camera_3d.set_preset(preset);
+                                    let mut goal = camera_3d_target.unwrap_or(*camera_3d);
+                                    goal.set_preset(preset);
+                                    *camera_3d_target = Some(goal);
                                 }
+                            }
+                            if icons::hud_icon_button(
+                                ui,
+                                ToolIcon::SceneCamera,
+                                "Snap view to Scene Camera / Projector",
+                                false,
+                            ) {
+                                *camera_3d_target = Some(*showcase_camera);
                             }
                         }
                     });
@@ -510,6 +581,7 @@ fn handle_3d_viewport_input(
     ui: &egui::Ui,
     response: &egui::Response,
     camera: &mut OrbitCamera,
+    camera_target: &mut Option<OrbitCamera>,
     allow_primary_orbit: bool,
 ) {
     let primary_drag = response.dragged_by(egui::PointerButton::Primary)
@@ -518,6 +590,7 @@ fn handle_3d_viewport_input(
         || response.dragged_by(egui::PointerButton::Middle)
         || primary_drag
     {
+        *camera_target = None;
         let delta = response.drag_delta();
         let shift = ui.input(|i| i.modifiers.shift);
         if shift {
@@ -530,6 +603,7 @@ fn handle_3d_viewport_input(
     if response.hovered() {
         let scroll = ui.input(|i| i.smooth_scroll_delta.y);
         if scroll.abs() > 0.01 {
+            *camera_target = None;
             camera.zoom(scroll);
         }
     }
@@ -910,7 +984,7 @@ fn draw_selection_brackets(
     };
 
     let painter = ui.painter_at(viewport_rect);
-    let stroke = Stroke::new(2.2, tokens::PRIMARY);
+    let stroke = Stroke::new(2.2_f32, tokens::PRIMARY);
     let arm_x = (sel.width() * 0.22).clamp(8.0, 22.0);
     let arm_y = (sel.height() * 0.22).clamp(8.0, 22.0);
 
@@ -939,6 +1013,309 @@ fn draw_selection_brackets(
             egui::FontId::monospace(10.5),
             tokens::PRIMARY,
         );
+    }
+}
+
+const GADGET_HIT_RADIUS_PX: f32 = 18.0;
+const MIN_SUN_ELEVATION: f32 = 0.12;
+const MAX_SUN_ELEVATION: f32 = 1.50;
+
+/// Computes the 3D world position of the interactive Sun gizmo orbiting `target`.
+pub fn light_world_position(
+    target: glam::Vec3,
+    azimuth: f32,
+    elevation: f32,
+    radius: f32,
+) -> glam::Vec3 {
+    let cos_e = elevation.cos();
+    let dir = glam::Vec3::new(
+        cos_e * azimuth.sin(),
+        elevation.sin(),
+        cos_e * azimuth.cos(),
+    )
+    .normalize_or_zero();
+    target + dir * radius
+}
+
+/// Projects a 3D world point into 2D screen coordinates inside `viewport_rect`.
+/// Returns `None` if the point lies behind the camera near plane.
+pub fn project_world_point(
+    pt: glam::Vec3,
+    camera: &OrbitCamera,
+    viewport_rect: egui::Rect,
+) -> Option<egui::Pos2> {
+    let w = viewport_rect.width().max(1.0);
+    let h = viewport_rect.height().max(1.0);
+    let aspect = w / h;
+    let view = glam::Mat4::look_at_rh(camera.position(), camera.target, glam::Vec3::Y);
+    let proj = glam::Mat4::perspective_rh(camera.fov_y_radians, aspect, camera.near, camera.far);
+    let clip = (proj * view) * glam::Vec4::new(pt.x, pt.y, pt.z, 1.0);
+    if clip.w <= 1e-4 {
+        return None;
+    }
+    let ndc = clip.truncate() / clip.w;
+    let sx = viewport_rect.left() + (ndc.x * 0.5 + 0.5) * w;
+    let sy = viewport_rect.top() + (0.5 - ndc.y * 0.5) * h;
+    Some(egui::pos2(sx, sy))
+}
+
+/// Applies pointer drag delta in screen pixels to `(light_azimuth, light_elevation)`.
+pub fn apply_sun_drag_delta(azimuth: f32, elevation: f32, delta_px: egui::Vec2) -> (f32, f32) {
+    let next_az = (azimuth - delta_px.x * 0.012).rem_euclid(std::f32::consts::TAU);
+    let next_el = (elevation - delta_px.y * 0.010).clamp(MIN_SUN_ELEVATION, MAX_SUN_ELEVATION);
+    (next_az, next_el)
+}
+
+fn sun_gizmo_radius(camera: &OrbitCamera) -> f32 {
+    (camera.distance * 0.36).clamp(2.2, 5.5)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn handle_scene_gadget_input(
+    ui: &egui::Ui,
+    rect: egui::Rect,
+    response: &egui::Response,
+    scene: &mut SceneState,
+    history: &mut HistoryStack,
+    camera_3d: &mut OrbitCamera,
+    camera_3d_target: &mut Option<OrbitCamera>,
+    showcase_camera: &mut OrbitCamera,
+    showcase_camera_target: &mut Option<OrbitCamera>,
+    display_light: (f32, f32),
+    gadget_drag: &mut Option<SceneGadgetDrag>,
+) -> bool {
+    let sun_world = light_world_position(
+        camera_3d.target,
+        display_light.0,
+        display_light.1,
+        sun_gizmo_radius(camera_3d),
+    );
+    let sun_screen = project_world_point(sun_world, camera_3d, rect);
+    let cam_screen = project_world_point(showcase_camera.position(), camera_3d, rect);
+
+    if response.double_clicked_by(egui::PointerButton::Primary) {
+        if let (Some(pos), Some(cs)) = (response.interact_pointer_pos(), cam_screen) {
+            if pos.distance(cs) <= GADGET_HIT_RADIUS_PX {
+                *camera_3d_target = Some(*showcase_camera);
+                return true;
+            }
+        }
+    }
+
+    if gadget_drag.is_none() && response.drag_started_by(egui::PointerButton::Primary) {
+        if let Some(pos) = response.interact_pointer_pos() {
+            if let Some(ss) = sun_screen {
+                if pos.distance(ss) <= GADGET_HIT_RADIUS_PX {
+                    *gadget_drag = Some(SceneGadgetDrag::Sun {
+                        start_azimuth: scene.light_azimuth,
+                        start_elevation: scene.light_elevation,
+                    });
+                    return true;
+                }
+            }
+            if let Some(cs) = cam_screen {
+                if pos.distance(cs) <= GADGET_HIT_RADIUS_PX {
+                    *showcase_camera_target = None;
+                    *gadget_drag = Some(SceneGadgetDrag::Camera);
+                    return true;
+                }
+            }
+        }
+    }
+
+    if let Some(drag) = *gadget_drag {
+        match drag {
+            SceneGadgetDrag::Sun {
+                start_azimuth,
+                start_elevation,
+            } => {
+                if response.dragged_by(egui::PointerButton::Primary) {
+                    let delta = response.drag_delta();
+                    let (az, el) =
+                        apply_sun_drag_delta(scene.light_azimuth, scene.light_elevation, delta);
+                    scene.light_azimuth = az;
+                    scene.light_elevation = el;
+                    scene.mark_modified();
+                    return true;
+                }
+                if response.drag_stopped_by(egui::PointerButton::Primary) {
+                    let final_az = scene.light_azimuth;
+                    let final_el = scene.light_elevation;
+                    scene.light_azimuth = start_azimuth;
+                    scene.light_elevation = start_elevation;
+                    let _ = history.execute(
+                        scene,
+                        Command::SetLightDirection {
+                            azimuth: final_az,
+                            elevation: final_el,
+                        },
+                    );
+                    *gadget_drag = None;
+                    return true;
+                }
+            }
+            SceneGadgetDrag::Camera => {
+                if response.dragged_by(egui::PointerButton::Primary) {
+                    *showcase_camera_target = None;
+                    let delta = response.drag_delta();
+                    if ui.input(|i| i.modifiers.shift) {
+                        showcase_camera.pan(delta.x, delta.y);
+                    } else {
+                        showcase_camera.orbit(delta.x, delta.y);
+                    }
+                    return true;
+                }
+                if response.drag_stopped_by(egui::PointerButton::Primary) {
+                    *gadget_drag = None;
+                    return true;
+                }
+            }
+        }
+    }
+
+    false
+}
+
+fn draw_scene_gadgets(
+    ui: &egui::Ui,
+    viewport_rect: egui::Rect,
+    response: &egui::Response,
+    display_light: (f32, f32),
+    camera_3d: &OrbitCamera,
+    showcase_camera: &OrbitCamera,
+    active_drag: Option<SceneGadgetDrag>,
+) {
+    let painter = ui.painter_at(viewport_rect);
+    let hover = response.hover_pos();
+
+    // 1. Draggable Sun / Key Light gizmo
+    let sun_world = light_world_position(
+        camera_3d.target,
+        display_light.0,
+        display_light.1,
+        sun_gizmo_radius(camera_3d),
+    );
+    if let Some(sun_pos) = project_world_point(sun_world, camera_3d, viewport_rect) {
+        let sun_active = matches!(active_drag, Some(SceneGadgetDrag::Sun { .. }))
+            || hover.is_some_and(|h| h.distance(sun_pos) <= GADGET_HIT_RADIUS_PX);
+        let sun_gold = egui::Color32::from_rgb(255, 206, 84);
+        let sun_ray_col =
+            egui::Color32::from_rgba_unmultiplied(255, 206, 84, if sun_active { 170 } else { 95 });
+        if let Some(target_pos) = project_world_point(camera_3d.target, camera_3d, viewport_rect) {
+            painter.line_segment([sun_pos, target_pos], Stroke::new(1.4_f32, sun_ray_col));
+        }
+        let fill = if sun_active {
+            egui::Color32::from_rgba_unmultiplied(68, 52, 18, 235)
+        } else {
+            egui::Color32::from_rgba_unmultiplied(28, 30, 38, 215)
+        };
+        painter.circle_filled(sun_pos, 14.5, fill);
+        painter.circle_stroke(
+            sun_pos,
+            14.5,
+            Stroke::new(if sun_active { 2.2_f32 } else { 1.5_f32 }, sun_gold),
+        );
+        painter.text(
+            sun_pos,
+            egui::Align2::CENTER_CENTER,
+            ToolIcon::Sun.glyph(),
+            egui::FontId::proportional(16.0),
+            sun_gold,
+        );
+        if sun_active {
+            painter.text(
+                sun_pos + egui::vec2(0.0, 21.0),
+                egui::Align2::CENTER_TOP,
+                format!(
+                    "SUN {:.0}° / {:.0}°",
+                    display_light.0.to_degrees(),
+                    display_light.1.to_degrees()
+                ),
+                egui::FontId::monospace(10.0),
+                sun_gold,
+            );
+        }
+    }
+
+    // 2. Draggable Camera / Projector proxy gizmo + frustum pyramid
+    let cam_origin = showcase_camera.position();
+    if let Some(cam_pos) = project_world_point(cam_origin, camera_3d, viewport_rect) {
+        let cam_active = matches!(active_drag, Some(SceneGadgetDrag::Camera))
+            || hover.is_some_and(|h| h.distance(cam_pos) <= GADGET_HIT_RADIUS_PX);
+        let cam_cyan = egui::Color32::from_rgb(92, 196, 255);
+        let frustum_col =
+            egui::Color32::from_rgba_unmultiplied(92, 196, 255, if cam_active { 200 } else { 120 });
+
+        let fwd = (showcase_camera.target - cam_origin).normalize_or_zero();
+        let right = fwd.cross(glam::Vec3::Y).normalize_or_zero();
+        let up = right.cross(fwd).normalize_or_zero();
+        let frustum_center = cam_origin + fwd * 0.65;
+        let hw = 0.24;
+        let hh = 0.15;
+        let corners_world = [
+            frustum_center - right * hw + up * hh,
+            frustum_center + right * hw + up * hh,
+            frustum_center + right * hw - up * hh,
+            frustum_center - right * hw - up * hh,
+        ];
+        let corners_2d: [Option<egui::Pos2>; 4] = [
+            project_world_point(corners_world[0], camera_3d, viewport_rect),
+            project_world_point(corners_world[1], camera_3d, viewport_rect),
+            project_world_point(corners_world[2], camera_3d, viewport_rect),
+            project_world_point(corners_world[3], camera_3d, viewport_rect),
+        ];
+        for c in corners_2d.into_iter().flatten() {
+            painter.line_segment([cam_pos, c], Stroke::new(1.3_f32, frustum_col));
+        }
+        for i in 0..4 {
+            if let (Some(a), Some(b)) = (corners_2d[i], corners_2d[(i + 1) % 4]) {
+                painter.line_segment([a, b], Stroke::new(1.3_f32, frustum_col));
+            }
+        }
+        if let Some(target_pos) =
+            project_world_point(showcase_camera.target, camera_3d, viewport_rect)
+        {
+            painter.line_segment(
+                [cam_pos, target_pos],
+                Stroke::new(
+                    1.0_f32,
+                    egui::Color32::from_rgba_unmultiplied(
+                        92,
+                        196,
+                        255,
+                        if cam_active { 125 } else { 55 },
+                    ),
+                ),
+            );
+        }
+
+        let fill = if cam_active {
+            egui::Color32::from_rgba_unmultiplied(20, 48, 68, 235)
+        } else {
+            egui::Color32::from_rgba_unmultiplied(28, 30, 38, 215)
+        };
+        painter.circle_filled(cam_pos, 14.5, fill);
+        painter.circle_stroke(
+            cam_pos,
+            14.5,
+            Stroke::new(if cam_active { 2.2_f32 } else { 1.5_f32 }, cam_cyan),
+        );
+        painter.text(
+            cam_pos,
+            egui::Align2::CENTER_CENTER,
+            ToolIcon::SceneCamera.glyph(),
+            egui::FontId::proportional(15.5),
+            cam_cyan,
+        );
+        if cam_active {
+            painter.text(
+                cam_pos + egui::vec2(0.0, 21.0),
+                egui::Align2::CENTER_TOP,
+                "CAM (drag / 2x click)",
+                egui::FontId::monospace(10.0),
+                cam_cyan,
+            );
+        }
     }
 }
 
@@ -971,5 +1348,37 @@ mod tests {
         let screen = project_bounds_to_screen_rect(wmin, wmax, &cam, vp).unwrap();
         assert!(screen.width() > 10.0 && screen.height() > 10.0);
         assert!(vp.contains_rect(screen));
+    }
+
+    #[test]
+    fn light_world_position_matches_spherical_light_direction() {
+        let target = glam::Vec3::new(0.0, 1.0, 0.0);
+        let pos = light_world_position(target, 0.0, std::f32::consts::FRAC_PI_2, 4.0);
+        assert!((pos - glam::Vec3::new(0.0, 5.0, 0.0)).length() < 1e-4);
+
+        let side = light_world_position(glam::Vec3::ZERO, std::f32::consts::FRAC_PI_2, 0.0, 3.0);
+        assert!((side - glam::Vec3::new(3.0, 0.0, 0.0)).length() < 1e-4);
+    }
+
+    #[test]
+    fn apply_sun_drag_delta_updates_azimuth_and_clamps_elevation() {
+        let (az, el) = apply_sun_drag_delta(0.5, 0.8, egui::vec2(100.0, -500.0));
+        assert!((0.0..std::f32::consts::TAU).contains(&az));
+        assert!((el - MAX_SUN_ELEVATION).abs() < 1e-5);
+
+        let (_, el_low) = apply_sun_drag_delta(0.5, 0.2, egui::vec2(0.0, 500.0));
+        assert!((el_low - MIN_SUN_ELEVATION).abs() < 1e-5);
+    }
+
+    #[test]
+    fn project_world_point_projects_in_front_and_rejects_behind() {
+        let cam = OrbitCamera::new();
+        let vp = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 600.0));
+        let center = project_world_point(cam.target, &cam, vp).unwrap();
+        assert!((center.x - 400.0).abs() < 2.0);
+        assert!((center.y - 300.0).abs() < 2.0);
+
+        let behind = cam.position() + (cam.position() - cam.target).normalize() * 2.0;
+        assert!(project_world_point(behind, &cam, vp).is_none());
     }
 }

@@ -136,10 +136,23 @@ impl ViewportRenderer {
             .zip(scene.character_rig.as_ref())
             .map(|(solver, rig)| solver.skin_matrices(rig));
 
+        let is_visible = |node_id: tessel_core::NodeId| -> bool {
+            scene
+                .character_rig
+                .as_ref()
+                .and_then(|r| r.node_visibility.get(&node_id).copied())
+                .unwrap_or_else(|| scene.nodes.get(&node_id).map(|n| n.visible).unwrap_or(true))
+        };
+        let rig_pose_mats = scene
+            .character_rig
+            .as_ref()
+            .filter(|r| !r.node_parent_overrides.is_empty())
+            .map(|r| (r.world_pose_matrices(), r.world_rest_matrices()));
+
         let mut vertices = Vec::new();
         let mut indices = Vec::new();
         for (node_id, vol) in &scene.voxel_volumes {
-            let visible = scene.nodes.get(node_id).map(|n| n.visible).unwrap_or(true);
+            let visible = is_visible(*node_id);
             if !visible || vol.is_empty() {
                 continue;
             }
@@ -172,11 +185,27 @@ impl ViewportRenderer {
 
         let mut custom_items = Vec::new();
         for (node_id, mesh) in &scene.lowpoly_meshes {
-            let visible = scene.nodes.get(node_id).map(|n| n.visible).unwrap_or(true);
+            let visible = is_visible(*node_id);
             if !visible || mesh.faces.is_empty() {
                 continue;
             }
-            let node_mat = scene.node_world_matrix(*node_id);
+            let base_node_mat = scene.node_world_matrix(*node_id);
+            let parent_override = scene
+                .character_rig
+                .as_ref()
+                .and_then(|r| r.node_parent_overrides.get(node_id).copied());
+            let node_mat = match (parent_override, &rig_pose_mats) {
+                (Some(ps_key), Some((world_mats, rest_mats))) => {
+                    tessel_core::CharacterRig::compute_node_override_matrix(
+                        ps_key,
+                        base_node_mat,
+                        world_mats,
+                        rest_mats,
+                    )
+                }
+                _ => base_node_mat,
+            };
+            let skip_skin = parent_override.is_some();
             let normal_mat = node_mat.inverse().transpose();
 
             // Apply live morph-target deformations when any morph weight for this node is non-zero.
@@ -226,17 +255,19 @@ impl ViewportRenderer {
                             v.tangent[2],
                         ))
                         .normalize_or_zero();
-                    if let (Some(solver), Some(mats)) = (&skin_solver, &skin_mats) {
-                        let w = tri
-                            .source_indices
-                            .get(corner)
-                            .and_then(|src| active_mesh.skin_weights.get(src).copied())
-                            .unwrap_or_else(|| solver.weights_for_vertex(Some(*node_id), wp));
-                        let (sp, sn) = solver.deform_point_normal(mats, w, wp, wn);
-                        let (_, st) = solver.deform_point_normal(mats, w, wp, wt);
-                        wp = sp;
-                        wn = sn;
-                        wt = st;
+                    if !skip_skin {
+                        if let (Some(solver), Some(mats)) = (&skin_solver, &skin_mats) {
+                            let w = tri
+                                .source_indices
+                                .get(corner)
+                                .and_then(|src| active_mesh.skin_weights.get(src).copied())
+                                .unwrap_or_else(|| solver.weights_for_vertex(Some(*node_id), wp));
+                            let (sp, sn) = solver.deform_point_normal(mats, w, wp, wn);
+                            let (_, st) = solver.deform_point_normal(mats, w, wp, wt);
+                            wp = sp;
+                            wn = sn;
+                            wt = st;
+                        }
                     }
                     let uv = if active_mesh.texture.is_some() || active_mesh.normal_map.is_some() {
                         v.uv
@@ -266,15 +297,17 @@ impl ViewportRenderer {
                     let mut wn = normal_mat
                         .transform_vector3(glam::Vec3::from_array(v.normal))
                         .normalize_or_zero();
-                    if let (Some(solver), Some(mats)) = (&skin_solver, &skin_mats) {
-                        let w = tri
-                            .source_indices
-                            .get(corner)
-                            .and_then(|src| active_mesh.skin_weights.get(src).copied())
-                            .unwrap_or_else(|| solver.weights_for_vertex(Some(*node_id), wp));
-                        let (sp, sn) = solver.deform_point_normal(mats, w, wp, wn);
-                        wp = sp;
-                        wn = sn;
+                    if !skip_skin {
+                        if let (Some(solver), Some(mats)) = (&skin_solver, &skin_mats) {
+                            let w = tri
+                                .source_indices
+                                .get(corner)
+                                .and_then(|src| active_mesh.skin_weights.get(src).copied())
+                                .unwrap_or_else(|| solver.weights_for_vertex(Some(*node_id), wp));
+                            let (sp, sn) = solver.deform_point_normal(mats, w, wp, wn);
+                            wp = sp;
+                            wn = sn;
+                        }
                     }
                     vertices.push(StudioVertex3D {
                         position: wp.to_array(),
@@ -318,6 +351,32 @@ impl ViewportRenderer {
         pixels_per_point: f32,
         render_preview: bool,
     ) {
+        self.render_with_light(
+            queue,
+            encoder,
+            scene,
+            camera_3d,
+            camera_2d,
+            pixels_per_point,
+            render_preview,
+            scene.light_azimuth,
+            scene.light_elevation,
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn render_with_light(
+        &self,
+        queue: &wgpu::Queue,
+        encoder: &mut wgpu::CommandEncoder,
+        scene: &SceneState,
+        camera_3d: &OrbitCamera,
+        camera_2d: &PixelCamera2D,
+        pixels_per_point: f32,
+        render_preview: bool,
+        light_azimuth: f32,
+        light_elevation: f32,
+    ) {
         match scene.active_mode {
             AppMode::Pixel => {
                 self.pixel_pass
@@ -340,8 +399,7 @@ impl ViewportRenderer {
             }
             AppMode::Voxel | AppMode::LowPoly | AppMode::Character => {
                 let aspect = self.size.0 as f32 / self.size.1.max(1) as f32;
-                let uniform =
-                    camera_3d.to_uniform(aspect, scene.light_azimuth, scene.light_elevation);
+                let uniform = camera_3d.to_uniform(aspect, light_azimuth, light_elevation);
                 self.grid_pass.update_camera(queue, &uniform);
                 self.shadow_pass.update_camera(queue, &uniform);
                 self.mesh_pass.update_camera(queue, &uniform);
@@ -368,11 +426,10 @@ impl ViewportRenderer {
                     occlusion_query_set: None,
                     timestamp_writes: None,
                 });
-                if render_preview {
-                    self.shadow_pass.draw(&mut pass);
-                } else {
+                if !render_preview {
                     self.grid_pass.draw(&mut pass);
                 }
+                self.shadow_pass.draw(&mut pass);
                 self.mesh_pass.draw(&mut pass);
                 if !render_preview {
                     self.overlay_pass.draw(&mut pass);

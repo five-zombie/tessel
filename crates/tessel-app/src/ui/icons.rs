@@ -73,6 +73,8 @@ pub enum ToolIcon {
     NewProject,
     Hand,
     Select,
+    Sun,
+    SceneCamera,
 }
 
 impl ToolIcon {
@@ -146,13 +148,15 @@ impl ToolIcon {
             Self::NewProject => r::FILE_PLUS,
             Self::Hand => r::HAND,
             Self::Select => r::CURSOR,
+            Self::Sun => r::SUN,
+            Self::SceneCamera => r::VIDEO_CAMERA,
         }
     }
 }
 
 /// Every icon, for the headless paint smoke test below.
 #[cfg(test)]
-pub const ALL: [ToolIcon; 65] = [
+pub const ALL: [ToolIcon; 67] = [
     ToolIcon::Pencil,
     ToolIcon::Eraser,
     ToolIcon::Fill,
@@ -218,6 +222,8 @@ pub const ALL: [ToolIcon; 65] = [
     ToolIcon::NewProject,
     ToolIcon::Hand,
     ToolIcon::Select,
+    ToolIcon::Sun,
+    ToolIcon::SceneCamera,
 ];
 
 /// One clickable toolbar cell. To add a button, push one of these into a

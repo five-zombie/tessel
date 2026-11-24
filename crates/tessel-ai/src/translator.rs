@@ -209,6 +209,57 @@ fn resolve_clip_index(
         .map_or(0, |r| r.active_animation))
 }
 
+/// Resolves `"$N.field"` / `"$N.a.b"` placeholders in `scene_batch` arguments against prior results.
+fn resolve_batch_refs(value: &Value, results: &[Value]) -> Result<Value, AiError> {
+    match value {
+        Value::String(s) if s.starts_with('$') => {
+            let rest = &s[1..];
+            let Some((idx_str, path)) = rest.split_once('.') else {
+                return Ok(value.clone());
+            };
+            let Ok(idx) = idx_str.parse::<usize>() else {
+                return Ok(value.clone());
+            };
+            let mut cur = results.get(idx).ok_or_else(|| {
+                AiError::InvalidArguments(format!(
+                    "batch reference '{s}' out of range (only {} prior results)",
+                    results.len()
+                ))
+            })?;
+            for seg in path.split('.') {
+                cur = if let Some(obj) = cur.as_object() {
+                    obj.get(seg)
+                } else if let Some(arr) = cur.as_array() {
+                    seg.parse::<usize>().ok().and_then(|i| arr.get(i))
+                } else {
+                    None
+                }
+                .ok_or_else(|| {
+                    AiError::InvalidArguments(format!(
+                        "batch reference '{s}' missing segment '{seg}'"
+                    ))
+                })?;
+            }
+            Ok(cur.clone())
+        }
+        Value::Array(items) => {
+            let mut out = Vec::with_capacity(items.len());
+            for item in items {
+                out.push(resolve_batch_refs(item, results)?);
+            }
+            Ok(Value::Array(out))
+        }
+        Value::Object(map) => {
+            let mut out = serde_json::Map::with_capacity(map.len());
+            for (k, v) in map {
+                out.insert(k.clone(), resolve_batch_refs(v, results)?);
+            }
+            Ok(Value::Object(out))
+        }
+        _ => Ok(value.clone()),
+    }
+}
+
 /// Validates and executes a named tool call against `SceneState` & `HistoryStack`.
 pub fn execute_tool_call(
     name: &str,
@@ -372,7 +423,17 @@ pub fn execute_tool_call(
                         "nested 'scene_batch' is not allowed".into(),
                     ));
                 }
-                let sub_args = item.get("arguments").cloned().unwrap_or_else(|| json!({}));
+                let raw_args = item.get("arguments").cloned().unwrap_or_else(|| json!({}));
+                let sub_args = match resolve_batch_refs(&raw_args, &results) {
+                    Ok(v) => v,
+                    Err(err) => {
+                        *scene = prev_scene;
+                        *history = prev_history;
+                        return Err(AiError::InvalidArguments(format!(
+                            "batch aborted at calls[{idx}] ({sub_name}): {err}"
+                        )));
+                    }
+                };
                 match execute_tool_call(sub_name, &sub_args, scene, history, allowed_export_dir) {
                     Ok(val) => results.push(val),
                     Err(err) => {
@@ -599,21 +660,30 @@ pub fn execute_tool_call(
             } else {
                 None
             };
-            let sc = match (parse_opt_vec3(args, "scale")?, size_vec_scale) {
-                (Some(a), Some(b)) => Some(a * b),
-                (Some(a), None) => Some(a),
-                (None, Some(b)) => Some(b),
-                (None, None) => None,
+            let sc = parse_opt_vec3(args, "scale")?;
+            let min_s = tessel_core::mesh::ops::MIN_PRIMITIVE_SIZE;
+            let (actual_size_json, clamped) = if let Some(v) = size_vec_scale {
+                let actual_v = glam::Vec3::new(v.x.max(min_s), v.y.max(min_s), v.z.max(min_s));
+                let mut mesh = tessel_core::mesh::ops::create_primitive(kind, 1.0, material);
+                for vert in &mut mesh.vertices {
+                    *vert *= actual_v;
+                }
+                history.execute(scene, Command::ImportLowPolyMesh { name, mesh })?;
+                let was_clamped = (actual_v - v).abs().max_element() > 1e-6;
+                (json!(actual_v.to_array()), was_clamped)
+            } else {
+                history.execute(
+                    scene,
+                    Command::CreatePrimitiveMesh {
+                        name,
+                        kind,
+                        size,
+                        material,
+                    },
+                )?;
+                let actual_s = size.max(min_s);
+                (json!(actual_s), (actual_s - size).abs() > 1e-6)
             };
-            history.execute(
-                scene,
-                Command::CreatePrimitiveMesh {
-                    name,
-                    kind,
-                    size,
-                    material,
-                },
-            )?;
             let created_id = scene.selected_node;
             if let (Some(node_id), true) =
                 (created_id, pos.is_some() || rot.is_some() || sc.is_some())
@@ -634,7 +704,6 @@ pub fn execute_tool_call(
                 }
                 history.execute(scene, Command::SetNodeTransform { node_id, transform })?;
             }
-            let actual_size = size.max(tessel_core::mesh::ops::MIN_PRIMITIVE_SIZE);
             let bounds = created_id
                 .and_then(|id| scene.lowpoly_meshes.get(&id))
                 .map(|m| {
@@ -644,8 +713,8 @@ pub fn execute_tool_call(
             Ok(json!({
                 "ok": true,
                 "node_id": created_id.map(|n| n.0),
-                "actual_size": actual_size,
-                "clamped": (actual_size - size).abs() > 1e-6,
+                "actual_size": actual_size_json,
+                "clamped": clamped,
                 "bounds": bounds
             }))
         }
@@ -701,6 +770,165 @@ pub fn execute_tool_call(
             let mesh = tessel_core::mesh::ops::create_lathe_mesh(
                 &profile, segments, angle_deg, cap_ends, material,
             )?;
+            let vert_count = mesh.vertices.len();
+            let face_count = mesh.faces.len();
+            let (lo, hi) = mesh.bounds();
+            history.execute(scene, Command::ImportLowPolyMesh { name, mesh })?;
+            let created_id = scene.selected_node;
+            if let (Some(node_id), true) =
+                (created_id, pos.is_some() || rot.is_some() || sc.is_some())
+            {
+                let mut transform = scene
+                    .nodes
+                    .get(&node_id)
+                    .map(|n| n.transform)
+                    .unwrap_or_default();
+                if let Some(p) = pos {
+                    transform.translation = p;
+                }
+                if let Some(r) = rot {
+                    transform.rotation = r;
+                }
+                if let Some(s) = sc {
+                    transform.scale = s;
+                }
+                history.execute(scene, Command::SetNodeTransform { node_id, transform })?;
+            }
+            Ok(json!({
+                "ok": true,
+                "node_id": created_id.map(|n| n.0),
+                "vertices": vert_count,
+                "faces": face_count,
+                "bounds": { "min": lo.to_array(), "max": hi.to_array() }
+            }))
+        }
+        "mesh_create_extruded_polygon" => {
+            let pts_arr = args
+                .get("points")
+                .and_then(Value::as_array)
+                .ok_or_else(|| AiError::InvalidArguments("missing 'points' array".into()))?;
+            let mut points = Vec::with_capacity(pts_arr.len());
+            for (i, item) in pts_arr.iter().enumerate() {
+                let pair = item.as_array().ok_or_else(|| {
+                    AiError::InvalidArguments(format!("points[{i}] must be [x, y]"))
+                })?;
+                if pair.len() != 2 {
+                    return Err(AiError::InvalidArguments(format!(
+                        "points[{i}] must have 2 numbers [x, y]"
+                    )));
+                }
+                let x = pair[0].as_f64().ok_or_else(|| {
+                    AiError::InvalidArguments(format!("points[{i}][0] must be a number"))
+                })? as f32;
+                let y = pair[1].as_f64().ok_or_else(|| {
+                    AiError::InvalidArguments(format!("points[{i}][1] must be a number"))
+                })? as f32;
+                points.push([x, y]);
+            }
+            let depth = args
+                .get("depth")
+                .and_then(Value::as_f64)
+                .ok_or_else(|| AiError::InvalidArguments("missing 'depth'".into()))?
+                as f32;
+            let material = parse_palette_index(args, 4)?;
+            let name = args
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or("ExtrudedPolygon")
+                .to_string();
+            let pos = parse_opt_vec3(args, "position")?;
+            let rot = if args.get("rotation_deg").is_some() {
+                Some(parse_rotation_deg(args)?)
+            } else {
+                None
+            };
+            let sc = parse_opt_vec3(args, "scale")?;
+            let mesh = tessel_core::mesh::ops::create_extruded_polygon(&points, depth, material)?;
+            let vert_count = mesh.vertices.len();
+            let face_count = mesh.faces.len();
+            let (lo, hi) = mesh.bounds();
+            history.execute(scene, Command::ImportLowPolyMesh { name, mesh })?;
+            let created_id = scene.selected_node;
+            if let (Some(node_id), true) =
+                (created_id, pos.is_some() || rot.is_some() || sc.is_some())
+            {
+                let mut transform = scene
+                    .nodes
+                    .get(&node_id)
+                    .map(|n| n.transform)
+                    .unwrap_or_default();
+                if let Some(p) = pos {
+                    transform.translation = p;
+                }
+                if let Some(r) = rot {
+                    transform.rotation = r;
+                }
+                if let Some(s) = sc {
+                    transform.scale = s;
+                }
+                history.execute(scene, Command::SetNodeTransform { node_id, transform })?;
+            }
+            Ok(json!({
+                "ok": true,
+                "node_id": created_id.map(|n| n.0),
+                "vertices": vert_count,
+                "faces": face_count,
+                "bounds": { "min": lo.to_array(), "max": hi.to_array() }
+            }))
+        }
+        "mesh_create_loft" => {
+            let secs_arr = args
+                .get("sections")
+                .and_then(Value::as_array)
+                .ok_or_else(|| AiError::InvalidArguments("missing 'sections' array".into()))?;
+            let mut sections = Vec::with_capacity(secs_arr.len());
+            for (si, sec_val) in secs_arr.iter().enumerate() {
+                let ring_arr = sec_val.as_array().ok_or_else(|| {
+                    AiError::InvalidArguments(format!("sections[{si}] must be an array of [x,y,z]"))
+                })?;
+                let mut ring = Vec::with_capacity(ring_arr.len());
+                for (vi, pt) in ring_arr.iter().enumerate() {
+                    let coords = pt.as_array().ok_or_else(|| {
+                        AiError::InvalidArguments(format!(
+                            "sections[{si}][{vi}] must be [x, y, z]"
+                        ))
+                    })?;
+                    if coords.len() != 3 {
+                        return Err(AiError::InvalidArguments(format!(
+                            "sections[{si}][{vi}] must have 3 numbers"
+                        )));
+                    }
+                    let x = coords[0].as_f64().ok_or_else(|| {
+                        AiError::InvalidArguments(format!("sections[{si}][{vi}][0] must be number"))
+                    })? as f32;
+                    let y = coords[1].as_f64().ok_or_else(|| {
+                        AiError::InvalidArguments(format!("sections[{si}][{vi}][1] must be number"))
+                    })? as f32;
+                    let z = coords[2].as_f64().ok_or_else(|| {
+                        AiError::InvalidArguments(format!("sections[{si}][{vi}][2] must be number"))
+                    })? as f32;
+                    ring.push(glam::Vec3::new(x, y, z));
+                }
+                sections.push(ring);
+            }
+            let cap_ends = args
+                .get("cap_ends")
+                .and_then(Value::as_bool)
+                .unwrap_or(true);
+            let material = parse_palette_index(args, 4)?;
+            let name = args
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or("LoftMesh")
+                .to_string();
+            let pos = parse_opt_vec3(args, "position")?;
+            let rot = if args.get("rotation_deg").is_some() {
+                Some(parse_rotation_deg(args)?)
+            } else {
+                None
+            };
+            let sc = parse_opt_vec3(args, "scale")?;
+            let mesh = tessel_core::mesh::ops::create_loft_mesh(&sections, cap_ends, material)?;
             let vert_count = mesh.vertices.len();
             let face_count = mesh.faces.len();
             let (lo, hi) = mesh.bounds();
@@ -2276,6 +2504,101 @@ pub fn execute_tool_call(
                 .get("preset")
                 .and_then(Value::as_str)
                 .unwrap_or("starter");
+            let append = args.get("append").and_then(Value::as_bool).unwrap_or(false);
+            if append {
+                let template = match preset {
+                    "starter" => tessel_core::CharacterRig::biped_template(),
+                    "humanoid" => tessel_core::CharacterRig::humanoid_template(),
+                    other => {
+                        return Err(AiError::InvalidArguments(format!(
+                            "unknown rig preset '{other}'; use 'starter' or 'humanoid'"
+                        )));
+                    }
+                };
+                if scene.character_rig.is_none() {
+                    history.execute(scene, Command::ApplyHumanoidRig)?;
+                }
+                let prefix = args.get("prefix").and_then(Value::as_str).unwrap_or("P2_");
+                let offset = parse_opt_vec3(args, "offset")?.unwrap_or(glam::Vec3::ZERO);
+                let yaw_deg = args.get("yaw_deg").and_then(Value::as_f64).unwrap_or(0.0) as f32;
+                if !yaw_deg.is_finite() {
+                    return Err(AiError::InvalidArguments("'yaw_deg' must be finite".into()));
+                }
+                let include_default_clips = args
+                    .get("include_default_clips")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(true);
+                let yaw_q = glam::Quat::from_rotation_y(yaw_deg.to_radians());
+
+                let base_id = scene
+                    .character_rig
+                    .as_ref()
+                    .and_then(|r| r.bones.iter().map(|b| b.id.0).max())
+                    .map(|m| m + 1)
+                    .unwrap_or(0);
+                let mut id_map = std::collections::BTreeMap::new();
+                let mut cmds = Vec::with_capacity(template.bones.len() + 1);
+                let mut bone_ids_json = serde_json::Map::new();
+                let mut appended_root: Option<BoneId> = None;
+                for (i, b) in template.bones.iter().enumerate() {
+                    let new_id = BoneId(base_id + i as u32);
+                    id_map.insert(b.id, new_id);
+                    let new_parent = b.parent.and_then(|p| id_map.get(&p).copied());
+                    let pos = if new_parent.is_none() {
+                        appended_root = Some(new_id);
+                        offset + b.rest_local.translation
+                    } else {
+                        // Keep child translations in character-local space; Root rest_local.rotation
+                        // carries yaw_deg so all child pose/keyframe rotations stay character-local.
+                        b.rest_local.translation
+                    };
+                    let name = format!("{prefix}{}", b.name);
+                    bone_ids_json.insert(name.clone(), json!(new_id.0));
+                    cmds.push(Command::AddBone {
+                        name,
+                        parent: new_parent,
+                        position: pos,
+                    });
+                }
+                if let Some(root_id) = appended_root {
+                    if yaw_deg.abs() > 1e-4 {
+                        cmds.push(Command::SetBoneRestRotation {
+                            bone_id: root_id,
+                            rotation: yaw_q,
+                        });
+                    }
+                }
+                let count = template.bones.len();
+                if include_default_clips {
+                    if let Some(rig) = scene.character_rig.as_ref() {
+                        for tmpl_clip in &template.animations {
+                            if let Some(clip_idx) =
+                                rig.animations.iter().position(|c| c.name == tmpl_clip.name)
+                            {
+                                for ch in &tmpl_clip.channels {
+                                    if let Some(&mapped_bone) = id_map.get(&ch.bone_id) {
+                                        for kf in &ch.keyframes {
+                                            cmds.push(Command::SetAnimationKeyframe {
+                                                clip_index: clip_idx,
+                                                bone_id: mapped_bone,
+                                                keyframe: *kf,
+                                            });
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                history.execute(scene, Command::Transaction(cmds))?;
+                return Ok(json!({
+                    "ok": true,
+                    "preset": preset,
+                    "appended": true,
+                    "bones_added": count,
+                    "bone_ids": bone_ids_json
+                }));
+            }
             match preset {
                 "starter" => {
                     history.execute(scene, Command::ApplyBipedRig)?;
@@ -2395,21 +2718,450 @@ pub fn execute_tool_call(
                 u32::try_from(raw_id)
                     .map_err(|_| AiError::InvalidArguments("bone_id overflow".into()))?,
             );
-            let delta = parse_rotation_deg(args)?;
-            let rest = scene
+            let has_rot = args.get("rotation_deg").is_some();
+            let trans_delta = parse_opt_vec3(args, "translation")?;
+            if !has_rot && trans_delta.is_none() {
+                return Err(AiError::InvalidArguments(
+                    "provide 'rotation_deg' and/or 'translation'".into(),
+                ));
+            }
+            let (rest_rot, rest_trans) = scene
                 .character_rig
                 .as_ref()
                 .and_then(|r| r.bone(bone_id))
-                .map(|b| b.rest_local.rotation)
-                .unwrap_or(glam::Quat::IDENTITY);
+                .map(|b| (b.rest_local.rotation, b.rest_local.translation))
+                .unwrap_or((glam::Quat::IDENTITY, glam::Vec3::ZERO));
+            let mut cmds = Vec::new();
+            if has_rot {
+                let delta = parse_rotation_deg(args)?;
+                cmds.push(Command::SetBoneRotation {
+                    bone_id,
+                    rotation: rest_rot * delta,
+                });
+            }
+            if let Some(td) = trans_delta {
+                cmds.push(Command::SetBoneTranslation {
+                    bone_id,
+                    translation: rest_trans + td,
+                });
+            }
+            if cmds.len() == 1 {
+                history.execute(scene, cmds.remove(0))?;
+            } else {
+                history.execute(scene, Command::Transaction(cmds))?;
+            }
+            Ok(json!({ "ok": true, "bone_id": bone_id.0 }))
+        }
+        "character_set_clip_layer" => {
+            if args.get("clear").and_then(Value::as_bool).unwrap_or(false) {
+                history.execute(scene, Command::SetClipLayers { layers: Vec::new() })?;
+                return Ok(json!({ "ok": true, "layers": 0 }));
+            }
+            let bone_prefix = args
+                .get("bone_prefix")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            let time_offset = args
+                .get("time_offset")
+                .and_then(Value::as_f64)
+                .unwrap_or(0.0) as f32;
+            if !time_offset.is_finite() {
+                return Err(AiError::InvalidArguments(
+                    "'time_offset' must be finite".into(),
+                ));
+            }
+            let rig = scene
+                .character_rig
+                .as_ref()
+                .ok_or_else(|| AiError::InvalidArguments("no character rig applied".into()))?;
+            let clip_index = if let Some(idx) = args.get("clip_index").and_then(Value::as_u64) {
+                idx as usize
+            } else if let Some(name) = args.get("clip_name").and_then(Value::as_str) {
+                rig.animations
+                    .iter()
+                    .position(|c| c.name == name)
+                    .ok_or_else(|| AiError::InvalidArguments(format!("clip '{name}' not found")))?
+            } else {
+                return Err(AiError::InvalidArguments(
+                    "missing 'clip_name' or 'clip_index'".into(),
+                ));
+            };
+            if clip_index >= rig.animations.len() {
+                return Err(AiError::InvalidArguments("clip_index out of range".into()));
+            }
+            let mut layers = rig.clip_layers.clone();
+            if let Some(existing) = layers.iter_mut().find(|l| l.bone_prefix == bone_prefix) {
+                existing.clip_index = clip_index;
+                existing.time_offset = time_offset;
+            } else {
+                layers.push(tessel_core::ClipLayer {
+                    clip_index,
+                    bone_prefix: bone_prefix.clone(),
+                    time_offset,
+                });
+            }
+            let count = layers.len();
+            history.execute(scene, Command::SetClipLayers { layers })?;
+            Ok(json!({
+                "ok": true,
+                "bone_prefix": bone_prefix,
+                "clip_index": clip_index,
+                "layers": count
+            }))
+        }
+        "character_bake_clip_layers" => {
+            let name = args
+                .get("name")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .ok_or_else(|| AiError::InvalidArguments("missing non-empty 'name'".into()))?
+                .to_string();
+            let fps = args.get("fps").and_then(Value::as_f64).unwrap_or(24.0) as f32;
+            if !fps.is_finite() || fps < 1.0 {
+                return Err(AiError::InvalidArguments("'fps' must be >= 1".into()));
+            }
+            let duration_override = match args.get("duration_secs") {
+                None => None,
+                Some(v) => {
+                    let d = v.as_f64().ok_or_else(|| {
+                        AiError::InvalidArguments("'duration_secs' must be a number".into())
+                    })? as f32;
+                    if !d.is_finite() || d <= 0.0 {
+                        return Err(AiError::InvalidArguments(
+                            "'duration_secs' must be > 0".into(),
+                        ));
+                    }
+                    Some(d)
+                }
+            };
+            let clamp_floor_y = match args.get("floor_y") {
+                None => None,
+                Some(v) => {
+                    let fy = v.as_f64().ok_or_else(|| {
+                        AiError::InvalidArguments("'floor_y' must be a number".into())
+                    })? as f32;
+                    if !fy.is_finite() {
+                        return Err(AiError::InvalidArguments("'floor_y' must be finite".into()));
+                    }
+                    Some(fy)
+                }
+            };
+            let activate = args.get("activate").and_then(Value::as_bool).unwrap_or(true);
+            let clear_layers = args
+                .get("clear_layers")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            let rig = scene
+                .character_rig
+                .as_ref()
+                .ok_or_else(|| AiError::InvalidArguments("no character rig applied".into()))?;
+            let baked = rig
+                .bake_clip_layers(name.clone(), fps, duration_override, clamp_floor_y)
+                .ok_or_else(|| {
+                    AiError::InvalidArguments("rig has no bones or animations to bake".into())
+                })?;
+            let duration_secs = baked.duration_secs;
+            let channels = baked.channels.len();
+            let visibility_tracks = baked.visibility_tracks.len();
+            let mut cmds = vec![Command::UpsertAnimationClip {
+                clip: baked,
+                activate,
+            }];
+            if clear_layers {
+                cmds.push(Command::SetClipLayers { layers: Vec::new() });
+            }
+            history.execute(scene, Command::Transaction(cmds))?;
+            let clip_index = scene
+                .character_rig
+                .as_ref()
+                .and_then(|r| r.animations.iter().position(|c| c.name == name))
+                .unwrap_or(0);
+            Ok(json!({
+                "ok": true,
+                "name": name,
+                "clip_index": clip_index,
+                "duration_secs": duration_secs,
+                "channels": channels,
+                "visibility_tracks": visibility_tracks
+            }))
+        }
+        "character_clamp_clip_to_floor" => {
+            let floor_y = args.get("floor_y").and_then(Value::as_f64).unwrap_or(0.0) as f32;
+            if !floor_y.is_finite() {
+                return Err(AiError::InvalidArguments("'floor_y' must be finite".into()));
+            }
+            let fps = args.get("fps").and_then(Value::as_f64).unwrap_or(24.0) as f32;
+            if !fps.is_finite() || fps < 1.0 {
+                return Err(AiError::InvalidArguments("'fps' must be >= 1".into()));
+            }
+            let bone_prefix = args
+                .get("bone_prefix")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            let rig = scene
+                .character_rig
+                .as_ref()
+                .ok_or_else(|| AiError::InvalidArguments("no character rig applied".into()))?;
+            let clip_index = if let Some(idx) = args.get("clip_index").and_then(Value::as_u64) {
+                idx as usize
+            } else if let Some(name) = args.get("clip_name").and_then(Value::as_str) {
+                rig.animations
+                    .iter()
+                    .position(|c| c.name == name)
+                    .ok_or_else(|| AiError::InvalidArguments(format!("clip '{name}' not found")))?
+            } else {
+                rig.active_animation
+            };
+            let clamped = rig
+                .clamp_clip_to_floor(clip_index, bone_prefix, floor_y, fps)
+                .ok_or_else(|| {
+                    AiError::InvalidArguments(format!(
+                        "unable to clamp clip {clip_index} for prefix '{bone_prefix}'"
+                    ))
+                })?;
+            let clip_name = clamped.name.clone();
+            let duration_secs = clamped.duration_secs;
             history.execute(
                 scene,
-                Command::SetBoneRotation {
-                    bone_id,
-                    rotation: rest * delta,
+                Command::UpsertAnimationClip {
+                    clip: clamped,
+                    activate: false,
                 },
             )?;
-            Ok(json!({ "ok": true, "bone_id": bone_id.0 }))
+            Ok(json!({
+                "ok": true,
+                "clip_index": clip_index,
+                "clip_name": clip_name,
+                "bone_prefix": bone_prefix,
+                "floor_y": floor_y,
+                "duration_secs": duration_secs
+            }))
+        }
+        "character_clamp_to_floor" => {
+            let floor_y = args.get("floor_y").and_then(Value::as_f64).unwrap_or(0.0) as f32;
+            if !floor_y.is_finite() {
+                return Err(AiError::InvalidArguments("'floor_y' must be finite".into()));
+            }
+            let bone_prefix = args
+                .get("bone_prefix")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            let rig = scene
+                .character_rig
+                .as_ref()
+                .ok_or_else(|| AiError::InvalidArguments("no character rig applied".into()))?;
+            let matching_bones: Vec<&tessel_core::Bone> = rig
+                .bones
+                .iter()
+                .filter(|b| {
+                    if bone_prefix.is_empty() {
+                        !b.name.contains('_')
+                    } else {
+                        b.name.starts_with(bone_prefix)
+                    }
+                })
+                .collect();
+            let root_bone = matching_bones
+                .iter()
+                .find(|b| b.parent.is_none())
+                .copied()
+                .ok_or_else(|| {
+                    AiError::InvalidArguments(format!(
+                        "no root bone found for prefix '{bone_prefix}'"
+                    ))
+                })?;
+            let world_mats = rig.world_pose_matrices();
+            let mut min_y = f32::INFINITY;
+            for b in &matching_bones {
+                if let Some(mat) = world_mats.get(&b.id) {
+                    min_y = min_y.min(mat.transform_point3(glam::Vec3::ZERO).y);
+                }
+            }
+            if !min_y.is_finite() {
+                return Err(AiError::InvalidArguments(
+                    "unable to compute character world bounds".into(),
+                ));
+            }
+            let delta_y = floor_y - min_y;
+            let mut next_trans = root_bone.pose_local.translation;
+            next_trans.y += delta_y;
+            let root_id = root_bone.id;
+            history.execute(
+                scene,
+                Command::SetBoneTranslation {
+                    bone_id: root_id,
+                    translation: next_trans,
+                },
+            )?;
+            Ok(json!({
+                "ok": true,
+                "root_bone_id": root_id.0,
+                "min_y_before": min_y,
+                "delta_y": delta_y,
+                "floor_y": floor_y
+            }))
+        }
+        "character_set_parent_switch_keyframe" => {
+            let node_id = args
+                .get("node_id")
+                .and_then(Value::as_u64)
+                .map(NodeId)
+                .ok_or_else(|| AiError::InvalidArguments("missing 'node_id'".into()))?;
+            let time_secs = args
+                .get("time_secs")
+                .and_then(Value::as_f64)
+                .ok_or_else(|| AiError::InvalidArguments("missing 'time_secs'".into()))?
+                as f32;
+            if !time_secs.is_finite() || time_secs < 0.0 {
+                return Err(AiError::InvalidArguments(
+                    "'time_secs' must be finite and >= 0".into(),
+                ));
+            }
+            let bone_id = match args.get("bone_id") {
+                None | Some(Value::Null) => None,
+                Some(v) => {
+                    let raw = v.as_u64().ok_or_else(|| {
+                        AiError::InvalidArguments("'bone_id' must be integer or null".into())
+                    })?;
+                    Some(BoneId(u32::try_from(raw).map_err(|_| {
+                        AiError::InvalidArguments("bone_id overflow".into())
+                    })?))
+                }
+            };
+            let position = parse_opt_vec3(args, "position")?.unwrap_or(glam::Vec3::ZERO);
+            let rotation = if args.get("rotation_deg").is_some() {
+                parse_rotation_deg(args)?
+            } else {
+                glam::Quat::IDENTITY
+            };
+            let clip_index = if let Some(idx) = args.get("clip_index").and_then(Value::as_u64) {
+                idx as usize
+            } else if let Some(name) = args.get("clip_name").and_then(Value::as_str) {
+                let existing = scene
+                    .character_rig
+                    .as_ref()
+                    .and_then(|r| r.animations.iter().position(|c| c.name == name));
+                match existing {
+                    Some(i) => i,
+                    None => {
+                        let dur = args
+                            .get("duration_secs")
+                            .and_then(Value::as_f64)
+                            .unwrap_or((time_secs as f64).max(1.0))
+                            as f32;
+                        history.execute(
+                            scene,
+                            Command::AddAnimationClip {
+                                name: name.to_string(),
+                                duration_secs: dur.max(0.1),
+                            },
+                        )?;
+                        scene
+                            .character_rig
+                            .as_ref()
+                            .map(|r| r.animations.len().saturating_sub(1))
+                            .unwrap_or(0)
+                    }
+                }
+            } else {
+                scene
+                    .character_rig
+                    .as_ref()
+                    .map(|r| r.active_animation)
+                    .unwrap_or(0)
+            };
+            let key = tessel_core::ParentSwitchKey {
+                time_secs,
+                bone_id,
+                position,
+                rotation,
+            };
+            history.execute(
+                scene,
+                Command::SetParentSwitchKeyframe {
+                    clip_index,
+                    node_id,
+                    key,
+                },
+            )?;
+            Ok(json!({
+                "ok": true,
+                "clip_index": clip_index,
+                "node_id": node_id.0,
+                "time_secs": time_secs,
+                "bone_id": bone_id.map(|b| b.0),
+                "detached": bone_id.is_none()
+            }))
+        }
+        "character_set_visibility_keyframe" => {
+            let node_id = args
+                .get("node_id")
+                .and_then(Value::as_u64)
+                .map(NodeId)
+                .ok_or_else(|| AiError::InvalidArguments("missing 'node_id'".into()))?;
+            let time_secs = args
+                .get("time_secs")
+                .and_then(Value::as_f64)
+                .ok_or_else(|| AiError::InvalidArguments("missing 'time_secs'".into()))?
+                as f32;
+            let visible = args
+                .get("visible")
+                .and_then(Value::as_bool)
+                .ok_or_else(|| AiError::InvalidArguments("missing boolean 'visible'".into()))?;
+            let clip_index = if let Some(idx) = args.get("clip_index").and_then(Value::as_u64) {
+                idx as usize
+            } else if let Some(name) = args.get("clip_name").and_then(Value::as_str) {
+                let existing = scene
+                    .character_rig
+                    .as_ref()
+                    .and_then(|r| r.animations.iter().position(|c| c.name == name));
+                match existing {
+                    Some(i) => i,
+                    None => {
+                        let dur = args
+                            .get("duration_secs")
+                            .and_then(Value::as_f64)
+                            .unwrap_or((time_secs as f64).max(1.0))
+                            as f32;
+                        history.execute(
+                            scene,
+                            Command::AddAnimationClip {
+                                name: name.to_string(),
+                                duration_secs: dur.max(0.1),
+                            },
+                        )?;
+                        scene
+                            .character_rig
+                            .as_ref()
+                            .map(|r| r.animations.len().saturating_sub(1))
+                            .unwrap_or(0)
+                    }
+                }
+            } else {
+                scene
+                    .character_rig
+                    .as_ref()
+                    .map(|r| r.active_animation)
+                    .unwrap_or(0)
+            };
+            history.execute(
+                scene,
+                Command::SetVisibilityKeyframe {
+                    clip_index,
+                    node_id,
+                    time_secs,
+                    visible,
+                },
+            )?;
+            Ok(json!({
+                "ok": true,
+                "clip_index": clip_index,
+                "node_id": node_id.0,
+                "time_secs": time_secs,
+                "visible": visible
+            }))
         }
         "character_set_keyframe" => {
             let raw_id = args
@@ -2428,6 +3180,22 @@ pub fn execute_tool_call(
             let rotation = parse_rotation_deg(args)?;
             let translation = parse_opt_vec3(args, "translation")?.unwrap_or(glam::Vec3::ZERO);
             let scale = parse_opt_vec3(args, "scale")?.unwrap_or(glam::Vec3::ONE);
+            let interpolation = match args
+                .get("interpolation")
+                .and_then(Value::as_str)
+                .unwrap_or("linear")
+            {
+                "linear" => tessel_core::KeyframeInterpolation::Linear,
+                "step" => tessel_core::KeyframeInterpolation::Step,
+                "ease_in" => tessel_core::KeyframeInterpolation::EaseIn,
+                "ease_out" => tessel_core::KeyframeInterpolation::EaseOut,
+                "ease_in_out" => tessel_core::KeyframeInterpolation::EaseInOut,
+                other => {
+                    return Err(AiError::InvalidArguments(format!(
+                        "unsupported interpolation '{other}'"
+                    )));
+                }
+            };
             let clip_index = if let Some(idx) = args.get("clip_index").and_then(Value::as_u64) {
                 idx as usize
             } else if let Some(name) = args.get("clip_name").and_then(Value::as_str) {
@@ -2471,6 +3239,7 @@ pub fn execute_tool_call(
                         translation,
                         rotation,
                         scale,
+                        interpolation,
                     },
                 },
             )?;
@@ -2498,17 +3267,57 @@ pub fn execute_tool_call(
             let end = parse_bone("end_bone_id")?;
             let target = parse_opt_vec3(args, "target")?
                 .ok_or_else(|| AiError::InvalidArguments("missing 'target'".into()))?;
-            let pole = parse_opt_vec3(args, "pole_vector")?.unwrap_or(glam::Vec3::Z);
+            let pole = if let Some(pt) = parse_opt_vec3(args, "pole_target")? {
+                let root_world = scene
+                    .character_rig
+                    .as_ref()
+                    .and_then(|r| r.world_pose_matrices().get(&root).copied())
+                    .map(|m| m.transform_point3(glam::Vec3::ZERO))
+                    .unwrap_or(glam::Vec3::ZERO);
+                let dir = pt - root_world;
+                if dir.length_squared() > 1e-8 {
+                    dir.normalize()
+                } else {
+                    glam::Vec3::Z
+                }
+            } else {
+                parse_opt_vec3(args, "pole_vector")?.unwrap_or(glam::Vec3::Z)
+            };
+            let end_world_rot_deg = parse_opt_vec3(args, "end_world_rotation_deg")?;
             let end_rot_deg = parse_opt_vec3(args, "end_rotation_deg")?;
 
-            let mut cmds = vec![Command::SolveTwoBoneIk {
-                root_bone: root,
-                mid_bone: mid,
-                end_bone: end,
-                target,
-                pole,
-            }];
-            if let Some(deg) = end_rot_deg {
+            history.execute(
+                scene,
+                Command::SolveTwoBoneIk {
+                    root_bone: root,
+                    mid_bone: mid,
+                    end_bone: end,
+                    target,
+                    pole,
+                },
+            )?;
+            if let Some(wdeg) = end_world_rot_deg {
+                let desired_world = glam::Quat::from_euler(
+                    glam::EulerRot::XYZ,
+                    wdeg.x.to_radians(),
+                    wdeg.y.to_radians(),
+                    wdeg.z.to_radians(),
+                );
+                let parent_world_rot = scene
+                    .character_rig
+                    .as_ref()
+                    .and_then(|r| r.world_pose_matrices().get(&mid).copied())
+                    .map(|m| glam::Quat::from_mat4(&m).normalize())
+                    .unwrap_or(glam::Quat::IDENTITY);
+                let local_rot = (parent_world_rot.inverse() * desired_world).normalize();
+                history.execute(
+                    scene,
+                    Command::SetBoneRotation {
+                        bone_id: end,
+                        rotation: local_rot,
+                    },
+                )?;
+            } else if let Some(deg) = end_rot_deg {
                 let rest = scene
                     .character_rig
                     .as_ref()
@@ -2521,15 +3330,13 @@ pub fn execute_tool_call(
                     deg.y.to_radians(),
                     deg.z.to_radians(),
                 );
-                cmds.push(Command::SetBoneRotation {
-                    bone_id: end,
-                    rotation: rest * delta,
-                });
-            }
-            if cmds.len() == 1 {
-                history.execute(scene, cmds.remove(0))?;
-            } else {
-                history.execute(scene, Command::Transaction(cmds))?;
+                history.execute(
+                    scene,
+                    Command::SetBoneRotation {
+                        bone_id: end,
+                        rotation: rest * delta,
+                    },
+                )?;
             }
 
             let bone_delta_deg = |bid: BoneId| -> [f32; 3] {
@@ -2633,6 +3440,18 @@ pub fn execute_tool_call(
                     Some(out)
                 }
             };
+            let interpolation = match args.get("interpolation").and_then(Value::as_str) {
+                None | Some("linear") => tessel_core::KeyframeInterpolation::Linear,
+                Some("step") => tessel_core::KeyframeInterpolation::Step,
+                Some("ease_in") => tessel_core::KeyframeInterpolation::EaseIn,
+                Some("ease_out") => tessel_core::KeyframeInterpolation::EaseOut,
+                Some("ease_in_out") => tessel_core::KeyframeInterpolation::EaseInOut,
+                Some(other) => {
+                    return Err(AiError::InvalidArguments(format!(
+                        "unknown interpolation '{other}'; use linear|step|ease_in|ease_out|ease_in_out"
+                    )));
+                }
+            };
             let cmds: Vec<Command> = rig
                 .bones
                 .iter()
@@ -2642,11 +3461,18 @@ pub fn execute_tool_call(
                         .is_none_or(|list| list.contains(&b.id))
                 })
                 .map(|b| {
-                    let delta = b.rest_local.rotation.inverse() * b.pose_local.rotation;
+                    let rot_delta = b.rest_local.rotation.inverse() * b.pose_local.rotation;
+                    let trans_delta = b.pose_local.translation - b.rest_local.translation;
                     Command::SetAnimationKeyframe {
                         clip_index,
                         bone_id: b.id,
-                        keyframe: Keyframe::rotation_only(time_secs, delta),
+                        keyframe: Keyframe {
+                            time_secs,
+                            translation: trans_delta,
+                            rotation: rot_delta,
+                            scale: glam::Vec3::ONE,
+                            interpolation,
+                        },
                     }
                 })
                 .collect();
@@ -3229,6 +4055,8 @@ pub fn scene_summary_json(scene: &SceneState) -> Value {
         "active_mode": scene.active_mode.label(),
         "revision": scene.revision,
         "selected_node": scene.selected_node.map(|n| n.0),
+        "light_azimuth_deg": scene.light_azimuth.to_degrees(),
+        "light_elevation_deg": scene.light_elevation.to_degrees(),
         "has_character_rig": scene.character_rig.is_some(),
         "animations": animations,
         "nodes": nodes
@@ -3709,6 +4537,10 @@ mod tests {
         // closed with a clear message instead of misrouting to UnknownTool.
         for (name, args) in [
             ("camera_get", json!({})),
+            (
+                "camera_set_pose",
+                json!({ "yaw_deg": 45.0, "pitch_deg": 20.0 }),
+            ),
             ("camera_look_at", json!({ "target": [0.0, 0.5, 0.0] })),
             ("camera_zoom", json!({ "factor": 0.5 })),
             ("camera_orbit", json!({ "dx": 10.0, "dy": 0.0 })),
@@ -4962,8 +5794,8 @@ mod tests {
         )
         .unwrap();
         let node_id = prim["node_id"].as_u64().unwrap();
-        let sc = scene.nodes[&tessel_core::NodeId(node_id)].transform.scale;
-        assert!((sc.x - 0.42).abs() < 1e-4 && (sc.y - 0.56).abs() < 1e-4);
+        let (lo, hi) = scene.lowpoly_meshes[&tessel_core::NodeId(node_id)].bounds();
+        assert!(((hi.x - lo.x) - 0.42).abs() < 1e-4 && ((hi.y - lo.y) - 0.56).abs() < 1e-4);
 
         // 3. Apply humanoid rig & verify character_solve_ik moves arm bones
         execute_tool_call(
@@ -5244,5 +6076,791 @@ mod tests {
         .unwrap();
         assert_eq!(morph["ok"], true);
         assert_eq!(morph["affected_vertices"], 4);
+    }
+
+    #[test]
+    fn v30_extruded_polygon_and_ik_world_end_rotation() {
+        let mut scene = SceneState::new();
+        let mut history = HistoryStack::new();
+        let dir = std::env::temp_dir();
+
+        // 1. Create necktie silhouette via mesh_create_extruded_polygon
+        let tie = execute_tool_call(
+            "mesh_create_extruded_polygon",
+            &json!({
+                "name": "Necktie",
+                "points": [[-0.03, 0.0], [0.03, 0.0], [0.045, -0.32], [0.0, -0.38], [-0.045, -0.32]],
+                "depth": 0.015,
+                "palette_index": 1,
+                "position": [0.0, 1.42, 0.12]
+            }),
+            &mut scene,
+            &mut history,
+            &dir,
+        )
+        .unwrap();
+        assert_eq!(tie["ok"], true);
+        assert_eq!(tie["vertices"], 10);
+        assert_eq!(tie["faces"], 7);
+
+        // 2. IK with pole_target (world point) + end_world_rotation_deg (world-space aim)
+        execute_tool_call(
+            "character_apply_biped_rig",
+            &json!({ "preset": "humanoid" }),
+            &mut scene,
+            &mut history,
+            &dir,
+        )
+        .unwrap();
+        let rig = scene.character_rig.as_ref().unwrap();
+        let upper = rig
+            .bones
+            .iter()
+            .find(|b| b.name == "RightUpperArm")
+            .unwrap()
+            .id;
+        let mid = rig
+            .bones
+            .iter()
+            .find(|b| b.name == "RightForearm")
+            .unwrap()
+            .id;
+        let end = rig.bones.iter().find(|b| b.name == "RightHand").unwrap().id;
+
+        execute_tool_call(
+            "character_solve_ik",
+            &json!({
+                "root_bone_id": upper.0,
+                "mid_bone_id": mid.0,
+                "end_bone_id": end.0,
+                "target": [-0.18, 1.25, 0.35],
+                "pole_target": [-0.35, 0.90, -0.15],
+                "end_world_rotation_deg": [0.0, 0.0, 0.0]
+            }),
+            &mut scene,
+            &mut history,
+            &dir,
+        )
+        .unwrap();
+        let end_world_mat = scene.character_rig.as_ref().unwrap().world_pose_matrices()[&end];
+        let end_world_rot = glam::Quat::from_mat4(&end_world_mat).normalize();
+        assert!(
+            end_world_rot.angle_between(glam::Quat::IDENTITY) < 1e-2,
+            "end_bone_id world rotation should match identity [0,0,0] regardless of forearm IK"
+        );
+    }
+
+    #[test]
+    fn v32_loft_mesh_and_multi_character_subrig_append() {
+        let mut scene = SceneState::new();
+        let mut history = HistoryStack::new();
+        let dir = std::env::temp_dir();
+
+        // 1. Create tapered torso via mesh_create_loft
+        let loft = execute_tool_call(
+            "mesh_create_loft",
+            &json!({
+                "name": "TaperedTorso",
+                "sections": [
+                    [[0.0, 0.0, 0.2], [0.25, 0.0, 0.0], [0.0, 0.0, -0.2], [-0.25, 0.0, 0.0]],
+                    [[0.0, 0.5, 0.16], [0.20, 0.5, 0.0], [0.0, 0.5, -0.16], [-0.20, 0.5, 0.0]]
+                ],
+                "cap_ends": true,
+                "palette_index": 3
+            }),
+            &mut scene,
+            &mut history,
+            &dir,
+        )
+        .unwrap();
+        assert_eq!(loft["ok"], true);
+        assert_eq!(loft["vertices"], 8);
+        assert_eq!(loft["faces"], 6);
+
+        // 2. Apply P1 humanoid rig, then append P2 humanoid sub-rig at z=2.0 facing -Z (yaw 180)
+        execute_tool_call(
+            "character_apply_biped_rig",
+            &json!({ "preset": "humanoid" }),
+            &mut scene,
+            &mut history,
+            &dir,
+        )
+        .unwrap();
+        let p2 = execute_tool_call(
+            "character_apply_biped_rig",
+            &json!({
+                "preset": "humanoid",
+                "append": true,
+                "prefix": "P2_",
+                "offset": [0.0, 0.0, 2.0],
+                "yaw_deg": 180.0
+            }),
+            &mut scene,
+            &mut history,
+            &dir,
+        )
+        .unwrap();
+        assert_eq!(p2["ok"], true);
+        assert_eq!(p2["bones_added"], 19);
+        assert_eq!(p2["bone_ids"]["P2_Root"], 19);
+        assert_eq!(scene.character_rig.as_ref().unwrap().bones.len(), 38);
+    }
+
+    #[test]
+    fn v33_scene_batch_chains_prior_results_and_bakes_vector_size() {
+        let mut scene = SceneState::new();
+        let mut history = HistoryStack::new();
+        let dir = std::env::temp_dir();
+
+        let batch = execute_tool_call(
+            "scene_batch",
+            &json!({
+                "calls": [
+                    {
+                        "name": "mesh_create_primitive",
+                        "arguments": {
+                            "name": "Helmet",
+                            "kind": "cube",
+                            "size": [0.3, 0.2, 0.25],
+                            "palette_index": 3
+                        }
+                    },
+                    {
+                        "name": "character_apply_biped_rig",
+                        "arguments": { "preset": "humanoid" }
+                    },
+                    {
+                        "name": "character_bind_node",
+                        "arguments": {
+                            "node_id": "$0.node_id",
+                            "bone_id": 4
+                        }
+                    }
+                ]
+            }),
+            &mut scene,
+            &mut history,
+            &dir,
+        )
+        .unwrap();
+        assert_eq!(batch["ok"], true);
+        assert_eq!(batch["count"], 3);
+        let helmet_id = batch["results"][0]["node_id"].as_u64().unwrap();
+        let actual_sz = batch["results"][0]["actual_size"].as_array().unwrap();
+        assert!((actual_sz[0].as_f64().unwrap() - 0.3).abs() < 1e-5);
+        assert!((actual_sz[1].as_f64().unwrap() - 0.2).abs() < 1e-5);
+        assert!((actual_sz[2].as_f64().unwrap() - 0.25).abs() < 1e-5);
+        let (lo, hi) = scene.lowpoly_meshes[&tessel_core::NodeId(helmet_id)].bounds();
+        assert!(((hi.x - lo.x) - 0.3).abs() < 1e-4);
+        assert!(((hi.y - lo.y) - 0.2).abs() < 1e-4);
+        assert!(((hi.z - lo.z) - 0.25).abs() < 1e-4);
+        assert!(scene
+            .character_rig
+            .as_ref()
+            .unwrap()
+            .bindings
+            .iter()
+            .any(|b| b.node_id == tessel_core::NodeId(helmet_id) && b.bone_id == BoneId(4)));
+    }
+
+    #[test]
+    fn v34_closes_all_gaps_v2_items() {
+        let mut scene = SceneState::new();
+        let mut history = HistoryStack::new();
+        let dir = std::env::temp_dir();
+
+        // 2.2 & 2.3: Append P2 humanoid facing -Z (yaw 180) with default clips remapped
+        execute_tool_call(
+            "character_apply_biped_rig",
+            &json!({ "preset": "humanoid" }),
+            &mut scene,
+            &mut history,
+            &dir,
+        )
+        .unwrap();
+        let p2 = execute_tool_call(
+            "character_apply_biped_rig",
+            &json!({
+                "preset": "humanoid",
+                "append": true,
+                "prefix": "P2_",
+                "offset": [0.0, 0.0, 2.0],
+                "yaw_deg": 180.0
+            }),
+            &mut scene,
+            &mut history,
+            &dir,
+        )
+        .unwrap();
+        let p2_root = p2["bone_ids"]["P2_Root"].as_u64().unwrap() as u32;
+        let p2_left_thigh = p2["bone_ids"]["P2_LeftThigh"].as_u64().unwrap() as u32;
+
+        // Walk clip now animates P2's LeftThigh automatically (#2.2)
+        let walk = scene
+            .character_rig
+            .as_ref()
+            .unwrap()
+            .animations
+            .iter()
+            .find(|c| c.name == "Walk")
+            .unwrap();
+        assert!(walk
+            .channels
+            .iter()
+            .any(|c| c.bone_id == BoneId(p2_left_thigh)));
+
+        // P2_Root carries yaw=180 rest rotation (#2.3) so child local axes are character-local
+        let p2_root_bone = scene
+            .character_rig
+            .as_ref()
+            .unwrap()
+            .bone(BoneId(p2_root))
+            .unwrap();
+        assert!(
+            p2_root_bone
+                .rest_local
+                .rotation
+                .angle_between(glam::Quat::from_rotation_y(std::f32::consts::PI))
+                < 1e-4
+        );
+
+        // 2.5: Pose supports translation + snapshot preserves translation delta
+        execute_tool_call(
+            "character_set_bone_pose",
+            &json!({
+                "bone_id": p2_root,
+                "translation": [0.25, -0.1, 0.0],
+                "rotation_deg": [0.0, 15.0, 0.0]
+            }),
+            &mut scene,
+            &mut history,
+            &dir,
+        )
+        .unwrap();
+        execute_tool_call(
+            "character_snapshot_pose_to_keyframe",
+            &json!({
+                "clip_name": "Dodge",
+                "duration_secs": 1.0,
+                "time_secs": 0.4,
+                "bone_ids": [p2_root]
+            }),
+            &mut scene,
+            &mut history,
+            &dir,
+        )
+        .unwrap();
+        let dodge = scene
+            .character_rig
+            .as_ref()
+            .unwrap()
+            .animations
+            .iter()
+            .find(|c| c.name == "Dodge")
+            .unwrap();
+        let kf = dodge.sample_bone(BoneId(p2_root), 0.4).unwrap();
+        assert!((kf.translation.x - 0.25).abs() < 1e-4);
+        assert!((kf.translation.y - (-0.1)).abs() < 1e-4);
+
+        // 2.4: Per-node visibility keyframes toggle live visibility on playback scrub
+        let flash = execute_tool_call(
+            "mesh_create_primitive",
+            &json!({ "name": "MuzzleFlash", "kind": "sphere", "size": 0.08, "palette_index": 6 }),
+            &mut scene,
+            &mut history,
+            &dir,
+        )
+        .unwrap();
+        let flash_id = flash["node_id"].as_u64().unwrap();
+        execute_tool_call(
+            "character_set_visibility_keyframe",
+            &json!({ "clip_name": "Dodge", "node_id": flash_id, "time_secs": 0.0, "visible": false }),
+            &mut scene,
+            &mut history,
+            &dir,
+        )
+        .unwrap();
+        execute_tool_call(
+            "character_set_visibility_keyframe",
+            &json!({ "clip_name": "Dodge", "node_id": flash_id, "time_secs": 0.3, "visible": true }),
+            &mut scene,
+            &mut history,
+            &dir,
+        )
+        .unwrap();
+        execute_tool_call(
+            "character_set_visibility_keyframe",
+            &json!({ "clip_name": "Dodge", "node_id": flash_id, "time_secs": 0.5, "visible": false }),
+            &mut scene,
+            &mut history,
+            &dir,
+        )
+        .unwrap();
+
+        execute_tool_call(
+            "character_set_playback_time",
+            &json!({ "clip_name": "Dodge", "time_secs": 0.1 }),
+            &mut scene,
+            &mut history,
+            &dir,
+        )
+        .unwrap();
+        assert!(!scene.character_rig.as_ref().unwrap().node_visibility[&NodeId(flash_id)]);
+        execute_tool_call(
+            "character_set_playback_time",
+            &json!({ "clip_name": "Dodge", "time_secs": 0.35 }),
+            &mut scene,
+            &mut history,
+            &dir,
+        )
+        .unwrap();
+        assert!(scene.character_rig.as_ref().unwrap().node_visibility[&NodeId(flash_id)]);
+    }
+
+    #[test]
+    fn v36_clip_layers_interpolation_and_floor_clamp() {
+        let mut scene = SceneState::new();
+        let mut history = HistoryStack::new();
+        let dir = std::env::temp_dir();
+
+        execute_tool_call(
+            "character_apply_biped_rig",
+            &json!({ "preset": "humanoid" }),
+            &mut scene,
+            &mut history,
+            &dir,
+        )
+        .unwrap();
+        let p2 = execute_tool_call(
+            "character_apply_biped_rig",
+            &json!({
+                "preset": "humanoid",
+                "append": true,
+                "prefix": "P2_",
+                "offset": [0.0, 0.0, 2.0],
+                "yaw_deg": 180.0
+            }),
+            &mut scene,
+            &mut history,
+            &dir,
+        )
+        .unwrap();
+        let p2_root = p2["bone_ids"]["P2_Root"].as_u64().unwrap() as u32;
+
+        // 1. Step & ease_in_out keyframe interpolation on ShotFall clip
+        execute_tool_call(
+            "character_set_keyframe",
+            &json!({
+                "clip_name": "ShotFall",
+                "duration_secs": 1.0,
+                "bone_id": p2_root,
+                "time_secs": 0.0,
+                "rotation_deg": [0.0, 0.0, 0.0],
+                "interpolation": "step"
+            }),
+            &mut scene,
+            &mut history,
+            &dir,
+        )
+        .unwrap();
+        execute_tool_call(
+            "character_set_keyframe",
+            &json!({
+                "clip_name": "ShotFall",
+                "bone_id": p2_root,
+                "time_secs": 0.5,
+                "rotation_deg": [-85.0, 0.0, 0.0],
+                "interpolation": "ease_out"
+            }),
+            &mut scene,
+            &mut history,
+            &dir,
+        )
+        .unwrap();
+        let shot = scene
+            .character_rig
+            .as_ref()
+            .unwrap()
+            .animations
+            .iter()
+            .find(|c| c.name == "ShotFall")
+            .unwrap();
+        // Step interpolation holds 0° until t=0.5s
+        let mid_kf = shot.sample_bone(BoneId(p2_root), 0.25).unwrap();
+        assert!(mid_kf.rotation.angle_between(glam::Quat::IDENTITY) < 1e-4);
+
+        // 2. Simultaneous per-character clip layers: P1 Walk + P2 ShotFall
+        execute_tool_call(
+            "character_set_clip_layer",
+            &json!({ "clip_name": "ShotFall", "bone_prefix": "P2_" }),
+            &mut scene,
+            &mut history,
+            &dir,
+        )
+        .unwrap();
+        execute_tool_call(
+            "character_set_playback_time",
+            &json!({ "clip_name": "Walk", "time_secs": 0.5 }),
+            &mut scene,
+            &mut history,
+            &dir,
+        )
+        .unwrap();
+        let rig = scene.character_rig.as_ref().unwrap();
+        let p2_bone = rig.bone(BoneId(p2_root)).unwrap();
+        let p2_delta = p2_bone.rest_local.rotation.inverse() * p2_bone.pose_local.rotation;
+        assert!(p2_delta.angle_between(glam::Quat::IDENTITY) > 1.0);
+
+        // 3. Floor clamp shifts P2_Root Y so lowest joint sits flush on y = 0.0
+        let clamp = execute_tool_call(
+            "character_clamp_to_floor",
+            &json!({ "floor_y": 0.0, "bone_prefix": "P2_" }),
+            &mut scene,
+            &mut history,
+            &dir,
+        )
+        .unwrap();
+        assert_eq!(clamp["ok"], true);
+        let mats = scene.character_rig.as_ref().unwrap().world_pose_matrices();
+        let min_y = scene
+            .character_rig
+            .as_ref()
+            .unwrap()
+            .bones
+            .iter()
+            .filter(|b| b.name.starts_with("P2_"))
+            .map(|b| mats[&b.id].transform_point3(glam::Vec3::ZERO).y)
+            .fold(f32::INFINITY, f32::min);
+        assert!(
+            min_y.abs() < 1e-3,
+            "min_y after floor clamp should be ~0, got {min_y}"
+        );
+    }
+
+    #[test]
+    fn v39_snapshot_interpolation_bake_clip_layers_and_subframe_floor_clamp() {
+        let mut scene = SceneState::new();
+        let mut history = HistoryStack::new();
+        let dir = std::env::temp_dir();
+
+        execute_tool_call(
+            "mesh_create_primitive",
+            &json!({ "name": "HeroBody", "kind": "cube", "size": 1.0 }),
+            &mut scene,
+            &mut history,
+            &dir,
+        )
+        .unwrap();
+        execute_tool_call(
+            "character_apply_biped_rig",
+            &json!({ "preset": "starter" }),
+            &mut scene,
+            &mut history,
+            &dir,
+        )
+        .unwrap();
+        let p2 = execute_tool_call(
+            "character_apply_biped_rig",
+            &json!({
+                "preset": "starter",
+                "append": true,
+                "prefix": "P2_",
+                "offset": [0.0, 0.0, 2.0],
+                "yaw_deg": 180.0
+            }),
+            &mut scene,
+            &mut history,
+            &dir,
+        )
+        .unwrap();
+        let p2_root = p2["bone_ids"]["P2_Root"].as_u64().unwrap() as u32;
+
+        // 1. character_snapshot_pose_to_keyframe with interpolation: "ease_out"
+        execute_tool_call(
+            "character_set_bone_pose",
+            &json!({ "bone_id": p2_root, "rotation_deg": [-86.0, 0.0, 0.0] }),
+            &mut scene,
+            &mut history,
+            &dir,
+        )
+        .unwrap();
+        execute_tool_call(
+            "character_snapshot_pose_to_keyframe",
+            &json!({
+                "clip_name": "FallArc",
+                "duration_secs": 1.0,
+                "time_secs": 0.0,
+                "bone_ids": [p2_root],
+                "interpolation": "ease_out"
+            }),
+            &mut scene,
+            &mut history,
+            &dir,
+        )
+        .unwrap();
+        // Reset root to upright at t=0 and fallen at t=1.0
+        execute_tool_call(
+            "character_set_keyframe",
+            &json!({
+                "clip_name": "FallArc",
+                "bone_id": p2_root,
+                "time_secs": 0.0,
+                "rotation_deg": [0.0, 0.0, 0.0],
+                "interpolation": "ease_out"
+            }),
+            &mut scene,
+            &mut history,
+            &dir,
+        )
+        .unwrap();
+        execute_tool_call(
+            "character_set_keyframe",
+            &json!({
+                "clip_name": "FallArc",
+                "bone_id": p2_root,
+                "time_secs": 1.0,
+                "rotation_deg": [-86.0, 0.0, 0.0],
+                "interpolation": "linear"
+            }),
+            &mut scene,
+            &mut history,
+            &dir,
+        )
+        .unwrap();
+        let fall_clip = scene
+            .character_rig
+            .as_ref()
+            .unwrap()
+            .animations
+            .iter()
+            .find(|c| c.name == "FallArc")
+            .unwrap();
+        let ch = fall_clip
+            .channels
+            .iter()
+            .find(|c| c.bone_id == BoneId(p2_root))
+            .unwrap();
+        assert_eq!(
+            ch.keyframes[0].interpolation,
+            tessel_core::KeyframeInterpolation::EaseOut
+        );
+
+        // 2. Sub-frame floor clamp keeps P2 flush on y=0.0 even at mid-arc t=0.5s
+        let clamped = execute_tool_call(
+            "character_clamp_clip_to_floor",
+            &json!({ "clip_name": "FallArc", "bone_prefix": "P2_", "floor_y": 0.0, "fps": 20 }),
+            &mut scene,
+            &mut history,
+            &dir,
+        )
+        .unwrap();
+        assert_eq!(clamped["ok"], true);
+        execute_tool_call(
+            "character_set_playback_time",
+            &json!({ "clip_name": "FallArc", "time_secs": 0.5 }),
+            &mut scene,
+            &mut history,
+            &dir,
+        )
+        .unwrap();
+        let mats = scene.character_rig.as_ref().unwrap().world_pose_matrices();
+        let mid_min_y = scene
+            .character_rig
+            .as_ref()
+            .unwrap()
+            .bones
+            .iter()
+            .filter(|b| b.name.starts_with("P2_"))
+            .map(|b| mats[&b.id].transform_point3(glam::Vec3::ZERO).y)
+            .fold(f32::INFINITY, f32::min);
+        assert!(
+            mid_min_y.abs() < 0.02,
+            "mid-arc min_y after sub-frame floor clamp should be ~0, got {mid_min_y}"
+        );
+
+        // 3. Bake multi-character clip_layers into 1 standalone clip ready for .glb
+        execute_tool_call(
+            "character_set_clip_layer",
+            &json!({ "clip_name": "Walk", "bone_prefix": "" }),
+            &mut scene,
+            &mut history,
+            &dir,
+        )
+        .unwrap();
+        execute_tool_call(
+            "character_set_clip_layer",
+            &json!({ "clip_name": "FallArc", "bone_prefix": "P2_" }),
+            &mut scene,
+            &mut history,
+            &dir,
+        )
+        .unwrap();
+        let baked = execute_tool_call(
+            "character_bake_clip_layers",
+            &json!({ "name": "CombinedBattle", "fps": 12, "floor_y": 0.0, "clear_layers": true }),
+            &mut scene,
+            &mut history,
+            &dir,
+        )
+        .unwrap();
+        assert_eq!(baked["ok"], true);
+        assert_eq!(baked["name"], "CombinedBattle");
+        assert!(baked["channels"].as_u64().unwrap() >= 14);
+        assert!(scene.character_rig.as_ref().unwrap().clip_layers.is_empty());
+
+        // Verify .glb export includes the baked clip cleanly
+        execute_tool_call(
+            "scene_set_mode",
+            &json!({ "mode": "character" }),
+            &mut scene,
+            &mut history,
+            &dir,
+        )
+        .unwrap();
+        let (glb, _) =
+            tessel_io::export_glb_bytes(&scene, tessel_io::ExportPreset::Godot4).unwrap();
+        assert!(glb.starts_with(b"glTF"));
+        let json_len = u32::from_le_bytes([glb[12], glb[13], glb[14], glb[15]]) as usize;
+        let glb_json = std::str::from_utf8(&glb[20..20 + json_len]).unwrap();
+        assert!(glb_json.contains("\"CombinedBattle\""));
+    }
+
+    #[test]
+    fn v40_dynamic_parent_switch_weapon_drop_and_glb_export() {
+        let mut scene = SceneState::new();
+        let mut history = HistoryStack::new();
+        let dir = std::env::temp_dir();
+
+        execute_tool_call(
+            "scene_set_mode",
+            &json!({ "mode": "character" }),
+            &mut scene,
+            &mut history,
+            &dir,
+        )
+        .unwrap();
+        let rifle = execute_tool_call(
+            "mesh_create_primitive",
+            &json!({ "name": "Rifle", "kind": "cube", "size": [0.1, 0.1, 0.8] }),
+            &mut scene,
+            &mut history,
+            &dir,
+        )
+        .unwrap();
+        let rifle_id = rifle["node_id"].as_u64().unwrap();
+        execute_tool_call(
+            "character_apply_biped_rig",
+            &json!({ "preset": "starter" }),
+            &mut scene,
+            &mut history,
+            &dir,
+        )
+        .unwrap();
+        let right_arm = scene
+            .character_rig
+            .as_ref()
+            .unwrap()
+            .bones
+            .iter()
+            .find(|b| b.name == "RightArm")
+            .unwrap()
+            .id
+            .0 as u64;
+
+        // Hold rifle in RightArm at t=0.0, detach & drop to floor at t=0.5 -> t=1.0
+        execute_tool_call(
+            "character_set_parent_switch_keyframe",
+            &json!({
+                "clip_name": "WeaponDrop",
+                "duration_secs": 1.0,
+                "node_id": rifle_id,
+                "time_secs": 0.0,
+                "bone_id": right_arm
+            }),
+            &mut scene,
+            &mut history,
+            &dir,
+        )
+        .unwrap();
+        execute_tool_call(
+            "character_set_parent_switch_keyframe",
+            &json!({
+                "clip_name": "WeaponDrop",
+                "node_id": rifle_id,
+                "time_secs": 0.5,
+                "bone_id": null,
+                "position": [0.5, 0.8, 0.3],
+                "rotation_deg": [0.0, 0.0, 0.0]
+            }),
+            &mut scene,
+            &mut history,
+            &dir,
+        )
+        .unwrap();
+        execute_tool_call(
+            "character_set_parent_switch_keyframe",
+            &json!({
+                "clip_name": "WeaponDrop",
+                "node_id": rifle_id,
+                "time_secs": 1.0,
+                "bone_id": null,
+                "position": [0.8, 0.05, 0.6],
+                "rotation_deg": [0.0, 45.0, 90.0]
+            }),
+            &mut scene,
+            &mut history,
+            &dir,
+        )
+        .unwrap();
+
+        // At t=0.25 rifle is still attached to RightArm
+        execute_tool_call(
+            "character_set_playback_time",
+            &json!({ "clip_name": "WeaponDrop", "time_secs": 0.25 }),
+            &mut scene,
+            &mut history,
+            &dir,
+        )
+        .unwrap();
+        let ov_hold = scene
+            .character_rig
+            .as_ref()
+            .unwrap()
+            .node_parent_overrides
+            .get(&NodeId(rifle_id))
+            .copied()
+            .unwrap();
+        assert_eq!(ov_hold.bone_id, Some(BoneId(right_arm as u32)));
+
+        // At t=0.75 rifle is detached and interpolated halfway along drop arc
+        execute_tool_call(
+            "character_set_playback_time",
+            &json!({ "clip_name": "WeaponDrop", "time_secs": 0.75 }),
+            &mut scene,
+            &mut history,
+            &dir,
+        )
+        .unwrap();
+        let ov_drop = scene
+            .character_rig
+            .as_ref()
+            .unwrap()
+            .node_parent_overrides
+            .get(&NodeId(rifle_id))
+            .copied()
+            .unwrap();
+        assert_eq!(ov_drop.bone_id, None);
+        assert!((ov_drop.position.x - 0.65).abs() < 1e-3);
+        assert!((ov_drop.position.y - 0.425).abs() < 1e-3);
+
+        // Export .glb includes WeaponDrop animation with translation + rotation channels
+        let (glb, _) =
+            tessel_io::export_glb_bytes(&scene, tessel_io::ExportPreset::Godot4).unwrap();
+        assert!(glb.starts_with(b"glTF"));
+        let json_len = u32::from_le_bytes([glb[12], glb[13], glb[14], glb[15]]) as usize;
+        let glb_json = std::str::from_utf8(&glb[20..20 + json_len]).unwrap();
+        assert!(glb_json.contains("\"WeaponDrop\""));
+        assert!(glb_json.contains("\"translation\""));
+        assert!(glb_json.contains("\"rotation\""));
     }
 }

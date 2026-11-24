@@ -63,7 +63,7 @@ pub fn tool_definitions() -> Vec<Value> {
         }),
         json!({
             "name": "scene_batch",
-            "description": "Execute up to 512 tool calls atomically in one MCP request. If any call fails, the entire scene and undo history roll back cleanly.",
+            "description": "Execute up to 512 tool calls atomically in one MCP request. Supports referencing prior call results via \"$N.field\" or \"$N.nested.field\" placeholders (e.g. \"$0.node_id\", \"$1.bone_ids.P2_Root\"). If any call fails, the entire scene and undo history roll back cleanly.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -204,6 +204,55 @@ pub fn tool_definitions() -> Vec<Value> {
                     "scale": { "type": "array", "items": { "type": "number" }, "minItems": 3, "maxItems": 3 }
                 },
                 "required": ["profile"]
+            }
+        }),
+        json!({
+            "name": "mesh_create_extruded_polygon",
+            "description": "Create a 3D Low-Poly mesh by extruding a 2D XY polygon [[x, y], ...] (3..=64 points) by 'depth' along Z (centered on [-depth/2, +depth/2]). Automatically normalizes CW/CCW winding so front/back caps and side walls always face outward. Ideal for neckties, armor plates, buckles, weapon silhouettes, blades, and emblems.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "name": { "type": "string" },
+                    "points": {
+                        "type": "array",
+                        "minItems": 3,
+                        "maxItems": 64,
+                        "items": { "type": "array", "items": { "type": "number" }, "minItems": 2, "maxItems": 2 }
+                    },
+                    "depth": { "type": "number", "minimum": 0.005 },
+                    "palette_index": { "type": "integer", "minimum": 1, "maximum": 255 },
+                    "position": { "type": "array", "items": { "type": "number" }, "minItems": 3, "maxItems": 3 },
+                    "rotation_deg": { "type": "array", "items": { "type": "number" }, "minItems": 3, "maxItems": 3 },
+                    "scale": { "type": "array", "items": { "type": "number" }, "minItems": 3, "maxItems": 3 }
+                },
+                "required": ["points", "depth"]
+            }
+        }),
+        json!({
+            "name": "mesh_create_loft",
+            "description": "Create a lofted Low-Poly mesh by connecting 2..=32 closed 3D cross-section rings of equal vertex count (3..=64) with automatic outward CCW winding and optional end caps. Ideal for tapered torsos, limbs, boots, backpacks, capes, and rifle stocks.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "name": { "type": "string" },
+                    "sections": {
+                        "type": "array",
+                        "minItems": 2,
+                        "maxItems": 32,
+                        "items": {
+                            "type": "array",
+                            "minItems": 3,
+                            "maxItems": 64,
+                            "items": { "type": "array", "items": { "type": "number" }, "minItems": 3, "maxItems": 3 }
+                        }
+                    },
+                    "cap_ends": { "type": "boolean" },
+                    "palette_index": { "type": "integer", "minimum": 1, "maximum": 255 },
+                    "position": { "type": "array", "items": { "type": "number" }, "minItems": 3, "maxItems": 3 },
+                    "rotation_deg": { "type": "array", "items": { "type": "number" }, "minItems": 3, "maxItems": 3 },
+                    "scale": { "type": "array", "items": { "type": "number" }, "minItems": 3, "maxItems": 3 }
+                },
+                "required": ["sections"]
             }
         }),
         json!({
@@ -725,11 +774,16 @@ pub fn tool_definitions() -> Vec<Value> {
         }),
         json!({
             "name": "character_apply_biped_rig",
-            "description": "Apply a humanoid skeleton rig (Right-Handed +Y Up, +Z Front: Left=+X, Right=-X). Pass preset='starter' (default, 7 bones with Idle & Walk) or preset='humanoid' (19-bone 1:1 full humanoid skeleton).",
+            "description": "Apply a humanoid skeleton rig (Right-Handed +Y Up, +Z Front: Left=+X, Right=-X). Pass preset='starter' (default, 7 bones) or preset='humanoid' (19-bone 1:1 humanoid). For multi-character scenes, pass append=true with prefix (e.g. 'P2_'), offset [x,y,z], and yaw_deg (e.g. 180) to spawn an additional prefixed skeleton into the active rig in 1 call and receive its bone_ids map.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "preset": { "type": "string", "enum": ["starter", "humanoid"] }
+                    "preset": { "type": "string", "enum": ["starter", "humanoid"] },
+                    "append": { "type": "boolean", "description": "When true, append a new sub-skeleton into the existing CharacterRig instead of replacing it (ideal for 2+ character scenes)" },
+                    "prefix": { "type": "string", "description": "Bone name prefix when append=true (e.g. 'P2_')" },
+                    "offset": { "type": "array", "items": { "type": "number" }, "minItems": 3, "maxItems": 3, "description": "World-space root translation [x, y, z] for appended sub-skeleton" },
+                    "yaw_deg": { "type": "number", "description": "Yaw rotation in degrees around +Y applied to the appended sub-skeleton's Root rest orientation (so child rotations remain character-local)" },
+                    "include_default_clips": { "type": "boolean", "description": "When append=true, automatically remap Idle & Walk channels onto the appended sub-skeleton (default true)" }
                 }
             }
         }),
@@ -784,19 +838,109 @@ pub fn tool_definitions() -> Vec<Value> {
         }),
         json!({
             "name": "character_set_bone_pose",
-            "description": "Set a bone's pose rotation in degrees [pitch, yaw, roll] on the active character rig.",
+            "description": "Set a bone's live pose rotation_deg [pitch, yaw, roll] and/or translation [dx, dy, dz] offset from rest pose on the active character rig (captured by character_snapshot_pose_to_keyframe). Right-Handed (+Y Up, +Z Front, +X Left): positive pitch (+X) tilts/falls FORWARD, negative pitch (-X) tilts/falls BACKWARD in character-local space.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "bone_id": { "type": "integer", "minimum": 0 },
-                    "rotation_deg": { "type": "array", "items": { "type": "number" }, "minItems": 3, "maxItems": 3 }
+                    "rotation_deg": { "type": "array", "items": { "type": "number" }, "minItems": 3, "maxItems": 3 },
+                    "translation": { "type": "array", "items": { "type": "number" }, "minItems": 3, "maxItems": 3, "description": "Optional local translation offset [dx, dy, dz] relative to rest pose" }
                 },
-                "required": ["bone_id", "rotation_deg"]
+                "required": ["bone_id"]
+            }
+        }),
+        json!({
+            "name": "character_set_clip_layer",
+            "description": "Assign an independent animation clip to a bone prefix (e.g. P1 '' plays Walk while P2 'P2_' plays ShotFall simultaneously). Pass clear=true to remove all clip layers.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "clip_index": { "type": "integer", "minimum": 0 },
+                    "clip_name": { "type": "string" },
+                    "bone_prefix": { "type": "string", "description": "Bone name prefix for this layer (e.g. 'P2_', or '' for base layer)" },
+                    "time_offset": { "type": "number", "description": "Optional playback time offset in seconds" },
+                    "clear": { "type": "boolean", "description": "When true, clears all clip layers" }
+                }
+            }
+        }),
+        json!({
+            "name": "character_bake_clip_layers",
+            "description": "Bake the current multi-character clip_layers composition (including rotations, translations, morph weights, and visibility tracks) into a single permanent AnimationClip ready for .glb export and viewport_render_turntable_gif. Optionally clamps all characters to floor_y at every sampled frame.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "name": { "type": "string", "description": "Name of the baked clip (replaces existing clip with same name)" },
+                    "fps": { "type": "number", "minimum": 1, "maximum": 120, "description": "Sampling frame rate (default 24)" },
+                    "duration_secs": { "type": "number", "minimum": 0.05, "description": "Optional duration override in seconds (defaults to max duration across clip layers)" },
+                    "floor_y": { "type": "number", "description": "Optional floor Y height to clamp every character onto at each baked sample" },
+                    "activate": { "type": "boolean", "description": "Make the baked clip active (default true)" },
+                    "clear_layers": { "type": "boolean", "description": "Clear clip_layers after baking (default false)" }
+                },
+                "required": ["name"]
+            }
+        }),
+        json!({
+            "name": "character_clamp_clip_to_floor",
+            "description": "Sample in-between frames of an animation clip at fps and adjust the character Root bone's Y translation keyframes so the character stays flush on floor_y (default 0.0) throughout extreme rotations (e.g. 0° -> 86° fall) without floating or penetrating the floor.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "clip_index": { "type": "integer", "minimum": 0 },
+                    "clip_name": { "type": "string" },
+                    "bone_prefix": { "type": "string", "description": "Optional sub-skeleton prefix (e.g. 'P2_', default '' for primary character)" },
+                    "floor_y": { "type": "number", "description": "Target floor Y height (default 0.0)" },
+                    "fps": { "type": "number", "minimum": 1, "maximum": 120, "description": "Sub-frame sampling rate (default 24)" }
+                }
+            }
+        }),
+        json!({
+            "name": "character_clamp_to_floor",
+            "description": "Automatically shift a character's Root bone Y position so its lowest deformed joint or bound mesh vertex sits flush on floor_y (default 0.0) without floor penetration.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "floor_y": { "type": "number", "description": "Target floor Y height (default 0.0)" },
+                    "bone_prefix": { "type": "string", "description": "Optional sub-skeleton prefix (e.g. 'P2_', default '' for primary character)" }
+                }
+            }
+        }),
+        json!({
+            "name": "character_set_parent_switch_keyframe",
+            "description": "Dynamically attach, switch parent bone, or detach/drop a prop or weapon node in world space mid-clip (e.g. hold rifle in RightHand at t=0.0, detach to floor world_position at t=0.5, or switch to Torso holster). Exports as standard glTF 2.0 TRS animation channels.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "clip_index": { "type": "integer", "minimum": 0 },
+                    "clip_name": { "type": "string" },
+                    "duration_secs": { "type": "number", "minimum": 0.1 },
+                    "node_id": { "type": "integer", "minimum": 1 },
+                    "time_secs": { "type": "number", "minimum": 0.0 },
+                    "bone_id": { "type": ["integer", "null"], "description": "Bone ID to attach to, or null/omitted to detach into world space" },
+                    "position": { "type": "array", "items": { "type": "number" }, "minItems": 3, "maxItems": 3, "description": "World-space position [x,y,z] when detached (bone_id=null), or local offset when attached" },
+                    "rotation_deg": { "type": "array", "items": { "type": "number" }, "minItems": 3, "maxItems": 3, "description": "Euler XYZ degrees in world space when detached, or local offset when attached" }
+                },
+                "required": ["node_id", "time_secs"]
+            }
+        }),
+        json!({
+            "name": "character_set_visibility_keyframe",
+            "description": "Insert or update a step-interpolated visibility keyframe (visible: true/false) for a scene node in an animation clip (ideal for toggling muzzle flashes, tracers, or props during playback).",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "clip_index": { "type": "integer", "minimum": 0 },
+                    "clip_name": { "type": "string" },
+                    "duration_secs": { "type": "number", "minimum": 0.1 },
+                    "node_id": { "type": "integer", "minimum": 1 },
+                    "time_secs": { "type": "number", "minimum": 0.0 },
+                    "visible": { "type": "boolean" }
+                },
+                "required": ["node_id", "time_secs", "visible"]
             }
         }),
         json!({
             "name": "character_set_keyframe",
-            "description": "Insert or update a bone TRS keyframe in an animation clip (creates clip if clip_name is new). rotation_deg is required; translation defaults to [0,0,0] (offset added to the rest pose) and scale defaults to [1,1,1] (multiplier).",
+            "description": "Insert or update a bone TRS keyframe in an animation clip (creates clip if clip_name is new). rotation_deg is required (+X pitch tilts FORWARD, -X tilts BACKWARD in character-local space); translation defaults to [0,0,0], scale defaults to [1,1,1], interpolation defaults to 'linear' ('linear'|'step'|'ease_in'|'ease_out'|'ease_in_out').",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -807,14 +951,15 @@ pub fn tool_definitions() -> Vec<Value> {
                     "time_secs": { "type": "number", "minimum": 0.0 },
                     "rotation_deg": { "type": "array", "items": { "type": "number" }, "minItems": 3, "maxItems": 3 },
                     "translation": { "type": "array", "items": { "type": "number" }, "minItems": 3, "maxItems": 3 },
-                    "scale": { "type": "array", "items": { "type": "number" }, "minItems": 3, "maxItems": 3 }
+                    "scale": { "type": "array", "items": { "type": "number" }, "minItems": 3, "maxItems": 3 },
+                    "interpolation": { "type": "string", "enum": ["linear", "step", "ease_in", "ease_out", "ease_in_out"] }
                 },
                 "required": ["bone_id", "time_secs", "rotation_deg"]
             }
         }),
         json!({
             "name": "character_solve_ik",
-            "description": "Analytic two-bone IK: rotate root and mid bones so the end bone reaches target [x, y, z], optionally aiming end_bone_id via end_rotation_deg. Returns reached position and resulting bone delta rotations_deg. Use character_snapshot_pose_to_keyframe to bake the solved pose into an animation clip.",
+            "description": "Analytic two-bone IK: rotate root and mid bones so the end bone reaches target [x, y, z]. Use 'pole_target' for a world-space bend point OR 'pole_vector' for a world-space bend direction. Use 'end_world_rotation_deg' to orient end_bone_id in world space (auto-compensating forearm rotation) or 'end_rotation_deg' for local rotation. Returns reached position and resulting bone delta rotations_deg.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -822,15 +967,17 @@ pub fn tool_definitions() -> Vec<Value> {
                     "mid_bone_id": { "type": "integer", "minimum": 0 },
                     "end_bone_id": { "type": "integer", "minimum": 0 },
                     "target": { "type": "array", "items": { "type": "number" }, "minItems": 3, "maxItems": 3, "description": "World-space target position [x, y, z] for end_bone_id" },
+                    "pole_target": { "type": "array", "items": { "type": "number" }, "minItems": 3, "maxItems": 3, "description": "World-space POINT [x, y, z] that the elbow/knee bends toward (auto-converted to direction from root_bone_id)" },
                     "pole_vector": { "type": "array", "items": { "type": "number" }, "minItems": 3, "maxItems": 3, "description": "World-space DIRECTION vector (not a world point) steering the elbow/knee bend plane; e.g. [0, -1, -1] for elbow down-back, [0, 0, 1] for knee forward" },
-                    "end_rotation_deg": { "type": "array", "items": { "type": "number" }, "minItems": 3, "maxItems": 3, "description": "Optional Euler XYZ degrees (relative to rest pose) applied to end_bone_id after solving IK" }
+                    "end_world_rotation_deg": { "type": "array", "items": { "type": "number" }, "minItems": 3, "maxItems": 3, "description": "Optional WORLD-SPACE Euler XYZ degrees for end_bone_id after solving IK (automatically compensates for mid_bone_id world rotation)" },
+                    "end_rotation_deg": { "type": "array", "items": { "type": "number" }, "minItems": 3, "maxItems": 3, "description": "Optional LOCAL Euler XYZ degrees (relative to rest pose) applied to end_bone_id after solving IK" }
                 },
                 "required": ["root_bone_id", "mid_bone_id", "end_bone_id", "target"]
             }
         }),
         json!({
             "name": "character_snapshot_pose_to_keyframe",
-            "description": "Bake/snapshot the current live bone pose (e.g. after character_solve_ik or manual posing) into an animation clip at time_secs as a single atomic transaction. Creates the clip automatically if clip_name is new.",
+            "description": "Bake/snapshot the current live bone pose (e.g. after character_solve_ik or character_clamp_to_floor) into an animation clip at time_secs as a single atomic transaction. Creates the clip automatically if clip_name is new. Supports optional interpolation ('linear'|'step'|'ease_in'|'ease_out'|'ease_in_out').",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -838,7 +985,8 @@ pub fn tool_definitions() -> Vec<Value> {
                     "clip_name": { "type": "string" },
                     "duration_secs": { "type": "number", "minimum": 0.1 },
                     "time_secs": { "type": "number", "minimum": 0.0 },
-                    "bone_ids": { "type": "array", "items": { "type": "integer", "minimum": 0 }, "description": "Optional subset of bone IDs to snapshot (defaults to all bones in the rig)" }
+                    "bone_ids": { "type": "array", "items": { "type": "integer", "minimum": 0 }, "description": "Optional subset of bone IDs to snapshot (defaults to all bones in the rig)" },
+                    "interpolation": { "type": "string", "enum": ["linear", "step", "ease_in", "ease_out", "ease_in_out"] }
                 },
                 "required": ["time_secs"]
             }
@@ -1060,15 +1208,37 @@ pub fn tool_definitions() -> Vec<Value> {
         }),
         json!({
             "name": "camera_get",
-            "description": "Read the live viewport camera state (target, yaw, pitch, distance). Requires the live GUI viewport; unavailable headless.",
-            "inputSchema": { "type": "object", "properties": {} }
-        }),
-        json!({
-            "name": "camera_look_at",
-            "description": "Point the live viewport camera at an absolute world position [x, y, z]. Requires the live GUI viewport.",
+            "description": "Read the live viewport and scene/projector camera state (target, yaw, pitch, distance). Pass camera: 'viewport' (default) or 'scene'. Requires the live GUI viewport; unavailable headless.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
+                    "camera": { "type": "string", "enum": ["viewport", "scene"] }
+                }
+            }
+        }),
+        json!({
+            "name": "camera_set_pose",
+            "description": "Set target, yaw_deg (or yaw), pitch_deg (or pitch), and/or distance of the live viewport or scene/projector camera in one smooth call. Requires the live GUI viewport.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "camera": { "type": "string", "enum": ["viewport", "scene"] },
+                    "target": { "type": "array", "items": { "type": "number" }, "minItems": 3, "maxItems": 3 },
+                    "yaw_deg": { "type": "number" },
+                    "pitch_deg": { "type": "number" },
+                    "yaw": { "type": "number" },
+                    "pitch": { "type": "number" },
+                    "distance": { "type": "number", "minimum": 0.25 }
+                }
+            }
+        }),
+        json!({
+            "name": "camera_look_at",
+            "description": "Point the live viewport or scene/projector camera at an absolute world position [x, y, z]. Requires the live GUI viewport.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "camera": { "type": "string", "enum": ["viewport", "scene"] },
                     "target": { "type": "array", "items": { "type": "number" }, "minItems": 3, "maxItems": 3 }
                 },
                 "required": ["target"]
@@ -1076,10 +1246,11 @@ pub fn tool_definitions() -> Vec<Value> {
         }),
         json!({
             "name": "camera_zoom",
-            "description": "Zoom the live viewport camera. Pass factor (> 0, < 1 zooms in) or an absolute distance (> 0). Requires the live GUI viewport.",
+            "description": "Zoom the live viewport or scene/projector camera. Pass factor (> 0, < 1 zooms in) or an absolute distance (> 0). Requires the live GUI viewport.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
+                    "camera": { "type": "string", "enum": ["viewport", "scene"] },
                     "factor": { "type": "number" },
                     "distance": { "type": "number", "minimum": 0 }
                 }
@@ -1087,10 +1258,11 @@ pub fn tool_definitions() -> Vec<Value> {
         }),
         json!({
             "name": "camera_orbit",
-            "description": "Orbit the live viewport camera by pixel deltas (dx turns yaw, dy turns pitch). Requires the live GUI viewport.",
+            "description": "Orbit the live viewport or scene/projector camera by pixel deltas (dx turns yaw, dy turns pitch). Requires the live GUI viewport.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
+                    "camera": { "type": "string", "enum": ["viewport", "scene"] },
                     "dx": { "type": "number" },
                     "dy": { "type": "number" }
                 },
@@ -1099,10 +1271,11 @@ pub fn tool_definitions() -> Vec<Value> {
         }),
         json!({
             "name": "camera_pan",
-            "description": "Pan the live viewport camera target by pixel deltas. Requires the live GUI viewport.",
+            "description": "Pan the live viewport or scene/projector camera target by pixel deltas. Requires the live GUI viewport.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
+                    "camera": { "type": "string", "enum": ["viewport", "scene"] },
                     "dx": { "type": "number" },
                     "dy": { "type": "number" }
                 },
@@ -1111,15 +1284,21 @@ pub fn tool_definitions() -> Vec<Value> {
         }),
         json!({
             "name": "camera_reset",
-            "description": "Reset the live viewport camera to its default view. Requires the live GUI viewport.",
-            "inputSchema": { "type": "object", "properties": {} }
-        }),
-        json!({
-            "name": "camera_preset",
-            "description": "Move the live viewport camera to a named preset view. Requires the live GUI viewport.",
+            "description": "Reset the live viewport or scene/projector camera to its default view. Requires the live GUI viewport.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
+                    "camera": { "type": "string", "enum": ["viewport", "scene"] }
+                }
+            }
+        }),
+        json!({
+            "name": "camera_preset",
+            "description": "Move the live viewport or scene/projector camera to a named preset view. Requires the live GUI viewport.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "camera": { "type": "string", "enum": ["viewport", "scene"] },
                     "name": { "type": "string", "enum": ["iso", "front", "back", "right", "left", "top"] }
                 },
                 "required": ["name"]

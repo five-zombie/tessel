@@ -65,7 +65,7 @@ fn show_pixel_timeline(ctx: &egui::Context, scene: &mut SceneState, history: &mu
     let frame = Frame::NONE
         .fill(tokens::SURFACE_CONTAINER)
         .inner_margin(Margin::symmetric(12, 6))
-        .stroke(Stroke::new(1.0, tokens::OUTLINE_VARIANT));
+        .stroke(Stroke::new(1.0_f32, tokens::OUTLINE_VARIANT));
 
     egui::TopBottomPanel::bottom("tessel_timeline")
         .exact_height(38.0)
@@ -135,7 +135,7 @@ fn show_character_timeline(
     let frame = Frame::NONE
         .fill(tokens::SURFACE_CONTAINER)
         .inner_margin(Margin::symmetric(12, 6))
-        .stroke(Stroke::new(1.0, tokens::OUTLINE_VARIANT));
+        .stroke(Stroke::new(1.0_f32, tokens::OUTLINE_VARIANT));
 
     if scene.character_rig.is_none() {
         let mut pending_cmd: Option<Command> = None;
@@ -423,7 +423,7 @@ fn show_character_timeline(
             painter.rect_stroke(
                 rect,
                 CornerRadius::same(4),
-                Stroke::new(1.0, tokens::OUTLINE_VARIANT),
+                Stroke::new(1.0_f32, tokens::OUTLINE_VARIANT),
                 egui::StrokeKind::Inside,
             );
 
@@ -433,7 +433,7 @@ fn show_character_timeline(
                     egui::pos2(rect.left(), ruler_y),
                     egui::pos2(rect.right(), ruler_y),
                 ],
-                Stroke::new(1.0, tokens::OUTLINE_VARIANT),
+                Stroke::new(1.0_f32, tokens::OUTLINE_VARIANT),
             );
 
             // Minor frame ticks
@@ -444,7 +444,7 @@ fn show_character_timeline(
                 let x = track_left + frac * track_w;
                 painter.line_segment(
                     [egui::pos2(x, ruler_y - 4.0), egui::pos2(x, ruler_y)],
-                    Stroke::new(1.0, tokens::OUTLINE_VARIANT),
+                    Stroke::new(1.0_f32, tokens::OUTLINE_VARIANT),
                 );
             }
 
@@ -459,7 +459,7 @@ fn show_character_timeline(
                         egui::pos2(x, ruler_y - 9.0),
                         egui::pos2(x, rect.bottom() - 2.0),
                     ],
-                    Stroke::new(1.0, tokens::SURFACE_HIGH),
+                    Stroke::new(1.0_f32, tokens::SURFACE_HIGH),
                 );
                 painter.text(
                     egui::pos2(x + 2.0, rect.top() + 3.0),
@@ -493,7 +493,7 @@ fn show_character_timeline(
                 painter.add(egui::Shape::convex_polygon(
                     diamond,
                     fill,
-                    Stroke::new(1.0, tokens::SURFACE_LOW),
+                    Stroke::new(1.0_f32, tokens::SURFACE_LOW),
                 ));
             }
 
@@ -505,7 +505,7 @@ fn show_character_timeline(
                     egui::pos2(play_x, rect.top()),
                     egui::pos2(play_x, rect.bottom()),
                 ],
-                Stroke::new(2.0, tokens::PRIMARY),
+                Stroke::new(2.0_f32, tokens::PRIMARY),
             );
             let handle = vec![
                 egui::pos2(play_x - 5.0, rect.top()),

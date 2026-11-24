@@ -2,3 +2,4 @@
 knl-config.json
 /target/
 *.tessel.tmp
+/exports/

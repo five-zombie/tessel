@@ -100,6 +100,17 @@ pub fn save_tessel_project_with_thumbnail(
         file.sync_all()?;
     }
     fs::rename(&tmp_path, path)?;
+    #[cfg(unix)]
+    if let Some(parent) = path.parent() {
+        let dir_path = if parent.as_os_str().is_empty() {
+            Path::new(".")
+        } else {
+            parent
+        };
+        if let Ok(dir) = fs::File::open(dir_path) {
+            let _ = dir.sync_all();
+        }
+    }
     Ok(())
 }
 
@@ -136,7 +147,9 @@ mod tests {
         let fake_thumb = [0x89u8, 0x50, 0x4E, 0x47];
         let encoded = encode_tessel_project_with_thumbnail(&scene, Some(&fake_thumb)).unwrap();
         let archive = ZipArchive::new(Cursor::new(&encoded)).unwrap();
-        assert!(archive.file_names().any(|n| n == "thumbnail.png"));
+        assert!(archive
+            .file_names()
+            .any(|n| n.is_ok_and(|s| s == "thumbnail.png")));
 
         let decoded = decode_tessel_project(&encoded).unwrap();
         assert_eq!(decoded.voxel_volumes[&id].voxel_count(), 8);

@@ -9,8 +9,9 @@ pub mod voxel;
 
 pub use character::{
     solve_for_rig, solve_two_bone_ik, AnimationClip, AutoSkinSolver, Bone, BoneChannel, BoneId,
-    CharacterRig, Keyframe, MorphWeightKey, MorphWeightTrack, SampledBonePose, SkinBinding,
-    VertexSkinWeights,
+    CharacterRig, ClipLayer, Keyframe, KeyframeInterpolation, MorphWeightKey, MorphWeightTrack,
+    ParentSwitchKey, ParentSwitchTrack, SampledBonePose, SkinBinding, VertexSkinWeights,
+    VisibilityKey, VisibilityTrack,
 };
 pub use command::{Command, HistoryStack, UndoDelta};
 pub use error::CoreError;
