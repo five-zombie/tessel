@@ -2,9 +2,10 @@ use std::io::Write;
 use std::path::Path;
 use std::process::{Command as ProcessCommand, Stdio};
 
-use egui::{CornerRadius, RichText};
+use egui::RichText;
 use tessel_ai::LiveMcpServerHandle;
 
+use super::icons::{self, ToolIcon};
 use super::theme::tokens;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -195,15 +196,17 @@ pub fn show_mcp_dialog(
         .fixed_size(egui::vec2(520.0, 410.0))
         .show(ctx, |ui| {
             ui.horizontal(|ui| {
-                let (status_text, status_color, btn_label) = match live_mcp {
+                let (status_text, status_color, srv_icon, srv_tip) = match live_mcp {
                     Some(mcp) => (
                         format!("Live HTTP: http://127.0.0.1:{}/mcp", mcp.port),
                         tokens::PRIMARY,
+                        ToolIcon::Stop,
                         "Stop Server",
                     ),
                     None => (
                         "Live HTTP: Offline".into(),
                         tokens::ON_SURFACE_VARIANT,
+                        ToolIcon::Play,
                         "Start Server",
                     ),
                 };
@@ -215,7 +218,7 @@ pub fn show_mcp_dialog(
                         .color(status_color),
                 );
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.small_button(btn_label).clicked() {
+                    if icons::hud_icon_button(ui, srv_icon, srv_tip, live_mcp.is_some()) {
                         action.toggle_server = true;
                     }
                 });
@@ -235,15 +238,16 @@ pub fn show_mcp_dialog(
                         .desired_width(235.0)
                         .code_editor(),
                 );
-                if ui.small_button("Copy").clicked() {
+                if icons::hud_icon_button(ui, ToolIcon::Copy, "Copy", false) {
                     copy_text_reliable(ui.ctx(), active_token);
                     state.status_message = Some("Copied Bearer Token to clipboard.".into());
                 }
-                if ui
-                    .small_button("Rotate")
-                    .on_hover_text("Generate a new persistent MCP token")
-                    .clicked()
-                {
+                if icons::hud_icon_button(
+                    ui,
+                    ToolIcon::RotateButton,
+                    "Generate a new persistent MCP token",
+                    false,
+                ) {
                     action.rotate_token = true;
                 }
             });
@@ -313,15 +317,12 @@ pub fn show_mcp_dialog(
 
             ui.add_space(10.0);
             ui.horizontal(|ui| {
-                let copy_btn = egui::Button::new(
-                    RichText::new(format!("Copy {} Config", state.client.label()))
-                        .strong()
-                        .color(tokens::ON_PRIMARY),
-                )
-                .fill(tokens::PRIMARY_CONTAINER)
-                .corner_radius(CornerRadius::same(4));
-
-                if ui.add(copy_btn).clicked() {
+                if icons::hud_icon_button(
+                    ui,
+                    ToolIcon::Copy,
+                    &format!("Copy {} Config", state.client.label()),
+                    false,
+                ) {
                     copy_text_reliable(ui.ctx(), &snippet);
                     state.status_message = Some(format!(
                         "Copied {} ({}) config to clipboard.",
@@ -330,7 +331,7 @@ pub fn show_mcp_dialog(
                     ));
                 }
 
-                if ui.button("Close").clicked() {
+                if icons::hud_icon_button(ui, ToolIcon::Close, "Close", false) {
                     state.open = false;
                 }
             });

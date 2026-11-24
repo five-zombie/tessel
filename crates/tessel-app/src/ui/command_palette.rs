@@ -10,11 +10,13 @@ use super::theme::tokens;
 pub struct CommandPaletteState {
     pub open: bool,
     pub query: String,
+    pub selected_index: usize,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PaletteAction {
     Mode(AppMode),
+    NewProject,
     OpenExport,
     ImportMesh,
     Undo,
@@ -23,7 +25,14 @@ enum PaletteAction {
     SpawnStarterBipedVoxel,
     NewPixelCanvas,
     NewLowPolyCube,
+    ApplyHumanoidRig,
     ApplyBipedRig,
+    ResetCharacterPose,
+    WeldMeshVertices,
+    FlipMeshNormals,
+    MirrorMeshX,
+    ApplyMeshTransform,
+    ClearScene,
 }
 
 struct ActionEntry {
@@ -54,6 +63,11 @@ const ACTIONS: &[ActionEntry] = &[
         action: PaletteAction::Mode(AppMode::Character),
     },
     ActionEntry {
+        label: "New Project (Reset Workspace)",
+        shortcut: "Ctrl+N",
+        action: PaletteAction::NewProject,
+    },
+    ActionEntry {
         label: "Export Asset (.glb / .obj / .stl / .vox / .png / .gif)",
         shortcut: "Ctrl+E",
         action: PaletteAction::OpenExport,
@@ -79,9 +93,44 @@ const ACTIONS: &[ActionEntry] = &[
         action: PaletteAction::NewLowPolyCube,
     },
     ActionEntry {
-        label: "Apply Biped Character Rig (Idle + Walk)",
+        label: "Apply Humanoid Character Rig (19 Bones, Idle + Walk)",
+        shortcut: "",
+        action: PaletteAction::ApplyHumanoidRig,
+    },
+    ActionEntry {
+        label: "Apply Biped Character Rig (11 Bones, Idle + Walk)",
         shortcut: "",
         action: PaletteAction::ApplyBipedRig,
+    },
+    ActionEntry {
+        label: "Character: Reset All Bones to Rest Pose",
+        shortcut: "",
+        action: PaletteAction::ResetCharacterPose,
+    },
+    ActionEntry {
+        label: "Mesh: Weld Coincident Vertices",
+        shortcut: "",
+        action: PaletteAction::WeldMeshVertices,
+    },
+    ActionEntry {
+        label: "Mesh: Flip Face Normals",
+        shortcut: "",
+        action: PaletteAction::FlipMeshNormals,
+    },
+    ActionEntry {
+        label: "Mesh: Mirror Selected Along X",
+        shortcut: "",
+        action: PaletteAction::MirrorMeshX,
+    },
+    ActionEntry {
+        label: "Mesh: Apply Transform to Geometry",
+        shortcut: "",
+        action: PaletteAction::ApplyMeshTransform,
+    },
+    ActionEntry {
+        label: "Scene: Clear All Nodes",
+        shortcut: "",
+        action: PaletteAction::ClearScene,
     },
     ActionEntry {
         label: "Undo Last Action",
@@ -100,6 +149,22 @@ const ACTIONS: &[ActionEntry] = &[
     },
 ];
 
+fn filter_actions(query: &str) -> Vec<&'static ActionEntry> {
+    let needle = query.trim().to_lowercase();
+    ACTIONS
+        .iter()
+        .filter(|a| needle.is_empty() || a.label.to_lowercase().contains(&needle))
+        .collect()
+}
+
+fn step_selection(current: usize, len: usize, delta: isize) -> usize {
+    if len == 0 {
+        return 0;
+    }
+    let cur = current.min(len - 1) as isize;
+    (cur + delta).rem_euclid(len as isize) as usize
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn show_command_palette(
     ctx: &egui::Context,
@@ -110,6 +175,7 @@ pub fn show_command_palette(
     camera_2d: &mut PixelCamera2D,
     export_open: &mut bool,
     import_mesh: &mut bool,
+    new_project: &mut bool,
 ) {
     if !state.open {
         return;
@@ -118,6 +184,7 @@ pub fn show_command_palette(
     if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
         state.open = false;
         state.query.clear();
+        state.selected_index = 0;
         return;
     }
 
@@ -129,24 +196,37 @@ pub fn show_command_palette(
         .collapsible(false)
         .resizable(false)
         .anchor(egui::Align2::CENTER_TOP, egui::vec2(0.0, 64.0))
-        .fixed_size(egui::vec2(420.0, 280.0))
+        .fixed_size(egui::vec2(440.0, 310.0))
         .show(ctx, |ui| {
             let input = ui.add(
                 egui::TextEdit::singleline(&mut state.query)
                     .desired_width(f32::INFINITY)
-                    .hint_text("Type a command..."),
+                    .hint_text("Type a command... (Up/Down + Enter)"),
             );
             input.request_focus();
+            if input.changed() {
+                state.selected_index = 0;
+            }
 
             ui.add_space(6.0);
             ui.separator();
             ui.add_space(4.0);
 
-            let needle = state.query.trim().to_lowercase();
-            let filtered: Vec<&ActionEntry> = ACTIONS
-                .iter()
-                .filter(|a| needle.is_empty() || a.label.to_lowercase().contains(&needle))
-                .collect();
+            let filtered = filter_actions(&state.query);
+            if !filtered.is_empty() {
+                state.selected_index = state.selected_index.min(filtered.len() - 1);
+                if ui.input(|i| i.key_pressed(egui::Key::ArrowDown)) {
+                    state.selected_index = step_selection(state.selected_index, filtered.len(), 1);
+                }
+                if ui.input(|i| i.key_pressed(egui::Key::ArrowUp)) {
+                    state.selected_index = step_selection(state.selected_index, filtered.len(), -1);
+                }
+                if ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                    triggered = Some(filtered[state.selected_index].action);
+                }
+            } else {
+                state.selected_index = 0;
+            }
 
             if filtered.is_empty() {
                 ui.label(
@@ -158,9 +238,14 @@ pub fn show_command_palette(
                 );
             } else {
                 egui::ScrollArea::vertical().show(ui, |ui| {
-                    for entry in filtered {
+                    for (idx, entry) in filtered.iter().enumerate() {
+                        let is_selected = idx == state.selected_index;
                         ui.horizontal(|ui| {
-                            if ui.selectable_label(false, entry.label).clicked() {
+                            let resp = ui.selectable_label(is_selected, entry.label);
+                            if is_selected {
+                                resp.scroll_to_me(Some(egui::Align::Center));
+                            }
+                            if resp.clicked() {
                                 triggered = Some(entry.action);
                             }
                             if !entry.shortcut.is_empty() {
@@ -191,14 +276,17 @@ pub fn show_command_palette(
             camera_2d,
             export_open,
             import_mesh,
+            new_project,
         );
         state.open = false;
         state.query.clear();
+        state.selected_index = 0;
     } else {
         state.open = open;
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn execute_action(
     action: PaletteAction,
     scene: &mut SceneState,
@@ -207,12 +295,16 @@ fn execute_action(
     camera_2d: &mut PixelCamera2D,
     export_open: &mut bool,
     import_mesh: &mut bool,
+    new_project: &mut bool,
 ) {
     match action {
         PaletteAction::Mode(mode) => {
             if scene.active_mode != mode {
                 let _ = history.execute(scene, Command::SetMode(mode));
             }
+        }
+        PaletteAction::NewProject => {
+            *new_project = true;
         }
         PaletteAction::OpenExport => {
             *export_open = true;
@@ -257,6 +349,15 @@ fn execute_action(
                 ]),
             );
         }
+        PaletteAction::ApplyHumanoidRig => {
+            let _ = history.execute(
+                scene,
+                Command::Transaction(vec![
+                    Command::ApplyHumanoidRig,
+                    Command::SetMode(AppMode::Character),
+                ]),
+            );
+        }
         PaletteAction::ApplyBipedRig => {
             let _ = history.execute(
                 scene,
@@ -265,6 +366,51 @@ fn execute_action(
                     Command::SetMode(AppMode::Character),
                 ]),
             );
+        }
+        PaletteAction::ResetCharacterPose => {
+            let _ = history.execute(scene, Command::ResetCharacterPose);
+        }
+        PaletteAction::WeldMeshVertices => {
+            if let Some(node_id) = scene.active_lowpoly_node() {
+                let _ = history.execute(
+                    scene,
+                    Command::WeldMeshVertices {
+                        node_id,
+                        tolerance: 1e-4,
+                    },
+                );
+            }
+        }
+        PaletteAction::FlipMeshNormals => {
+            if let Some(node_id) = scene.active_lowpoly_node() {
+                let _ = history.execute(
+                    scene,
+                    Command::FlipMeshNormals {
+                        node_id,
+                        face_ids: None,
+                    },
+                );
+            }
+        }
+        PaletteAction::MirrorMeshX => {
+            if let Some(node_id) = scene.active_lowpoly_node() {
+                let _ = history.execute(
+                    scene,
+                    Command::MirrorLowPolyMesh {
+                        node_id,
+                        axis: 0,
+                        merge_original: true,
+                    },
+                );
+            }
+        }
+        PaletteAction::ApplyMeshTransform => {
+            if let Some(node_id) = scene.active_lowpoly_node() {
+                let _ = history.execute(scene, Command::ApplyMeshTransform { node_id });
+            }
+        }
+        PaletteAction::ClearScene => {
+            let _ = history.execute(scene, Command::ClearScene);
         }
         PaletteAction::SpawnStarterBipedVoxel => {
             let _ = history.execute(
@@ -331,5 +477,60 @@ fn execute_action(
                 );
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn filter_and_keyboard_step_navigation_wrap_cleanly() {
+        let hits = filter_actions("humanoid");
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].action, PaletteAction::ApplyHumanoidRig);
+
+        assert_eq!(step_selection(0, 5, -1), 4);
+        assert_eq!(step_selection(4, 5, 1), 0);
+        assert_eq!(step_selection(0, 0, 1), 0);
+    }
+
+    #[test]
+    fn execute_action_applies_humanoid_rig_and_new_project_flag() {
+        let mut scene = SceneState::new();
+        let mut history = HistoryStack::new();
+        let mut cam3d = OrbitCamera::new();
+        let mut cam2d = PixelCamera2D::new();
+        let mut export_open = false;
+        let mut import_mesh = false;
+        let mut new_project = false;
+
+        execute_action(
+            PaletteAction::ApplyHumanoidRig,
+            &mut scene,
+            &mut history,
+            &mut cam3d,
+            &mut cam2d,
+            &mut export_open,
+            &mut import_mesh,
+            &mut new_project,
+        );
+        assert_eq!(scene.active_mode, AppMode::Character);
+        assert_eq!(
+            scene.character_rig.as_ref().map(|r| r.bones.len()),
+            Some(19)
+        );
+
+        execute_action(
+            PaletteAction::NewProject,
+            &mut scene,
+            &mut history,
+            &mut cam3d,
+            &mut cam2d,
+            &mut export_open,
+            &mut import_mesh,
+            &mut new_project,
+        );
+        assert!(new_project);
     }
 }

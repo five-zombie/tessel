@@ -9,12 +9,37 @@ use super::nano::{ChunkCoord, VoxelCoord};
 
 /// Unit Anchor: Sparse chunked 3D voxel volume with deterministic ordering & dirty tracking.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(from = "VoxelVolumeRaw")]
 pub struct VoxelVolume {
     #[serde(with = "chunks_serde")]
     chunks: BTreeMap<ChunkCoord, VoxelChunk>,
     #[serde(skip)]
     dirty_chunks: BTreeSet<ChunkCoord>,
     voxel_count: usize,
+}
+
+#[derive(Deserialize)]
+struct VoxelVolumeRaw {
+    #[serde(with = "chunks_serde")]
+    chunks: BTreeMap<ChunkCoord, VoxelChunk>,
+    #[serde(default)]
+    #[allow(dead_code)]
+    voxel_count: usize,
+}
+
+impl From<VoxelVolumeRaw> for VoxelVolume {
+    fn from(raw: VoxelVolumeRaw) -> Self {
+        let voxel_count = raw
+            .chunks
+            .values()
+            .map(|c| usize::from(c.occupied_count()))
+            .sum();
+        Self {
+            chunks: raw.chunks,
+            dirty_chunks: BTreeSet::new(),
+            voxel_count,
+        }
+    }
 }
 
 mod chunks_serde {
@@ -199,5 +224,23 @@ impl VoxelVolume {
 impl Default for VoxelVolume {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn deserialize_recomputes_stale_voxel_count() {
+        let mut vol = VoxelVolume::new();
+        let c = PaletteIndex::new(3).unwrap();
+        vol.set(VoxelCoord::new(0, 0, 0), Some(c));
+        vol.set(VoxelCoord::new(1, 0, 0), Some(c));
+        let loaded = VoxelVolume::from(VoxelVolumeRaw {
+            chunks: vol.chunks,
+            voxel_count: 999_999,
+        });
+        assert_eq!(loaded.voxel_count(), 2);
     }
 }

@@ -1,12 +1,14 @@
 use egui::{CornerRadius, Frame, Margin, RichText, Stroke};
 use tessel_core::{AppMode, Command, HistoryStack, SceneState};
 
+use super::icons::{self, ToolIcon};
 use super::theme::tokens;
 
 pub struct TopBarActions {
     pub open_mcp: bool,
     pub save_project: bool,
     pub open_project: bool,
+    pub new_project: bool,
     pub import_mesh: bool,
     pub open_settings: bool,
 }
@@ -23,6 +25,7 @@ pub fn show_top_bar(
         open_mcp: false,
         save_project: false,
         open_project: false,
+        new_project: false,
         import_mesh: false,
         open_settings: false,
     };
@@ -42,56 +45,57 @@ pub fn show_top_bar(
                         .size(13.5)
                         .color(tokens::ON_SURFACE),
                 );
-                if ui.small_button("Open").clicked() {
+                if icons::hud_icon_button(ui, ToolIcon::NewProject, "New project", false) {
+                    actions.new_project = true;
+                }
+                if icons::hud_icon_button(ui, ToolIcon::Open, "Open project", false) {
                     actions.open_project = true;
                 }
-                if ui.small_button("Save").clicked() {
+                if icons::hud_icon_button(ui, ToolIcon::Save, "Save project", false) {
                     actions.save_project = true;
                 }
-                if ui
-                    .small_button("Import")
-                    .on_hover_text("Import 3D Mesh (.obj / .glb)")
-                    .clicked()
-                {
+                if icons::hud_icon_button(
+                    ui,
+                    ToolIcon::Import,
+                    "Import 3D Mesh (.obj / .glb)",
+                    false,
+                ) {
                     actions.import_mesh = true;
                 }
                 ui.separator();
 
                 for mode in AppMode::ALL {
+                    let icon = match mode {
+                        AppMode::Pixel => ToolIcon::ModePixel,
+                        AppMode::Voxel => ToolIcon::ModeVoxel,
+                        AppMode::LowPoly => ToolIcon::ModeLowPoly,
+                        AppMode::Character => ToolIcon::ModeCharacter,
+                    };
                     let selected = scene.active_mode == mode;
-                    let text_color = if selected {
-                        tokens::ON_PRIMARY
-                    } else {
-                        tokens::ON_SURFACE
-                    };
-                    let fill = if selected {
-                        tokens::PRIMARY_CONTAINER
-                    } else {
-                        tokens::SURFACE_HIGH
-                    };
-
-                    let btn = egui::Button::new(RichText::new(mode.label()).color(text_color))
-                        .fill(fill)
-                        .corner_radius(CornerRadius::same(4));
-
-                    if ui.add(btn).clicked() && !selected {
+                    if icons::hud_icon_button(ui, icon, mode.label(), selected) && !selected {
                         let _ = history.execute(scene, Command::SetMode(mode));
                     }
                 }
 
                 ui.separator();
 
-                if ui
-                    .add_enabled(history.can_undo(), egui::Button::new("Undo"))
-                    .clicked()
-                {
+                if icons::hud_icon_button_enabled(
+                    ui,
+                    ToolIcon::Undo,
+                    "Undo",
+                    false,
+                    history.can_undo(),
+                ) {
                     let _ = history.undo(scene);
                 }
 
-                if ui
-                    .add_enabled(history.can_redo(), egui::Button::new("Redo"))
-                    .clicked()
-                {
+                if icons::hud_icon_button_enabled(
+                    ui,
+                    ToolIcon::Redo,
+                    "Redo",
+                    false,
+                    history.can_redo(),
+                ) {
                     let _ = history.redo(scene);
                 }
 
@@ -107,7 +111,7 @@ pub fn show_top_bar(
                     if ui.add(export_btn).clicked() {
                         *export_open = true;
                     }
-                    if ui.small_button("Settings").clicked() {
+                    if icons::hud_icon_button(ui, ToolIcon::Settings, "Settings", false) {
                         actions.open_settings = true;
                     }
                     ui.separator();

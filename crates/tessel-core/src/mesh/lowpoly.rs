@@ -1,6 +1,9 @@
+use std::collections::BTreeMap;
+
 use glam::Vec3;
 use serde::{Deserialize, Serialize};
 
+use crate::character::VertexSkinWeights;
 use crate::palette::PaletteIndex;
 
 use super::face::Face;
@@ -19,6 +22,9 @@ pub struct TriVertex {
 pub struct TriangulatedMesh {
     pub vertices: Vec<TriVertex>,
     pub indices: Vec<u32>,
+    /// Source `LowPolyMesh::vertices` index per output vertex (for manual
+    /// skin-weight / morph lookups that triangulation otherwise erases).
+    pub source_indices: Vec<usize>,
 }
 
 /// Sub-Unit: PBR surface material properties for a `LowPolyMesh` (rendered live & exported to `.glb`).
@@ -39,6 +45,16 @@ impl Default for MeshMaterial {
     }
 }
 
+/// Named blend-shape target: sparse per-vertex position deltas applied on
+/// top of the base mesh (glTF morph target). Deltas accumulate via
+/// `mesh_morph_delta` and survive index-stable edits; full rebuilds
+/// (bevel/subdivide/decimate) clear all morphs.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+pub struct MorphTarget {
+    pub name: String,
+    pub deltas: BTreeMap<usize, Vec3>,
+}
+
 /// Unit Anchor: Editable indexed low-poly mesh supporting triangles & quads with flat/smooth shading,
 /// PBR material properties, and optional auto-UV RGBA texture painting.
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
@@ -53,6 +69,16 @@ pub struct LowPolyMesh {
     pub smooth_shading: bool,
     #[serde(default)]
     pub material: MeshMaterial,
+    /// Sparse manual skin-weight overrides by vertex index (weight paint).
+    /// Export prefers these over the auto solver. Index-stable edits
+    /// (move/set/translate/extrude/inset) keep them; full rebuilds
+    /// (bevel/subdivide/decimate) clear them since indices stop meaning
+    /// the same corners.
+    #[serde(default)]
+    pub skin_weights: BTreeMap<usize, VertexSkinWeights>,
+    /// Named morph targets (blend shapes) as sparse per-vertex deltas.
+    #[serde(default)]
+    pub morphs: Vec<MorphTarget>,
 }
 
 impl LowPolyMesh {
@@ -205,6 +231,7 @@ impl LowPolyMesh {
                     tangent,
                     palette_index: face.material,
                 });
+                out.source_indices.extend_from_slice(&[i0, i1, i2]);
                 out.indices.extend_from_slice(&[base, base + 1, base + 2]);
             }
         }

@@ -13,14 +13,14 @@ use crate::translator::{execute_tool_call, palette_summary_json, scene_summary_j
 pub use http::{LiveMcpRequest, LiveMcpServerHandle};
 
 const MCP_SERVER_INSTRUCTIONS: &str = "\
-Tessel is a 3D & 2D asset creation studio (Pixel, Voxel, Low-Poly, Character) using a Right-Handed +Y Up, +Z Front coordinate system (1 voxel = 0.1m).
+Tessel is a 3D & 2D asset creation studio (Pixel, Voxel, Low-Poly, Character) using a Right-Handed +Y Up, +Z Front coordinate system (1 voxel = 0.1m; Left = +X, Right = -X).
 Recommended workflow:
-1. Call `scene_inspect` (or read `tessel://scene/summary` and `tessel://palette/current`) before editing so you know existing node IDs, positions, bounds, and palette indices (1..=255). Add custom colors to slots 1..=255 anytime with `palette_set_color` (`rgb` or `hex`).
-2. Remove unwanted starter nodes (such as 'Starter Voxel') with `scene_delete_node` before sculpting a new asset. Position, rotate, or scale any node with `scene_set_node_transform` (`position`, `rotation_deg`, `scale`), group/parent parts with `scene_set_parent`, and adjust studio lighting with `scene_set_lighting`.
-3. Voxel mode: use `voxel_fill_box` and `voxel_fill_ellipsoid` (bounds ±256), then optionally `voxel_convert_to_lowpoly`.
-4. Low-Poly mode: compose primitives via `mesh_create_primitive` (`cube`, `plane`, `cylinder`, `cone`, `sphere`, `torus`, `capsule` with `position`, `rotation_deg`, `scale`), generate curved shoulder straps/belts/cables with `mesh_create_curve_tube` (`points`, `radius`, `flatness`), inspect face IDs/normals with `mesh_inspect`, bevel/panel faces with `mesh_inset_face`, extrude pockets/flaps/straps with `mesh_extrude_face`, chamfer hard edges/corners with `mesh_bevel`, sculpt faces with `mesh_translate_face`, optimize LOD with `mesh_decimate`, or import `.obj`/`.glb` (`mesh_import`, preserving UVs). Apply custom `.png`/`.jpg` textures or normal maps (skin, wood, fur, fabric, camo, stitching) via `mesh_load_texture` and `mesh_load_normal_map`. Paint patterns/spots via `mesh_fill_texture` then `mesh_paint_spot` (`point`+`normal` or `uv`, `radius_px`, optional `mirror_x: true` for X symmetry). Adjust PBR finish (`metallic`, `roughness`, `emissive`) with `mesh_set_material`. Round organic shapes with `mesh_smooth_subdivide` (1-3 iterations) and `mesh_set_shading` (`smooth: true`).
-5. Character & Prop Rigging mode: call `character_apply_biped_rig` for humanoids or `character_add_bone` + `character_bind_node` for custom prop rigs (backpacks, weapons, chests), pose bones with `character_set_bone_pose`, and author custom animations with `character_set_keyframe`. Exporting `.glb` while a rig is active automatically embeds glTF 2.0 auto-weight smooth skinning (`skins`, `JOINTS_0`, `WEIGHTS_0`, `inverseBindMatrices`).
-6. Read `tessel://viewport/preview` (when GUI is running) to visually inspect results, use `history_undo`/`history_redo` if needed, and export via `project_export` (`.glb`, `.obj`, `.stl`, `.vox`, `.png`, `.gif`).";
+1. Call `scene_inspect` (or read `tessel://scene/summary` and `tessel://palette/current`) before editing, or call `scene_clear` to start fresh. Add custom colors to slots 1..=255 with `palette_set_color` (`rgb` or `hex`). Use `scene_batch` (up to 128 calls, atomic rollback) for fast multi-step builds, `scene_rename_node` to label parts, `scene_set_node_transform` to pose nodes, `scene_set_parent` to group, and `scene_set_lighting` for studio key light.
+2. Voxel mode: use `voxel_fill_box` and `voxel_fill_ellipsoid` (bounds ±256), then optionally `voxel_convert_to_lowpoly`.
+3. Low-Poly mode: create bespoke 1:1 geometry via `mesh_create_raw` (`vertices`, `faces` with per-face `palette_index` & optional `uvs`), compose primitives via `mesh_create_primitive` (`cube`, `plane`, `cylinder`, `cone`, `sphere`, `torus`, `capsule`; bottom-anchored y in [0, size], min size 0.005), generate curved straps/cables with `mesh_create_curve_tube`, join parts with `mesh_join`, bake transforms before mirroring/bending via `mesh_apply_transform`, mirror symmetrically with `mesh_mirror`, collapse center seams with `mesh_weld_vertices`, fix inside-out faces with `mesh_flip_normals`, deform with `mesh_taper` / `mesh_bend`, shift pivots with `mesh_set_origin`, subdivide locally with `mesh_subdivide_face`, paint per-face colors with `mesh_set_face_material`, batch-update vertices with `mesh_set_vertices`, inspect with `mesh_inspect`, bevel/inset/extrude (`mesh_inset_face`, `mesh_extrude_face`, `mesh_bevel`), sculpt (`mesh_translate_face`, `mesh_move_vertices`, `mesh_set_vertex`), project UVs (`mesh_project_uvs`), paint 3D textures (`mesh_fill_texture`, `mesh_paint_spot` with `mirror_x: true`, `mesh_paint_line`, `mesh_paint_rect`, `mesh_load_texture`, `mesh_load_normal_map`), tune PBR (`mesh_set_material`), and smooth (`mesh_smooth_subdivide`, `mesh_set_shading`).
+4. Character & Prop Rigging mode: call `character_apply_biped_rig` (`preset: \"starter\"` 7-bone or `preset: \"humanoid\"` 19-bone with built-in Idle & Walk; Left=+X, Right=-X), adjust rest positions (`character_set_bone_rest_position`), isolate limbs (`character_set_node_bone_mask`), bind rigid gear (`character_bind_node`), inspect weights (`character_inspect_weights`), pose (`character_set_bone_pose`, `character_solve_ik`), scrub live animations (`character_set_playback_time`, `character_reset_pose`), author keyframes (`character_set_keyframe`), and animate blend shapes (`character_set_morph_weight`). Both live viewport rendering and `viewport_screenshot` deform meshes in real time.
+5. Verify visually with `viewport_screenshot` (`width`, `height`, `target`, `yaw`, `pitch`, `distance >= 0.25`, `preview: true` for clean PBR without wireframe) or `viewport_set_preview` + `tessel://viewport/preview`. Save editable projects with `project_save` / `project_open` (`.tessel`) and export game-ready assets with `project_export` (`.glb` with automatic PBR material deduplication, `.obj`, `.stl`, `.vox`, `.png`, `.gif`).
+6. Live GUI viewport only: frame subjects with `camera_get`, `camera_look_at`, `camera_zoom`, `camera_orbit`, `camera_pan`, `camera_preset`, `camera_reset`, and `viewport_set_preview`.";
 
 /// Processes a single JSON-RPC 2.0 MCP request directly against any live `SceneState` & `HistoryStack`.
 pub fn dispatch_mcp_message(
@@ -71,15 +71,32 @@ pub fn dispatch_mcp_message_with_preview(
                 .get("arguments")
                 .cloned()
                 .unwrap_or_else(|| json!({}));
+            let started = std::time::Instant::now();
             match execute_tool_call(tool_name, &args, scene, history, allowed_export_dir) {
-                Ok(val) => Ok(json!({
-                    "content": [{ "type": "text", "text": val.to_string() }],
-                    "isError": false
-                })),
-                Err(err) => Ok(json!({
-                    "content": [{ "type": "text", "text": err.to_structured_json().to_string() }],
-                    "isError": true
-                })),
+                Ok(val) => {
+                    tracing::debug!(
+                        tool = tool_name,
+                        elapsed_ms = started.elapsed().as_millis() as u64,
+                        is_error = false,
+                        "MCP tool call succeeded"
+                    );
+                    Ok(json!({
+                        "content": [{ "type": "text", "text": val.to_string() }],
+                        "isError": false
+                    }))
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        tool = tool_name,
+                        elapsed_ms = started.elapsed().as_millis() as u64,
+                        error = %err,
+                        "MCP tool call failed"
+                    );
+                    Ok(json!({
+                        "content": [{ "type": "text", "text": err.to_structured_json().to_string() }],
+                        "isError": true
+                    }))
+                }
             }
         }
         "resources/list" => Ok(json!({
@@ -137,6 +154,13 @@ pub fn dispatch_mcp_message_with_preview(
         "prompts/list" => Ok(json!({
             "prompts": [
                 {
+                    "name": "create-lowpoly-character",
+                    "description": "Skill: Build a 1:1 low-poly humanoid character using mesh_create_raw, mesh_apply_transform + mesh_mirror + mesh_weld_vertices, 19-bone humanoid rig, bone masks, live animation scrubbing, and .tessel/.glb export.",
+                    "arguments": [
+                        { "name": "character_concept", "description": "Character theme (e.g. tactical survivor, sci-fi trooper)", "required": false }
+                    ]
+                },
+                {
                     "name": "create-voxel-character",
                     "description": "Skill: Build a proportional voxel humanoid character, apply biped rig, inspect preview, and export .glb.",
                     "arguments": [
@@ -175,6 +199,29 @@ pub fn dispatch_mcp_message_with_preview(
             let prompt_name = params.get("name").and_then(Value::as_str).unwrap_or("");
             let args = params.get("arguments").cloned().unwrap_or(Value::Null);
             match prompt_name {
+                "create-lowpoly-character" => {
+                    let concept = args
+                        .get("character_concept")
+                        .and_then(Value::as_str)
+                        .unwrap_or("1:1 tactical low-poly character");
+                    Ok(json!({
+                        "description": "Tessel 1:1 Low-Poly Character Creation Skill",
+                        "messages": [{
+                            "role": "user",
+                            "content": {
+                                "type": "text",
+                                "text": format!(
+                                    "Create a 1:1 low-poly '{concept}' in Tessel (~1.82m tall, Right-Handed +Y Up, +Z Front, Left=+X, Right=-X).\n\
+                                     1. Call `scene_clear` and populate custom palette colors with `palette_set_color` (batch with `scene_batch`).\n\
+                                     2. Sculpt unified anatomy (torso/head/helmet/visor) with `mesh_create_raw` (per-face `palette_index`) and `mesh_bend`/`mesh_taper`; build left limbs once, then run `mesh_join` -> `mesh_apply_transform` -> `mesh_mirror` (`axis: \"x\"`) -> `mesh_weld_vertices`.\n\
+                                     3. Apply `character_apply_biped_rig` (`preset: \"humanoid\"`, 19 bones with built-in Idle & Walk), rigidly bind helmets/props via `character_bind_node`, and isolate trousers/torso from arms via `character_set_node_bone_mask`.\n\
+                                     4. Scrub `character_set_playback_time` (e.g. `Walk` at `0.25`) and verify visually with `viewport_screenshot` (`preview: true`).\n\
+                                     5. Save editable `.tessel` via `project_save` and export game-ready `.glb` via `project_export`."
+                                )
+                            }
+                        }]
+                    }))
+                }
                 "create-voxel-character" => {
                     let concept = args
                         .get("character_concept")
@@ -304,6 +351,7 @@ pub struct McpServer {
     pub scene: SceneState,
     pub history: HistoryStack,
     pub allowed_export_dir: PathBuf,
+    headless: Option<crate::headless::HeadlessRenderer>,
 }
 
 impl McpServer {
@@ -312,17 +360,129 @@ impl McpServer {
             scene: SceneState::new(),
             history: HistoryStack::new(),
             allowed_export_dir,
+            headless: None,
         }
     }
 
     /// Processes a single JSON-RPC 2.0 request and returns an optional response (`None` for notifications).
     pub fn handle_message(&mut self, request: &Value) -> Option<Value> {
+        if request.get("method").and_then(Value::as_str) == Some("tools/call") {
+            match request
+                .get("params")
+                .and_then(|p| p.get("name"))
+                .and_then(Value::as_str)
+            {
+                Some("viewport_screenshot") => return Some(self.call_viewport_screenshot(request)),
+                Some("viewport_render_turntable_gif") => {
+                    return Some(self.call_viewport_turntable_gif(request));
+                }
+                _ => {}
+            }
+        }
         dispatch_mcp_message(
             request,
             &mut self.scene,
             &mut self.history,
             &self.allowed_export_dir,
         )
+    }
+
+    /// Renders the current scene offscreen (headless GPU) and returns the PNG
+    /// as an MCP image content block. The renderer is created lazily so
+    /// machines without a GPU keep working for every other tool.
+    fn call_viewport_screenshot(&mut self, request: &Value) -> Value {
+        use crate::error::AiError;
+        let id = request.get("id").cloned().unwrap_or(Value::Null);
+        let args = request
+            .get("params")
+            .and_then(|p| p.get("arguments"))
+            .cloned()
+            .unwrap_or_else(|| json!({}));
+        let result = (|| -> Result<Value, AiError> {
+            let w = args
+                .get("width")
+                .and_then(Value::as_u64)
+                .unwrap_or(640)
+                .clamp(16, 1024) as u32;
+            let h = args
+                .get("height")
+                .and_then(Value::as_u64)
+                .unwrap_or(480)
+                .clamp(16, 1024) as u32;
+            let preview = args
+                .get("preview")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            let cam = crate::headless::screenshot_camera(&args)?;
+            if self.headless.is_none() {
+                self.headless = Some(crate::headless::HeadlessRenderer::new(640, 480)?);
+            }
+            let png = self
+                .headless
+                .as_mut()
+                .expect("headless renderer just created")
+                .render_png(&self.scene, &cam, w, h, preview)?;
+            Ok(json!([
+                { "type": "text", "text": format!("viewport {w}x{h} sRGB PNG") },
+                { "type": "image", "data": base64::engine::general_purpose::STANDARD.encode(&png), "mimeType": "image/png" },
+            ]))
+        })();
+        match result {
+            Ok(content) => json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "result": { "content": content, "isError": false },
+            }),
+            Err(err) => json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "result": {
+                    "content": [{ "type": "text", "text": err.to_structured_json().to_string() }],
+                    "isError": true,
+                },
+            }),
+        }
+    }
+
+    /// Renders a 360-degree animated turntable GIF offscreen and saves it inside `allowed_export_dir`.
+    fn call_viewport_turntable_gif(&mut self, request: &Value) -> Value {
+        use crate::error::AiError;
+        let id = request.get("id").cloned().unwrap_or(Value::Null);
+        let args = request
+            .get("params")
+            .and_then(|p| p.get("arguments"))
+            .cloned()
+            .unwrap_or_else(|| json!({}));
+        let result = (|| -> Result<Value, AiError> {
+            let parsed = crate::headless::parse_turntable_args(&self.allowed_export_dir, &args)?;
+            if self.headless.is_none() {
+                self.headless = Some(crate::headless::HeadlessRenderer::new(320, 320)?);
+            }
+            let Some(renderer) = self.headless.as_mut() else {
+                return Err(AiError::InvalidArguments(
+                    "headless renderer unavailable".into(),
+                ));
+            };
+            renderer.render_turntable_gif(&self.scene, &parsed)
+        })();
+        match result {
+            Ok(val) => json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "result": {
+                    "content": [{ "type": "text", "text": val.to_string() }],
+                    "isError": false,
+                },
+            }),
+            Err(err) => json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "result": {
+                    "content": [{ "type": "text", "text": err.to_structured_json().to_string() }],
+                    "isError": true,
+                },
+            }),
+        }
     }
 
     /// Runs the line-delimited JSON-RPC stdio transport loop until EOF.
@@ -432,6 +592,62 @@ mod tests {
     }
 
     #[test]
+    fn mcp_viewport_screenshot_needs_gpu_but_validates_args_first() {
+        let export_dir = std::env::temp_dir().join("tessel_mcp_shot_test");
+        let _ = std::fs::remove_dir_all(&export_dir);
+        let mut server = McpServer::new(export_dir);
+
+        // Bad camera args fail before any GPU is touched.
+        let bad = server
+            .handle_message(&json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {
+                    "name": "viewport_screenshot",
+                    "arguments": { "target": [0.0, 0.0] }
+                }
+            }))
+            .unwrap();
+        assert_eq!(bad["result"]["isError"], true);
+        assert!(bad["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("target"));
+
+        // A real render needs a GPU; CI sandboxes without one get a clear
+        // error instead of a hang (run with a GPU, e.g. lavapipe, for pixels).
+        let shot = server
+            .handle_message(&json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "tools/call",
+                "params": {
+                    "name": "viewport_screenshot",
+                    "arguments": { "width": 64, "height": 64 }
+                }
+            }))
+            .unwrap();
+        if shot["result"]["isError"] == true {
+            let msg = shot["result"]["content"][0]["text"].as_str().unwrap();
+            assert!(
+                msg.contains("GPU"),
+                "GPU-less failure must say so, got: {msg}"
+            );
+            eprintln!("SKIP pixels: no GPU adapter in this environment");
+            return;
+        }
+        let content = shot["result"]["content"].as_array().unwrap();
+        assert_eq!(content.len(), 2);
+        let b64 = content[1]["data"].as_str().unwrap();
+        assert_eq!(content[1]["mimeType"], "image/png");
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(b64)
+            .unwrap();
+        assert_eq!(&bytes[1..4], b"PNG", "must be a real PNG file");
+    }
+
+    #[test]
     fn mcp_rejects_out_of_bounds_and_excessive_batches() {
         let mut server = McpServer::new(std::env::temp_dir());
         let oob = server
@@ -504,7 +720,25 @@ mod tests {
         assert!(instructions.contains("mesh_smooth_subdivide"));
 
         let prompts = list["result"]["prompts"].as_array().unwrap();
-        assert_eq!(prompts.len(), 5);
+        assert_eq!(prompts.len(), 6);
+
+        let lp_skill = server
+            .handle_message(&json!({
+                "jsonrpc": "2.0",
+                "id": 13,
+                "method": "prompts/get",
+                "params": {
+                    "name": "create-lowpoly-character",
+                    "arguments": { "character_concept": "PUBG Lone Survivor" }
+                }
+            }))
+            .unwrap();
+        let lp_text = lp_skill["result"]["messages"][0]["content"]["text"]
+            .as_str()
+            .unwrap();
+        assert!(lp_text.contains("PUBG Lone Survivor"));
+        assert!(lp_text.contains("mesh_create_raw"));
+        assert!(lp_text.contains("character_set_node_bone_mask"));
 
         let rig_skill = server
             .handle_message(&json!({

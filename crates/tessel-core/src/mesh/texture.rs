@@ -91,6 +91,122 @@ impl MeshTexture {
             }
         }
     }
+
+    /// Paints a solid line segment from `uv_start` to `uv_end` with pixel width `width_px`.
+    /// Returns `(byte_offset, previous_rgba)` entries for lightweight undo.
+    pub fn paint_line(
+        &mut self,
+        uv_start: [f32; 2],
+        uv_end: [f32; 2],
+        width_px: f32,
+        color: Rgba8,
+    ) -> Vec<(usize, [u8; 4])> {
+        let w = self.width as i32;
+        let h = self.height as i32;
+        if w <= 0 || h <= 0 || self.rgba.len() < (w as usize * h as usize * 4) {
+            return Vec::new();
+        }
+        let x0 = uv_start[0].clamp(0.0, 1.0) * (w - 1) as f32;
+        let y0 = uv_start[1].clamp(0.0, 1.0) * (h - 1) as f32;
+        let x1 = uv_end[0].clamp(0.0, 1.0) * (w - 1) as f32;
+        let y1 = uv_end[1].clamp(0.0, 1.0) * (h - 1) as f32;
+        let r = (width_px.clamp(1.0, 96.0) * 0.5).max(0.5);
+        let r_ceil = r.ceil() as i32;
+        let r2 = r * r;
+
+        let min_x = (x0.min(x1).floor() as i32 - r_ceil).max(0);
+        let max_x = (x0.max(x1).ceil() as i32 + r_ceil).min(w - 1);
+        let min_y = (y0.min(y1).floor() as i32 - r_ceil).max(0);
+        let max_y = (y0.max(y1).ceil() as i32 + r_ceil).min(h - 1);
+
+        let vx = x1 - x0;
+        let vy = y1 - y0;
+        let len2 = vx * vx + vy * vy;
+        let new_px = [color.r, color.g, color.b, color.a];
+        let mut undo_pixels = Vec::new();
+
+        for py in min_y..=max_y {
+            let fy = py as f32;
+            for px in min_x..=max_x {
+                let fx = px as f32;
+                let t = if len2 > 1e-6 {
+                    (((fx - x0) * vx + (fy - y0) * vy) / len2).clamp(0.0, 1.0)
+                } else {
+                    0.0
+                };
+                let dx = fx - (x0 + vx * t);
+                let dy = fy - (y0 + vy * t);
+                if dx * dx + dy * dy <= r2 {
+                    let offset = ((py as usize) * (w as usize) + (px as usize)) * 4;
+                    let prev = [
+                        self.rgba[offset],
+                        self.rgba[offset + 1],
+                        self.rgba[offset + 2],
+                        self.rgba[offset + 3],
+                    ];
+                    if prev != new_px {
+                        undo_pixels.push((offset, prev));
+                        self.rgba[offset..offset + 4].copy_from_slice(&new_px);
+                    }
+                }
+            }
+        }
+        undo_pixels
+    }
+
+    /// Paints a solid axis-aligned UV rectangle `[uv_min, uv_max]`.
+    /// Returns `(byte_offset, previous_rgba)` entries for lightweight undo.
+    pub fn paint_rect(
+        &mut self,
+        uv_min: [f32; 2],
+        uv_max: [f32; 2],
+        color: Rgba8,
+    ) -> Vec<(usize, [u8; 4])> {
+        let w = self.width as i32;
+        let h = self.height as i32;
+        if w <= 0 || h <= 0 || self.rgba.len() < (w as usize * h as usize * 4) {
+            return Vec::new();
+        }
+        let u0 = uv_min[0].min(uv_max[0]).clamp(0.0, 1.0);
+        let u1 = uv_min[0].max(uv_max[0]).clamp(0.0, 1.0);
+        let v0 = uv_min[1].min(uv_max[1]).clamp(0.0, 1.0);
+        let v1 = uv_min[1].max(uv_max[1]).clamp(0.0, 1.0);
+
+        let min_x = ((u0 * (w - 1) as f32).floor() as i32).max(0);
+        let max_x = ((u1 * (w - 1) as f32).ceil() as i32).min(w - 1);
+        let min_y = ((v0 * (h - 1) as f32).floor() as i32).max(0);
+        let max_y = ((v1 * (h - 1) as f32).ceil() as i32).min(h - 1);
+
+        let new_px = [color.r, color.g, color.b, color.a];
+        let mut undo_pixels = Vec::new();
+        for py in min_y..=max_y {
+            for px in min_x..=max_x {
+                let offset = ((py as usize) * (w as usize) + (px as usize)) * 4;
+                let prev = [
+                    self.rgba[offset],
+                    self.rgba[offset + 1],
+                    self.rgba[offset + 2],
+                    self.rgba[offset + 3],
+                ];
+                if prev != new_px {
+                    undo_pixels.push((offset, prev));
+                    self.rgba[offset..offset + 4].copy_from_slice(&new_px);
+                }
+            }
+        }
+        undo_pixels
+    }
+}
+
+/// Automatic UV projection mode for `LowPolyMesh`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum UvProjection {
+    Box,
+    PlanarX,
+    PlanarY,
+    PlanarZ,
+    CylindricalY,
+    Spherical,
 }
 
 /// Deterministic 3x2 box-projection UV atlas mapping any 3D point + outward normal

@@ -11,6 +11,7 @@ path = "src/main.rs"
 [dependencies]
 bytemuck.workspace = true
 directories.workspace = true
+egui-phosphor = "0.9"
 egui.workspace = true
 egui-wgpu.workspace = true
 egui-winit.workspace = true

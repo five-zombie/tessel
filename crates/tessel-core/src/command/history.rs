@@ -12,6 +12,10 @@ struct HistoryRecord {
 }
 
 /// Deterministic Undo/Redo stack bound to the single Command Bus.
+///
+/// Note: This is a bounded, mutable in-memory editor history (`DEFAULT_MAX_HISTORY = 256`,
+/// oldest entries evicted FIFO) for interactive undo/redo — it is **not** a durable,
+/// append-only security or compliance audit trail.
 #[derive(Debug, Clone)]
 pub struct HistoryStack {
     undo_stack: Vec<HistoryRecord>,

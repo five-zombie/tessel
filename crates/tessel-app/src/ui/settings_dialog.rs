@@ -1,13 +1,14 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
-use egui::{CornerRadius, RichText};
+use egui::RichText;
 use tessel_ai::{AiProviderKind, DirectAiConfig, LiveMcpServerHandle};
 
 use crate::settings::{
     load_api_key_from_keyring, save_api_key_to_keyring, AppPaths, AppSettings, ProviderProfile,
 };
 
+use super::icons::{self, ToolIcon};
 use super::theme::tokens;
 
 pub struct SettingsDialogState {
@@ -101,7 +102,7 @@ pub fn show_settings_dialog(
                         ui.add(
                             egui::TextEdit::singleline(&mut profile.base_url).desired_width(250.0),
                         );
-                        if ui.small_button("Reset").clicked() {
+                        if icons::hud_icon_button(ui, ToolIcon::Reset, "Reset Base URL", false) {
                             profile.base_url = kind.default_base_url().into();
                         }
                     });
@@ -139,7 +140,7 @@ pub fn show_settings_dialog(
             ui.horizontal(|ui| {
                 ui.label("Allowed Export Dir:");
                 ui.add(egui::TextEdit::singleline(&mut state.export_dir_text).desired_width(220.0));
-                if ui.small_button("Browse...").clicked() {
+                if icons::hud_icon_button(ui, ToolIcon::Open, "Browse folders", false) {
                     if let Some(folder) = rfd::FileDialog::new().pick_folder() {
                         state.export_dir_text = folder.display().to_string();
                     }
@@ -159,22 +160,14 @@ pub fn show_settings_dialog(
                         tokens::ON_SURFACE_VARIANT
                     },
                 ));
-                if ui.small_button("Open MCP Setup...").clicked() {
+                if icons::hud_icon_button(ui, ToolIcon::Settings, "Open MCP Setup", false) {
                     *mcp_dialog_open = true;
                 }
             });
 
             ui.add_space(12.0);
             ui.horizontal(|ui| {
-                let save_btn = egui::Button::new(
-                    RichText::new("Save Settings")
-                        .strong()
-                        .color(tokens::ON_PRIMARY),
-                )
-                .fill(tokens::PRIMARY_CONTAINER)
-                .corner_radius(CornerRadius::same(4));
-
-                if ui.add(save_btn).clicked() {
+                if icons::hud_icon_button(ui, ToolIcon::Save, "Save Settings", false) {
                     let mut keyring_err: Option<String> = None;
                     for &p_kind in &AiProviderKind::ALL {
                         if let Some(prof) = state.profiles.get(&p_kind) {
@@ -216,7 +209,7 @@ pub fn show_settings_dialog(
                     };
                 }
 
-                if ui.button("Close").clicked() {
+                if icons::hud_icon_button(ui, ToolIcon::Close, "Close", false) {
                     state.open = false;
                 }
             });

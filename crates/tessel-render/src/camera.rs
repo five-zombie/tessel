@@ -4,7 +4,7 @@ use crate::vertex::CameraUniform;
 
 const MIN_PITCH: f32 = -1.52;
 const MAX_PITCH: f32 = 1.52;
-const MIN_DISTANCE: f32 = 1.0;
+const MIN_DISTANCE: f32 = 0.25;
 const MAX_DISTANCE: f32 = 120.0;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
