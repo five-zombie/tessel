@@ -8,7 +8,7 @@ pub fn show_toolbar(ctx: &egui::Context, scene: &mut SceneState, history: &mut H
     let frame = Frame::NONE
         .fill(tokens::SURFACE_LOW)
         .inner_margin(Margin::symmetric(6, 10))
-        .stroke(Stroke::new(1.0, tokens::OUTLINE_VARIANT));
+        .stroke(Stroke::new(1.0_f32, tokens::OUTLINE_VARIANT));
 
     egui::SidePanel::left("tessel_toolbar")
         .exact_width(112.0)

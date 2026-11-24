@@ -22,7 +22,10 @@ pub mod tokens {
 
 pub fn apply_tactile_precision_theme(ctx: &egui::Context) {
     let mut visuals = Visuals::dark();
-    let border_stroke = Stroke::new(1.0, Color32::from_rgba_unmultiplied(0x54, 0x43, 0x38, 128));
+    let border_stroke = Stroke::new(
+        1.0_f32,
+        Color32::from_rgba_unmultiplied(0x54, 0x43, 0x38, 128),
+    );
 
     visuals.extreme_bg_color = tokens::SURFACE;
     visuals.panel_fill = tokens::SURFACE_LOW;
@@ -37,7 +40,7 @@ pub fn apply_tactile_precision_theme(ctx: &egui::Context) {
     visuals.window_stroke = border_stroke;
 
     visuals.selection.bg_fill = tokens::PRIMARY_CONTAINER;
-    visuals.selection.stroke = Stroke::new(1.0, tokens::PRIMARY);
+    visuals.selection.stroke = Stroke::new(1.0_f32, tokens::PRIMARY);
 
     visuals.widgets.noninteractive.bg_fill = tokens::SURFACE_LOW;
     visuals.widgets.noninteractive.bg_stroke = border_stroke;
@@ -50,11 +53,11 @@ pub fn apply_tactile_precision_theme(ctx: &egui::Context) {
 
     visuals.widgets.hovered.bg_fill = tokens::SURFACE_HIGHEST;
     visuals.widgets.hovered.weak_bg_fill = tokens::SURFACE_HIGHEST;
-    visuals.widgets.hovered.bg_stroke = Stroke::new(1.0, tokens::OUTLINE_VARIANT);
+    visuals.widgets.hovered.bg_stroke = Stroke::new(1.0_f32, tokens::OUTLINE_VARIANT);
     visuals.widgets.hovered.corner_radius = CornerRadius::same(4);
 
     visuals.widgets.active.bg_fill = tokens::PRIMARY_CONTAINER;
-    visuals.widgets.active.fg_stroke = Stroke::new(1.5, tokens::ON_PRIMARY);
+    visuals.widgets.active.fg_stroke = Stroke::new(1.5_f32, tokens::ON_PRIMARY);
     visuals.widgets.active.corner_radius = CornerRadius::same(4);
 
     ctx.set_visuals(visuals);

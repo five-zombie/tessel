@@ -147,7 +147,9 @@ mod tests {
         let fake_thumb = [0x89u8, 0x50, 0x4E, 0x47];
         let encoded = encode_tessel_project_with_thumbnail(&scene, Some(&fake_thumb)).unwrap();
         let archive = ZipArchive::new(Cursor::new(&encoded)).unwrap();
-        assert!(archive.file_names().any(|n| n == "thumbnail.png"));
+        assert!(archive
+            .file_names()
+            .any(|n| n.is_ok_and(|s| s == "thumbnail.png")));
 
         let decoded = decode_tessel_project(&encoded).unwrap();
         assert_eq!(decoded.voxel_volumes[&id].voxel_count(), 8);

@@ -82,7 +82,7 @@ pub fn show_inspector(
     let frame = Frame::NONE
         .fill(tokens::SURFACE_LOW)
         .inner_margin(Margin::same(10))
-        .stroke(Stroke::new(1.0, tokens::OUTLINE_VARIANT));
+        .stroke(Stroke::new(1.0_f32, tokens::OUTLINE_VARIANT));
 
     egui::SidePanel::right("tessel_inspector")
         .exact_width(256.0)
@@ -178,9 +178,9 @@ fn show_palette_section(ui: &mut egui::Ui, scene: &mut SceneState, history: &mut
                 let selected = scene.active_color == idx;
                 let fill = Color32::from_rgba_unmultiplied(rgba.r, rgba.g, rgba.b, rgba.a);
                 let stroke = if selected {
-                    Stroke::new(2.0, tokens::PRIMARY)
+                    Stroke::new(2.0_f32, tokens::PRIMARY)
                 } else {
-                    Stroke::new(1.0, tokens::OUTLINE_VARIANT)
+                    Stroke::new(1.0_f32, tokens::OUTLINE_VARIANT)
                 };
                 let (rect, resp) =
                     ui.allocate_exact_size(egui::vec2(24.0, 24.0), egui::Sense::click());

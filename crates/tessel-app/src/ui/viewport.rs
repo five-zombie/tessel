@@ -321,7 +321,7 @@ fn draw_camera_compass(ui: &egui::Ui, rect: egui::Rect, camera: &OrbitCamera) {
     painter.circle_stroke(
         center,
         radius + 6.0,
-        Stroke::new(1.0, tokens::OUTLINE_VARIANT),
+        Stroke::new(1.0_f32, tokens::OUTLINE_VARIANT),
     );
 
     let view = glam::Mat4::look_at_rh(camera.position(), camera.target, glam::Vec3::Y);
@@ -339,7 +339,7 @@ fn draw_camera_compass(ui: &egui::Ui, rect: egui::Rect, camera: &OrbitCamera) {
 
     for (label, v, col) in projected {
         let end = center + egui::vec2(v.x * radius, -v.y * radius);
-        painter.line_segment([center, end], Stroke::new(2.0, col));
+        painter.line_segment([center, end], Stroke::new(2.0_f32, col));
         painter.text(
             end + egui::vec2(v.x * 7.0, -v.y * 7.0),
             egui::Align2::CENTER_CENTER,
@@ -467,7 +467,7 @@ fn show_viewport_hud(
         .show(ui.ctx(), |ui| {
             Frame::NONE
                 .fill(tokens::SURFACE_LOW)
-                .stroke(Stroke::new(1.0, tokens::OUTLINE_VARIANT))
+                .stroke(Stroke::new(1.0_f32, tokens::OUTLINE_VARIANT))
                 .corner_radius(CornerRadius::same(4))
                 .inner_margin(Margin::symmetric(6, 4))
                 .show(ui, |ui| {
@@ -984,7 +984,7 @@ fn draw_selection_brackets(
     };
 
     let painter = ui.painter_at(viewport_rect);
-    let stroke = Stroke::new(2.2, tokens::PRIMARY);
+    let stroke = Stroke::new(2.2_f32, tokens::PRIMARY);
     let arm_x = (sel.width() * 0.22).clamp(8.0, 22.0);
     let arm_y = (sel.height() * 0.22).clamp(8.0, 22.0);
 
@@ -1202,7 +1202,7 @@ fn draw_scene_gadgets(
         let sun_ray_col =
             egui::Color32::from_rgba_unmultiplied(255, 206, 84, if sun_active { 170 } else { 95 });
         if let Some(target_pos) = project_world_point(camera_3d.target, camera_3d, viewport_rect) {
-            painter.line_segment([sun_pos, target_pos], Stroke::new(1.4, sun_ray_col));
+            painter.line_segment([sun_pos, target_pos], Stroke::new(1.4_f32, sun_ray_col));
         }
         let fill = if sun_active {
             egui::Color32::from_rgba_unmultiplied(68, 52, 18, 235)
@@ -1213,7 +1213,7 @@ fn draw_scene_gadgets(
         painter.circle_stroke(
             sun_pos,
             14.5,
-            Stroke::new(if sun_active { 2.2 } else { 1.5 }, sun_gold),
+            Stroke::new(if sun_active { 2.2_f32 } else { 1.5_f32 }, sun_gold),
         );
         painter.text(
             sun_pos,
@@ -1265,11 +1265,11 @@ fn draw_scene_gadgets(
             project_world_point(corners_world[3], camera_3d, viewport_rect),
         ];
         for c in corners_2d.into_iter().flatten() {
-            painter.line_segment([cam_pos, c], Stroke::new(1.3, frustum_col));
+            painter.line_segment([cam_pos, c], Stroke::new(1.3_f32, frustum_col));
         }
         for i in 0..4 {
             if let (Some(a), Some(b)) = (corners_2d[i], corners_2d[(i + 1) % 4]) {
-                painter.line_segment([a, b], Stroke::new(1.3, frustum_col));
+                painter.line_segment([a, b], Stroke::new(1.3_f32, frustum_col));
             }
         }
         if let Some(target_pos) =
@@ -1278,7 +1278,7 @@ fn draw_scene_gadgets(
             painter.line_segment(
                 [cam_pos, target_pos],
                 Stroke::new(
-                    1.0,
+                    1.0_f32,
                     egui::Color32::from_rgba_unmultiplied(
                         92,
                         196,
@@ -1298,7 +1298,7 @@ fn draw_scene_gadgets(
         painter.circle_stroke(
             cam_pos,
             14.5,
-            Stroke::new(if cam_active { 2.2 } else { 1.5 }, cam_cyan),
+            Stroke::new(if cam_active { 2.2_f32 } else { 1.5_f32 }, cam_cyan),
         );
         painter.text(
             cam_pos,

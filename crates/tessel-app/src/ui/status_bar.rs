@@ -55,7 +55,7 @@ pub fn show_status_bar(
     let frame = Frame::NONE
         .fill(tokens::SURFACE)
         .inner_margin(Margin::symmetric(12, 4))
-        .stroke(Stroke::new(1.0, tokens::OUTLINE_VARIANT));
+        .stroke(Stroke::new(1.0_f32, tokens::OUTLINE_VARIANT));
 
     egui::TopBottomPanel::bottom("tessel_status_bar")
         .exact_height(24.0)

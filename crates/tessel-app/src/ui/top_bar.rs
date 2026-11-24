@@ -32,7 +32,7 @@ pub fn show_top_bar(
     let frame = Frame::NONE
         .fill(tokens::SURFACE_LOW)
         .inner_margin(Margin::symmetric(12, 6))
-        .stroke(Stroke::new(1.0, tokens::OUTLINE_VARIANT));
+        .stroke(Stroke::new(1.0_f32, tokens::OUTLINE_VARIANT));
 
     egui::TopBottomPanel::top("tessel_top_bar")
         .exact_height(40.0)
