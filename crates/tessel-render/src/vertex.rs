@@ -25,7 +25,7 @@ pub struct CameraUniform {
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Pod, Zeroable)]
 pub struct MaterialUniform {
-    /// `[metallic, roughness, 0.0, 0.0]`
+    /// `[metallic, roughness, receive_shadow (1.0/0.0), 0.0]`
     pub pbr: [f32; 4],
     /// `[emissive_r, emissive_g, emissive_b, 0.0]`
     pub emissive: [f32; 4],
@@ -34,8 +34,29 @@ pub struct MaterialUniform {
 impl Default for MaterialUniform {
     fn default() -> Self {
         Self {
-            pbr: [0.0, 0.85, 0.0, 0.0],
+            pbr: [0.0, 0.85, 1.0, 0.0],
             emissive: [0.0, 0.0, 0.0, 0.0],
+        }
+    }
+}
+
+/// Directional shadow-map light projection, normal-offset bias, and NPR viewport shading params (96 bytes).
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Pod, Zeroable)]
+pub struct ShadowMapUniform {
+    pub light_view_proj: [[f32; 4]; 4],
+    /// `[normal_bias, depth_bias, shadow_strength, enabled]`
+    pub bias_params: [f32; 4],
+    /// `[shading_mode (0=PBR,1=NPR,2=Silhouette,3=Luminance), outline_width, fog_dist, paper_grain]`
+    pub npr_params: [f32; 4],
+}
+
+impl Default for ShadowMapUniform {
+    fn default() -> Self {
+        Self {
+            light_view_proj: glam::Mat4::IDENTITY.to_cols_array_2d(),
+            bias_params: [0.015, 0.0015, 0.55, 0.0],
+            npr_params: [0.0, 0.014, 40.0, 0.06],
         }
     }
 }

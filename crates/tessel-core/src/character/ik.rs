@@ -182,9 +182,124 @@ pub fn apply_deltas_end_pos(
     new_mid + mid_delta * root_delta * (end_pos - mid_pos)
 }
 
+/// Solves multi-bone chain IK (Cyclic Coordinate Descent) for any valid parent-child chain
+/// `chain[0] <- chain[1] <- ... <- chain[N-1]` (`N >= 2`) so the end bone `chain[N-1]` reaches `target`.
+/// Returns the updated LOCAL pose rotations for `chain[0..N-1]`.
+pub fn solve_chain_ik(
+    rig: &CharacterRig,
+    chain: &[BoneId],
+    target: Vec3,
+    max_iterations: u32,
+    tolerance: f32,
+) -> Result<Vec<(BoneId, Quat)>, CoreError> {
+    if chain.len() < 2 || chain.len() > 32 || !target.is_finite() {
+        return Err(CoreError::OutOfBounds);
+    }
+    rig.bone(chain[0]).ok_or(CoreError::OutOfBounds)?;
+    for pair in chain.windows(2) {
+        let child = rig.bone(pair[1]).ok_or(CoreError::OutOfBounds)?;
+        if child.parent != Some(pair[0]) {
+            return Err(CoreError::OutOfBounds);
+        }
+    }
+
+    let iters = max_iterations.clamp(1, 64);
+    let tol = if tolerance.is_finite() {
+        tolerance.clamp(1e-4, 1.0)
+    } else {
+        1e-3
+    };
+    let end_id = chain[chain.len() - 1];
+    let mut sim = rig.clone();
+
+    for _ in 0..iters {
+        let world = sim.world_pose_matrices();
+        let Some(end_pos) = world.get(&end_id).map(|m| m.transform_point3(Vec3::ZERO)) else {
+            return Err(CoreError::OutOfBounds);
+        };
+        if (end_pos - target).length() <= tol {
+            break;
+        }
+        for &joint_id in chain[..chain.len() - 1].iter().rev() {
+            let world = sim.world_pose_matrices();
+            let (Some(j_mat), Some(e_mat)) = (world.get(&joint_id), world.get(&end_id)) else {
+                continue;
+            };
+            let j_pos = j_mat.transform_point3(Vec3::ZERO);
+            let e_pos = e_mat.transform_point3(Vec3::ZERO);
+            let to_end = (e_pos - j_pos).normalize_or_zero();
+            let to_tgt = (target - j_pos).normalize_or_zero();
+            if to_end.length_squared() < 1e-8 || to_tgt.length_squared() < 1e-8 {
+                continue;
+            }
+            let delta_world = Quat::from_rotation_arc(to_end, to_tgt);
+            if !delta_world.is_finite() {
+                continue;
+            }
+            let (_, j_world_rot, _) = j_mat.to_scale_rotation_translation();
+            let parent_world_rot = sim
+                .bone(joint_id)
+                .and_then(|b| b.parent)
+                .and_then(|pid| world.get(&pid))
+                .map(|m| m.to_scale_rotation_translation().1)
+                .unwrap_or(Quat::IDENTITY);
+            let new_world_rot = (delta_world * j_world_rot).normalize();
+            let new_local_rot = (parent_world_rot.conjugate() * new_world_rot).normalize();
+            if new_local_rot.is_finite() {
+                if let Some(bone) = sim.bone_mut(joint_id) {
+                    bone.pose_local.rotation = new_local_rot;
+                }
+            }
+        }
+    }
+
+    let mut out = Vec::with_capacity(chain.len() - 1);
+    for &bid in &chain[..chain.len() - 1] {
+        let rot = sim
+            .bone(bid)
+            .map(|b| b.pose_local.rotation)
+            .ok_or(CoreError::OutOfBounds)?;
+        out.push((bid, rot));
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn solve_chain_ik_converges_on_four_bone_chain() {
+        let mut rig = CharacterRig::default();
+        for i in 0..4u32 {
+            rig.bones.push(crate::character::Bone::new(
+                BoneId(i),
+                format!("Seg{i}"),
+                if i == 0 { None } else { Some(BoneId(i - 1)) },
+                crate::scene::Transform {
+                    translation: if i == 0 {
+                        Vec3::ZERO
+                    } else {
+                        Vec3::new(0.0, 0.5, 0.0)
+                    },
+                    ..Default::default()
+                },
+            ));
+        }
+        let target = Vec3::new(1.0, 0.8, 0.2);
+        let chain = [BoneId(0), BoneId(1), BoneId(2), BoneId(3)];
+        let rots = solve_chain_ik(&rig, &chain, target, 32, 1e-3).unwrap();
+        assert_eq!(rots.len(), 3);
+        for (bid, rot) in rots {
+            rig.bone_mut(bid).unwrap().pose_local.rotation = rot;
+        }
+        let mats = rig.world_pose_matrices();
+        let end_pos = mats[&BoneId(3)].transform_point3(Vec3::ZERO);
+        assert!(
+            (end_pos - target).length() < 0.05,
+            "4-bone CCD IK did not converge: end={end_pos:?}, target={target:?}"
+        );
+    }
 
     fn straight_leg() -> (Vec3, Vec3, Vec3) {
         (

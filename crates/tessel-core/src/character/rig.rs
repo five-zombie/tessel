@@ -25,6 +25,276 @@ pub struct SampledBonePose {
     pub local_rotation: Quat,
 }
 
+/// World-space surface contact hit returned by vertical raycast grounding.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SurfaceHit {
+    pub y: f32,
+    pub normal: Vec3,
+}
+
+/// 3-bone limb contact chain (`root` -> `mid` -> `end`) for generalized foot/wheel/quadruped grounding.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContactChain {
+    pub root: BoneId,
+    pub mid: BoneId,
+    pub end: BoneId,
+}
+
+/// Configuration options for v4.9 Surface-Raycast Grounding v2.
+#[derive(Debug, Clone, PartialEq)]
+pub struct GroundingOptions {
+    pub solve_foot_ik: bool,
+    pub align_foot_normal: bool,
+    pub pelvis_tilt: bool,
+    /// Height above reference foot/root to start downward rays (prevents snapping to overhead bridges/caves).
+    pub step_up_clearance: f32,
+    /// Half-length of heel-to-toe multi-ray footprint sweep (`0.0` = single center ray).
+    pub footprint_half_length: f32,
+    /// Optional explicit 3-bone contact chains; when empty, auto-discovers humanoid Left/Right leg chains.
+    pub contact_chains: Vec<ContactChain>,
+}
+
+impl Default for GroundingOptions {
+    fn default() -> Self {
+        Self {
+            solve_foot_ik: false,
+            align_foot_normal: false,
+            pelvis_tilt: false,
+            step_up_clearance: 1.0,
+            footprint_half_length: 0.08,
+            contact_chains: Vec::new(),
+        }
+    }
+}
+
+/// Single surface source (either a `LowPolyMesh` or a `VoxelVolume`) in world space.
+#[derive(Debug, Clone, Copy)]
+pub enum SurfaceSource<'a> {
+    Mesh {
+        mesh: &'a crate::mesh::LowPolyMesh,
+        world_mat: Mat4,
+        world_inv: Mat4,
+        normal_mat: Mat4,
+    },
+    Voxel {
+        volume: &'a crate::voxel::VoxelVolume,
+        unit_scale: f32,
+        world_mat: Mat4,
+        world_inv: Mat4,
+        normal_mat: Mat4,
+    },
+}
+
+/// World-space collection of target surface meshes and/or voxel volumes for vertical raycast grounding.
+#[derive(Debug, Clone)]
+pub struct SurfaceTarget<'a> {
+    pub sources: Vec<SurfaceSource<'a>>,
+}
+
+impl<'a> SurfaceTarget<'a> {
+    pub fn from_scene(scene: &'a crate::scene::SceneState, node_id: NodeId) -> Option<Self> {
+        Self::from_scene_nodes(scene, &[node_id])
+    }
+
+    /// Collects all valid `LowPolyMesh` and `VoxelVolume` surface sources for `node_ids`.
+    pub fn from_scene_nodes(
+        scene: &'a crate::scene::SceneState,
+        node_ids: &[NodeId],
+    ) -> Option<Self> {
+        let mut sources = Vec::new();
+        for &node_id in node_ids {
+            let world_mat = scene.node_world_matrix(node_id);
+            if world_mat.determinant().abs() <= 1e-8 {
+                continue;
+            }
+            let world_inv = world_mat.inverse();
+            let normal_mat = world_inv.transpose();
+            if let Some(mesh) = scene.lowpoly_meshes.get(&node_id) {
+                if !mesh.faces.is_empty() {
+                    sources.push(SurfaceSource::Mesh {
+                        mesh,
+                        world_mat,
+                        world_inv,
+                        normal_mat,
+                    });
+                    continue;
+                }
+            }
+            if let Some(volume) = scene.voxel_volumes.get(&node_id) {
+                if !volume.is_empty() {
+                    sources.push(SurfaceSource::Voxel {
+                        volume,
+                        unit_scale: scene.unit_scale.max(1e-4),
+                        world_mat,
+                        world_inv,
+                        normal_mat,
+                    });
+                }
+            }
+        }
+        (!sources.is_empty()).then_some(Self { sources })
+    }
+
+    /// Casts a vertical downward ray (`-Y`) starting at `(world_x, start_y, world_z)` across all
+    /// surface sources and returns the highest hit below `start_y` (with fallback from `y = 10_000.0`
+    /// if the character starts below all surfaces).
+    pub fn sample_surface_hit(
+        &self,
+        world_x: f32,
+        world_z: f32,
+        start_y: f32,
+    ) -> Option<SurfaceHit> {
+        let local_start = if start_y.is_finite() {
+            start_y
+        } else {
+            10_000.0
+        };
+        self.cast_downward_from(world_x, world_z, local_start)
+            .or_else(|| {
+                if local_start < 9_999.0 {
+                    self.cast_downward_from(world_x, world_z, 10_000.0)
+                } else {
+                    None
+                }
+            })
+    }
+
+    fn cast_downward_from(&self, world_x: f32, world_z: f32, start_y: f32) -> Option<SurfaceHit> {
+        let ray_origin_w = Vec3::new(world_x, start_y, world_z);
+        let mut best: Option<SurfaceHit> = None;
+
+        for source in &self.sources {
+            let candidate = match *source {
+                SurfaceSource::Mesh {
+                    mesh,
+                    world_mat,
+                    world_inv,
+                    normal_mat,
+                } => {
+                    let local_orig = world_inv.transform_point3(ray_origin_w);
+                    let local_dir = world_inv.transform_vector3(-Vec3::Y).normalize_or_zero();
+                    crate::mesh::ops::raycast_mesh_hit(mesh, local_orig, local_dir).and_then(
+                        |hit| {
+                            let wp = world_mat.transform_point3(hit.point);
+                            if !wp.y.is_finite() || wp.y > start_y + 1e-2 {
+                                return None;
+                            }
+                            let mut wn =
+                                normal_mat.transform_vector3(hit.normal).normalize_or_zero();
+                            if wn.length_squared() < 1e-6 {
+                                wn = Vec3::Y;
+                            } else if wn.y < 0.0 {
+                                wn = -wn;
+                            }
+                            Some(SurfaceHit {
+                                y: wp.y,
+                                normal: wn,
+                            })
+                        },
+                    )
+                }
+                SurfaceSource::Voxel {
+                    volume,
+                    unit_scale,
+                    world_mat,
+                    world_inv,
+                    normal_mat,
+                } => {
+                    let local_orig = world_inv.transform_point3(ray_origin_w);
+                    let local_dir = world_inv.transform_vector3(-Vec3::Y).normalize_or_zero();
+                    crate::voxel::ops::raycast_voxels(
+                        volume, local_orig, local_dir, unit_scale, 512,
+                    )
+                    .and_then(|hit| {
+                        let top_local = Vec3::new(
+                            (hit.voxel.x as f32 + 0.5) * unit_scale,
+                            (hit.voxel.y as f32 + 1.0) * unit_scale,
+                            (hit.voxel.z as f32 + 0.5) * unit_scale,
+                        );
+                        let wp = world_mat.transform_point3(top_local);
+                        if !wp.y.is_finite() || wp.y > start_y + 1e-2 {
+                            return None;
+                        }
+                        let mut wn = normal_mat.transform_vector3(Vec3::Y).normalize_or_zero();
+                        if wn.length_squared() < 1e-6 {
+                            wn = Vec3::Y;
+                        } else if wn.y < 0.0 {
+                            wn = -wn;
+                        }
+                        Some(SurfaceHit {
+                            y: wp.y,
+                            normal: wn,
+                        })
+                    })
+                }
+            };
+
+            if let Some(hit) = candidate {
+                if best.is_none_or(|b| hit.y > b.y) {
+                    best = Some(hit);
+                }
+            }
+        }
+        best
+    }
+
+    /// Multi-ray heel+toe footprint sweep returning the highest contact height and averaged normal.
+    pub fn sample_surface_footprint(
+        &self,
+        world_x: f32,
+        world_z: f32,
+        start_y: f32,
+        forward_xz: Vec3,
+        half_length: f32,
+    ) -> Option<SurfaceHit> {
+        let center_hit = self.sample_surface_hit(world_x, world_z, start_y);
+        if half_length <= 1e-4 {
+            return center_hit;
+        }
+        let fwd = Vec3::new(forward_xz.x, 0.0, forward_xz.z).normalize_or_zero();
+        if fwd.length_squared() < 1e-6 {
+            return center_hit;
+        }
+        let toe_hit = self.sample_surface_hit(
+            world_x + fwd.x * half_length,
+            world_z + fwd.z * half_length,
+            start_y,
+        );
+        let heel_hit = self.sample_surface_hit(
+            world_x - fwd.x * half_length,
+            world_z - fwd.z * half_length,
+            start_y,
+        );
+
+        let mut max_y = f32::NEG_INFINITY;
+        let mut normal_sum = Vec3::ZERO;
+        let mut count = 0u32;
+        for h in [center_hit, toe_hit, heel_hit].into_iter().flatten() {
+            max_y = max_y.max(h.y);
+            normal_sum += h.normal;
+            count += 1;
+        }
+        if count == 0 || !max_y.is_finite() {
+            return None;
+        }
+        let normal = normal_sum.normalize_or_zero();
+        Some(SurfaceHit {
+            y: max_y,
+            normal: if normal.length_squared() > 1e-6 {
+                normal
+            } else {
+                Vec3::Y
+            },
+        })
+    }
+
+    /// Casts a vertical downward ray (`-Y`) at `(world_x, world_z)` and returns the surface hit Y in world space.
+    pub fn sample_surface_y(&self, world_x: f32, world_z: f32) -> Option<f32> {
+        self.sample_surface_hit(world_x, world_z, 10_000.0)
+            .map(|h| h.y)
+    }
+}
+
 /// Independent animation clip layer applied to bones matching `bone_prefix`
 /// (enables simultaneous per-character playback, e.g. P1 `Walk` + P2 `ShotFall`).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -60,6 +330,10 @@ pub struct CharacterRig {
     /// refreshed by `apply_active_animation` from `parent_switch_tracks`.
     #[serde(default)]
     pub node_parent_overrides: BTreeMap<NodeId, super::anim::ParentSwitchKey>,
+    /// Live sampled per-node local TRS delta overrides `node_id -> Keyframe`,
+    /// refreshed by `apply_active_animation` from `node_transform_tracks`.
+    #[serde(default)]
+    pub node_transform_overrides: BTreeMap<NodeId, super::nano::Keyframe>,
     /// Optional per-prefix clip layers evaluated on top of `active_animation`.
     #[serde(default)]
     pub clip_layers: Vec<ClipLayer>,
@@ -103,6 +377,7 @@ impl CharacterRig {
             node_bone_masks: BTreeMap::new(),
             node_visibility: BTreeMap::new(),
             node_parent_overrides: BTreeMap::new(),
+            node_transform_overrides: BTreeMap::new(),
             clip_layers: Vec::new(),
         }
     }
@@ -162,6 +437,7 @@ impl CharacterRig {
             node_bone_masks: BTreeMap::new(),
             node_visibility: BTreeMap::new(),
             node_parent_overrides: BTreeMap::new(),
+            node_transform_overrides: BTreeMap::new(),
             clip_layers: Vec::new(),
         }
     }
@@ -256,7 +532,12 @@ impl CharacterRig {
             return;
         };
         let t = if clip.duration_secs > 0.0 {
-            self.playback_time % clip.duration_secs
+            if self.playback_time >= 0.0 && (self.playback_time - clip.duration_secs).abs() <= 1e-4
+            {
+                clip.duration_secs
+            } else {
+                self.playback_time.rem_euclid(clip.duration_secs)
+            }
         } else {
             0.0
         };
@@ -282,6 +563,10 @@ impl CharacterRig {
         for (node, key) in clip.sample_parent_switches(t) {
             self.node_parent_overrides.insert(node, key);
         }
+        self.node_transform_overrides.clear();
+        for (node, kf) in clip.sample_node_transforms(t) {
+            self.node_transform_overrides.insert(node, kf);
+        }
 
         // Apply optional per-prefix clip layers on top of the active clip.
         let layers = self.clip_layers.clone();
@@ -295,7 +580,12 @@ impl CharacterRig {
                 0.0
             };
             for bone in &mut self.bones {
-                if !layer.bone_prefix.is_empty() && !bone.name.starts_with(&layer.bone_prefix) {
+                let matches = if layer.bone_prefix.is_empty() {
+                    !bone.name.contains('_')
+                } else {
+                    bone.name.starts_with(&layer.bone_prefix)
+                };
+                if !matches {
                     continue;
                 }
                 bone.pose_local = bone.rest_local;
@@ -315,6 +605,9 @@ impl CharacterRig {
             }
             for (node, key) in layer_clip.sample_parent_switches(lt) {
                 self.node_parent_overrides.insert(node, key);
+            }
+            for (node, kf) in layer_clip.sample_node_transforms(lt) {
+                self.node_transform_overrides.insert(node, kf);
             }
         }
     }
@@ -365,21 +658,285 @@ impl CharacterRig {
         bone_prefix: &str,
         floor_y: f32,
     ) -> Option<(BoneId, f32, f32)> {
+        self.clamp_sub_skeleton_to_floor_with_bounds(bone_prefix, floor_y, None)
+    }
+
+    /// Shifts the sub-skeleton's root bone Y translation so its lowest skinned mesh vertex
+    /// (when `bounds` has vertices for this sub-skeleton) or lowest joint sits at `floor_y`.
+    /// Returns `(root_id, min_y_before, delta_y)`.
+    pub fn clamp_sub_skeleton_to_floor_with_bounds(
+        &mut self,
+        bone_prefix: &str,
+        floor_y: f32,
+        bounds: Option<&super::skin::SkinnedBoundsCache>,
+    ) -> Option<(BoneId, f32, f32)> {
+        self.clamp_sub_skeleton_to_surface(bone_prefix, floor_y, bounds, None, false)
+            .map(|(root_id, min_y, delta_y, _)| (root_id, min_y, delta_y))
+    }
+
+    /// Grounds a sub-skeleton onto either a flat `fallback_floor_y` or an uneven target mesh
+    /// `surface` via vertical `-Y` raycast. When `solve_foot_ik` is true and humanoid leg chains
+    /// exist, solves two-bone leg IK for `LeftFoot` and `RightFoot` to plant both feet on slopes.
+    /// Returns `(root_id, min_y_before, delta_y, target_surface_y)`.
+    pub fn clamp_sub_skeleton_to_surface(
+        &mut self,
+        bone_prefix: &str,
+        fallback_floor_y: f32,
+        bounds: Option<&super::skin::SkinnedBoundsCache>,
+        surface: Option<&SurfaceTarget<'_>>,
+        solve_foot_ik: bool,
+    ) -> Option<(BoneId, f32, f32, f32)> {
+        self.clamp_sub_skeleton_to_surface_v2(
+            bone_prefix,
+            fallback_floor_y,
+            bounds,
+            surface,
+            &GroundingOptions {
+                solve_foot_ik,
+                ..GroundingOptions::default()
+            },
+        )
+    }
+
+    /// Grounding v2: local-start overhang-safe raycast, multi-surface (mesh + voxel),
+    /// heel+toe footprint sweep, optional foot normal alignment, pelvis tilt, and custom contact chains.
+    pub fn clamp_sub_skeleton_to_surface_v2(
+        &mut self,
+        bone_prefix: &str,
+        fallback_floor_y: f32,
+        bounds: Option<&super::skin::SkinnedBoundsCache>,
+        surface: Option<&SurfaceTarget<'_>>,
+        options: &GroundingOptions,
+    ) -> Option<(BoneId, f32, f32, f32)> {
         let (root_id, bone_ids) = self.sub_skeleton_root_and_bones(bone_prefix)?;
         let world_mats = self.world_pose_matrices();
-        let mut min_y = f32::INFINITY;
-        for id in &bone_ids {
-            if let Some(mat) = world_mats.get(id) {
-                min_y = min_y.min(mat.transform_point3(Vec3::ZERO).y);
+        let min_pt = if let Some(pt) =
+            bounds.and_then(|cache| cache.sub_skeleton_min_point(self, bone_prefix))
+        {
+            pt
+        } else {
+            let mut best: Option<Vec3> = None;
+            for id in &bone_ids {
+                if let Some(mat) = world_mats.get(id) {
+                    let p = mat.transform_point3(Vec3::ZERO);
+                    if p.is_finite() && best.is_none_or(|b| p.y < b.y) {
+                        best = Some(p);
+                    }
+                }
+            }
+            best?
+        };
+
+        let root_world = world_mats
+            .get(&root_id)
+            .map(|m| m.transform_point3(Vec3::ZERO))
+            .unwrap_or(min_pt);
+        let root_rot_before = self
+            .bones
+            .iter()
+            .find(|b| b.id == root_id)
+            .map(|b| b.pose_local.rotation)
+            .unwrap_or(Quat::IDENTITY);
+        let forward_xz = (root_rot_before * Vec3::Z).normalize_or_zero();
+        let clearance = if options.step_up_clearance.is_finite() {
+            options.step_up_clearance.clamp(0.05, 20.0)
+        } else {
+            1.0
+        };
+        let half_len = if options.footprint_half_length.is_finite() {
+            options.footprint_half_length.clamp(0.0, 1.0)
+        } else {
+            0.08
+        };
+
+        let find_bone_by_suffix = |suffix: &str| -> Option<BoneId> {
+            let target_name = format!("{bone_prefix}{suffix}");
+            self.bones
+                .iter()
+                .find(|b| b.name == target_name)
+                .map(|b| b.id)
+        };
+        let chains: Vec<ContactChain> = if !options.contact_chains.is_empty() {
+            options.contact_chains.clone()
+        } else {
+            let mut auto = Vec::new();
+            for (r, m, e) in [
+                ("LeftThigh", "LeftCalf", "LeftFoot"),
+                ("RightThigh", "RightCalf", "RightFoot"),
+            ] {
+                if let (Some(root), Some(mid), Some(end)) = (
+                    find_bone_by_suffix(r),
+                    find_bone_by_suffix(m),
+                    find_bone_by_suffix(e),
+                ) {
+                    auto.push(ContactChain { root, mid, end });
+                }
+            }
+            auto
+        };
+
+        let mut target_y = fallback_floor_y;
+        let mut chain_hits: Vec<Option<SurfaceHit>> = vec![None; chains.len()];
+
+        if let Some(surf) = surface {
+            let ref_start_y = min_pt.y.max(root_world.y) + clearance;
+            for (i, ch) in chains.iter().enumerate() {
+                if let Some(fm) = world_mats.get(&ch.end) {
+                    let fp = fm.transform_point3(Vec3::ZERO);
+                    let ray_start = fp.y + clearance;
+                    chain_hits[i] =
+                        surf.sample_surface_footprint(fp.x, fp.z, ray_start, forward_xz, half_len);
+                }
+            }
+            let valid_ys: Vec<f32> = chain_hits.iter().flatten().map(|h| h.y).collect();
+            if options.solve_foot_ik && !valid_ys.is_empty() {
+                target_y = valid_ys.iter().copied().fold(f32::INFINITY, f32::min);
+            } else if let Some(hit) = surf
+                .sample_surface_footprint(min_pt.x, min_pt.z, ref_start_y, forward_xz, half_len)
+                .or_else(|| {
+                    surf.sample_surface_footprint(
+                        root_world.x,
+                        root_world.z,
+                        ref_start_y,
+                        forward_xz,
+                        half_len,
+                    )
+                })
+            {
+                target_y = hit.y;
             }
         }
-        if !min_y.is_finite() {
-            return None;
-        }
-        let delta_y = floor_y - min_y;
+
+        let delta_y = target_y - min_pt.y;
         let root = self.bones.iter_mut().find(|b| b.id == root_id)?;
         root.pose_local.translation.y += delta_y;
-        Some((root_id, min_y, delta_y))
+
+        if options.pelvis_tilt && chains.len() >= 2 {
+            if let (Some(h0), Some(h1)) = (chain_hits[0], chain_hits[1]) {
+                if let (Some(m0), Some(m1)) = (
+                    world_mats.get(&chains[0].end),
+                    world_mats.get(&chains[1].end),
+                ) {
+                    let p0 = m0.transform_point3(Vec3::ZERO);
+                    let p1 = m1.transform_point3(Vec3::ZERO);
+                    let horiz_span = Vec3::new(p0.x - p1.x, 0.0, p0.z - p1.z).length();
+                    if horiz_span > 0.05 {
+                        let fwd_axis = if forward_xz.length_squared() > 1e-6 {
+                            forward_xz
+                        } else {
+                            Vec3::Z
+                        };
+                        let left_axis = Vec3::Y.cross(fwd_axis).normalize_or_zero();
+                        let sign = if (p0 - p1).dot(left_axis) < 0.0 {
+                            -1.0
+                        } else {
+                            1.0
+                        };
+                        let tilt_rad = (sign * (h0.y - h1.y) / horiz_span)
+                            .atan()
+                            .clamp(-0.35, 0.35);
+                        let tilt_q = Quat::from_axis_angle(fwd_axis, tilt_rad * 0.5);
+                        root.pose_local.rotation = (tilt_q * root.pose_local.rotation).normalize();
+                    }
+                }
+            }
+        }
+        let root_rot = root.pose_local.rotation;
+
+        if (options.solve_foot_ik || options.align_foot_normal) && surface.is_some() {
+            if let Some(surf) = surface {
+                let updated_mats = self.world_pose_matrices();
+                let sole_offset = chains
+                    .iter()
+                    .filter_map(|c| updated_mats.get(&c.end))
+                    .map(|m| m.transform_point3(Vec3::ZERO).y)
+                    .fold(f32::INFINITY, f32::min);
+                let foot_clearance = if sole_offset.is_finite() {
+                    (sole_offset - target_y).max(0.0)
+                } else {
+                    0.0
+                };
+                let knee_pole = (root_rot * Vec3::Z).normalize_or_zero();
+
+                for (i, ch) in chains.iter().enumerate() {
+                    let Some(foot_mat) = updated_mats.get(&ch.end) else {
+                        continue;
+                    };
+                    let fp = foot_mat.transform_point3(Vec3::ZERO);
+                    let Some(hit) = chain_hits[i].or_else(|| {
+                        surf.sample_surface_footprint(
+                            fp.x,
+                            fp.z,
+                            fp.y + clearance,
+                            forward_xz,
+                            half_len,
+                        )
+                    }) else {
+                        continue;
+                    };
+
+                    if options.solve_foot_ik {
+                        let goal = Vec3::new(fp.x, hit.y + foot_clearance, fp.z);
+                        if (goal.y - fp.y).abs() > 1e-3 {
+                            if let Ok((r_rot, m_rot)) = super::ik::solve_for_rig(
+                                self,
+                                ch.root,
+                                ch.mid,
+                                ch.end,
+                                goal,
+                                Some(knee_pole),
+                            ) {
+                                if let Some(tb) = self.bone_mut(ch.root) {
+                                    tb.pose_local.rotation = r_rot;
+                                }
+                                if let Some(cb) = self.bone_mut(ch.mid) {
+                                    cb.pose_local.rotation = m_rot;
+                                }
+                            }
+                        }
+                    }
+
+                    if options.align_foot_normal {
+                        let n = hit.normal.normalize_or_zero();
+                        if n.length_squared() > 1e-6 && n.y > 0.1 {
+                            let raw_angle = Vec3::Y.dot(n).clamp(-1.0, 1.0).acos();
+                            let max_angle = 45.0_f32.to_radians();
+                            let tilt_world = if raw_angle > 1e-4 {
+                                let axis = Vec3::Y.cross(n).normalize_or_zero();
+                                if axis.length_squared() > 1e-6 {
+                                    Quat::from_axis_angle(axis, raw_angle.min(max_angle))
+                                } else {
+                                    Quat::IDENTITY
+                                }
+                            } else {
+                                Quat::IDENTITY
+                            };
+                            let post_ik_mats = self.world_pose_matrices();
+                            let parent_world_rot = self
+                                .bones
+                                .iter()
+                                .find(|b| b.id == ch.end)
+                                .and_then(|b| b.parent)
+                                .and_then(|pid| post_ik_mats.get(&pid))
+                                .map(|m| m.to_scale_rotation_translation().1)
+                                .unwrap_or(Quat::IDENTITY);
+                            let foot_world_rot = post_ik_mats
+                                .get(&ch.end)
+                                .map(|m| m.to_scale_rotation_translation().1)
+                                .unwrap_or(parent_world_rot);
+                            let desired_world = (tilt_world * foot_world_rot).normalize();
+                            let desired_local =
+                                (parent_world_rot.inverse() * desired_world).normalize();
+                            if let Some(fb) = self.bone_mut(ch.end) {
+                                fb.pose_local.rotation = desired_local;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        Some((root_id, min_pt.y, delta_y, target_y))
     }
 
     /// Bakes the current `clip_layers` composition (or active clip if `clip_layers` is empty)
@@ -390,6 +947,20 @@ impl CharacterRig {
         fps: f32,
         duration_override: Option<f32>,
         clamp_floor_y: Option<f32>,
+    ) -> Option<AnimationClip> {
+        self.bake_clip_layers_with_bounds(name, fps, duration_override, clamp_floor_y, None)
+    }
+
+    /// Bakes the current `clip_layers` composition into a standalone `AnimationClip`,
+    /// optionally clamping each sub-skeleton to `clamp_floor_y` using skinned mesh vertices
+    /// when `bounds` is provided.
+    pub fn bake_clip_layers_with_bounds(
+        &self,
+        name: String,
+        fps: f32,
+        duration_override: Option<f32>,
+        clamp_floor_y: Option<f32>,
+        bounds: Option<&super::skin::SkinnedBoundsCache>,
     ) -> Option<AnimationClip> {
         if self.bones.is_empty() || self.animations.is_empty() {
             return None;
@@ -409,7 +980,12 @@ impl CharacterRig {
                 .unwrap_or(1.0)
                 .max(0.1)
         };
-        let steps = ((duration_secs * fps.clamp(1.0, 120.0)).round() as usize).max(1);
+        let duration_secs = if duration_secs.is_finite() {
+            duration_secs.clamp(0.05, 600.0)
+        } else {
+            1.0
+        };
+        let steps = ((duration_secs * fps.clamp(1.0, 120.0)).round() as usize).clamp(1, 2048);
 
         // Collect all sub-skeleton prefixes present in the rig for optional floor clamping.
         let mut prefixes: Vec<String> = Vec::new();
@@ -445,7 +1021,7 @@ impl CharacterRig {
             sim.apply_active_animation();
             if let Some(fy) = clamp_floor_y {
                 for pfx in &prefixes {
-                    let _ = sim.clamp_sub_skeleton_to_floor(pfx, fy);
+                    let _ = sim.clamp_sub_skeleton_to_floor_with_bounds(pfx, fy, bounds);
                 }
             }
             for b in &sim.bones {
@@ -497,6 +1073,15 @@ impl CharacterRig {
                     },
                 );
             }
+            for (&node_id, &nt_kf) in &sim.node_transform_overrides {
+                baked.upsert_node_transform_key(
+                    node_id,
+                    super::nano::Keyframe {
+                        time_secs: t,
+                        ..nt_kf
+                    },
+                );
+            }
         }
         Some(baked)
     }
@@ -510,10 +1095,107 @@ impl CharacterRig {
         floor_y: f32,
         fps: f32,
     ) -> Option<AnimationClip> {
+        self.clamp_clip_to_floor_with_bounds(clip_index, bone_prefix, floor_y, fps, None)
+    }
+
+    /// Samples in-between frames of `clip_index` at `fps` and adjusts the sub-skeleton's
+    /// root bone Y translation keyframes so the lowest skinned mesh vertex (or joint fallback)
+    /// sits flush on `floor_y`.
+    pub fn clamp_clip_to_floor_with_bounds(
+        &self,
+        clip_index: usize,
+        bone_prefix: &str,
+        floor_y: f32,
+        fps: f32,
+        bounds: Option<&super::skin::SkinnedBoundsCache>,
+    ) -> Option<AnimationClip> {
+        self.clamp_clip_to_surface(clip_index, bone_prefix, floor_y, fps, bounds, None, false)
+    }
+
+    /// Samples in-between frames of `clip_index` at `fps` and grounds the sub-skeleton onto
+    /// either a flat `fallback_floor_y` or a target surface mesh `surface` (with optional two-bone
+    /// leg IK on slopes).
+    #[allow(clippy::too_many_arguments)]
+    pub fn clamp_clip_to_surface(
+        &self,
+        clip_index: usize,
+        bone_prefix: &str,
+        fallback_floor_y: f32,
+        fps: f32,
+        bounds: Option<&super::skin::SkinnedBoundsCache>,
+        surface: Option<&SurfaceTarget<'_>>,
+        solve_foot_ik: bool,
+    ) -> Option<AnimationClip> {
+        self.clamp_clip_to_surface_v2(
+            clip_index,
+            bone_prefix,
+            fallback_floor_y,
+            fps,
+            bounds,
+            surface,
+            &GroundingOptions {
+                solve_foot_ik,
+                ..GroundingOptions::default()
+            },
+        )
+    }
+
+    /// Grounding v2 clip baker: samples in-between frames at `fps` and grounds onto multi-surface
+    /// targets with overhang clearance, footprint sweep, optional foot IK, normal alignment, and pelvis tilt.
+    #[allow(clippy::too_many_arguments)]
+    pub fn clamp_clip_to_surface_v2(
+        &self,
+        clip_index: usize,
+        bone_prefix: &str,
+        fallback_floor_y: f32,
+        fps: f32,
+        bounds: Option<&super::skin::SkinnedBoundsCache>,
+        surface: Option<&SurfaceTarget<'_>>,
+        options: &GroundingOptions,
+    ) -> Option<AnimationClip> {
         let mut clip = self.animations.get(clip_index)?.clone();
         let (root_id, _) = self.sub_skeleton_root_and_bones(bone_prefix)?;
-        let duration = clip.duration_secs.max(0.05);
-        let steps = ((duration * fps.clamp(1.0, 120.0)).round() as usize).max(1);
+        let duration = if clip.duration_secs.is_finite() {
+            clip.duration_secs.clamp(0.05, 600.0)
+        } else {
+            1.0
+        };
+        let steps = ((duration * fps.clamp(1.0, 120.0)).round() as usize).clamp(1, 2048);
+
+        let mut leg_ids: Vec<BoneId> = Vec::new();
+        if (options.solve_foot_ik || options.align_foot_normal) && surface.is_some() {
+            if !options.contact_chains.is_empty() {
+                for ch in &options.contact_chains {
+                    if options.solve_foot_ik {
+                        leg_ids.push(ch.root);
+                        leg_ids.push(ch.mid);
+                    }
+                    if options.align_foot_normal {
+                        leg_ids.push(ch.end);
+                    }
+                }
+            } else {
+                let suffixes: &[&str] = match (options.solve_foot_ik, options.align_foot_normal) {
+                    (true, true) => &[
+                        "LeftThigh",
+                        "LeftCalf",
+                        "LeftFoot",
+                        "RightThigh",
+                        "RightCalf",
+                        "RightFoot",
+                    ],
+                    (true, false) => &["LeftThigh", "LeftCalf", "RightThigh", "RightCalf"],
+                    (false, true) => &["LeftFoot", "RightFoot"],
+                    (false, false) => &[],
+                };
+                for suffix in suffixes {
+                    let target_name = format!("{bone_prefix}{suffix}");
+                    if let Some(b) = self.bones.iter().find(|b| b.name == target_name) {
+                        leg_ids.push(b.id);
+                    }
+                }
+            }
+        }
 
         let mut sim = self.clone();
         sim.clip_layers.clear();
@@ -531,27 +1213,54 @@ impl CharacterRig {
                 t
             };
             sim.apply_active_animation();
-            let _ = sim.clamp_sub_skeleton_to_floor(bone_prefix, floor_y);
-            if let Some(root) = sim.bones.iter().find(|b| b.id == root_id) {
-                let rot_delta = root.rest_local.rotation.inverse() * root.pose_local.rotation;
-                let trans_delta = root.pose_local.translation - root.rest_local.translation;
-                let existing_interp = clip
-                    .channels
-                    .iter()
-                    .find(|c| c.bone_id == root_id)
-                    .and_then(|c| c.keyframes.iter().find(|k| (k.time_secs - t).abs() <= 1e-3))
-                    .map(|k| k.interpolation)
-                    .unwrap_or(crate::character::KeyframeInterpolation::Linear);
-                clip.upsert_keyframe(
-                    root_id,
-                    crate::character::Keyframe {
-                        time_secs: t,
-                        translation: trans_delta,
-                        rotation: rot_delta,
-                        scale: Vec3::ONE,
-                        interpolation: existing_interp,
-                    },
-                );
+            let _ = sim.clamp_sub_skeleton_to_surface_v2(
+                bone_prefix,
+                fallback_floor_y,
+                bounds,
+                surface,
+                options,
+            );
+            let mut record_ids = vec![root_id];
+            record_ids.extend_from_slice(&leg_ids);
+            for bid in record_ids {
+                if let Some(bone) = sim.bones.iter().find(|b| b.id == bid) {
+                    let rot_delta = bone.rest_local.rotation.inverse() * bone.pose_local.rotation;
+                    let trans_delta = bone.pose_local.translation - bone.rest_local.translation;
+                    let existing_interp = clip
+                        .channels
+                        .iter()
+                        .find(|c| c.bone_id == bid)
+                        .and_then(|c| c.keyframes.iter().find(|k| (k.time_secs - t).abs() <= 1e-3))
+                        .map(|k| k.interpolation)
+                        .unwrap_or(crate::character::KeyframeInterpolation::Linear);
+                    let scale_delta = Vec3::new(
+                        if bone.rest_local.scale.x.abs() > 1e-6 {
+                            bone.pose_local.scale.x / bone.rest_local.scale.x
+                        } else {
+                            1.0
+                        },
+                        if bone.rest_local.scale.y.abs() > 1e-6 {
+                            bone.pose_local.scale.y / bone.rest_local.scale.y
+                        } else {
+                            1.0
+                        },
+                        if bone.rest_local.scale.z.abs() > 1e-6 {
+                            bone.pose_local.scale.z / bone.rest_local.scale.z
+                        } else {
+                            1.0
+                        },
+                    );
+                    clip.upsert_keyframe(
+                        bid,
+                        crate::character::Keyframe {
+                            time_secs: t,
+                            translation: trans_delta,
+                            rotation: rot_delta,
+                            scale: scale_delta,
+                            interpolation: existing_interp,
+                        },
+                    );
+                }
             }
         }
         Some(clip)
@@ -621,5 +1330,99 @@ mod tests {
         // Empty rig samples fine (zero bones).
         let empty = CharacterRig::default();
         assert_eq!(empty.sample_clip_pose(0, 0.0), None);
+    }
+
+    #[test]
+    fn grounding_v2_under_bridge_overhang_hits_lower_floor_not_bridge() {
+        let mut scene = crate::scene::SceneState::new();
+        let mat = crate::palette::PaletteIndex::new(3).unwrap();
+        // Lower floor at y = 0.0
+        let floor_id = scene.allocate_node_id();
+        scene.nodes.insert(
+            floor_id,
+            crate::scene::SceneNode {
+                id: floor_id,
+                name: "Floor".into(),
+                kind: crate::scene::NodeKind::LowPolyMesh,
+                visible: true,
+                parent: None,
+                transform: Transform::default(),
+            },
+        );
+        scene.lowpoly_meshes.insert(
+            floor_id,
+            crate::mesh::ops::create_primitive(crate::mesh::PrimitiveKind::Plane, 6.0, mat),
+        );
+        // Overhead bridge deck at y = 3.0
+        let bridge_id = scene.allocate_node_id();
+        scene.nodes.insert(
+            bridge_id,
+            crate::scene::SceneNode {
+                id: bridge_id,
+                name: "Bridge".into(),
+                kind: crate::scene::NodeKind::LowPolyMesh,
+                visible: true,
+                parent: None,
+                transform: Transform {
+                    translation: Vec3::new(0.0, 3.0, 0.0),
+                    ..Transform::default()
+                },
+            },
+        );
+        scene.lowpoly_meshes.insert(
+            bridge_id,
+            crate::mesh::ops::create_primitive(crate::mesh::PrimitiveKind::Plane, 6.0, mat),
+        );
+
+        let surf = SurfaceTarget::from_scene_nodes(&scene, &[floor_id, bridge_id]).unwrap();
+        // Character stands at y = 0.2 under the y = 3.0 bridge: local ray starts at 0.2 + 1.0 = 1.2 -> hits y = 0.0!
+        let hit = surf.sample_surface_hit(0.0, 0.0, 1.2).unwrap();
+        assert!(
+            hit.y.abs() < 1e-3,
+            "expected lower floor at y=0.0 under overhang, got {}",
+            hit.y
+        );
+        // Character standing ON the bridge at y = 3.2: local ray starts at 4.2 -> hits y = 3.0!
+        let top_hit = surf.sample_surface_hit(0.0, 0.0, 4.2).unwrap();
+        assert!(
+            (top_hit.y - 3.0).abs() < 1e-3,
+            "expected bridge deck at y=3.0, got {}",
+            top_hit.y
+        );
+    }
+
+    #[test]
+    fn grounding_v2_supports_voxel_surface_and_foot_normal_alignment() {
+        let mut scene = crate::scene::SceneState::new();
+        let mat = crate::palette::PaletteIndex::new(4).unwrap();
+        // Voxel platform with voxels at y = 0..=4 (top at y = 0.5m at unit_scale 0.1).
+        let vox_id = scene.allocate_node_id();
+        scene.nodes.insert(
+            vox_id,
+            crate::scene::SceneNode {
+                id: vox_id,
+                name: "VoxelBlock".into(),
+                kind: crate::scene::NodeKind::VoxelVolume,
+                visible: true,
+                parent: None,
+                transform: Transform::default(),
+            },
+        );
+        let mut vol = crate::voxel::VoxelVolume::new();
+        for x in -4..=4 {
+            for z in -4..=4 {
+                vol.set(crate::voxel::VoxelCoord::new(x, 4, z), Some(mat));
+            }
+        }
+        scene.voxel_volumes.insert(vox_id, vol);
+
+        let surf = SurfaceTarget::from_scene_nodes(&scene, &[vox_id]).unwrap();
+        let hit = surf.sample_surface_hit(0.0, 0.0, 1.5).unwrap();
+        assert!(
+            (hit.y - 0.5).abs() < 1e-3,
+            "expected voxel top at y=0.5m, got {}",
+            hit.y
+        );
+        assert!(hit.normal.y > 0.99);
     }
 }

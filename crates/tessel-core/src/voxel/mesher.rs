@@ -34,11 +34,13 @@ pub fn greedy_mesh_volume(volume: &VoxelVolume, unit_scale: f32) -> VoxelMeshOut
         return output;
     };
 
-    let dims = [
-        (max_b.x - min_b.x + 1) as usize,
-        (max_b.y - min_b.y + 1) as usize,
-        (max_b.z - min_b.z + 1) as usize,
-    ];
+    let dx = i64::from(max_b.x) - i64::from(min_b.x) + 1;
+    let dy = i64::from(max_b.y) - i64::from(min_b.y) + 1;
+    let dz = i64::from(max_b.z) - i64::from(min_b.z) + 1;
+    if dx <= 0 || dy <= 0 || dz <= 0 || dx > 513 || dy > 513 || dz > 513 {
+        return output;
+    }
+    let dims = [dx as usize, dy as usize, dz as usize];
     let origin = [min_b.x, min_b.y, min_b.z];
 
     let sample =

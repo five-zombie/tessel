@@ -47,7 +47,8 @@ impl PixelLayer {
     }
 
     pub fn get(&self, coord: PixelCoord) -> Option<PaletteIndex> {
-        self.index(coord).and_then(|idx| self.pixels[idx])
+        self.index(coord)
+            .and_then(|idx| self.pixels.get(idx).copied().flatten())
     }
 
     pub fn set(
@@ -56,8 +57,9 @@ impl PixelLayer {
         color: Option<PaletteIndex>,
     ) -> Option<Option<PaletteIndex>> {
         let idx = self.index(coord)?;
-        let prev = self.pixels[idx];
-        self.pixels[idx] = color;
+        let slot = self.pixels.get_mut(idx)?;
+        let prev = *slot;
+        *slot = color;
         Some(prev)
     }
 

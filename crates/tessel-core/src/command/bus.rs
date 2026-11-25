@@ -6,8 +6,8 @@ use crate::character::{
 };
 use crate::error::CoreError;
 use crate::mesh::{
-    ops as mesh_ops, FaceId, LowPolyMesh, MeshMaterial, MeshTexture, PrimitiveKind, UvProjection,
-    DEFAULT_MESH_TEX_SIZE,
+    ops as mesh_ops, FaceId, LowPolyMesh, MeshMaterial, MeshPaintLayer, MeshTexture, PrimitiveKind,
+    UvProjection, DEFAULT_MESH_TEX_SIZE,
 };
 use crate::palette::{PaletteEntry, PaletteIndex, Rgba8};
 use crate::pixel::{FrameIndex, LayerId, PixelCanvas, PixelEdit, PixelFrame, PixelLayer};
@@ -42,6 +42,7 @@ pub enum Command {
         azimuth: f32,
         elevation: f32,
     },
+    SetShadingMode(crate::scene::ViewportShadingMode),
     SetPaletteEntry {
         index: PaletteIndex,
         entry: PaletteEntry,
@@ -70,6 +71,10 @@ pub enum Command {
         node_id: NodeId,
         frame: FrameIndex,
     },
+    SetPixelFps {
+        node_id: NodeId,
+        fps: u16,
+    },
     CreateVoxelVolume {
         name: String,
     },
@@ -94,6 +99,11 @@ pub enum Command {
         kind: PrimitiveKind,
         size: f32,
         material: PaletteIndex,
+    },
+    CreateTerrainMesh {
+        name: String,
+        params: crate::mesh::TerrainParams,
+        transform: Transform,
     },
     CreateCurveTubeMesh {
         name: String,
@@ -230,6 +240,14 @@ pub enum Command {
         radius_px: f32,
         color: Rgba8,
     },
+    PaintMeshSpot3D {
+        node_id: NodeId,
+        center: glam::Vec3,
+        radius: f32,
+        color: Rgba8,
+        brush_normal: Option<glam::Vec3>,
+        camera_pos: Option<glam::Vec3>,
+    },
     PaintMeshLine {
         node_id: NodeId,
         uv_start: [f32; 2],
@@ -262,6 +280,59 @@ pub enum Command {
     SetMeshNormalMap {
         node_id: NodeId,
         normal_map: Option<MeshTexture>,
+    },
+    SetMeshAoMap {
+        node_id: NodeId,
+        ao_map: Option<MeshTexture>,
+    },
+    AddMeshPaintLayer {
+        node_id: NodeId,
+        name: String,
+        opacity: f32,
+        fill_color: Option<Rgba8>,
+    },
+    SetMeshPaintLayer {
+        node_id: NodeId,
+        layer_id: u32,
+        name: Option<String>,
+        visible: Option<bool>,
+        opacity: Option<f32>,
+        set_active: bool,
+    },
+    DeleteMeshPaintLayer {
+        node_id: NodeId,
+        layer_id: u32,
+    },
+    SetMeshVertexColors {
+        node_id: NodeId,
+        updates: Vec<(usize, [f32; 4])>,
+    },
+    ClearMeshVertexColors {
+        node_id: NodeId,
+    },
+    SetMeshCreaseEdges {
+        node_id: NodeId,
+        edges: Vec<(usize, usize)>,
+    },
+    SetMeshProxyNormals {
+        node_id: NodeId,
+        normals: Vec<(usize, glam::Vec3)>,
+        clear: bool,
+    },
+    SetPixelLayerOpacity {
+        node_id: NodeId,
+        frame: FrameIndex,
+        layer_id: LayerId,
+        opacity: f32,
+    },
+    SetPixelOnionSkin {
+        node_id: NodeId,
+        enabled: bool,
+    },
+    UpdateAnimationClipMeta {
+        clip_index: usize,
+        name: Option<String>,
+        duration_secs: Option<f32>,
     },
     ApplyBipedRig,
     ApplyHumanoidRig,
@@ -355,6 +426,16 @@ pub enum Command {
     RemoveBone {
         bone_id: BoneId,
     },
+    CreateGroupNode {
+        name: String,
+        transform: Transform,
+        parent: Option<NodeId>,
+    },
+    SetNodeTransformKeyframe {
+        clip_index: usize,
+        node_id: NodeId,
+        keyframe: Keyframe,
+    },
     DuplicateNode {
         node_id: NodeId,
         name: Option<String>,
@@ -371,6 +452,7 @@ pub enum Command {
     SetAnimationPlaybackTime {
         clip_index: Option<usize>,
         time_secs: f32,
+        playing: Option<bool>,
     },
     ResetCharacterPose,
     ClearMeshTexture {
@@ -409,6 +491,7 @@ pub enum UndoDelta {
         azimuth: f32,
         elevation: f32,
     },
+    RestoreShadingMode(crate::scene::ViewportShadingMode),
     RestorePaletteEntry {
         index: PaletteIndex,
         previous: Option<PaletteEntry>,
@@ -439,6 +522,10 @@ pub enum UndoDelta {
         node_id: NodeId,
         previous_active: usize,
     },
+    RestorePixelFps {
+        node_id: NodeId,
+        previous: u16,
+    },
     RestoreVoxels {
         node_id: NodeId,
         previous_voxels: Vec<VoxelEdit>,
@@ -459,6 +546,29 @@ pub enum UndoDelta {
     RestoreMeshNormalMap {
         node_id: NodeId,
         previous: Option<MeshTexture>,
+    },
+    RestoreMeshAoMap {
+        node_id: NodeId,
+        previous: Option<MeshTexture>,
+    },
+    RestoreMeshPaintLayers {
+        node_id: NodeId,
+        previous_layers: Vec<MeshPaintLayer>,
+        previous_active: Option<u32>,
+        previous_texture: Option<MeshTexture>,
+    },
+    RestoreMeshPaintLayerPixels {
+        node_id: NodeId,
+        layer_id: u32,
+        previous_pixels: Vec<(usize, [u8; 4])>,
+    },
+    RestoreMeshVertexColors {
+        node_id: NodeId,
+        previous: std::collections::BTreeMap<usize, [f32; 4]>,
+    },
+    RestoreMeshCreaseEdges {
+        node_id: NodeId,
+        previous: Vec<(usize, usize)>,
     },
     RestoreMeshSmoothShading {
         node_id: NodeId,
@@ -507,6 +617,20 @@ pub enum UndoDelta {
     RestoreNodeName {
         node_id: NodeId,
         previous: String,
+    },
+    RestorePixelLayerOpacity {
+        node_id: NodeId,
+        frame: FrameIndex,
+        layer_id: LayerId,
+        previous: f32,
+    },
+    RestorePixelOnionSkin {
+        node_id: NodeId,
+        previous: bool,
+    },
+    RestoreMeshProxyNormals {
+        node_id: NodeId,
+        previous: std::collections::BTreeMap<usize, glam::Vec3>,
     },
     Transaction(Vec<UndoDelta>),
 }
@@ -657,6 +781,11 @@ impl Command {
                     elevation: prev_el,
                 }
             }
+            Self::SetShadingMode(mode) => {
+                let prev = scene.shading_mode;
+                scene.shading_mode = *mode;
+                UndoDelta::RestoreShadingMode(prev)
+            }
             Self::SetPaletteEntry { index, entry } => {
                 let previous = scene.palette.set(*index, entry.clone());
                 UndoDelta::RestorePaletteEntry {
@@ -706,11 +835,17 @@ impl Command {
                     .pixel_canvases
                     .get_mut(node_id)
                     .ok_or(CoreError::PixelCanvasNotFound(*node_id))?;
+                if canvas.frames.len() >= 128 {
+                    return Err(CoreError::OutOfBounds);
+                }
                 let (w, h) = (canvas.width, canvas.height);
                 let new_id = canvas.allocate_layer_id();
                 let frame_ref = canvas
                     .frame_mut(*frame)
                     .ok_or(CoreError::PixelFrameNotFound(*frame))?;
+                if frame_ref.layers.len() >= 32 {
+                    return Err(CoreError::OutOfBounds);
+                }
                 let previous_active = frame_ref.active_layer;
                 frame_ref.layers.push(PixelLayer::new(new_id, name, w, h));
                 frame_ref.active_layer = frame_ref.layers.len().saturating_sub(1);
@@ -751,6 +886,9 @@ impl Command {
                     .pixel_canvases
                     .get_mut(node_id)
                     .ok_or(CoreError::PixelCanvasNotFound(*node_id))?;
+                if canvas.frames.len() >= 128 {
+                    return Err(CoreError::OutOfBounds);
+                }
                 let (w, h) = (canvas.width, canvas.height);
                 let layer_id = canvas.allocate_layer_id();
                 let previous_active = canvas.active_frame;
@@ -774,6 +912,18 @@ impl Command {
                 UndoDelta::RestoreActivePixelFrame {
                     node_id: *node_id,
                     previous_active,
+                }
+            }
+            Self::SetPixelFps { node_id, fps } => {
+                let canvas = scene
+                    .pixel_canvases
+                    .get_mut(node_id)
+                    .ok_or(CoreError::PixelCanvasNotFound(*node_id))?;
+                let previous = canvas.fps;
+                canvas.fps = *fps;
+                UndoDelta::RestorePixelFps {
+                    node_id: *node_id,
+                    previous,
                 }
             }
             Self::CreateVoxelVolume { name } => {
@@ -888,6 +1038,32 @@ impl Command {
                         visible: true,
                         parent: None,
                         transform: Transform::default(),
+                    },
+                );
+                scene.lowpoly_meshes.insert(id, mesh);
+                scene.selected_node = Some(id);
+                UndoDelta::RemoveNode {
+                    id,
+                    previous_selection,
+                }
+            }
+            Self::CreateTerrainMesh {
+                name,
+                params,
+                transform,
+            } => {
+                let mesh = mesh_ops::create_terrain_mesh(params)?;
+                let id = scene.allocate_node_id();
+                let previous_selection = scene.selected_node;
+                scene.nodes.insert(
+                    id,
+                    SceneNode {
+                        id,
+                        name: name.clone(),
+                        kind: NodeKind::LowPolyMesh,
+                        visible: true,
+                        parent: None,
+                        transform: *transform,
                     },
                 );
                 scene.lowpoly_meshes.insert(id, mesh);
@@ -1422,6 +1598,21 @@ impl Command {
                         material.emissive[1].clamp(0.0, 1.0),
                         material.emissive[2].clamp(0.0, 1.0),
                     ],
+                    double_sided: material.double_sided,
+                    cast_shadow: material.cast_shadow,
+                    receive_shadow: material.receive_shadow,
+                    alpha_mode: match material.alpha_mode {
+                        crate::mesh::AlphaMode::Mask { cutoff } if cutoff.is_finite() => {
+                            crate::mesh::AlphaMode::Mask {
+                                cutoff: cutoff.clamp(0.0, 1.0),
+                            }
+                        }
+                        crate::mesh::AlphaMode::Mask { .. } => {
+                            crate::mesh::AlphaMode::Mask { cutoff: 0.5 }
+                        }
+                        other => other,
+                    },
+                    unlit: material.unlit,
                 };
                 let mesh = scene
                     .lowpoly_meshes
@@ -1451,15 +1642,86 @@ impl Command {
                     .lowpoly_meshes
                     .get_mut(node_id)
                     .ok_or(CoreError::LowPolyMeshNotFound(*node_id))?;
-                let was_none = mesh.texture.is_none();
-                let tex = mesh.texture.get_or_insert_with(|| {
-                    MeshTexture::solid(DEFAULT_MESH_TEX_SIZE, DEFAULT_MESH_TEX_SIZE, base_color)
-                });
-                let previous_pixels = tex.paint_disc(*uv, *radius_px, *color);
-                UndoDelta::RestoreMeshTexturePixels {
-                    node_id: *node_id,
-                    was_none,
-                    previous_pixels,
+                if let Some(layer_idx) = mesh.active_paint_layer_index() {
+                    let layer_id = mesh.paint_layers[layer_idx].id;
+                    let previous_pixels = mesh.paint_layers[layer_idx]
+                        .texture
+                        .paint_disc(*uv, *radius_px, *color);
+                    mesh.recomposite_paint_layers();
+                    UndoDelta::RestoreMeshPaintLayerPixels {
+                        node_id: *node_id,
+                        layer_id,
+                        previous_pixels,
+                    }
+                } else {
+                    let was_none = mesh.texture.is_none();
+                    let tex = mesh.texture.get_or_insert_with(|| {
+                        MeshTexture::solid(DEFAULT_MESH_TEX_SIZE, DEFAULT_MESH_TEX_SIZE, base_color)
+                    });
+                    let previous_pixels = tex.paint_disc(*uv, *radius_px, *color);
+                    UndoDelta::RestoreMeshTexturePixels {
+                        node_id: *node_id,
+                        was_none,
+                        previous_pixels,
+                    }
+                }
+            }
+            Self::PaintMeshSpot3D {
+                node_id,
+                center,
+                radius,
+                color,
+                brush_normal,
+                camera_pos,
+            } => {
+                let base_color = scene
+                    .lowpoly_meshes
+                    .get(node_id)
+                    .and_then(|m| m.faces.first())
+                    .and_then(|f| scene.palette.get(f.material))
+                    .map(|e| e.color)
+                    .unwrap_or(Rgba8::rgb(225, 226, 235));
+                let mesh = scene
+                    .lowpoly_meshes
+                    .get_mut(node_id)
+                    .ok_or(CoreError::LowPolyMeshNotFound(*node_id))?;
+                let params = crate::mesh::PaintSpot3DParams {
+                    center: *center,
+                    radius: *radius,
+                    color: *color,
+                    brush_normal: *brush_normal,
+                    camera_pos: *camera_pos,
+                };
+                if let Some(layer_idx) = mesh.active_paint_layer_index() {
+                    let layer_id = mesh.paint_layers[layer_idx].id;
+                    let mut tex = std::mem::replace(
+                        &mut mesh.paint_layers[layer_idx].texture,
+                        MeshTexture {
+                            width: 0,
+                            height: 0,
+                            rgba: Vec::new(),
+                        },
+                    );
+                    let previous_pixels = crate::mesh::paint_mesh_spot_3d(mesh, &mut tex, &params);
+                    mesh.paint_layers[layer_idx].texture = tex;
+                    mesh.recomposite_paint_layers();
+                    UndoDelta::RestoreMeshPaintLayerPixels {
+                        node_id: *node_id,
+                        layer_id,
+                        previous_pixels,
+                    }
+                } else {
+                    let was_none = mesh.texture.is_none();
+                    let mut tex = mesh.texture.take().unwrap_or_else(|| {
+                        MeshTexture::solid(DEFAULT_MESH_TEX_SIZE, DEFAULT_MESH_TEX_SIZE, base_color)
+                    });
+                    let previous_pixels = crate::mesh::paint_mesh_spot_3d(mesh, &mut tex, &params);
+                    mesh.texture = Some(tex);
+                    UndoDelta::RestoreMeshTexturePixels {
+                        node_id: *node_id,
+                        was_none,
+                        previous_pixels,
+                    }
                 }
             }
             Self::PaintMeshLine {
@@ -1480,15 +1742,28 @@ impl Command {
                     .lowpoly_meshes
                     .get_mut(node_id)
                     .ok_or(CoreError::LowPolyMeshNotFound(*node_id))?;
-                let was_none = mesh.texture.is_none();
-                let tex = mesh.texture.get_or_insert_with(|| {
-                    MeshTexture::solid(DEFAULT_MESH_TEX_SIZE, DEFAULT_MESH_TEX_SIZE, base_color)
-                });
-                let previous_pixels = tex.paint_line(*uv_start, *uv_end, *width_px, *color);
-                UndoDelta::RestoreMeshTexturePixels {
-                    node_id: *node_id,
-                    was_none,
-                    previous_pixels,
+                if let Some(layer_idx) = mesh.active_paint_layer_index() {
+                    let layer_id = mesh.paint_layers[layer_idx].id;
+                    let previous_pixels = mesh.paint_layers[layer_idx]
+                        .texture
+                        .paint_line(*uv_start, *uv_end, *width_px, *color);
+                    mesh.recomposite_paint_layers();
+                    UndoDelta::RestoreMeshPaintLayerPixels {
+                        node_id: *node_id,
+                        layer_id,
+                        previous_pixels,
+                    }
+                } else {
+                    let was_none = mesh.texture.is_none();
+                    let tex = mesh.texture.get_or_insert_with(|| {
+                        MeshTexture::solid(DEFAULT_MESH_TEX_SIZE, DEFAULT_MESH_TEX_SIZE, base_color)
+                    });
+                    let previous_pixels = tex.paint_line(*uv_start, *uv_end, *width_px, *color);
+                    UndoDelta::RestoreMeshTexturePixels {
+                        node_id: *node_id,
+                        was_none,
+                        previous_pixels,
+                    }
                 }
             }
             Self::PaintMeshRect {
@@ -1508,15 +1783,28 @@ impl Command {
                     .lowpoly_meshes
                     .get_mut(node_id)
                     .ok_or(CoreError::LowPolyMeshNotFound(*node_id))?;
-                let was_none = mesh.texture.is_none();
-                let tex = mesh.texture.get_or_insert_with(|| {
-                    MeshTexture::solid(DEFAULT_MESH_TEX_SIZE, DEFAULT_MESH_TEX_SIZE, base_color)
-                });
-                let previous_pixels = tex.paint_rect(*uv_min, *uv_max, *color);
-                UndoDelta::RestoreMeshTexturePixels {
-                    node_id: *node_id,
-                    was_none,
-                    previous_pixels,
+                if let Some(layer_idx) = mesh.active_paint_layer_index() {
+                    let layer_id = mesh.paint_layers[layer_idx].id;
+                    let previous_pixels = mesh.paint_layers[layer_idx]
+                        .texture
+                        .paint_rect(*uv_min, *uv_max, *color);
+                    mesh.recomposite_paint_layers();
+                    UndoDelta::RestoreMeshPaintLayerPixels {
+                        node_id: *node_id,
+                        layer_id,
+                        previous_pixels,
+                    }
+                } else {
+                    let was_none = mesh.texture.is_none();
+                    let tex = mesh.texture.get_or_insert_with(|| {
+                        MeshTexture::solid(DEFAULT_MESH_TEX_SIZE, DEFAULT_MESH_TEX_SIZE, base_color)
+                    });
+                    let previous_pixels = tex.paint_rect(*uv_min, *uv_max, *color);
+                    UndoDelta::RestoreMeshTexturePixels {
+                        node_id: *node_id,
+                        was_none,
+                        previous_pixels,
+                    }
                 }
             }
             Self::ProjectMeshUvs { node_id, mode } => {
@@ -1550,20 +1838,34 @@ impl Command {
                     .lowpoly_meshes
                     .get_mut(node_id)
                     .ok_or(CoreError::LowPolyMeshNotFound(*node_id))?;
-                let previous = mesh.texture.clone();
-                match &mut mesh.texture {
-                    Some(tex) => tex.fill(*color),
-                    None => {
-                        mesh.texture = Some(MeshTexture::solid(
-                            DEFAULT_MESH_TEX_SIZE,
-                            DEFAULT_MESH_TEX_SIZE,
-                            *color,
-                        ));
+                if let Some(layer_idx) = mesh.active_paint_layer_index() {
+                    let previous_layers = mesh.paint_layers.clone();
+                    let previous_active = mesh.active_paint_layer;
+                    let previous_texture = mesh.texture.clone();
+                    mesh.paint_layers[layer_idx].texture.fill(*color);
+                    mesh.recomposite_paint_layers();
+                    UndoDelta::RestoreMeshPaintLayers {
+                        node_id: *node_id,
+                        previous_layers,
+                        previous_active,
+                        previous_texture,
                     }
-                }
-                UndoDelta::RestoreMeshTextureFull {
-                    node_id: *node_id,
-                    previous,
+                } else {
+                    let previous = mesh.texture.clone();
+                    match &mut mesh.texture {
+                        Some(tex) => tex.fill(*color),
+                        None => {
+                            mesh.texture = Some(MeshTexture::solid(
+                                DEFAULT_MESH_TEX_SIZE,
+                                DEFAULT_MESH_TEX_SIZE,
+                                *color,
+                            ));
+                        }
+                    }
+                    UndoDelta::RestoreMeshTextureFull {
+                        node_id: *node_id,
+                        previous,
+                    }
                 }
             }
             Self::SetMeshTexture { node_id, texture } => {
@@ -1584,11 +1886,24 @@ impl Command {
                     .lowpoly_meshes
                     .get_mut(node_id)
                     .ok_or(CoreError::LowPolyMeshNotFound(*node_id))?;
-                let previous = mesh.texture.clone();
-                mesh.texture = texture.clone();
-                UndoDelta::RestoreMeshTextureFull {
-                    node_id: *node_id,
-                    previous,
+                if !mesh.paint_layers.is_empty() {
+                    let previous_layers = std::mem::take(&mut mesh.paint_layers);
+                    let previous_active = mesh.active_paint_layer.take();
+                    let previous_texture = mesh.texture.clone();
+                    mesh.texture = texture.clone();
+                    UndoDelta::RestoreMeshPaintLayers {
+                        node_id: *node_id,
+                        previous_layers,
+                        previous_active,
+                        previous_texture,
+                    }
+                } else {
+                    let previous = mesh.texture.clone();
+                    mesh.texture = texture.clone();
+                    UndoDelta::RestoreMeshTextureFull {
+                        node_id: *node_id,
+                        previous,
+                    }
                 }
             }
             Self::SetMeshNormalMap {
@@ -1615,6 +1930,327 @@ impl Command {
                 let previous = mesh.normal_map.clone();
                 mesh.normal_map = normal_map.clone();
                 UndoDelta::RestoreMeshNormalMap {
+                    node_id: *node_id,
+                    previous,
+                }
+            }
+            Self::SetMeshAoMap { node_id, ao_map } => {
+                if let Some(tex) = ao_map {
+                    let expected = (tex.width as usize)
+                        .checked_mul(tex.height as usize)
+                        .and_then(|px| px.checked_mul(4));
+                    if tex.width == 0
+                        || tex.height == 0
+                        || tex.width > 1024
+                        || tex.height > 1024
+                        || expected != Some(tex.rgba.len())
+                    {
+                        return Err(CoreError::OutOfBounds);
+                    }
+                }
+                let mesh = scene
+                    .lowpoly_meshes
+                    .get_mut(node_id)
+                    .ok_or(CoreError::LowPolyMeshNotFound(*node_id))?;
+                let previous = mesh.ao_map.clone();
+                mesh.ao_map = ao_map.clone();
+                UndoDelta::RestoreMeshAoMap {
+                    node_id: *node_id,
+                    previous,
+                }
+            }
+            Self::AddMeshPaintLayer {
+                node_id,
+                name,
+                opacity,
+                fill_color,
+            } => {
+                if !opacity.is_finite() {
+                    return Err(CoreError::OutOfBounds);
+                }
+                let base_color = scene
+                    .lowpoly_meshes
+                    .get(node_id)
+                    .and_then(|m| m.faces.first())
+                    .and_then(|f| scene.palette.get(f.material))
+                    .map(|e| e.color)
+                    .unwrap_or(Rgba8::rgb(225, 226, 235));
+                let mesh = scene
+                    .lowpoly_meshes
+                    .get_mut(node_id)
+                    .ok_or(CoreError::LowPolyMeshNotFound(*node_id))?;
+                let added_slots = if mesh.paint_layers.is_empty() { 2 } else { 1 };
+                if mesh.paint_layers.len().saturating_add(added_slots)
+                    > crate::mesh::layer::MAX_PAINT_LAYERS
+                {
+                    return Err(CoreError::OutOfBounds);
+                }
+                let previous_layers = mesh.paint_layers.clone();
+                let previous_active = mesh.active_paint_layer;
+                let previous_texture = mesh.texture.clone();
+
+                let (w, h) = mesh
+                    .paint_layers
+                    .first()
+                    .map(|l| (l.texture.width, l.texture.height))
+                    .or_else(|| mesh.texture.as_ref().map(|t| (t.width, t.height)))
+                    .unwrap_or((DEFAULT_MESH_TEX_SIZE, DEFAULT_MESH_TEX_SIZE));
+
+                if mesh.paint_layers.is_empty() {
+                    let base_tex = mesh
+                        .texture
+                        .clone()
+                        .unwrap_or_else(|| MeshTexture::solid(w, h, base_color));
+                    mesh.paint_layers
+                        .push(MeshPaintLayer::new(1, "Base", 1.0, base_tex));
+                }
+
+                let new_id = mesh.next_paint_layer_id();
+                let fill = fill_color.unwrap_or(Rgba8::rgba(0, 0, 0, 0));
+                let layer_tex = MeshTexture::solid(w, h, fill);
+                let label = if name.trim().is_empty() {
+                    format!("Layer {new_id}")
+                } else {
+                    name.trim().to_string()
+                };
+                mesh.paint_layers
+                    .push(MeshPaintLayer::new(new_id, label, *opacity, layer_tex));
+                mesh.active_paint_layer = Some(new_id);
+                mesh.recomposite_paint_layers();
+
+                UndoDelta::RestoreMeshPaintLayers {
+                    node_id: *node_id,
+                    previous_layers,
+                    previous_active,
+                    previous_texture,
+                }
+            }
+            Self::SetMeshPaintLayer {
+                node_id,
+                layer_id,
+                name,
+                visible,
+                opacity,
+                set_active,
+            } => {
+                let mesh = scene
+                    .lowpoly_meshes
+                    .get_mut(node_id)
+                    .ok_or(CoreError::LowPolyMeshNotFound(*node_id))?;
+                let Some(pos) = mesh.paint_layers.iter().position(|l| l.id == *layer_id) else {
+                    return Err(CoreError::OutOfBounds);
+                };
+                if let Some(op) = opacity {
+                    if !op.is_finite() {
+                        return Err(CoreError::OutOfBounds);
+                    }
+                }
+                let previous_layers = mesh.paint_layers.clone();
+                let previous_active = mesh.active_paint_layer;
+                let previous_texture = mesh.texture.clone();
+
+                if let Some(n) = name {
+                    if !n.trim().is_empty() {
+                        mesh.paint_layers[pos].name = n.trim().to_string();
+                    }
+                }
+                if let Some(v) = visible {
+                    mesh.paint_layers[pos].visible = *v;
+                }
+                if let Some(op) = opacity {
+                    mesh.paint_layers[pos].opacity = op.clamp(0.0, 1.0);
+                }
+                if *set_active {
+                    mesh.active_paint_layer = Some(*layer_id);
+                }
+                mesh.recomposite_paint_layers();
+
+                UndoDelta::RestoreMeshPaintLayers {
+                    node_id: *node_id,
+                    previous_layers,
+                    previous_active,
+                    previous_texture,
+                }
+            }
+            Self::DeleteMeshPaintLayer { node_id, layer_id } => {
+                let mesh = scene
+                    .lowpoly_meshes
+                    .get_mut(node_id)
+                    .ok_or(CoreError::LowPolyMeshNotFound(*node_id))?;
+                let Some(pos) = mesh.paint_layers.iter().position(|l| l.id == *layer_id) else {
+                    return Err(CoreError::OutOfBounds);
+                };
+                let previous_layers = mesh.paint_layers.clone();
+                let previous_active = mesh.active_paint_layer;
+                let previous_texture = mesh.texture.clone();
+
+                mesh.paint_layers.remove(pos);
+                if mesh.active_paint_layer == Some(*layer_id) {
+                    mesh.active_paint_layer = mesh.paint_layers.last().map(|l| l.id);
+                }
+                if mesh.paint_layers.is_empty() {
+                    mesh.texture = None;
+                } else {
+                    mesh.recomposite_paint_layers();
+                }
+
+                UndoDelta::RestoreMeshPaintLayers {
+                    node_id: *node_id,
+                    previous_layers,
+                    previous_active,
+                    previous_texture,
+                }
+            }
+            Self::SetMeshVertexColors { node_id, updates } => {
+                let mesh = scene
+                    .lowpoly_meshes
+                    .get_mut(node_id)
+                    .ok_or(CoreError::LowPolyMeshNotFound(*node_id))?;
+                for &(vid, rgba) in updates {
+                    if vid >= mesh.vertices.len() || rgba.iter().any(|c| !c.is_finite()) {
+                        return Err(CoreError::OutOfBounds);
+                    }
+                }
+                let previous = mesh.vertex_colors.clone();
+                for &(vid, rgba) in updates {
+                    mesh.vertex_colors.insert(
+                        vid,
+                        [
+                            rgba[0].clamp(0.0, 1.0),
+                            rgba[1].clamp(0.0, 1.0),
+                            rgba[2].clamp(0.0, 1.0),
+                            rgba[3].clamp(0.0, 1.0),
+                        ],
+                    );
+                }
+                UndoDelta::RestoreMeshVertexColors {
+                    node_id: *node_id,
+                    previous,
+                }
+            }
+            Self::ClearMeshVertexColors { node_id } => {
+                let mesh = scene
+                    .lowpoly_meshes
+                    .get_mut(node_id)
+                    .ok_or(CoreError::LowPolyMeshNotFound(*node_id))?;
+                let previous = std::mem::take(&mut mesh.vertex_colors);
+                UndoDelta::RestoreMeshVertexColors {
+                    node_id: *node_id,
+                    previous,
+                }
+            }
+            Self::SetMeshProxyNormals {
+                node_id,
+                normals,
+                clear,
+            } => {
+                let mesh = scene
+                    .lowpoly_meshes
+                    .get_mut(node_id)
+                    .ok_or(CoreError::LowPolyMeshNotFound(*node_id))?;
+                for &(vid, n) in normals {
+                    if vid >= mesh.vertices.len() || !n.is_finite() || n.length_squared() < 1e-8 {
+                        return Err(CoreError::OutOfBounds);
+                    }
+                }
+                let previous = mesh.proxy_normals.clone();
+                if *clear {
+                    mesh.proxy_normals.clear();
+                }
+                for &(vid, n) in normals {
+                    mesh.proxy_normals.insert(vid, n.normalize());
+                }
+                UndoDelta::RestoreMeshProxyNormals {
+                    node_id: *node_id,
+                    previous,
+                }
+            }
+            Self::SetPixelLayerOpacity {
+                node_id,
+                frame,
+                layer_id,
+                opacity,
+            } => {
+                if !opacity.is_finite() {
+                    return Err(CoreError::OutOfBounds);
+                }
+                let canvas = scene
+                    .pixel_canvases
+                    .get_mut(node_id)
+                    .ok_or(CoreError::PixelCanvasNotFound(*node_id))?;
+                let frame_ref = canvas
+                    .frame_mut(*frame)
+                    .ok_or(CoreError::PixelFrameNotFound(*frame))?;
+                let layer = frame_ref
+                    .layer_mut(*layer_id)
+                    .ok_or(CoreError::PixelLayerNotFound(*layer_id))?;
+                let previous = layer.opacity;
+                layer.opacity = opacity.clamp(0.0, 1.0);
+                UndoDelta::RestorePixelLayerOpacity {
+                    node_id: *node_id,
+                    frame: *frame,
+                    layer_id: *layer_id,
+                    previous,
+                }
+            }
+            Self::SetPixelOnionSkin { node_id, enabled } => {
+                let canvas = scene
+                    .pixel_canvases
+                    .get_mut(node_id)
+                    .ok_or(CoreError::PixelCanvasNotFound(*node_id))?;
+                let previous = canvas.onion_skin;
+                canvas.onion_skin = *enabled;
+                UndoDelta::RestorePixelOnionSkin {
+                    node_id: *node_id,
+                    previous,
+                }
+            }
+            Self::UpdateAnimationClipMeta {
+                clip_index,
+                name,
+                duration_secs,
+            } => {
+                if let Some(d) = duration_secs {
+                    if !d.is_finite() || *d < 0.05 || *d > 600.0 {
+                        return Err(CoreError::OutOfBounds);
+                    }
+                }
+                let rig = scene
+                    .character_rig
+                    .as_mut()
+                    .ok_or(CoreError::CharacterRigNotFound)?;
+                let clip = rig
+                    .animations
+                    .get_mut(*clip_index)
+                    .ok_or(CoreError::OutOfBounds)?;
+                let previous = clip.clone();
+                if let Some(n) = name {
+                    let trimmed = n.trim();
+                    if !trimmed.is_empty() {
+                        clip.name = trimmed.to_string();
+                    }
+                }
+                if let Some(d) = duration_secs {
+                    clip.duration_secs = *d;
+                }
+                UndoDelta::RestoreAnimationClip {
+                    clip_index: *clip_index,
+                    previous,
+                }
+            }
+            Self::SetMeshCreaseEdges { node_id, edges } => {
+                let mesh = scene
+                    .lowpoly_meshes
+                    .get_mut(node_id)
+                    .ok_or(CoreError::LowPolyMeshNotFound(*node_id))?;
+                for &(a, b) in edges {
+                    if a >= mesh.vertices.len() || b >= mesh.vertices.len() || a == b {
+                        return Err(CoreError::OutOfBounds);
+                    }
+                }
+                let previous = mesh.crease_edges.clone();
+                mesh.crease_edges = edges.clone();
+                UndoDelta::RestoreMeshCreaseEdges {
                     node_id: *node_id,
                     previous,
                 }
@@ -1824,10 +2460,11 @@ impl Command {
                 name,
                 duration_secs,
             } => {
+                let prev_rig = scene.character_rig.clone();
+                let had_rig = scene.character_rig.is_some();
                 let rig = scene
                     .character_rig
-                    .as_mut()
-                    .ok_or(CoreError::CharacterRigNotFound)?;
+                    .get_or_insert_with(CharacterRig::default);
                 let previous_active = rig.active_animation;
                 let previous_time = rig.playback_time;
                 rig.animations
@@ -1835,9 +2472,13 @@ impl Command {
                 rig.active_animation = rig.animations.len().saturating_sub(1);
                 rig.playback_time = 0.0;
                 rig.playing = false;
-                UndoDelta::PopAnimationClip {
-                    previous_active,
-                    previous_time,
+                if had_rig {
+                    UndoDelta::PopAnimationClip {
+                        previous_active,
+                        previous_time,
+                    }
+                } else {
+                    UndoDelta::RestoreCharacterRig(prev_rig)
                 }
             }
             Self::SetAnimationKeyframe {
@@ -2052,6 +2693,7 @@ impl Command {
                 }
                 rig.active_animation = *clip_index;
                 rig.playback_time = 0.0;
+                rig.apply_active_animation();
                 UndoDelta::RestoreCharacterRig(previous)
             }
             Self::RemoveAnimationClip { clip_index } => {
@@ -2064,8 +2706,20 @@ impl Command {
                     return Err(CoreError::OutOfBounds);
                 }
                 rig.animations.remove(*clip_index);
+                rig.clip_layers.retain_mut(|layer| {
+                    if layer.clip_index == *clip_index {
+                        false
+                    } else {
+                        if layer.clip_index > *clip_index {
+                            layer.clip_index -= 1;
+                        }
+                        true
+                    }
+                });
                 if rig.animations.is_empty() {
                     rig.active_animation = 0;
+                } else if *clip_index < rig.active_animation {
+                    rig.active_animation -= 1;
                 } else if rig.active_animation >= rig.animations.len() {
                     rig.active_animation = rig.animations.len() - 1;
                 }
@@ -2099,10 +2753,83 @@ impl Command {
                 }
                 rig.bones.retain(|b| !removed.contains(&b.id));
                 rig.bindings.retain(|b| !removed.contains(&b.bone_id));
+                for mask in rig.node_bone_masks.values_mut() {
+                    mask.retain(|bid| !removed.contains(bid));
+                }
+                rig.node_bone_masks.retain(|_, mask| !mask.is_empty());
                 for clip in rig.animations.iter_mut() {
                     clip.channels.retain(|c| !removed.contains(&c.bone_id));
+                    for track in clip.parent_switch_tracks.iter_mut() {
+                        for k in track.keys.iter_mut() {
+                            if k.bone_id.is_some_and(|bid| removed.contains(&bid)) {
+                                k.bone_id = None;
+                            }
+                        }
+                    }
                 }
                 UndoDelta::RestoreCharacterRig(previous)
+            }
+            Self::CreateGroupNode {
+                name,
+                transform,
+                parent,
+            } => {
+                if let Some(pid) = *parent {
+                    if !scene.nodes.contains_key(&pid) {
+                        return Err(CoreError::NodeNotFound(pid));
+                    }
+                }
+                let id = scene.allocate_node_id();
+                let previous_selection = scene.selected_node;
+                scene.nodes.insert(
+                    id,
+                    SceneNode {
+                        id,
+                        name: name.clone(),
+                        kind: NodeKind::Group,
+                        visible: true,
+                        parent: *parent,
+                        transform: *transform,
+                    },
+                );
+                scene.selected_node = Some(id);
+                UndoDelta::RemoveNode {
+                    id,
+                    previous_selection,
+                }
+            }
+            Self::SetNodeTransformKeyframe {
+                clip_index,
+                node_id,
+                keyframe,
+            } => {
+                if !scene.nodes.contains_key(node_id) {
+                    return Err(CoreError::NodeNotFound(*node_id));
+                }
+                if !keyframe.time_secs.is_finite()
+                    || keyframe.time_secs < 0.0
+                    || !keyframe.translation.is_finite()
+                    || !keyframe.rotation.is_finite()
+                    || !keyframe.scale.is_finite()
+                {
+                    return Err(CoreError::OutOfBounds);
+                }
+                let prev = scene.character_rig.clone();
+                let rig = scene
+                    .character_rig
+                    .get_or_insert_with(CharacterRig::default);
+                if rig.animations.is_empty() && *clip_index == 0 {
+                    rig.animations.push(AnimationClip::new_empty(
+                        "SceneAnim",
+                        keyframe.time_secs.max(1.0),
+                    ));
+                }
+                let clip = rig
+                    .animations
+                    .get_mut(*clip_index)
+                    .ok_or(CoreError::OutOfBounds)?;
+                clip.upsert_node_transform_key(*node_id, *keyframe);
+                UndoDelta::RestoreCharacterRig(prev)
             }
             Self::DuplicateNode { node_id, name } => {
                 let source = scene
@@ -2193,6 +2920,7 @@ impl Command {
             Self::SetAnimationPlaybackTime {
                 clip_index,
                 time_secs,
+                playing,
             } => {
                 if !time_secs.is_finite() || *time_secs < 0.0 {
                     return Err(CoreError::OutOfBounds);
@@ -2210,7 +2938,7 @@ impl Command {
                     rig.active_animation = idx;
                 }
                 rig.playback_time = *time_secs;
-                rig.playing = false;
+                rig.playing = playing.unwrap_or(false);
                 rig.apply_active_animation();
                 UndoDelta::RestoreCharacterRig(prev)
             }
@@ -2224,6 +2952,7 @@ impl Command {
                     bone.pose_local = bone.rest_local;
                 }
                 rig.morph_weights.clear();
+                rig.node_transform_overrides.clear();
                 rig.playback_time = 0.0;
                 rig.playing = false;
                 UndoDelta::RestoreCharacterRig(prev)
@@ -2242,24 +2971,36 @@ impl Command {
                     .ok_or(CoreError::LowPolyMeshNotFound(*node_id))?;
                 let mut deltas = Vec::with_capacity(2);
                 if *clear_color {
-                    let previous = mesh.texture.clone();
-                    mesh.texture = None;
-                    deltas.push(UndoDelta::RestoreMeshTextureFull {
-                        node_id: *node_id,
-                        previous,
-                    });
+                    if !mesh.paint_layers.is_empty() {
+                        let previous_layers = std::mem::take(&mut mesh.paint_layers);
+                        let previous_active = mesh.active_paint_layer.take();
+                        let previous_texture = mesh.texture.take();
+                        deltas.push(UndoDelta::RestoreMeshPaintLayers {
+                            node_id: *node_id,
+                            previous_layers,
+                            previous_active,
+                            previous_texture,
+                        });
+                    } else {
+                        let previous = mesh.texture.take();
+                        deltas.push(UndoDelta::RestoreMeshTextureFull {
+                            node_id: *node_id,
+                            previous,
+                        });
+                    }
                 }
                 if *clear_normal {
-                    let previous = mesh.normal_map.clone();
-                    mesh.normal_map = None;
+                    let previous = mesh.normal_map.take();
                     deltas.push(UndoDelta::RestoreMeshNormalMap {
                         node_id: *node_id,
                         previous,
                     });
                 }
-                match deltas.len() {
-                    1 => deltas.into_iter().next().expect("exactly one"),
-                    _ => UndoDelta::Transaction(deltas),
+                let mut iter = deltas.into_iter();
+                match (iter.next(), iter.next()) {
+                    (Some(one), None) => one,
+                    (Some(a), Some(b)) => UndoDelta::Transaction(vec![a, b]),
+                    _ => return Err(CoreError::OutOfBounds),
                 }
             }
             Self::Transaction(commands) => {
@@ -2343,6 +3084,9 @@ impl UndoDelta {
             Self::RestoreLightDirection { azimuth, elevation } => {
                 scene.light_azimuth = *azimuth;
                 scene.light_elevation = *elevation;
+            }
+            Self::RestoreShadingMode(prev) => {
+                scene.shading_mode = *prev;
             }
             Self::RestorePaletteEntry { index, previous } => match previous {
                 Some(entry) => {
@@ -2433,6 +3177,13 @@ impl UndoDelta {
                     .ok_or(CoreError::PixelCanvasNotFound(*node_id))?;
                 canvas.active_frame = *previous_active;
             }
+            Self::RestorePixelFps { node_id, previous } => {
+                let canvas = scene
+                    .pixel_canvases
+                    .get_mut(node_id)
+                    .ok_or(CoreError::PixelCanvasNotFound(*node_id))?;
+                canvas.fps = *previous;
+            }
             Self::RestoreVoxels {
                 node_id,
                 previous_voxels,
@@ -2479,6 +3230,55 @@ impl UndoDelta {
                     .get_mut(node_id)
                     .ok_or(CoreError::LowPolyMeshNotFound(*node_id))?;
                 mesh.normal_map = previous.clone();
+            }
+            Self::RestoreMeshAoMap { node_id, previous } => {
+                let mesh = scene
+                    .lowpoly_meshes
+                    .get_mut(node_id)
+                    .ok_or(CoreError::LowPolyMeshNotFound(*node_id))?;
+                mesh.ao_map = previous.clone();
+            }
+            Self::RestoreMeshPaintLayers {
+                node_id,
+                previous_layers,
+                previous_active,
+                previous_texture,
+            } => {
+                let mesh = scene
+                    .lowpoly_meshes
+                    .get_mut(node_id)
+                    .ok_or(CoreError::LowPolyMeshNotFound(*node_id))?;
+                mesh.paint_layers = previous_layers.clone();
+                mesh.active_paint_layer = *previous_active;
+                mesh.texture = previous_texture.clone();
+            }
+            Self::RestoreMeshPaintLayerPixels {
+                node_id,
+                layer_id,
+                previous_pixels,
+            } => {
+                let mesh = scene
+                    .lowpoly_meshes
+                    .get_mut(node_id)
+                    .ok_or(CoreError::LowPolyMeshNotFound(*node_id))?;
+                if let Some(layer) = mesh.paint_layers.iter_mut().find(|l| l.id == *layer_id) {
+                    layer.texture.restore_pixels(previous_pixels);
+                }
+                mesh.recomposite_paint_layers();
+            }
+            Self::RestoreMeshVertexColors { node_id, previous } => {
+                let mesh = scene
+                    .lowpoly_meshes
+                    .get_mut(node_id)
+                    .ok_or(CoreError::LowPolyMeshNotFound(*node_id))?;
+                mesh.vertex_colors = previous.clone();
+            }
+            Self::RestoreMeshCreaseEdges { node_id, previous } => {
+                let mesh = scene
+                    .lowpoly_meshes
+                    .get_mut(node_id)
+                    .ok_or(CoreError::LowPolyMeshNotFound(*node_id))?;
+                mesh.crease_edges = previous.clone();
             }
             Self::RestoreMeshSmoothShading { node_id, previous } => {
                 let mesh = scene
@@ -2573,6 +3373,30 @@ impl UndoDelta {
                     (*previous_active).min(rig.animations.len().saturating_sub(1));
                 rig.playback_time = *previous_time;
                 rig.apply_active_animation();
+            }
+            Self::RestorePixelLayerOpacity {
+                node_id,
+                frame,
+                layer_id,
+                previous,
+            } => {
+                if let Some(canvas) = scene.pixel_canvases.get_mut(node_id) {
+                    if let Some(frame_ref) = canvas.frame_mut(*frame) {
+                        if let Some(layer) = frame_ref.layer_mut(*layer_id) {
+                            layer.opacity = *previous;
+                        }
+                    }
+                }
+            }
+            Self::RestorePixelOnionSkin { node_id, previous } => {
+                if let Some(canvas) = scene.pixel_canvases.get_mut(node_id) {
+                    canvas.onion_skin = *previous;
+                }
+            }
+            Self::RestoreMeshProxyNormals { node_id, previous } => {
+                if let Some(mesh) = scene.lowpoly_meshes.get_mut(node_id) {
+                    mesh.proxy_normals = previous.clone();
+                }
             }
             Self::RestoreAnimationClip {
                 clip_index,

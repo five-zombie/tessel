@@ -34,33 +34,124 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      - name: Install Linux desktop libs
+      - name: Install Linux desktop & packaging tools
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y pkg-config libxkbcommon-dev libwayland-dev libx11-dev
+        run: sudo apt-get update && sudo apt-get install -y pkg-config libxkbcommon-dev libwayland-dev libx11-dev rpm
 
-      - name: Build Linux binary
+      - name: Build Linux packages (.tar.gz, .deb, .rpm)
         if: runner.os == 'Linux'
         run: |
           cargo build --release -p tessel-app
+
+          RAW_VER="${GITHUB_REF_NAME#v}"
+          RAW_VER="${RAW_VER%-release}"
+          DEB_VER="${RAW_VER//-/\~}"
+          RPM_VER="${RAW_VER//-/\~}"
+
+          mkdir -p dist
+
+          # 1. Portable .tar.gz
           mkdir -p dist/tessel-linux-x86_64
           cp target/release/tessel dist/tessel-linux-x86_64/tessel
           cp README.md LICENSE dist/tessel-linux-x86_64/
           tar -czf dist/tessel-linux-x86_64.tar.gz -C dist tessel-linux-x86_64
           rm -rf dist/tessel-linux-x86_64
 
-      - name: Build Windows .exe
+          # Shared desktop entry
+          cat > tessel.desktop <<'EOF'
+          [Desktop Entry]
+          Type=Application
+          Name=Tessel
+          Comment=AI-first Pixel, Voxel, Low-Poly, and Character 3D Studio
+          Exec=/usr/bin/tessel
+          Terminal=false
+          Categories=Graphics;3DGraphics;2DGraphics;
+          EOF
+
+          # 2. Debian / Ubuntu (.deb)
+          PKG_DIR="pkg-deb"
+          mkdir -p "${PKG_DIR}/DEBIAN" \
+                   "${PKG_DIR}/usr/bin" \
+                   "${PKG_DIR}/usr/share/applications" \
+                   "${PKG_DIR}/usr/share/doc/tessel"
+          install -m 0755 target/release/tessel "${PKG_DIR}/usr/bin/tessel"
+          install -m 0644 tessel.desktop "${PKG_DIR}/usr/share/applications/tessel.desktop"
+          install -m 0644 LICENSE "${PKG_DIR}/usr/share/doc/tessel/copyright"
+          install -m 0644 README.md "${PKG_DIR}/usr/share/doc/tessel/README.md"
+          cat > "${PKG_DIR}/DEBIAN/control" <<EOF
+          Package: tessel
+          Version: ${DEB_VER}
+          Section: graphics
+          Priority: optional
+          Architecture: amd64
+          Maintainer: The Five Zombie Org <noreply@github.com>
+          Depends: libc6, libx11-6, libxkbcommon0, libwayland-client0
+          Description: AI-first Pixel, Voxel, Low-Poly, and Character 3D Studio
+           Cross-platform desktop studio built in Pure Rust for creating Pixel,
+           Voxel, Low-Poly, and Character assets with glTF 2.0 (.glb) export
+           and MCP integration.
+          EOF
+          chmod 0755 "${PKG_DIR}/DEBIAN"
+          dpkg-deb --build --root-owner-group "${PKG_DIR}" "dist/tessel_${DEB_VER}_amd64.deb"
+          rm -rf "${PKG_DIR}"
+
+          # 3. Fedora / RHEL / openSUSE (.rpm)
+          RPM_TOP="$(pwd)/rpmbuild"
+          mkdir -p "${RPM_TOP}"/{BUILD,RPMS,SOURCES,SPECS,SRPMS}
+          cat > "${RPM_TOP}/SPECS/tessel.spec" <<EOF
+          %define _build_id_links none
+          %global debug_package %{nil}
+
+          Name:           tessel
+          Version:        ${RPM_VER}
+          Release:        1
+          Summary:        AI-first Pixel, Voxel, Low-Poly, and Character 3D Studio
+          License:        Apache-2.0
+          BuildArch:      x86_64
+
+          %description
+          Cross-platform desktop studio built in Pure Rust for creating Pixel,
+          Voxel, Low-Poly, and Character assets with glTF 2.0 (.glb) export
+          and MCP integration.
+
+          %install
+          install -D -m 0755 %{_sourcedir}/tessel %{buildroot}/usr/bin/tessel
+          install -D -m 0644 %{_sourcedir}/tessel.desktop %{buildroot}/usr/share/applications/tessel.desktop
+          install -D -m 0644 %{_sourcedir}/LICENSE %{buildroot}/usr/share/licenses/tessel/LICENSE
+          install -D -m 0644 %{_sourcedir}/README.md %{buildroot}/usr/share/doc/tessel/README.md
+
+          %files
+          /usr/bin/tessel
+          /usr/share/applications/tessel.desktop
+          /usr/share/licenses/tessel/LICENSE
+          /usr/share/doc/tessel/README.md
+          EOF
+          cp target/release/tessel tessel.desktop LICENSE README.md "${RPM_TOP}/SOURCES/"
+          rpmbuild --define "_topdir ${RPM_TOP}" -bb "${RPM_TOP}/SPECS/tessel.spec"
+          cp "${RPM_TOP}"/RPMS/x86_64/tessel-*.rpm dist/
+          rm -rf "${RPM_TOP}" tessel.desktop
+
+      - name: Build Windows packages (.exe, .zip)
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
           cargo build --release -p tessel-app
-          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          New-Item -ItemType Directory -Force -Path dist/tessel-windows-x86_64 | Out-Null
           Copy-Item target/release/tessel.exe dist/tessel-windows-x86_64.exe
+          Copy-Item target/release/tessel.exe dist/tessel-windows-x86_64/tessel.exe
+          Copy-Item README.md, LICENSE dist/tessel-windows-x86_64/
+          Compress-Archive -Path dist/tessel-windows-x86_64 -DestinationPath dist/tessel-windows-x86_64.zip -Force
+          Remove-Item -Recurse -Force dist/tessel-windows-x86_64
 
-      - name: Build macOS Universal binary
+      - name: Build macOS Universal packages (.tar.gz, .dmg)
         if: runner.os == 'macOS'
         run: |
           cargo build --release -p tessel-app --target aarch64-apple-darwin
           cargo build --release -p tessel-app --target x86_64-apple-darwin
+
+          RAW_VER="${GITHUB_REF_NAME#v}"
+          RAW_VER="${RAW_VER%-release}"
+
           mkdir -p dist/tessel-macos-universal
           lipo -create \
             target/aarch64-apple-darwin/release/tessel \
@@ -68,7 +159,40 @@ jobs:
             -output dist/tessel-macos-universal/tessel
           cp README.md LICENSE dist/tessel-macos-universal/
           tar -czf dist/tessel-macos-universal.tar.gz -C dist tessel-macos-universal
-          rm -rf dist/tessel-macos-universal
+
+          # Universal .app bundle inside .dmg
+          APP_DIR="dist/dmg/Tessel.app"
+          mkdir -p "${APP_DIR}/Contents/MacOS" "${APP_DIR}/Contents/Resources"
+          cp dist/tessel-macos-universal/tessel "${APP_DIR}/Contents/MacOS/tessel"
+          chmod +x "${APP_DIR}/Contents/MacOS/tessel"
+          cat > "${APP_DIR}/Contents/Info.plist" <<EOF
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>CFBundleName</key>
+            <string>Tessel</string>
+            <key>CFBundleDisplayName</key>
+            <string>Tessel</string>
+            <key>CFBundleIdentifier</key>
+            <string>org.fivezombie.tessel</string>
+            <key>CFBundleVersion</key>
+            <string>${RAW_VER}</string>
+            <key>CFBundleShortVersionString</key>
+            <string>${RAW_VER}</string>
+            <key>CFBundleExecutable</key>
+            <string>tessel</string>
+            <key>CFBundlePackageType</key>
+            <string>APPL</string>
+            <key>NSHighResolutionCapable</key>
+            <true/>
+          </dict>
+          </plist>
+          EOF
+          codesign --force --deep --sign - "${APP_DIR}"
+          ln -s /Applications dist/dmg/Applications
+          hdiutil create -volname "Tessel" -srcfolder dist/dmg -ov -format UDZO dist/tessel-macos-universal.dmg
+          rm -rf dist/tessel-macos-universal dist/dmg
 
       - name: Upload build artifact
         uses: actions/upload-artifact@v7

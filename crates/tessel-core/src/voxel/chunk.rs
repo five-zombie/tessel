@@ -38,7 +38,8 @@ impl VoxelChunk {
         color: Option<PaletteIndex>,
     ) -> Option<PaletteIndex> {
         let i = Self::idx(x, y, z);
-        let prev_raw = self.cells[i];
+        let cell = self.cells.get_mut(i)?;
+        let prev_raw = *cell;
         let next_raw = color.map_or(0, PaletteIndex::get);
         if prev_raw != next_raw {
             if prev_raw == 0 && next_raw != 0 {
@@ -46,7 +47,7 @@ impl VoxelChunk {
             } else if prev_raw != 0 && next_raw == 0 {
                 self.occupied = self.occupied.saturating_sub(1);
             }
-            self.cells[i] = next_raw;
+            *cell = next_raw;
         }
         PaletteIndex::new(prev_raw).ok()
     }

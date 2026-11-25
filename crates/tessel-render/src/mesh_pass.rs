@@ -1,9 +1,46 @@
-use tessel_core::{MeshMaterial, MeshTexture, Palette, PaletteIndex};
+use tessel_core::{
+    AlphaMode, MeshMaterial, MeshTexture, Palette, PaletteIndex, ViewportShadingMode,
+};
 use wgpu::util::DeviceExt;
 
-use crate::vertex::{CameraUniform, MaterialUniform, StudioVertex3D};
+use crate::vertex::{CameraUniform, MaterialUniform, ShadowMapUniform, StudioVertex3D};
 
 const MESH_SHADER_WGSL: &str = include_str!("../../../assets/shaders/mesh_3d.wgsl");
+const SHADOW_DEPTH_SHADER_WGSL: &str = include_str!("../../../assets/shaders/shadow_depth.wgsl");
+const OUTLINE_HULL_SHADER_WGSL: &str = include_str!("../../../assets/shaders/outline_hull.wgsl");
+const SHADOW_MAP_SIZE: u32 = 2048;
+
+/// Computes an orthographic directional light view-projection matrix framing `[min, max]`.
+pub fn compute_light_view_proj(light_dir: glam::Vec3, min: [f32; 3], max: [f32; 3]) -> glam::Mat4 {
+    let dir = light_dir.normalize_or_zero();
+    let key_dir = if dir.length_squared() > 1e-6 {
+        dir
+    } else {
+        glam::Vec3::new(0.55, 0.82, 0.45).normalize()
+    };
+    let (center, radius) = if min.iter().all(|v| v.is_finite())
+        && max.iter().all(|v| v.is_finite())
+        && min[0] <= max[0]
+        && min[1] <= max[1]
+        && min[2] <= max[2]
+    {
+        let mn = glam::Vec3::from_array(min);
+        let mx = glam::Vec3::from_array(max);
+        ((mn + mx) * 0.5, ((mx - mn).length() * 0.5).max(1.5))
+    } else {
+        (glam::Vec3::ZERO, 4.0)
+    };
+    let eye = center + key_dir * (radius * 2.5);
+    let up = if key_dir.y.abs() > 0.98 {
+        glam::Vec3::Z
+    } else {
+        glam::Vec3::Y
+    };
+    let view = glam::Mat4::look_at_rh(eye, center, up);
+    let extent = radius * 1.25;
+    let proj = glam::Mat4::orthographic_rh(-extent, extent, -extent, extent, 0.05, radius * 5.5);
+    proj * view
+}
 
 pub struct CustomMeshUpload<'a> {
     pub texture: Option<&'a MeshTexture>,
@@ -21,12 +58,18 @@ struct TexturedMeshDraw {
     vertex_buffer: wgpu::Buffer,
     index_buffer: wgpu::Buffer,
     index_count: u32,
+    cast_shadow: bool,
+    alpha_blend: bool,
 }
 
 /// Renders shaded 3D Voxel & Low-Poly meshes using a 256x1 palette texture (or per-mesh RGBA texture)
-/// with per-mesh PBR material properties, tangent-space normal mapping, and depth testing.
+/// with per-mesh PBR material properties, tangent-space normal mapping, real directional shadow map,
+/// NPR / Sumi-e preview + inverted-hull outlines, transparent blending, and depth testing.
 pub struct MeshPass {
     pipeline: wgpu::RenderPipeline,
+    blend_pipeline: wgpu::RenderPipeline,
+    outline_pipeline: wgpu::RenderPipeline,
+    shadow_depth_pipeline: wgpu::RenderPipeline,
     bgl: wgpu::BindGroupLayout,
     camera_buffer: wgpu::Buffer,
     _default_material_buffer: wgpu::Buffer,
@@ -36,6 +79,11 @@ pub struct MeshPass {
     default_normal_view: wgpu::TextureView,
     sampler: wgpu::Sampler,
     bind_group: wgpu::BindGroup,
+    _shadow_depth_texture: wgpu::Texture,
+    shadow_depth_view: wgpu::TextureView,
+    shadow_uniform_buffer: wgpu::Buffer,
+    shadow_depth_bg: wgpu::BindGroup,
+    shadow_sample_bg: wgpu::BindGroup,
     vertex_buffer: Option<wgpu::Buffer>,
     index_buffer: Option<wgpu::Buffer>,
     index_count: u32,
@@ -191,9 +239,112 @@ impl MeshPass {
             ],
         });
 
+        let shadow_depth_texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("tessel-dir-shadow-depth-2048"),
+            size: wgpu::Extent3d {
+                width: SHADOW_MAP_SIZE,
+                height: SHADOW_MAP_SIZE,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Depth32Float,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        });
+        let shadow_depth_view =
+            shadow_depth_texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let shadow_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("tessel-dir-shadow-cmp-sampler"),
+            address_mode_u: wgpu::AddressMode::ClampToEdge,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            compare: Some(wgpu::CompareFunction::LessEqual),
+            ..Default::default()
+        });
+        let shadow_uniform_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("tessel-dir-shadow-uniform"),
+            contents: bytemuck::bytes_of(&ShadowMapUniform::default()),
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        });
+
+        let shadow_depth_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("tessel-shadow-depth-bgl"),
+            entries: &[wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::VERTEX,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            }],
+        });
+        let shadow_depth_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("tessel-shadow-depth-bg"),
+            layout: &shadow_depth_bgl,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: shadow_uniform_buffer.as_entire_binding(),
+            }],
+        });
+
+        let shadow_sample_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("tessel-shadow-sample-bgl"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Depth,
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Comparison),
+                    count: None,
+                },
+            ],
+        });
+        let shadow_sample_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("tessel-shadow-sample-bg"),
+            layout: &shadow_sample_bgl,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: shadow_uniform_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(&shadow_depth_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::Sampler(&shadow_sampler),
+                },
+            ],
+        });
+
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("tessel-mesh-pipeline-layout"),
-            bind_group_layouts: &[&bgl],
+            bind_group_layouts: &[&bgl, &shadow_sample_bgl],
             push_constant_ranges: &[],
         });
 
@@ -265,8 +416,160 @@ impl MeshPass {
             cache: None,
         });
 
+        let shadow_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("tessel-shadow-depth-shader"),
+            source: wgpu::ShaderSource::Wgsl(SHADOW_DEPTH_SHADER_WGSL.into()),
+        });
+        let shadow_pipeline_layout =
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("tessel-shadow-depth-pipeline-layout"),
+                bind_group_layouts: &[&shadow_depth_bgl],
+                push_constant_ranges: &[],
+            });
+        let shadow_vertex_layout = wgpu::VertexBufferLayout {
+            array_stride: std::mem::size_of::<StudioVertex3D>() as wgpu::BufferAddress,
+            step_mode: wgpu::VertexStepMode::Vertex,
+            attributes: &[
+                wgpu::VertexAttribute {
+                    offset: 0,
+                    shader_location: 0,
+                    format: wgpu::VertexFormat::Float32x3,
+                },
+                wgpu::VertexAttribute {
+                    offset: 12,
+                    shader_location: 1,
+                    format: wgpu::VertexFormat::Float32x3,
+                },
+                wgpu::VertexAttribute {
+                    offset: 24,
+                    shader_location: 2,
+                    format: wgpu::VertexFormat::Float32x2,
+                },
+                wgpu::VertexAttribute {
+                    offset: 32,
+                    shader_location: 3,
+                    format: wgpu::VertexFormat::Float32,
+                },
+                wgpu::VertexAttribute {
+                    offset: 36,
+                    shader_location: 4,
+                    format: wgpu::VertexFormat::Float32x4,
+                },
+            ],
+        };
+        let shadow_depth_pipeline =
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("tessel-shadow-depth-pipeline"),
+                layout: Some(&shadow_pipeline_layout),
+                vertex: wgpu::VertexState {
+                    module: &shadow_shader,
+                    entry_point: Some("vs_main"),
+                    buffers: std::slice::from_ref(&shadow_vertex_layout),
+                    compilation_options: wgpu::PipelineCompilationOptions::default(),
+                },
+                fragment: None,
+                primitive: wgpu::PrimitiveState {
+                    cull_mode: None,
+                    front_face: wgpu::FrontFace::Ccw,
+                    ..Default::default()
+                },
+                depth_stencil: Some(wgpu::DepthStencilState {
+                    format: wgpu::TextureFormat::Depth32Float,
+                    depth_write_enabled: true,
+                    depth_compare: wgpu::CompareFunction::Less,
+                    stencil: wgpu::StencilState::default(),
+                    bias: wgpu::DepthBiasState {
+                        constant: 2,
+                        slope_scale: 2.0,
+                        clamp: 0.0,
+                    },
+                }),
+                multisample: wgpu::MultisampleState::default(),
+                multiview: None,
+                cache: None,
+            });
+
+        let blend_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("tessel-mesh-3d-blend-pipeline"),
+            layout: Some(&pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: Some("vs_main"),
+                buffers: std::slice::from_ref(&shadow_vertex_layout),
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: Some("fs_main"),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: color_format,
+                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+            }),
+            primitive: wgpu::PrimitiveState {
+                cull_mode: None,
+                front_face: wgpu::FrontFace::Ccw,
+                ..Default::default()
+            },
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: depth_format,
+                depth_write_enabled: false,
+                depth_compare: wgpu::CompareFunction::Less,
+                stencil: wgpu::StencilState::default(),
+                bias: wgpu::DepthBiasState::default(),
+            }),
+            multisample: wgpu::MultisampleState::default(),
+            multiview: None,
+            cache: None,
+        });
+
+        let outline_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("tessel-outline-hull-shader"),
+            source: wgpu::ShaderSource::Wgsl(OUTLINE_HULL_SHADER_WGSL.into()),
+        });
+        let outline_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("tessel-outline-hull-pipeline"),
+            layout: Some(&pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &outline_shader,
+                entry_point: Some("vs_main"),
+                buffers: std::slice::from_ref(&shadow_vertex_layout),
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &outline_shader,
+                entry_point: Some("fs_main"),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: color_format,
+                    blend: Some(wgpu::BlendState::REPLACE),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+            }),
+            primitive: wgpu::PrimitiveState {
+                cull_mode: Some(wgpu::Face::Front),
+                front_face: wgpu::FrontFace::Ccw,
+                ..Default::default()
+            },
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: depth_format,
+                depth_write_enabled: true,
+                depth_compare: wgpu::CompareFunction::LessEqual,
+                stencil: wgpu::StencilState::default(),
+                bias: wgpu::DepthBiasState::default(),
+            }),
+            multisample: wgpu::MultisampleState::default(),
+            multiview: None,
+            cache: None,
+        });
+
         Self {
             pipeline,
+            blend_pipeline,
+            outline_pipeline,
+            shadow_depth_pipeline,
             bgl,
             camera_buffer,
             _default_material_buffer: default_material_buffer,
@@ -276,6 +579,11 @@ impl MeshPass {
             default_normal_view,
             sampler,
             bind_group,
+            _shadow_depth_texture: shadow_depth_texture,
+            shadow_depth_view,
+            shadow_uniform_buffer,
+            shadow_depth_bg,
+            shadow_sample_bg,
             vertex_buffer: None,
             index_buffer: None,
             index_count: 0,
@@ -379,9 +687,23 @@ impl MeshPass {
             if vertices.is_empty() || indices.is_empty() {
                 continue;
             }
+            let alpha_cutoff = match mat.alpha_mode {
+                AlphaMode::Mask { cutoff } => cutoff.clamp(1e-4, 1.0),
+                _ => 0.0,
+            };
             let mat_uniform = MaterialUniform {
-                pbr: [mat.metallic, mat.roughness, 0.0, 0.0],
-                emissive: [mat.emissive[0], mat.emissive[1], mat.emissive[2], 0.0],
+                pbr: [
+                    mat.metallic,
+                    mat.roughness,
+                    if mat.receive_shadow { 1.0 } else { 0.0 },
+                    alpha_cutoff,
+                ],
+                emissive: [
+                    mat.emissive[0],
+                    mat.emissive[1],
+                    mat.emissive[2],
+                    if mat.unlit { 1.0 } else { 0.0 },
+                ],
             };
             let material_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
                 label: Some("tessel-custom-material-uniform"),
@@ -531,6 +853,8 @@ impl MeshPass {
                 vertex_buffer,
                 index_buffer,
                 index_count: indices.len() as u32,
+                cast_shadow: mat.cast_shadow,
+                alpha_blend: mat.alpha_mode == AlphaMode::Blend,
             });
         }
     }
@@ -539,8 +863,72 @@ impl MeshPass {
         queue.write_buffer(&self.camera_buffer, 0, bytemuck::bytes_of(uniform));
     }
 
-    pub fn draw<'a>(&'a self, pass: &mut wgpu::RenderPass<'a>) {
+    /// Renders all shadow-casting 3D meshes into the 2048x2048 directional depth shadow map
+    /// and updates the active NPR/PBR shading mode uniform.
+    pub fn render_shadow_map(
+        &self,
+        queue: &wgpu::Queue,
+        encoder: &mut wgpu::CommandEncoder,
+        light_dir: glam::Vec3,
+        min: [f32; 3],
+        max: [f32; 3],
+        shading_mode: ViewportShadingMode,
+    ) {
+        let has_geo = self.index_count > 0 || self.textured_draws.iter().any(|d| d.cast_shadow);
+        let light_vp = compute_light_view_proj(light_dir, min, max);
+        let mode_id = match shading_mode {
+            ViewportShadingMode::Pbr => 0.0,
+            ViewportShadingMode::NprSumie => 1.0,
+            ViewportShadingMode::SilhouetteCheck => 2.0,
+            ViewportShadingMode::LuminanceValueCheck => 3.0,
+        };
+        let uniform = ShadowMapUniform {
+            light_view_proj: light_vp.to_cols_array_2d(),
+            bias_params: [0.015, 0.0015, 0.55, if has_geo { 1.0 } else { 0.0 }],
+            npr_params: [mode_id, 0.014, 40.0, 0.06],
+        };
+        queue.write_buffer(&self.shadow_uniform_buffer, 0, bytemuck::bytes_of(&uniform));
+
+        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("tessel-dir-shadow-depth-pass"),
+            color_attachments: &[],
+            depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                view: &self.shadow_depth_view,
+                depth_ops: Some(wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(1.0),
+                    store: wgpu::StoreOp::Store,
+                }),
+                stencil_ops: None,
+            }),
+            occlusion_query_set: None,
+            timestamp_writes: None,
+        });
+        if !has_geo {
+            return;
+        }
+        pass.set_pipeline(&self.shadow_depth_pipeline);
+        pass.set_bind_group(0, &self.shadow_depth_bg, &[]);
+        if let (Some(vb), Some(ib)) = (&self.vertex_buffer, &self.index_buffer) {
+            if self.index_count > 0 {
+                pass.set_vertex_buffer(0, vb.slice(..));
+                pass.set_index_buffer(ib.slice(..), wgpu::IndexFormat::Uint32);
+                pass.draw_indexed(0..self.index_count, 0, 0..1);
+            }
+        }
+        for draw in &self.textured_draws {
+            if !draw.cast_shadow {
+                continue;
+            }
+            pass.set_vertex_buffer(0, draw.vertex_buffer.slice(..));
+            pass.set_index_buffer(draw.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+            pass.draw_indexed(0..draw.index_count, 0, 0..1);
+        }
+    }
+
+    pub fn draw<'a>(&'a self, pass: &mut wgpu::RenderPass<'a>, shading_mode: ViewportShadingMode) {
+        // 1. Opaque & Alpha-Mask geometry pass
         pass.set_pipeline(&self.pipeline);
+        pass.set_bind_group(1, &self.shadow_sample_bg, &[]);
         if let (Some(vb), Some(ib)) = (&self.vertex_buffer, &self.index_buffer) {
             if self.index_count > 0 {
                 pass.set_bind_group(0, &self.bind_group, &[]);
@@ -550,10 +938,77 @@ impl MeshPass {
             }
         }
         for draw in &self.textured_draws {
+            if draw.alpha_blend {
+                continue;
+            }
             pass.set_bind_group(0, &draw.bind_group, &[]);
             pass.set_vertex_buffer(0, draw.vertex_buffer.slice(..));
             pass.set_index_buffer(draw.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
             pass.draw_indexed(0..draw.index_count, 0, 0..1);
+        }
+
+        // 2. Inverted-hull ink outline pass when NPR Sumi-e mode is active
+        if shading_mode == ViewportShadingMode::NprSumie {
+            pass.set_pipeline(&self.outline_pipeline);
+            pass.set_bind_group(1, &self.shadow_sample_bg, &[]);
+            if let (Some(vb), Some(ib)) = (&self.vertex_buffer, &self.index_buffer) {
+                if self.index_count > 0 {
+                    pass.set_bind_group(0, &self.bind_group, &[]);
+                    pass.set_vertex_buffer(0, vb.slice(..));
+                    pass.set_index_buffer(ib.slice(..), wgpu::IndexFormat::Uint32);
+                    pass.draw_indexed(0..self.index_count, 0, 0..1);
+                }
+            }
+            for draw in &self.textured_draws {
+                if draw.alpha_blend {
+                    continue;
+                }
+                pass.set_bind_group(0, &draw.bind_group, &[]);
+                pass.set_vertex_buffer(0, draw.vertex_buffer.slice(..));
+                pass.set_index_buffer(draw.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+                pass.draw_indexed(0..draw.index_count, 0, 0..1);
+            }
+        }
+
+        // 3. Transparent AlphaMode::Blend pass
+        if self.textured_draws.iter().any(|d| d.alpha_blend) {
+            pass.set_pipeline(&self.blend_pipeline);
+            pass.set_bind_group(1, &self.shadow_sample_bg, &[]);
+            for draw in &self.textured_draws {
+                if !draw.alpha_blend {
+                    continue;
+                }
+                pass.set_bind_group(0, &draw.bind_group, &[]);
+                pass.set_vertex_buffer(0, draw.vertex_buffer.slice(..));
+                pass.set_index_buffer(draw.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+                pass.draw_indexed(0..draw.index_count, 0, 0..1);
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn compute_light_view_proj_frames_scene_bounds_in_clip_space() {
+        let vp = compute_light_view_proj(
+            glam::Vec3::new(0.5, 0.8, 0.3),
+            [-2.0, 0.0, -2.0],
+            [2.0, 3.0, 2.0],
+        );
+        for x in [-2.0_f32, 2.0] {
+            for y in [0.0_f32, 3.0] {
+                for z in [-2.0_f32, 2.0] {
+                    let clip = vp * glam::Vec4::new(x, y, z, 1.0);
+                    let ndc = clip.truncate() / clip.w;
+                    assert!(
+                        ndc.x.abs() <= 1.0 && ndc.y.abs() <= 1.0 && (0.0..=1.0).contains(&ndc.z),
+                        "corner ({x},{y},{z}) projected outside shadow frustum: {ndc:?}"
+                    );
+                }
+            }
         }
     }
 }

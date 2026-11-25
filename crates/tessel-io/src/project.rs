@@ -55,13 +55,17 @@ pub fn encode_tessel_project_with_thumbnail(
     Ok(cursor.into_inner())
 }
 
-/// Decodes `.tessel` archive bytes with forward schema version checking.
+const MAX_MANIFEST_JSON_BYTES: u64 = 64 * 1024;
+const MAX_SCENE_JSON_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Decodes `.tessel` archive bytes with forward schema version checking and decompression bounds.
 pub fn decode_tessel_project(bytes: &[u8]) -> Result<SceneState, IoError> {
     let mut archive = ZipArchive::new(Cursor::new(bytes))?;
 
     let mut manifest_buf = String::new();
     archive
         .by_name("manifest.json")?
+        .take(MAX_MANIFEST_JSON_BYTES)
         .read_to_string(&mut manifest_buf)?;
     let manifest: ProjectManifest = serde_json::from_str(&manifest_buf)?;
     if manifest.schema_version > CURRENT_SCHEMA_VERSION {
@@ -69,9 +73,15 @@ pub fn decode_tessel_project(bytes: &[u8]) -> Result<SceneState, IoError> {
     }
 
     let mut scene_buf = String::new();
-    archive
+    let read_bytes = archive
         .by_name("scene.json")?
+        .take(MAX_SCENE_JSON_BYTES + 1)
         .read_to_string(&mut scene_buf)?;
+    if read_bytes as u64 > MAX_SCENE_JSON_BYTES {
+        return Err(IoError::ExportPathDenied(
+            "scene.json exceeds 64 MiB decompressed limit".into(),
+        ));
+    }
     let scene: SceneState = serde_json::from_str(&scene_buf)?;
     Ok(scene)
 }
@@ -114,8 +124,14 @@ pub fn save_tessel_project_with_thumbnail(
     Ok(())
 }
 
-/// Loads a `.tessel` project file from disk.
+/// Loads a `.tessel` project file from disk (bounded to 64 MiB).
 pub fn load_tessel_project(path: &Path) -> Result<SceneState, IoError> {
+    let meta = fs::metadata(path)?;
+    if meta.len() > 64 * 1024 * 1024 {
+        return Err(IoError::InvalidFormat(
+            "project file exceeds 64 MiB safety limit".into(),
+        ));
+    }
     let bytes = fs::read(path)?;
     decode_tessel_project(&bytes)
 }

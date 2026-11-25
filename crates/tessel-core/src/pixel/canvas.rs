@@ -107,18 +107,21 @@ impl PixelCanvas {
 
     /// Composites all visible layers of `frame_idx` into tightly packed RGBA8 bytes (`width * height * 4`).
     pub fn composite_frame_rgba(&self, frame_idx: usize, palette: &Palette) -> Vec<u8> {
-        let pixel_count = (self.width as usize).saturating_mul(self.height as usize);
-        let mut out = vec![0u8; pixel_count * 4];
+        const MAX_COMPOSITE_DIM: usize = 512;
+        let w = (self.width as usize).min(MAX_COMPOSITE_DIM);
+        let h = (self.height as usize).min(MAX_COMPOSITE_DIM);
+        let pixel_count = w.saturating_mul(h);
+        let mut out = vec![0u8; pixel_count.saturating_mul(4)];
         let Some(frame) = self.frames.get(frame_idx) else {
             return out;
         };
 
         for layer in &frame.layers {
-            if !layer.visible || layer.opacity <= 0.0 {
+            if !layer.visible || !layer.opacity.is_finite() || layer.opacity <= 0.0 {
                 continue;
             }
             let layer_alpha = layer.opacity.clamp(0.0, 1.0);
-            for (i, cell) in layer.pixels().iter().enumerate() {
+            for (i, cell) in layer.pixels().iter().take(pixel_count).enumerate() {
                 let Some(idx) = cell else {
                     continue;
                 };
@@ -130,6 +133,9 @@ impl PixelCanvas {
                     continue;
                 }
                 let base = i * 4;
+                if base + 3 >= out.len() {
+                    break;
+                }
                 let dst_a = f32::from(out[base + 3]) / 255.0;
                 let out_a = src_a + dst_a * (1.0 - src_a);
                 if out_a <= 0.0 {

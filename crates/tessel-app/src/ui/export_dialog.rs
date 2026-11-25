@@ -31,15 +31,12 @@ pub struct ExportDialogState {
 
 impl Default for ExportDialogState {
     fn default() -> Self {
-        let output_dir = std::env::current_dir()
-            .unwrap_or_else(|_| PathBuf::from("."))
-            .join("exports");
         Self {
             open: false,
             format: ExportFormat::Glb,
             preset: ExportPreset::Godot4,
             filename: "asset.glb".into(),
-            output_dir,
+            output_dir: crate::settings::default_export_dir(),
             turntable_size: 320,
             turntable_frames: 16,
             turntable_fps: 12,
@@ -194,12 +191,35 @@ pub fn show_export_dialog(
                 ui.label("Filename:");
                 ui.text_edit_singleline(&mut state.filename);
             });
-            ui.label(
-                RichText::new(format!("Output dir: {}", state.output_dir.display()))
-                    .monospace()
-                    .size(10.5)
-                    .color(tokens::ON_SURFACE_VARIANT),
-            );
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                ui.label("Output Dir:");
+                let mut dir_text = state.output_dir.to_string_lossy().into_owned();
+                let resp = ui.add(
+                    egui::TextEdit::singleline(&mut dir_text)
+                        .desired_width(220.0)
+                        .font(egui::TextStyle::Monospace),
+                );
+                if resp.changed() {
+                    let trimmed = dir_text.trim();
+                    if !trimmed.is_empty() {
+                        state.output_dir = PathBuf::from(trimmed);
+                    }
+                }
+                if ui.button("Browse…").clicked() {
+                    let mut picker = rfd::FileDialog::new();
+                    if state.output_dir.exists() {
+                        picker = picker.set_directory(&state.output_dir);
+                    } else if let Some(parent) = state.output_dir.parent() {
+                        if parent.exists() {
+                            picker = picker.set_directory(parent);
+                        }
+                    }
+                    if let Some(chosen) = picker.pick_folder() {
+                        state.output_dir = chosen;
+                    }
+                }
+            });
 
             ui.add_space(10.0);
             ui.horizontal(|ui| {
@@ -211,7 +231,10 @@ pub fn show_export_dialog(
                 .fill(tokens::PRIMARY_CONTAINER)
                 .corner_radius(CornerRadius::same(4));
                 if ui.add(export_btn).clicked() {
-                    if turntable_mode {
+                    if let Err(err) = std::fs::create_dir_all(&state.output_dir) {
+                        state.status_message =
+                            Some(Err(format!("Failed to create output dir: {err}")));
+                    } else if turntable_mode {
                         match build_turntable_args(state, camera_3d) {
                             Ok(args) => {
                                 action = ExportAction::TurntableGif(args);
@@ -318,5 +341,17 @@ mod tests {
         assert_eq!(args.fps, 2);
         assert_eq!(args.clip_index, Some(1));
         assert!(args.preview);
+    }
+
+    #[test]
+    fn default_export_dir_uses_os_home_tessel_project() {
+        let dir = crate::settings::default_export_dir();
+        assert_eq!(
+            dir.file_name().and_then(|n| n.to_str()),
+            Some("tessel-project")
+        );
+        if let Some(user_dirs) = directories::UserDirs::new() {
+            assert_eq!(dir, user_dirs.home_dir().join("tessel-project"));
+        }
     }
 }

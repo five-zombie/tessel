@@ -11,6 +11,17 @@ use crate::voxel::{Symmetry3D, VoxelTool, VoxelVolume};
 use super::nano::{AppMode, NodeId, NodeKind, Transform};
 
 /// Sub-Unit: Single scene graph node metadata.
+/// Viewport shading & NPR preview mode (shared by live GUI, headless screenshots, and turntables).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ViewportShadingMode {
+    #[default]
+    Pbr,
+    NprSumie,
+    SilhouetteCheck,
+    LuminanceValueCheck,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SceneNode {
     pub id: NodeId,
@@ -31,6 +42,8 @@ pub struct SceneState {
     pub light_azimuth: f32,
     #[serde(default = "default_light_elevation")]
     pub light_elevation: f32,
+    #[serde(default)]
+    pub shading_mode: ViewportShadingMode,
     pub palette: Palette,
     pub active_color: PaletteIndex,
     pub pixel_tool: PixelTool,
@@ -82,6 +95,7 @@ impl SceneState {
             unit_scale: 0.1,
             light_azimuth: default_light_azimuth(),
             light_elevation: default_light_elevation(),
+            shading_mode: ViewportShadingMode::Pbr,
             palette: Palette::studio_default(),
             active_color,
             pixel_tool: PixelTool::Pencil,
@@ -150,8 +164,19 @@ impl SceneState {
         self.lowpoly_meshes.keys().next().copied()
     }
 
-    /// Computes the world-space transform matrix for `id` by walking its `parent` hierarchy.
+    /// Computes the live world-space transform matrix for `id` by walking its `parent` hierarchy
+    /// and applying any active per-node transform animation overrides (`node_transform_overrides`).
     pub fn node_world_matrix(&self, id: NodeId) -> glam::Mat4 {
+        self.compute_node_world_matrix(id, true)
+    }
+
+    /// Computes the rest-pose world-space transform matrix for `id` ignoring live animation overrides
+    /// (used by exporters and rest-pose skinning).
+    pub fn node_rest_world_matrix(&self, id: NodeId) -> glam::Mat4 {
+        self.compute_node_world_matrix(id, false)
+    }
+
+    fn compute_node_world_matrix(&self, id: NodeId, apply_anim_overrides: bool) -> glam::Mat4 {
         let mut chain = Vec::new();
         let mut curr = Some(id);
         while let Some(nid) = curr {
@@ -167,10 +192,22 @@ impl SceneState {
         let mut mat = glam::Mat4::IDENTITY;
         for nid in chain.into_iter().rev() {
             if let Some(node) = self.nodes.get(&nid) {
+                let mut tr = node.transform;
+                if apply_anim_overrides {
+                    if let Some(delta) = self
+                        .character_rig
+                        .as_ref()
+                        .and_then(|r| r.node_transform_overrides.get(&nid))
+                    {
+                        tr.translation += delta.translation;
+                        tr.rotation = (tr.rotation * delta.rotation).normalize();
+                        tr.scale *= delta.scale;
+                    }
+                }
                 mat *= glam::Mat4::from_scale_rotation_translation(
-                    node.transform.scale,
-                    node.transform.rotation,
-                    node.transform.translation,
+                    tr.scale,
+                    tr.rotation,
+                    tr.translation,
                 );
             }
         }

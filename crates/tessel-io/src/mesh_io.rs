@@ -100,14 +100,22 @@ pub fn import_obj_str(obj_text: &str, material: PaletteIndex) -> Result<LowPolyM
                     .next()
                     .and_then(|s| s.parse().ok())
                     .ok_or_else(|| IoError::InvalidFormat("invalid OBJ vertex z".into()))?;
-                vertices.push(Vec3::new(x, y, z));
+                let v = Vec3::new(x, y, z);
+                if !v.is_finite() {
+                    return Err(IoError::InvalidFormat(
+                        "non-finite OBJ vertex coordinate".into(),
+                    ));
+                }
+                vertices.push(v);
             }
             "vt" => {
                 if let (Some(u), Some(v)) = (
                     parts.next().and_then(|s| s.parse::<f32>().ok()),
                     parts.next().and_then(|s| s.parse::<f32>().ok()),
                 ) {
-                    tex_coords.push([u, 1.0 - v]);
+                    if u.is_finite() && v.is_finite() {
+                        tex_coords.push([u, 1.0 - v]);
+                    }
                 }
             }
             "f" => {
@@ -173,6 +181,12 @@ pub fn import_obj_str(obj_text: &str, material: PaletteIndex) -> Result<LowPolyM
         faces,
         texture: None,
         normal_map: None,
+        ao_map: None,
+        paint_layers: Vec::new(),
+        active_paint_layer: None,
+        vertex_colors: BTreeMap::new(),
+        crease_edges: Vec::new(),
+        proxy_normals: BTreeMap::new(),
         smooth_shading: false,
         material: Default::default(),
         skin_weights: Default::default(),
@@ -202,7 +216,13 @@ pub fn import_glb_bytes(bytes: &[u8], material: PaletteIndex) -> Result<LowPolyM
             };
             let base = vertices.len();
             for p in positions {
-                vertices.push(Vec3::from_array(p));
+                let v = Vec3::from_array(p);
+                if !v.is_finite() {
+                    return Err(IoError::InvalidFormat(
+                        "non-finite GLB vertex position".into(),
+                    ));
+                }
+                vertices.push(v);
             }
             let added = vertices.len() - base;
             if added < 3 {
@@ -250,7 +270,17 @@ pub fn import_glb_bytes(bytes: &[u8], material: PaletteIndex) -> Result<LowPolyM
             }
             let prim_uvs: Vec<[f32; 2]> = reader
                 .read_tex_coords(0)
-                .map(|tc| tc.into_f32().collect())
+                .map(|tc| {
+                    tc.into_f32()
+                        .map(|uv| {
+                            if uv[0].is_finite() && uv[1].is_finite() {
+                                uv
+                            } else {
+                                [0.0, 0.0]
+                            }
+                        })
+                        .collect()
+                })
                 .unwrap_or_default();
             let indices: Vec<usize> = match reader.read_indices() {
                 Some(iter) => iter.into_u32().map(|i| base + i as usize).collect(),
@@ -283,6 +313,12 @@ pub fn import_glb_bytes(bytes: &[u8], material: PaletteIndex) -> Result<LowPolyM
         faces,
         texture: None,
         normal_map: None,
+        ao_map: None,
+        paint_layers: Vec::new(),
+        active_paint_layer: None,
+        vertex_colors: BTreeMap::new(),
+        crease_edges: Vec::new(),
+        proxy_normals: BTreeMap::new(),
         smooth_shading: false,
         material: Default::default(),
         skin_weights,
@@ -307,6 +343,12 @@ pub fn import_mesh_from_path(
         .unwrap_or("Imported Mesh")
         .to_string();
 
+    let meta = fs::metadata(path)?;
+    if meta.len() > 64 * 1024 * 1024 {
+        return Err(IoError::InvalidFormat(
+            "mesh file exceeds 64 MiB safety limit".into(),
+        ));
+    }
     let mesh = match ext.as_str() {
         "obj" => {
             let text = fs::read_to_string(path)?;
@@ -327,8 +369,24 @@ pub fn import_mesh_from_path(
 
 /// Loads a custom `.png` or `.jpg`/`.jpeg` texture image (e.g. from Blender, Poly Haven, AmbientCG)
 /// into a `MeshTexture`, downscaling safely if larger than 1024x1024.
+const MAX_IMPORT_IMAGE_FILE_BYTES: u64 = 32 * 1024 * 1024;
+const MAX_IMPORT_IMAGE_DIM: u32 = 4096;
+const MAX_IMPORT_IMAGE_ALLOC_BYTES: u64 = 64 * 1024 * 1024;
+
 pub fn import_mesh_texture_from_path(path: &Path) -> Result<MeshTexture, IoError> {
-    let mut img = image::open(path)?;
+    let meta = fs::metadata(path)?;
+    if meta.len() > MAX_IMPORT_IMAGE_FILE_BYTES {
+        return Err(IoError::ExportPathDenied(
+            "image file exceeds 32 MiB import limit".into(),
+        ));
+    }
+    let mut reader = image::ImageReader::open(path)?.with_guessed_format()?;
+    let mut limits = image::Limits::default();
+    limits.max_image_width = Some(MAX_IMPORT_IMAGE_DIM);
+    limits.max_image_height = Some(MAX_IMPORT_IMAGE_DIM);
+    limits.max_alloc = Some(MAX_IMPORT_IMAGE_ALLOC_BYTES);
+    reader.limits(limits);
+    let mut img = reader.decode()?;
     if img.width() > 1024 || img.height() > 1024 {
         img = img.thumbnail(1024, 1024);
     }
@@ -468,6 +526,36 @@ mod tests {
         assert_eq!(tex.height, 16);
         assert_eq!(tex.rgba.len(), 32 * 16 * 4);
         assert_eq!(&tex.rgba[0..4], &[120, 80, 45, 255]);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn import_mesh_texture_supports_tga_tiff_and_exr() {
+        let dir = std::env::temp_dir().join("tessel_v47_tex_interop_test");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        let rgba_img = image::RgbaImage::from_pixel(16, 12, image::Rgba([90, 140, 210, 255]));
+        for ext in ["tga", "tiff"] {
+            let p = dir.join(format!("albedo.{ext}"));
+            rgba_img.save(&p).unwrap();
+            let tex = import_mesh_texture_from_path(&p).unwrap();
+            assert_eq!(tex.width, 16);
+            assert_eq!(tex.height, 12);
+            assert_eq!(&tex.rgba[0..4], &[90, 140, 210, 255]);
+        }
+
+        // HDR 32-bit float EXR round-trip (converts cleanly to RGBA8).
+        let exr_path = dir.join("hdr_bake.exr");
+        let exr_img =
+            image::Rgba32FImage::from_pixel(8, 8, image::Rgba([0.5_f32, 0.25_f32, 0.75_f32, 1.0]));
+        exr_img.save(&exr_path).unwrap();
+        let exr_tex = import_mesh_texture_from_path(&exr_path).unwrap();
+        assert_eq!(exr_tex.width, 8);
+        assert_eq!(exr_tex.height, 8);
+        assert_eq!(exr_tex.rgba.len(), 8 * 8 * 4);
+        assert_eq!(exr_tex.rgba[3], 255);
 
         let _ = fs::remove_dir_all(&dir);
     }

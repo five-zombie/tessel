@@ -177,8 +177,8 @@ pub fn show_toolbar(ctx: &egui::Context, scene: &mut SceneState, history: &mut H
                         }
                         ui.separator();
                         let is_smooth = scene
-                            .lowpoly_meshes
-                            .get(&scene.active_lowpoly_node().unwrap())
+                            .active_lowpoly_node()
+                            .and_then(|id| scene.lowpoly_meshes.get(&id))
                             .is_some_and(|m| m.smooth_shading);
                         let edit = [
                             IconItem {

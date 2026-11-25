@@ -23,7 +23,8 @@ pub use project::{
     CURRENT_SCHEMA_VERSION,
 };
 pub use sprite::{
-    export_gif_bytes, export_png_bytes, export_sprite_sheet_bytes, SpriteSheetMetadata,
+    export_gif_bytes, export_mesh_texture_png_bytes, export_png_bytes, export_sprite_sheet_bytes,
+    SpriteSheetMetadata,
 };
 pub use vox::{export_vox_bytes, import_vox_bytes};
 

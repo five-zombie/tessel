@@ -18,6 +18,8 @@ pub struct GizmoDragState {
     pub node_id: NodeId,
     pub axis: GizmoAxis,
     pub start_transform: Transform,
+    pub start_world_pos: glam::Vec3,
+    pub parent_world_inv: glam::Mat4,
     pub start_axis_t: f32,
 }
 
@@ -362,9 +364,14 @@ fn handle_gizmo_drag_input(
     let Some(node_id) = scene.selected_node else {
         return false;
     };
-    let Some(node_transform) = scene.nodes.get(&node_id).map(|n| n.transform) else {
+    let Some(node) = scene.nodes.get(&node_id) else {
         return false;
     };
+    let node_transform = node.transform;
+    let parent_id = node.parent;
+    let world_origin = scene
+        .node_world_matrix(node_id)
+        .transform_point3(glam::Vec3::ZERO);
 
     let pointer_ray = |pos: egui::Pos2| -> (glam::Vec3, glam::Vec3) {
         let uv = [
@@ -378,24 +385,31 @@ fn handle_gizmo_drag_input(
     if gizmo_drag.is_none() {
         if let Some(hover) = response.hover_pos() {
             let (orig, dir) = pointer_ray(hover);
-            *active_axis =
-                pick_move_gizmo(orig, dir, node_transform.translation, GIZMO_AXIS_LEN, 0.14);
+            *active_axis = pick_move_gizmo(orig, dir, world_origin, GIZMO_AXIS_LEN, 0.14);
         }
     }
 
     if response.drag_started_by(egui::PointerButton::Primary) {
         if let Some(pos) = response.interact_pointer_pos() {
             let (orig, dir) = pointer_ray(pos);
-            if let Some(axis) =
-                pick_move_gizmo(orig, dir, node_transform.translation, GIZMO_AXIS_LEN, 0.16)
-            {
+            if let Some(axis) = pick_move_gizmo(orig, dir, world_origin, GIZMO_AXIS_LEN, 0.16) {
                 if let Some((start_t, _)) =
-                    closest_point_on_axis(orig, dir, node_transform.translation, axis.dir())
+                    closest_point_on_axis(orig, dir, world_origin, axis.dir())
                 {
+                    let parent_mat = parent_id
+                        .map(|pid| scene.node_world_matrix(pid))
+                        .unwrap_or(glam::Mat4::IDENTITY);
+                    let parent_world_inv = if parent_mat.determinant().abs() > 1e-8 {
+                        parent_mat.inverse()
+                    } else {
+                        glam::Mat4::IDENTITY
+                    };
                     *gizmo_drag = Some(GizmoDragState {
                         node_id,
                         axis,
                         start_transform: node_transform,
+                        start_world_pos: world_origin,
+                        parent_world_inv,
                         start_axis_t: start_t,
                     });
                     *active_axis = Some(axis);
@@ -409,16 +423,13 @@ fn handle_gizmo_drag_input(
         if response.dragged_by(egui::PointerButton::Primary) {
             if let Some(pos) = response.interact_pointer_pos() {
                 let (orig, dir) = pointer_ray(pos);
-                if let Some((cur_t, _)) = closest_point_on_axis(
-                    orig,
-                    dir,
-                    drag.start_transform.translation,
-                    drag.axis.dir(),
-                ) {
-                    let delta = cur_t - drag.start_axis_t;
+                if let Some((cur_t, _)) =
+                    closest_point_on_axis(orig, dir, drag.start_world_pos, drag.axis.dir())
+                {
+                    let world_delta = drag.axis.dir() * (cur_t - drag.start_axis_t);
+                    let local_delta = drag.parent_world_inv.transform_vector3(world_delta);
                     if let Some(node) = scene.nodes.get_mut(&drag.node_id) {
-                        node.transform.translation =
-                            drag.start_transform.translation + drag.axis.dir() * delta;
+                        node.transform.translation = drag.start_transform.translation + local_delta;
                         scene.mark_modified();
                     }
                 }
@@ -875,12 +886,53 @@ pub fn selected_node_world_bounds(
     node_id: NodeId,
 ) -> Option<(glam::Vec3, glam::Vec3)> {
     let node = scene.nodes.get(&node_id)?;
-    if !node.visible {
+    let visible = scene
+        .character_rig
+        .as_ref()
+        .and_then(|r| r.node_visibility.get(&node_id).copied())
+        .unwrap_or(node.visible);
+    if !visible {
         return None;
     }
-    let mat = scene.node_world_matrix(node_id);
+    let base_mat = scene.node_world_matrix(node_id);
+    let parent_override = scene
+        .character_rig
+        .as_ref()
+        .and_then(|r| r.node_parent_overrides.get(&node_id).copied());
+    let mat = match (parent_override, scene.character_rig.as_ref()) {
+        (Some(ps_key), Some(rig)) => tessel_core::CharacterRig::compute_node_override_matrix(
+            ps_key,
+            base_mat,
+            &rig.world_pose_matrices(),
+            &rig.world_rest_matrices(),
+        ),
+        _ => base_mat,
+    };
     if let Some(mesh) = scene.lowpoly_meshes.get(&node_id) {
         if !mesh.vertices.is_empty() {
+            if parent_override.is_none() {
+                if let Some(rig) = scene.character_rig.as_ref() {
+                    if let Some(solver) = tessel_core::AutoSkinSolver::from_rig(rig, 1.0) {
+                        let skin_mats = solver.skin_matrices(rig);
+                        let mut wmin = glam::Vec3::splat(f32::INFINITY);
+                        let mut wmax = glam::Vec3::splat(f32::NEG_INFINITY);
+                        for (vi, &v) in mesh.vertices.iter().enumerate() {
+                            let wp = mat.transform_point3(v);
+                            let w =
+                                mesh.skin_weights.get(&vi).copied().unwrap_or_else(|| {
+                                    solver.weights_for_vertex(Some(node_id), wp)
+                                });
+                            let (sp, _) =
+                                solver.deform_point_normal(&skin_mats, w, wp, glam::Vec3::Y);
+                            wmin = wmin.min(sp);
+                            wmax = wmax.max(sp);
+                        }
+                        if wmin.is_finite() && wmax.is_finite() {
+                            return Some((wmin, wmax));
+                        }
+                    }
+                }
+            }
             let (lmin, lmax) = mesh.bounds();
             return Some(transform_aabb(mat, lmin, lmax));
         }

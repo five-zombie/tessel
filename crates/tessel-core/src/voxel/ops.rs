@@ -53,6 +53,7 @@ pub fn box_fill_edits(
     let min_z = min.z.min(max.z);
     let max_z = min.z.max(max.z);
 
+    const MAX_FILL_EDITS: usize = 50_000;
     let mut edits = Vec::new();
     for y in min_y..=max_y {
         for z in min_z..=max_z {
@@ -66,6 +67,9 @@ pub fn box_fill_edits(
                     && z < max_z
                 {
                     continue;
+                }
+                if edits.len() >= MAX_FILL_EDITS {
+                    return edits;
                 }
                 edits.push(VoxelEdit {
                     coord: VoxelCoord::new(x, y, z),
@@ -83,9 +87,13 @@ pub fn ellipsoid_fill_edits(
     radii: [f32; 3],
     color: Option<PaletteIndex>,
 ) -> Vec<VoxelEdit> {
-    let rx = radii[0].max(0.5);
-    let ry = radii[1].max(0.5);
-    let rz = radii[2].max(0.5);
+    if !radii.iter().all(|r| r.is_finite()) {
+        return Vec::new();
+    }
+    const MAX_FILL_EDITS: usize = 50_000;
+    let rx = radii[0].clamp(0.5, 128.0);
+    let ry = radii[1].clamp(0.5, 128.0);
+    let rz = radii[2].clamp(0.5, 128.0);
     let ix = rx.ceil() as i32;
     let iy = ry.ceil() as i32;
     let iz = rz.ceil() as i32;
@@ -98,8 +106,15 @@ pub fn ellipsoid_fill_edits(
                 let ny = dy as f32 / ry;
                 let nz = dz as f32 / rz;
                 if nx * nx + ny * ny + nz * nz <= 1.0 {
+                    if edits.len() >= MAX_FILL_EDITS {
+                        return edits;
+                    }
                     edits.push(VoxelEdit {
-                        coord: VoxelCoord::new(center.x + dx, center.y + dy, center.z + dz),
+                        coord: VoxelCoord::new(
+                            center.x.saturating_add(dx),
+                            center.y.saturating_add(dy),
+                            center.z.saturating_add(dz),
+                        ),
                         color,
                     });
                 }

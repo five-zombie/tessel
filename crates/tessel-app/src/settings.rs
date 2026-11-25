@@ -7,6 +7,18 @@ use tessel_ai::AiProviderKind;
 
 const MAX_RECENT_PROJECTS: usize = 6;
 
+/// Returns the OS-native default export directory: `<home_dir>/tessel-project`
+/// (Linux: `/home/<user>/tessel-project`, macOS: `/Users/<user>/tessel-project`,
+/// Windows: `C:\Users\<user>\tessel-project`).
+pub fn default_export_dir() -> PathBuf {
+    if let Some(user_dirs) = directories::UserDirs::new() {
+        return user_dirs.home_dir().join("tessel-project");
+    }
+    std::env::current_dir()
+        .unwrap_or_else(|_| PathBuf::from("."))
+        .join("tessel-project")
+}
+
 #[derive(Debug, Clone)]
 pub struct AppPaths {
     pub config_dir: PathBuf,
@@ -70,9 +82,7 @@ pub struct AppSettings {
 
 impl Default for AppSettings {
     fn default() -> Self {
-        let allowed_export_dir = std::env::current_dir()
-            .unwrap_or_else(|_| PathBuf::from("."))
-            .join("exports");
+        let allowed_export_dir = default_export_dir();
         let mut provider_profiles = BTreeMap::new();
         for kind in AiProviderKind::ALL {
             provider_profiles.insert(kind, ProviderProfile::default_for(kind));
@@ -105,6 +115,12 @@ impl AppSettings {
                         "Invalid ai_base_url scheme in settings.json; resetting to provider default"
                     );
                     loaded.ai_base_url = loaded.ai_provider.default_base_url().into();
+                }
+                for (&provider, profile) in &mut loaded.provider_profiles {
+                    let pt = profile.base_url.trim();
+                    if !pt.is_empty() && !pt.starts_with("http://") && !pt.starts_with("https://") {
+                        profile.base_url = provider.default_base_url().into();
+                    }
                 }
                 loaded
             }
@@ -211,18 +227,32 @@ pub fn rotate_mcp_token(paths: &AppPaths) -> String {
 fn save_mcp_token(paths: &AppPaths, token: &str) {
     #[cfg(not(test))]
     if let Ok(entry) = keyring::Entry::new("tessel", "mcp_live_token") {
-        let _ = entry.set_password(token);
+        if entry.set_password(token).is_ok() {
+            let _ = fs::remove_file(mcp_token_file(paths));
+            return;
+        }
     }
     let token_path = mcp_token_file(paths);
     if let Some(parent) = token_path.parent() {
         let _ = fs::create_dir_all(parent);
     }
-    if fs::write(&token_path, token).is_ok() {
-        #[cfg(unix)]
+    #[cfg(unix)]
+    {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        if let Ok(mut file) = fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&token_path)
         {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = fs::set_permissions(&token_path, fs::Permissions::from_mode(0o600));
+            let _ = file.write_all(token.as_bytes());
         }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = fs::write(&token_path, token);
     }
 }
 

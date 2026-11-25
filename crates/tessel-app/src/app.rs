@@ -58,6 +58,7 @@ struct StudioState {
     ai_state: ui::inspector::DirectAiUiState,
     command_palette: ui::command_palette::CommandPaletteState,
     quick_start: ui::quick_start::QuickStartState,
+    about_open: bool,
     confirm_new_project: bool,
     confirm_exit: bool,
     quit_confirmed: bool,
@@ -79,6 +80,8 @@ fn camera_state_json(cam: &OrbitCamera) -> serde_json::Value {
         "yaw": cam.yaw,
         "pitch": cam.pitch,
         "distance": cam.distance,
+        "orthographic": cam.orthographic,
+        "fov_deg": cam.fov_y_radians.to_degrees(),
     })
 }
 
@@ -127,7 +130,14 @@ pub fn smooth_step_camera(current: &mut OrbitCamera, target: OrbitCamera, dt: f3
     let dpitch = target.pitch - current.pitch;
     let ddist = target.distance - current.distance;
     let dtarget = target.target - current.target;
-    if dtarget.length() < 1e-4 && dyaw.abs() < 1e-4 && dpitch.abs() < 1e-4 && ddist.abs() < 1e-4 {
+    let dfov = target.fov_y_radians - current.fov_y_radians;
+    current.orthographic = target.orthographic;
+    if dtarget.length() < 1e-4
+        && dyaw.abs() < 1e-4
+        && dpitch.abs() < 1e-4
+        && ddist.abs() < 1e-4
+        && dfov.abs() < 1e-4
+    {
         *current = target;
         return false;
     }
@@ -135,6 +145,7 @@ pub fn smooth_step_camera(current: &mut OrbitCamera, target: OrbitCamera, dt: f3
     current.yaw += dyaw * alpha;
     current.pitch += dpitch * alpha;
     current.distance += ddist * alpha;
+    current.fov_y_radians += dfov * alpha;
     true
 }
 
@@ -222,9 +233,24 @@ fn handle_camera_tool_call(
                 cam.distance = d.clamp(0.25, 120.0);
                 any = true;
             }
+            if let Some(telephoto) = args.get("telephoto").and_then(serde_json::Value::as_bool) {
+                if telephoto {
+                    cam.set_telephoto();
+                } else {
+                    cam.fov_y_radians = 45.0_f32.to_radians();
+                }
+                any = true;
+            }
+            if let Some(ortho) = args
+                .get("orthographic")
+                .and_then(serde_json::Value::as_bool)
+            {
+                cam.set_orthographic(ortho);
+                any = true;
+            }
             if !any {
                 return Err(AiError::InvalidArguments(
-                    "camera_set_pose needs at least one of target, yaw_deg/yaw, pitch_deg/pitch, distance".into(),
+                    "camera_set_pose needs at least one of target, yaw_deg/yaw, pitch_deg/pitch, distance, orthographic, telephoto".into(),
                 ));
             }
             Ok(
@@ -593,7 +619,9 @@ impl Default for StudioState {
                 open: true,
                 has_recovery,
                 error_message: None,
+                example_thumbs: None,
             },
+            about_open: false,
             confirm_new_project: false,
             confirm_exit: false,
             quit_confirmed: false,
@@ -779,14 +807,7 @@ impl GpuState {
         let mut hover_voxel = None;
         let mut active_gizmo_axis = None;
         let mut quick_action = ui::quick_start::QuickStartAction::None;
-        let mut top_actions = ui::top_bar::TopBarActions {
-            open_mcp: false,
-            save_project: false,
-            open_project: false,
-            new_project: false,
-            import_mesh: false,
-            open_settings: false,
-        };
+        let mut top_actions = ui::top_bar::TopBarActions::default();
         let mut toggle_mcp_server = false;
         let mut rotate_mcp = false;
         let mut save_and_quit = false;
@@ -866,6 +887,8 @@ impl GpuState {
             top_actions.new_project |= bar.new_project;
             top_actions.import_mesh |= bar.import_mesh;
             top_actions.open_settings |= bar.open_settings;
+            top_actions.open_welcome |= bar.open_welcome;
+            top_actions.open_about |= bar.open_about;
 
             ui::status_bar::show_status_bar(
                 ctx,
@@ -935,6 +958,7 @@ impl GpuState {
                 &mut studio.quick_start,
                 &studio.settings.recent_projects,
             );
+            ui::quick_start::show_about_dialog(ctx, &mut studio.about_open);
             ui::command_palette::show_command_palette(
                 ctx,
                 &mut studio.command_palette,
@@ -1044,6 +1068,42 @@ impl GpuState {
         });
 
         match quick_action {
+            ui::quick_start::QuickStartAction::OpenExample(example) => {
+                match example.load_copy() {
+                    Ok(loaded) => {
+                        studio.scene = loaded;
+                        studio.history = HistoryStack::new();
+                        studio.camera_3d_target = None;
+                        studio.showcase_camera_target = None;
+                        studio.display_light_azimuth = studio.scene.light_azimuth;
+                        studio.display_light_elevation = studio.scene.light_elevation;
+                        studio.camera_2d.reset();
+                        if let Some((target, yaw_deg, pitch_deg, distance)) = example.camera_pose()
+                        {
+                            studio.camera_3d.target = glam::Vec3::from(target);
+                            studio.camera_3d.yaw = yaw_deg.to_radians();
+                            studio.camera_3d.pitch = pitch_deg.to_radians();
+                            studio.camera_3d.distance = distance;
+                        } else {
+                            studio.camera_3d.reset();
+                        }
+                        studio.pixel_drag_start = None;
+                        studio.gizmo_drag = None;
+                        studio.scene_gadget_drag = None;
+                        studio.export_dialog.status_message = None;
+                        // Keep current_path = None so Ctrl+S always prompts Save As
+                        // and never overwrites the original example file.
+                        studio.project_files.current_path = None;
+                        studio
+                            .project_files
+                            .mark_baseline_revision(studio.scene.revision);
+                    }
+                    Err(err) => {
+                        studio.quick_start.open = true;
+                        studio.quick_start.error_message = Some(err);
+                    }
+                }
+            }
             ui::quick_start::QuickStartAction::RecoverSession => {
                 match studio.project_files.load_recovery_snapshot() {
                     Ok(loaded) => {
@@ -1112,6 +1172,13 @@ impl GpuState {
 
         if top_actions.open_settings {
             studio.settings_dialog.open = true;
+        }
+        if top_actions.open_welcome {
+            studio.quick_start.error_message = None;
+            studio.quick_start.open = true;
+        }
+        if top_actions.open_about {
+            studio.about_open = true;
         }
         if top_actions.import_mesh {
             if let Some(path) = rfd::FileDialog::new()

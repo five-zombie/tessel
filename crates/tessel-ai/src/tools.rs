@@ -21,14 +21,18 @@ pub fn tool_definitions() -> Vec<Value> {
         }),
         json!({
             "name": "palette_set_color",
-            "description": "Add or update a color in the 255-slot palette (1..=255) using either rgb [r,g,b] (0..255) or hex '#RRGGBB'.",
+            "description": "Add or update a color in the 255-slot palette (1..=255) using rgb [r,g,b] or hex '#RRGGBB'/'#RRGGBBAA', with optional alpha, roughness, metallic, and emissive.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "palette_index": { "type": "integer", "minimum": 1, "maximum": 255 },
                     "name": { "type": "string" },
                     "rgb": { "type": "array", "items": { "type": "integer", "minimum": 0, "maximum": 255 }, "minItems": 3, "maxItems": 3 },
-                    "hex": { "type": "string" }
+                    "hex": { "type": "string" },
+                    "alpha": { "type": "integer", "minimum": 0, "maximum": 255 },
+                    "roughness": { "type": "number", "minimum": 0.05, "maximum": 1.0 },
+                    "metallic": { "type": "number", "minimum": 0.0, "maximum": 1.0 },
+                    "emissive": { "type": "number", "minimum": 0.0, "maximum": 10.0 }
                 },
                 "required": ["palette_index"]
             }
@@ -70,7 +74,7 @@ pub fn tool_definitions() -> Vec<Value> {
                     "calls": {
                         "type": "array",
                         "minItems": 1,
-                        "maxItems": 128,
+                        "maxItems": 512,
                         "items": {
                             "type": "object",
                             "properties": {
@@ -82,6 +86,58 @@ pub fn tool_definitions() -> Vec<Value> {
                     }
                 },
                 "required": ["calls"]
+            }
+        }),
+        json!({
+            "name": "scene_create_group",
+            "description": "Create an empty Group / folder node for organizing scene hierarchies (e.g. Trees, Grass, Props) and animating entire subtrees without bones. Exports as a standard glTF 2.0 parent node.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "name": { "type": "string", "description": "Display name for the group node (default 'Group')" },
+                    "position": { "type": "array", "items": { "type": "number" }, "minItems": 3, "maxItems": 3 },
+                    "rotation_deg": { "type": "array", "items": { "type": "number" }, "minItems": 3, "maxItems": 3 },
+                    "scale": { "type": "array", "items": { "type": "number" }, "minItems": 3, "maxItems": 3 },
+                    "parent_node_id": { "type": ["integer", "null"], "minimum": 1 }
+                }
+            }
+        }),
+        json!({
+            "name": "scene_set_node_keyframe",
+            "description": "Animate any scene node's local TRS (position/rotation/scale delta relative to its base transform) directly in an animation clip WITHOUT needing any CharacterRig bones (prevents auto-skinning static props). Supports single keyframe OR bulk 'keyframes': [{ node_id, time_secs, translation?, rotation_deg?, scale?, interpolation? }, ...] in 1 atomic transaction. Works on meshes, voxels, and Group folders; exports as standard glTF 2.0 TRS channels.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "clip_index": { "type": "integer", "minimum": 0 },
+                    "clip_name": { "type": "string" },
+                    "duration_secs": { "type": "number", "minimum": 0.1 },
+                    "node_id": { "type": "integer", "minimum": 1 },
+                    "time_secs": { "type": "number", "minimum": 0.0 },
+                    "translation": { "type": "array", "items": { "type": "number" }, "minItems": 3, "maxItems": 3 },
+                    "rotation_deg": { "type": "array", "items": { "type": "number" }, "minItems": 3, "maxItems": 3 },
+                    "scale": { "type": "array", "items": { "type": "number" }, "minItems": 3, "maxItems": 3 },
+                    "interpolation": { "type": "string", "enum": ["linear", "step", "ease_in", "ease_out", "ease_in_out", "cubic_bezier"] },
+                    "bezier": { "type": "array", "items": { "type": "number" }, "minItems": 4, "maxItems": 4, "description": "Optional [p1x, p1y, p2x, p2y] control points when interpolation is 'cubic_bezier'" },
+                    "keyframes": {
+                        "type": "array",
+                        "minItems": 1,
+                        "maxItems": 2048,
+                        "description": "Optional bulk list of per-node TRS keyframes to upsert atomically into the target clip",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "node_id": { "type": "integer", "minimum": 1 },
+                                "time_secs": { "type": "number", "minimum": 0.0 },
+                                "translation": { "type": "array", "items": { "type": "number" }, "minItems": 3, "maxItems": 3 },
+                                "rotation_deg": { "type": "array", "items": { "type": "number" }, "minItems": 3, "maxItems": 3 },
+                                "scale": { "type": "array", "items": { "type": "number" }, "minItems": 3, "maxItems": 3 },
+                                "interpolation": { "type": "string", "enum": ["linear", "step", "ease_in", "ease_out", "ease_in_out", "cubic_bezier"] },
+                                "bezier": { "type": "array", "items": { "type": "number" }, "minItems": 4, "maxItems": 4 }
+                            },
+                            "required": ["node_id", "time_secs"]
+                        }
+                    }
+                }
             }
         }),
         json!({
@@ -121,32 +177,109 @@ pub fn tool_definitions() -> Vec<Value> {
             }
         }),
         json!({
+            "name": "scene_select_node",
+            "description": "Select an active scene node by node_id (or pass null to clear selection).",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "node_id": { "type": ["integer", "null"], "minimum": 1 }
+                }
+            }
+        }),
+        json!({
+            "name": "voxel_create_volume",
+            "description": "Create a new empty 3D voxel volume node and make it active.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "name": { "type": "string" }
+                }
+            }
+        }),
+        json!({
+            "name": "voxel_set_voxels",
+            "description": "Place or erase individual 3D voxels in the active or specified voxel node. Omit palette_index or pass null to erase. Supports optional X/Y/Z mirror symmetry.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "node_id": { "type": "integer" },
+                    "voxels": {
+                        "type": "array",
+                        "minItems": 1,
+                        "maxItems": 50000,
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "x": { "type": "integer" },
+                                "y": { "type": "integer" },
+                                "z": { "type": "integer" },
+                                "palette_index": { "type": ["integer", "null"], "minimum": 1, "maximum": 255 }
+                            },
+                            "required": ["x", "y", "z"]
+                        }
+                    },
+                    "mirror_x": { "type": "boolean" },
+                    "mirror_y": { "type": "boolean" },
+                    "mirror_z": { "type": "boolean" }
+                },
+                "required": ["voxels"]
+            }
+        }),
+        json!({
+            "name": "voxel_inspect",
+            "description": "Inspect a voxel volume node (voxel count, chunk count, and inclusive min/max bounds) without mutating the scene.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "node_id": { "type": "integer" }
+                }
+            }
+        }),
+        json!({
+            "name": "voxel_import",
+            "description": "Import a MagicaVoxel .vox file from inside the allowed exports directory as a new voxel volume node.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "filename": { "type": "string", "description": "Relative .vox filename inside exports/" },
+                    "name": { "type": "string" }
+                },
+                "required": ["filename"]
+            }
+        }),
+        json!({
             "name": "voxel_fill_box",
-            "description": "Fill an axis-aligned 3D voxel box (solid or hollow) in the active or specified voxel node.",
+            "description": "Fill or carve an axis-aligned 3D voxel box (solid or hollow) in the active or specified voxel node. Pass palette_index: null to erase/carve. Supports mirror_x/y/z.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "node_id": { "type": "integer" },
                     "min": { "type": "array", "items": { "type": "integer" }, "minItems": 3, "maxItems": 3 },
                     "max": { "type": "array", "items": { "type": "integer" }, "minItems": 3, "maxItems": 3 },
-                    "palette_index": { "type": "integer", "minimum": 1, "maximum": 255 },
-                    "hollow": { "type": "boolean" }
+                    "palette_index": { "type": ["integer", "null"], "minimum": 1, "maximum": 255 },
+                    "hollow": { "type": "boolean" },
+                    "mirror_x": { "type": "boolean" },
+                    "mirror_y": { "type": "boolean" },
+                    "mirror_z": { "type": "boolean" }
                 },
-                "required": ["min", "max", "palette_index"]
+                "required": ["min", "max"]
             }
         }),
         json!({
             "name": "voxel_fill_ellipsoid",
-            "description": "Fill a 3D voxel ellipsoid for organic parts (head, torso, boulders).",
+            "description": "Fill or carve a 3D voxel ellipsoid for organic parts (head, torso, boulders). Pass palette_index: null to erase/carve. Supports mirror_x/y/z.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "node_id": { "type": "integer" },
                     "center": { "type": "array", "items": { "type": "integer" }, "minItems": 3, "maxItems": 3 },
                     "radii": { "type": "array", "items": { "type": "number" }, "minItems": 3, "maxItems": 3 },
-                    "palette_index": { "type": "integer", "minimum": 1, "maximum": 255 }
+                    "palette_index": { "type": ["integer", "null"], "minimum": 1, "maximum": 255 },
+                    "mirror_x": { "type": "boolean" },
+                    "mirror_y": { "type": "boolean" },
+                    "mirror_z": { "type": "boolean" }
                 },
-                "required": ["center", "radii", "palette_index"]
+                "required": ["center", "radii"]
             }
         }),
         json!({
@@ -157,6 +290,207 @@ pub fn tool_definitions() -> Vec<Value> {
                 "properties": {
                     "node_id": { "type": "integer" },
                     "name": { "type": "string" }
+                }
+            }
+        }),
+        json!({
+            "name": "pixel_create_canvas",
+            "description": "Create a layered frame-by-frame pixel canvas (default 32x32) with one transparent layer. Each frame owns its own layers; use pixel_add_layer / pixel_add_frame to grow the sprite.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "name": { "type": "string" },
+                    "width": { "type": "integer", "minimum": 1, "maximum": 512 },
+                    "height": { "type": "integer", "minimum": 1, "maximum": 512 }
+                }
+            }
+        }),
+        json!({
+            "name": "pixel_add_layer",
+            "description": "Add a transparent pixel layer on top of a canvas frame. Returns the new layer_id for pixel_draw.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "node_id": { "type": "integer" },
+                    "frame": { "type": "integer", "minimum": 0 },
+                    "name": { "type": "string" }
+                }
+            }
+        }),
+        json!({
+            "name": "pixel_draw",
+            "description": "Paint pixels on one canvas layer (origin top-left). Each entry takes x, y and palette_index (1-255); omit palette_index or pass null to erase. Supports optional mirror_x / mirror_y symmetry.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "node_id": { "type": "integer" },
+                    "frame": { "type": "integer", "minimum": 0 },
+                    "layer_id": { "type": "integer", "minimum": 1 },
+                    "mirror_x": { "type": "boolean" },
+                    "mirror_y": { "type": "boolean" },
+                    "pixels": {
+                        "type": "array",
+                        "minItems": 1,
+                        "maxItems": 16384,
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "x": { "type": "integer", "minimum": 0 },
+                                "y": { "type": "integer", "minimum": 0 },
+                                "palette_index": { "type": ["integer", "null"], "minimum": 1, "maximum": 255 }
+                            },
+                            "required": ["x", "y"]
+                        }
+                    }
+                },
+                "required": ["pixels"]
+            }
+        }),
+        json!({
+            "name": "pixel_set_layer",
+            "description": "Update a pixel layer's visibility and/or opacity (0.0..=1.0) on a canvas frame.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "node_id": { "type": "integer" },
+                    "frame": { "type": "integer", "minimum": 0 },
+                    "layer_id": { "type": "integer", "minimum": 1 },
+                    "visible": { "type": "boolean" },
+                    "opacity": { "type": "number", "minimum": 0.0, "maximum": 1.0 }
+                },
+                "required": ["layer_id"]
+            }
+        }),
+        json!({
+            "name": "pixel_set_onion_skin",
+            "description": "Toggle onion skinning on a pixel canvas.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "node_id": { "type": "integer" },
+                    "enabled": { "type": "boolean" }
+                },
+                "required": ["enabled"]
+            }
+        }),
+        json!({
+            "name": "pixel_flood_fill",
+            "description": "4-connected flood fill starting at (x, y) on a pixel canvas layer. Pass palette_index: null to erase the connected region.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "node_id": { "type": "integer" },
+                    "frame": { "type": "integer", "minimum": 0 },
+                    "layer_id": { "type": "integer", "minimum": 1 },
+                    "x": { "type": "integer", "minimum": 0 },
+                    "y": { "type": "integer", "minimum": 0 },
+                    "palette_index": { "type": ["integer", "null"], "minimum": 1, "maximum": 255 }
+                },
+                "required": ["x", "y"]
+            }
+        }),
+        json!({
+            "name": "pixel_draw_line",
+            "description": "Draw a Bresenham pixel line from start [x,y] to end [x,y] on a pixel canvas layer. Pass palette_index: null to erase. Supports mirror_x / mirror_y.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "node_id": { "type": "integer" },
+                    "frame": { "type": "integer", "minimum": 0 },
+                    "layer_id": { "type": "integer", "minimum": 1 },
+                    "start": { "type": "array", "items": { "type": "integer", "minimum": 0 }, "minItems": 2, "maxItems": 2 },
+                    "end": { "type": "array", "items": { "type": "integer", "minimum": 0 }, "minItems": 2, "maxItems": 2 },
+                    "palette_index": { "type": ["integer", "null"], "minimum": 1, "maximum": 255 },
+                    "mirror_x": { "type": "boolean" },
+                    "mirror_y": { "type": "boolean" }
+                },
+                "required": ["start", "end"]
+            }
+        }),
+        json!({
+            "name": "pixel_draw_rect",
+            "description": "Draw a pixel rectangle (outline or filled) from min [x,y] to max [x,y] on a pixel canvas layer. Pass palette_index: null to erase. Supports mirror_x / mirror_y.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "node_id": { "type": "integer" },
+                    "frame": { "type": "integer", "minimum": 0 },
+                    "layer_id": { "type": "integer", "minimum": 1 },
+                    "min": { "type": "array", "items": { "type": "integer", "minimum": 0 }, "minItems": 2, "maxItems": 2 },
+                    "max": { "type": "array", "items": { "type": "integer", "minimum": 0 }, "minItems": 2, "maxItems": 2 },
+                    "palette_index": { "type": ["integer", "null"], "minimum": 1, "maximum": 255 },
+                    "filled": { "type": "boolean" },
+                    "mirror_x": { "type": "boolean" },
+                    "mirror_y": { "type": "boolean" }
+                },
+                "required": ["min", "max"]
+            }
+        }),
+        json!({
+            "name": "pixel_convert_to_voxel",
+            "description": "Convert a 2D pixel canvas active frame into a 3D extruded voxel volume node.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "node_id": { "type": "integer" },
+                    "depth": { "type": "integer", "minimum": 1, "maximum": 32 },
+                    "name": { "type": "string" }
+                }
+            }
+        }),
+        json!({
+            "name": "pixel_add_frame",
+            "description": "Append a blank animation frame (with one transparent layer) to a pixel canvas and make it active.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "node_id": { "type": "integer" }
+                }
+            }
+        }),
+        json!({
+            "name": "pixel_set_active_frame",
+            "description": "Select which canvas frame is active for drawing, inspection, and single-frame PNG export.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "node_id": { "type": "integer" },
+                    "frame": { "type": "integer", "minimum": 0 }
+                },
+                "required": ["frame"]
+            }
+        }),
+        json!({
+            "name": "pixel_set_fps",
+            "description": "Set canvas playback speed (frames per second, 1-60); controls animated GIF frame delay. Default is 8.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "node_id": { "type": "integer" },
+                    "fps": { "type": "integer", "minimum": 1, "maximum": 60 }
+                },
+                "required": ["fps"]
+            }
+        }),
+        json!({
+            "name": "pixel_inspect",
+            "description": "Report canvas dimensions, fps, frames, and per-frame layers with painted-pixel counts.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "node_id": { "type": "integer" },
+                    "frame": { "type": "integer", "minimum": 0 }
+                }
+            }
+        }),
+        json!({
+            "name": "pixel_export_sprite_sheet",
+            "description": "Pack all canvas frames side-by-side into one PNG sprite sheet inside the export dir and return frame rects with durations.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "node_id": { "type": "integer" },
+                    "filename": { "type": "string" }
                 }
             }
         }),
@@ -180,6 +514,30 @@ pub fn tool_definitions() -> Vec<Value> {
                     "scale": { "type": "array", "items": { "type": "number" }, "minItems": 3, "maxItems": 3 }
                 },
                 "required": ["kind"]
+            }
+        }),
+        json!({
+            "name": "mesh_create_terrain",
+            "description": "Generate a faceted (or smooth) low-poly terrain / diorama mesh centered on X/Z from either an explicit 'heights' grid ((subdiv_x+1)*(subdiv_z+1)) or deterministic seeded 2D fBm noise, with planar UVs, optional 'island_falloff', and elevation-banded 'palette_bands'.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "name": { "type": "string" },
+                    "width": { "type": "number", "minimum": 0.05, "description": "Terrain width along X (default 10.0)" },
+                    "depth": { "type": "number", "minimum": 0.05, "description": "Terrain depth along Z (default 10.0)" },
+                    "subdiv_x": { "type": "integer", "minimum": 1, "maximum": 128, "description": "Grid cells along X (default 16)" },
+                    "subdiv_z": { "type": "integer", "minimum": 1, "maximum": 128, "description": "Grid cells along Z (default 16)" },
+                    "height_scale": { "type": "number", "description": "Vertical amplitude multiplier (default 2.0)" },
+                    "seed": { "type": "integer", "minimum": 0, "description": "Deterministic noise seed (default 42)" },
+                    "octaves": { "type": "integer", "minimum": 1, "maximum": 8, "description": "fBm octaves (default 4)" },
+                    "frequency": { "type": "number", "minimum": 0.001, "description": "Noise spatial frequency (default 0.35)" },
+                    "island_falloff": { "type": "number", "minimum": 0.0, "description": "Radial edge attenuation for island dioramas (default 0.0)" },
+                    "heights": { "type": "array", "items": { "type": "number" }, "description": "Optional explicit heightmap values of length (subdiv_x+1)*(subdiv_z+1)" },
+                    "palette_bands": { "type": "array", "items": { "type": "integer", "minimum": 1, "maximum": 255 }, "description": "Optional elevation-ordered palette indices (low -> high)" },
+                    "palette_index": { "type": "integer", "minimum": 1, "maximum": 255 },
+                    "smooth_shading": { "type": "boolean" },
+                    "position": { "type": "array", "items": { "type": "number" }, "minItems": 3, "maxItems": 3 }
+                }
             }
         }),
         json!({
@@ -334,8 +692,30 @@ pub fn tool_definitions() -> Vec<Value> {
             }
         }),
         json!({
+            "name": "mesh_fill_smart_material",
+            "description": "Generate and apply a procedural Smart Material Lite RGBA texture (base color + curvature-driven convex edge wear + AO/concavity cavity dirt) onto a Low-Poly mesh in one atomic undoable command.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "node_id": { "type": "integer" },
+                    "base_palette_index": { "type": "integer", "minimum": 1, "maximum": 255 },
+                    "edge_palette_index": { "type": "integer", "minimum": 1, "maximum": 255 },
+                    "cavity_palette_index": { "type": "integer", "minimum": 1, "maximum": 255 },
+                    "edge_strength": { "type": "number", "minimum": 0.0, "maximum": 1.0 },
+                    "edge_threshold": { "type": "number", "minimum": 0.5, "maximum": 0.95 },
+                    "cavity_strength": { "type": "number", "minimum": 0.0, "maximum": 1.0 },
+                    "cavity_threshold": { "type": "number", "minimum": 0.05, "maximum": 1.0 },
+                    "ao_darken": { "type": "number", "minimum": 0.0, "maximum": 1.0 },
+                    "resolution": { "type": "integer", "minimum": 16, "maximum": 1024 },
+                    "samples": { "type": "integer", "minimum": 4, "maximum": 64 },
+                    "dilation_px": { "type": "integer", "minimum": 0, "maximum": 16 },
+                    "attach_ao": { "type": "boolean" }
+                }
+            }
+        }),
+        json!({
             "name": "mesh_load_texture",
-            "description": "Load a custom .png or .jpg/.jpeg image texture (e.g. wood bark, fur, fabric from Blender/Poly Haven) from the allowed export/workspace directory onto a Low-Poly mesh.",
+            "description": "Load a custom .png, .jpg/.jpeg, .tga, .tif/.tiff, or .exr image texture (e.g. from TextureCraft/Blender/Poly Haven) from the allowed export/workspace directory onto a Low-Poly mesh.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -347,7 +727,7 @@ pub fn tool_definitions() -> Vec<Value> {
         }),
         json!({
             "name": "mesh_load_normal_map",
-            "description": "Load a tangent-space Normal Map (.png or .jpg) from the allowed export/workspace directory onto a Low-Poly mesh for micro surface detail (skin pores, fabric weave, metal scratches).",
+            "description": "Load a tangent-space Normal Map (.png, .jpg, .tga, .tif/.tiff, or .exr) from the allowed export/workspace directory onto a Low-Poly mesh for micro surface detail (skin pores, fabric weave, metal scratches).",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -358,8 +738,80 @@ pub fn tool_definitions() -> Vec<Value> {
             }
         }),
         json!({
+            "name": "mesh_bake_maps",
+            "description": "Deterministically bake CPU surface maps (Ambient Occlusion, Curvature, Thickness) in UV space for a Low-Poly mesh. Optionally saves PNGs to the export directory and attaches the baked AO map to the mesh for glTF occlusionTexture export.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "node_id": { "type": "integer" },
+                    "maps": {
+                        "type": "array",
+                        "items": { "type": "string", "enum": ["ao", "curvature", "thickness"] }
+                    },
+                    "resolution": { "type": "integer", "minimum": 16, "maximum": 1024 },
+                    "samples": { "type": "integer", "minimum": 4, "maximum": 64 },
+                    "max_distance": { "type": "number", "minimum": 0.001, "maximum": 100.0 },
+                    "bias": { "type": "number", "minimum": 0.00001, "maximum": 1.0 },
+                    "dilation_px": { "type": "integer", "minimum": 0, "maximum": 16 },
+                    "output_prefix": { "type": "string" },
+                    "attach_ao": { "type": "boolean" }
+                }
+            }
+        }),
+        json!({
+            "name": "mesh_layer_add",
+            "description": "Add a non-destructive RGBA paint layer to a Low-Poly mesh and make it active (promotes any existing mesh texture to a 'Base' layer automatically).",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "node_id": { "type": "integer" },
+                    "name": { "type": "string" },
+                    "opacity": { "type": "number", "minimum": 0.0, "maximum": 1.0 },
+                    "palette_index": { "type": "integer", "minimum": 1, "maximum": 255 }
+                }
+            }
+        }),
+        json!({
+            "name": "mesh_layer_set",
+            "description": "Update a non-destructive paint layer's visibility, opacity, name, or active target state and recomposite the mesh texture.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "node_id": { "type": "integer" },
+                    "layer_id": { "type": "integer", "minimum": 1 },
+                    "name": { "type": "string" },
+                    "visible": { "type": "boolean" },
+                    "opacity": { "type": "number", "minimum": 0.0, "maximum": 1.0 },
+                    "active": { "type": "boolean" }
+                },
+                "required": ["layer_id"]
+            }
+        }),
+        json!({
+            "name": "mesh_layer_delete",
+            "description": "Delete a non-destructive paint layer from a Low-Poly mesh and recomposite the remaining layers.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "node_id": { "type": "integer" },
+                    "layer_id": { "type": "integer", "minimum": 1 }
+                },
+                "required": ["layer_id"]
+            }
+        }),
+        json!({
+            "name": "mesh_layer_list",
+            "description": "List all non-destructive paint layers on a Low-Poly mesh with their id, name, visibility, opacity, and active state.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "node_id": { "type": "integer" }
+                }
+            }
+        }),
+        json!({
             "name": "mesh_paint_spot",
-            "description": "Paint a circular spot onto a Low-Poly mesh's auto-UV texture at a 3D surface point+normal (or direct UV), with optional X mirror symmetry.",
+            "description": "Paint a circular spot onto a Low-Poly mesh's RGBA texture at a 3D surface point+normal (or direct UV), with optional X mirror symmetry, seam-crossing 3D brush (`across_seams`/`radius_world`), and camera-ray visibility culling (`camera_pos`) so strokes never bleed onto back-facing or occluded geometry.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -368,6 +820,9 @@ pub fn tool_definitions() -> Vec<Value> {
                     "normal": { "type": "array", "items": { "type": "number" }, "minItems": 3, "maxItems": 3 },
                     "uv": { "type": "array", "items": { "type": "number" }, "minItems": 2, "maxItems": 2 },
                     "radius_px": { "type": "number", "minimum": 1.0, "maximum": 96.0 },
+                    "radius_world": { "type": "number", "minimum": 0.0001, "maximum": 100.0 },
+                    "across_seams": { "type": "boolean" },
+                    "camera_pos": { "type": "array", "items": { "type": "number" }, "minItems": 3, "maxItems": 3 },
                     "palette_index": { "type": "integer", "minimum": 1, "maximum": 255 },
                     "mirror_x": { "type": "boolean" }
                 },
@@ -761,14 +1216,130 @@ pub fn tool_definitions() -> Vec<Value> {
         }),
         json!({
             "name": "mesh_set_material",
-            "description": "Set PBR material properties (metallic 0..1, roughness 0.05..1, emissive [r,g,b] 0..1) on a Low-Poly mesh.",
+            "description": "Set PBR material properties (metallic 0..1, roughness 0.05..1, emissive [r,g,b] 0..1, double_sided, cast_shadow, receive_shadow) on a Low-Poly mesh.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "node_id": { "type": "integer" },
                     "metallic": { "type": "number", "minimum": 0.0, "maximum": 1.0 },
                     "roughness": { "type": "number", "minimum": 0.05, "maximum": 1.0 },
-                    "emissive": { "type": "array", "items": { "type": "number" }, "minItems": 3, "maxItems": 3 }
+                    "emissive": { "type": "array", "items": { "type": "number" }, "minItems": 3, "maxItems": 3 },
+                    "double_sided": { "type": "boolean", "description": "Disable back-face culling on export (glTF doubleSided: true; ideal for thin grass blades, foliage, cloth)" },
+                    "cast_shadow": { "type": "boolean", "description": "Whether this mesh casts shadows into the directional shadow map (default true)" },
+                    "receive_shadow": { "type": "boolean", "description": "Whether this mesh receives shadows from the directional shadow map (default true)" },
+                    "alpha_mode": { "type": "string", "enum": ["opaque", "mask", "blend"], "description": "glTF 2.0 alphaMode (default opaque)" },
+                    "alpha_cutoff": { "type": "number", "minimum": 0.0, "maximum": 1.0, "description": "Alpha cutoff threshold when alpha_mode is 'mask' (default 0.5)" },
+                    "unlit": { "type": "boolean", "description": "Export with glTF KHR_materials_unlit extension for stylized/NPR shading (default false)" }
+                }
+            }
+        }),
+        json!({
+            "name": "mesh_set_vertex_colors",
+            "description": "Set or clear per-vertex RGBA attributes (glTF COLOR_0: R=outline weight, G=shadow bias, B=ink density, A=cavity) on a Low-Poly mesh.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "node_id": { "type": "integer" },
+                    "clear": { "type": "boolean", "description": "Clear all COLOR_0 vertex colors on the mesh" },
+                    "fill": { "type": "array", "items": { "type": "number", "minimum": 0.0, "maximum": 1.0 }, "minItems": 4, "maxItems": 4 },
+                    "updates": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "vertex_id": { "type": "integer", "minimum": 0 },
+                                "rgba": { "type": "array", "items": { "type": "number" }, "minItems": 4, "maxItems": 4 }
+                            },
+                            "required": ["vertex_id", "rgba"]
+                        }
+                    }
+                }
+            }
+        }),
+        json!({
+            "name": "mesh_set_crease_edges",
+            "description": "Tag explicit interior ink-crease edges [[v0, v1], ...] on a Low-Poly mesh for NPR / stylized line-art authoring.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "node_id": { "type": "integer" },
+                    "edges": {
+                        "type": "array",
+                        "items": { "type": "array", "items": { "type": "integer", "minimum": 0 }, "minItems": 2, "maxItems": 2 }
+                    }
+                },
+                "required": ["edges"]
+            }
+        }),
+        json!({
+            "name": "mesh_set_proxy_normals",
+            "description": "Set or clear per-vertex transferred/proxy normals on a low-poly mesh (for clean NPR/anime face shading and smooth outline normals).",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "node_id": { "type": "integer" },
+                    "clear": { "type": "boolean", "description": "Clear existing proxy normals before applying 'normals'" },
+                    "normals": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "vertex_id": { "type": "integer", "minimum": 0 },
+                                "normal": { "type": "array", "items": { "type": "number" }, "minItems": 3, "maxItems": 3 }
+                            },
+                            "required": ["vertex_id", "normal"]
+                        }
+                    }
+                }
+            }
+        }),
+        json!({
+            "name": "character_create_clip",
+            "description": "Create a new empty animation clip on the active character rig without needing to insert a keyframe first.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "name": { "type": "string" },
+                    "duration_secs": { "type": "number", "minimum": 0.05, "maximum": 600.0 },
+                    "activate": { "type": "boolean" }
+                },
+                "required": ["name"]
+            }
+        }),
+        json!({
+            "name": "character_update_clip",
+            "description": "Rename an existing animation clip and/or update its duration_secs.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "clip_index": { "type": "integer", "minimum": 0 },
+                    "clip_name": { "type": "string" },
+                    "name": { "type": "string" },
+                    "duration_secs": { "type": "number", "minimum": 0.05, "maximum": 600.0 }
+                }
+            }
+        }),
+        json!({
+            "name": "viewport_set_shading_mode",
+            "description": "Switch 3D viewport & screenshot shading preview mode between 'pbr' (default), 'npr_sumie' (ink-wash ramp, dark Fresnel rim, inverted-hull outlines, triplanar washi grain, depth ink-fade), 'silhouette_check', and 'luminance_value_check'.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "mode": {
+                        "type": "string",
+                        "enum": ["pbr", "npr_sumie", "silhouette_check", "luminance_value_check"]
+                    }
+                },
+                "required": ["mode"]
+            }
+        }),
+        json!({
+            "name": "mesh_validate_topology",
+            "description": "Validate Low-Poly mesh silhouette hygiene (sliver triangles, degenerate normals, non-manifold edges) and UV texel-density uniformity.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "node_id": { "type": "integer" }
                 }
             }
         }),
@@ -789,14 +1360,15 @@ pub fn tool_definitions() -> Vec<Value> {
         }),
         json!({
             "name": "character_set_bone_rest_position",
-            "description": "Move an existing bone's local rest position [x, y, z] without deleting its subtree.",
+            "description": "Move an existing bone's local rest position [x, y, z] and/or rest rotation_deg [pitch, yaw, roll] without deleting its subtree.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "bone_id": { "type": "integer", "minimum": 0 },
-                    "position": { "type": "array", "items": { "type": "number" }, "minItems": 3, "maxItems": 3 }
+                    "position": { "type": "array", "items": { "type": "number" }, "minItems": 3, "maxItems": 3 },
+                    "rotation_deg": { "type": "array", "items": { "type": "number" }, "minItems": 3, "maxItems": 3 }
                 },
-                "required": ["bone_id", "position"]
+                "required": ["bone_id"]
             }
         }),
         json!({
@@ -880,27 +1452,83 @@ pub fn tool_definitions() -> Vec<Value> {
             }
         }),
         json!({
+            "name": "character_solve_chain_ik",
+            "description": "Solve multi-bone chain IK (CCD) for any parent-child chain of 2..=32 bones (tails, spines, tentacles, limbs) so the end bone reaches target [x,y,z].",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "bone_ids": {
+                        "type": "array",
+                        "items": { "type": "integer", "minimum": 0 },
+                        "minItems": 2,
+                        "maxItems": 32
+                    },
+                    "target": { "type": "array", "items": { "type": "number" }, "minItems": 3, "maxItems": 3 },
+                    "max_iterations": { "type": "integer", "minimum": 1, "maximum": 64 },
+                    "tolerance": { "type": "number", "minimum": 0.0001, "maximum": 1.0 }
+                },
+                "required": ["bone_ids", "target"]
+            }
+        }),
+        json!({
+            "name": "character_set_clip_stepped_fps",
+            "description": "Configure quantized stepped playback FPS (e.g. 8 or 12 FPS on-twos/on-threes) on an animation clip, and optionally bake STEP keyframes for glTF 2.0 export.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "clip_index": { "type": "integer", "minimum": 0 },
+                    "clip_name": { "type": "string" },
+                    "stepped_fps": { "type": ["number", "null"], "minimum": 1.0, "maximum": 60.0 },
+                    "bake_stepped": { "type": "boolean" }
+                }
+            }
+        }),
+        json!({
             "name": "character_clamp_clip_to_floor",
-            "description": "Sample in-between frames of an animation clip at fps and adjust the character Root bone's Y translation keyframes so the character stays flush on floor_y (default 0.0) throughout extreme rotations (e.g. 0° -> 86° fall) without floating or penetrating the floor.",
+            "description": "Sample in-between frames of an animation clip at fps and adjust the character Root bone's Y translation keyframes so the character stays flush on floor_y (default 0.0) or uneven surface meshes/voxels (surface_node_id / surface_node_ids, with overhang clearance, optional solve_foot_ik, align_foot_normal, pelvis_tilt, and custom contact_chains).",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "clip_index": { "type": "integer", "minimum": 0 },
                     "clip_name": { "type": "string" },
                     "bone_prefix": { "type": "string", "description": "Optional sub-skeleton prefix (e.g. 'P2_', default '' for primary character)" },
-                    "floor_y": { "type": "number", "description": "Target floor Y height (default 0.0)" },
-                    "fps": { "type": "number", "minimum": 1, "maximum": 120, "description": "Sub-frame sampling rate (default 24)" }
+                    "floor_y": { "type": "number", "description": "Target flat floor Y height (default 0.0; fallback when outside surface)" },
+                    "fps": { "type": "number", "minimum": 1, "maximum": 120, "description": "Sub-frame sampling rate (default 24)" },
+                    "surface_node_id": { "type": "integer", "minimum": 1, "description": "Optional single terrain/surface mesh or voxel node_id for vertical -Y raycast grounding" },
+                    "surface_node_ids": { "type": "array", "items": { "type": "integer", "minimum": 1 }, "description": "Optional list of multiple surface mesh/voxel node_ids queried simultaneously" },
+                    "solve_foot_ik": { "type": "boolean", "description": "When true with surface target, solves two-bone leg IK on slopes (default false)" },
+                    "align_foot_normal": { "type": "boolean", "description": "When true with surface target, tilts foot/end bones to match surface normal (default false)" },
+                    "pelvis_tilt": { "type": "boolean", "description": "When true, rolls Root bone softly on steep left/right foot elevation deltas (default false)" },
+                    "step_up_clearance": { "type": "number", "minimum": 0.05, "maximum": 20.0, "description": "Local raycast height above foot/root for overhangs/bridges/caves (default 1.0)" },
+                    "footprint_half_length": { "type": "number", "minimum": 0.0, "maximum": 1.0, "description": "Half-length for heel+toe multi-ray footprint sweep (default 0.08; 0.0 = single ray)" },
+                    "contact_chains": {
+                        "type": "array",
+                        "items": { "type": "array", "items": { "type": "integer", "minimum": 1 }, "minItems": 3, "maxItems": 3 },
+                        "description": "Optional explicit [root_bone_id, mid_bone_id, end_bone_id] contact chains for quadruped/custom rigs"
+                    }
                 }
             }
         }),
         json!({
             "name": "character_clamp_to_floor",
-            "description": "Automatically shift a character's Root bone Y position so its lowest deformed joint or bound mesh vertex sits flush on floor_y (default 0.0) without floor penetration.",
+            "description": "Automatically shift a character's Root bone Y position so its lowest skinned mesh vertex (or joint fallback) sits flush on floor_y (default 0.0) or uneven surface meshes/voxels (surface_node_id / surface_node_ids, with overhang clearance, optional solve_foot_ik, align_foot_normal, pelvis_tilt, and custom contact_chains).",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "floor_y": { "type": "number", "description": "Target floor Y height (default 0.0)" },
-                    "bone_prefix": { "type": "string", "description": "Optional sub-skeleton prefix (e.g. 'P2_', default '' for primary character)" }
+                    "floor_y": { "type": "number", "description": "Target flat floor Y height (default 0.0; fallback when outside surface)" },
+                    "bone_prefix": { "type": "string", "description": "Optional sub-skeleton prefix (e.g. 'P2_', default '' for primary character)" },
+                    "surface_node_id": { "type": "integer", "minimum": 1, "description": "Optional single terrain/surface mesh or voxel node_id for vertical -Y raycast grounding" },
+                    "surface_node_ids": { "type": "array", "items": { "type": "integer", "minimum": 1 }, "description": "Optional list of multiple surface mesh/voxel node_ids queried simultaneously" },
+                    "solve_foot_ik": { "type": "boolean", "description": "When true with surface target, solves two-bone leg IK on slopes (default false)" },
+                    "align_foot_normal": { "type": "boolean", "description": "When true with surface target, tilts foot/end bones to match surface normal (default false)" },
+                    "pelvis_tilt": { "type": "boolean", "description": "When true, rolls Root bone softly on steep left/right foot elevation deltas (default false)" },
+                    "step_up_clearance": { "type": "number", "minimum": 0.05, "maximum": 20.0, "description": "Local raycast height above foot/root for overhangs/bridges/caves (default 1.0)" },
+                    "footprint_half_length": { "type": "number", "minimum": 0.0, "maximum": 1.0, "description": "Half-length for heel+toe multi-ray footprint sweep (default 0.08; 0.0 = single ray)" },
+                    "contact_chains": {
+                        "type": "array",
+                        "items": { "type": "array", "items": { "type": "integer", "minimum": 1 }, "minItems": 3, "maxItems": 3 },
+                        "description": "Optional explicit [root_bone_id, mid_bone_id, end_bone_id] contact chains for quadruped/custom rigs"
+                    }
                 }
             }
         }),
@@ -940,7 +1568,7 @@ pub fn tool_definitions() -> Vec<Value> {
         }),
         json!({
             "name": "character_set_keyframe",
-            "description": "Insert or update a bone TRS keyframe in an animation clip (creates clip if clip_name is new). rotation_deg is required (+X pitch tilts FORWARD, -X tilts BACKWARD in character-local space); translation defaults to [0,0,0], scale defaults to [1,1,1], interpolation defaults to 'linear' ('linear'|'step'|'ease_in'|'ease_out'|'ease_in_out').",
+            "description": "Insert or update one or many bone TRS keyframes in an animation clip (creates clip if clip_name is new). Pass either a single keyframe (bone_id, time_secs, rotation_deg) OR bulk 'keyframes': [{ bone_id, time_secs, rotation_deg, translation?, scale?, interpolation? }, ...] in one atomic transaction. +X pitch tilts FORWARD, -X tilts BACKWARD in character-local space.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -952,9 +1580,28 @@ pub fn tool_definitions() -> Vec<Value> {
                     "rotation_deg": { "type": "array", "items": { "type": "number" }, "minItems": 3, "maxItems": 3 },
                     "translation": { "type": "array", "items": { "type": "number" }, "minItems": 3, "maxItems": 3 },
                     "scale": { "type": "array", "items": { "type": "number" }, "minItems": 3, "maxItems": 3 },
-                    "interpolation": { "type": "string", "enum": ["linear", "step", "ease_in", "ease_out", "ease_in_out"] }
-                },
-                "required": ["bone_id", "time_secs", "rotation_deg"]
+                    "interpolation": { "type": "string", "enum": ["linear", "step", "ease_in", "ease_out", "ease_in_out", "cubic_bezier"] },
+                    "bezier": { "type": "array", "items": { "type": "number" }, "minItems": 4, "maxItems": 4, "description": "Optional [p1x, p1y, p2x, p2y] control points when interpolation is 'cubic_bezier'" },
+                    "keyframes": {
+                        "type": "array",
+                        "minItems": 1,
+                        "maxItems": 2048,
+                        "description": "Optional bulk list of keyframes to upsert atomically into the target clip",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "bone_id": { "type": "integer", "minimum": 0 },
+                                "time_secs": { "type": "number", "minimum": 0.0 },
+                                "rotation_deg": { "type": "array", "items": { "type": "number" }, "minItems": 3, "maxItems": 3 },
+                                "translation": { "type": "array", "items": { "type": "number" }, "minItems": 3, "maxItems": 3 },
+                                "scale": { "type": "array", "items": { "type": "number" }, "minItems": 3, "maxItems": 3 },
+                                "interpolation": { "type": "string", "enum": ["linear", "step", "ease_in", "ease_out", "ease_in_out", "cubic_bezier"] },
+                                "bezier": { "type": "array", "items": { "type": "number" }, "minItems": 4, "maxItems": 4 }
+                            },
+                            "required": ["bone_id", "time_secs", "rotation_deg"]
+                        }
+                    }
+                }
             }
         }),
         json!({
@@ -977,7 +1624,7 @@ pub fn tool_definitions() -> Vec<Value> {
         }),
         json!({
             "name": "character_snapshot_pose_to_keyframe",
-            "description": "Bake/snapshot the current live bone pose (e.g. after character_solve_ik or character_clamp_to_floor) into an animation clip at time_secs as a single atomic transaction. Creates the clip automatically if clip_name is new. Supports optional interpolation ('linear'|'step'|'ease_in'|'ease_out'|'ease_in_out').",
+            "description": "Bake/snapshot the current live bone pose (e.g. after character_solve_ik or character_clamp_to_floor) into an animation clip at time_secs as a single atomic transaction. Creates the clip automatically if clip_name is new. Supports optional interpolation ('linear'|'step'|'ease_in'|'ease_out'|'ease_in_out'|'cubic_bezier') and 'bezier': [p1x,p1y,p2x,p2y].",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -986,7 +1633,8 @@ pub fn tool_definitions() -> Vec<Value> {
                     "duration_secs": { "type": "number", "minimum": 0.1 },
                     "time_secs": { "type": "number", "minimum": 0.0 },
                     "bone_ids": { "type": "array", "items": { "type": "integer", "minimum": 0 }, "description": "Optional subset of bone IDs to snapshot (defaults to all bones in the rig)" },
-                    "interpolation": { "type": "string", "enum": ["linear", "step", "ease_in", "ease_out", "ease_in_out"] }
+                    "interpolation": { "type": "string", "enum": ["linear", "step", "ease_in", "ease_out", "ease_in_out", "cubic_bezier"] },
+                    "bezier": { "type": "array", "items": { "type": "number" }, "minItems": 4, "maxItems": 4 }
                 },
                 "required": ["time_secs"]
             }
@@ -1075,15 +1723,15 @@ pub fn tool_definitions() -> Vec<Value> {
         }),
         json!({
             "name": "character_set_playback_time",
-            "description": "Scrub an animation clip to time_secs and immediately apply its bone poses and morph weights to the live viewport for visual inspection or viewport_screenshot.",
+            "description": "Scrub an animation clip to time_secs and/or toggle live viewport play/pause (playing: true/false). Immediately applies bone poses and morph weights in all 3D modes (lowpoly, voxel, character) for live playback or viewport_screenshot.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "clip_index": { "type": "integer", "minimum": 0 },
                     "clip_name": { "type": "string" },
-                    "time_secs": { "type": "number", "minimum": 0.0 }
-                },
-                "required": ["time_secs"]
+                    "time_secs": { "type": "number", "minimum": 0.0 },
+                    "playing": { "type": "boolean", "description": "Optional live viewport play/pause state (defaults to false when scrubbing)" }
+                }
             }
         }),
         json!({
@@ -1129,12 +1777,15 @@ pub fn tool_definitions() -> Vec<Value> {
         }),
         json!({
             "name": "scene_duplicate_node",
-            "description": "Duplicate a scene node (mesh/voxel/pixel payload plus material, inheriting rig bindings) with a +0.5 x offset. Selects the copy.",
+            "description": "Duplicate a scene node (mesh/voxel/pixel payload plus material, inheriting rig bindings). Defaults to a +0.5 X offset unless position is provided; supports optional position, rotation_deg, and scale in one atomic call. Selects the copy.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "node_id": { "type": "integer", "minimum": 1 },
-                    "name": { "type": "string" }
+                    "name": { "type": "string" },
+                    "position": { "type": "array", "items": { "type": "number" }, "minItems": 3, "maxItems": 3 },
+                    "rotation_deg": { "type": "array", "items": { "type": "number" }, "minItems": 3, "maxItems": 3 },
+                    "scale": { "type": "array", "items": { "type": "number" }, "minItems": 3, "maxItems": 3 }
                 }
             }
         }),
@@ -1152,12 +1803,12 @@ pub fn tool_definitions() -> Vec<Value> {
         }),
         json!({
             "name": "mesh_clear_texture",
-            "description": "Clear a low-poly mesh's color texture, normal map, or both (undoable).",
+            "description": "Clear a low-poly mesh's color texture, normal map, ao map, both (color+normal), or all (color+normal+ao) (undoable).",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "node_id": { "type": "integer" },
-                    "target": { "type": "string", "enum": ["color", "normal", "both"] }
+                    "target": { "type": "string", "enum": ["color", "normal", "ao", "both", "all"] }
                 }
             }
         }),
@@ -1228,7 +1879,9 @@ pub fn tool_definitions() -> Vec<Value> {
                     "pitch_deg": { "type": "number" },
                     "yaw": { "type": "number" },
                     "pitch": { "type": "number" },
-                    "distance": { "type": "number", "minimum": 0.25 }
+                    "distance": { "type": "number", "minimum": 0.25 },
+                    "orthographic": { "type": "boolean", "description": "Use orthographic projection (flat perspective for NPR/turnarounds)" },
+                    "telephoto": { "type": "boolean", "description": "Use narrow 22-degree telephoto FOV (false resets to 45 deg)" }
                 }
             }
         }),
@@ -1328,8 +1981,10 @@ pub fn tool_definitions() -> Vec<Value> {
                     "pitch_deg": { "type": "number", "description": "Camera pitch in degrees (e.g. 15)" },
                     "yaw": { "type": "number", "description": "Camera yaw in radians (use yaw_deg for degrees)" },
                     "pitch": { "type": "number", "description": "Camera pitch in radians (use pitch_deg for degrees)" },
-                    "distance": { "type": "number", "minimum": 0 },
-                    "preview": { "type": "boolean" }
+                    "distance": { "type": "number", "minimum": 0.25 },
+                    "preview": { "type": "boolean" },
+                    "orthographic": { "type": "boolean", "description": "Render with orthographic projection" },
+                    "telephoto": { "type": "boolean", "description": "Render with narrow 22-degree telephoto FOV" }
                 }
             }
         }),
@@ -1351,6 +2006,8 @@ pub fn tool_definitions() -> Vec<Value> {
                     "pitch": { "type": "number", "description": "Camera pitch in radians (use pitch_deg for degrees)" },
                     "distance": { "type": "number", "minimum": 0.25 },
                     "preview": { "type": "boolean" },
+                    "orthographic": { "type": "boolean", "description": "Render turntable with orthographic projection" },
+                    "telephoto": { "type": "boolean", "description": "Render turntable with narrow 22-degree telephoto FOV" },
                     "clip_name": { "type": "string" },
                     "clip_index": { "type": "integer", "minimum": 0 }
                 },

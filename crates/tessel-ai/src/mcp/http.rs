@@ -2,15 +2,35 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpListener;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, RwLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
+
+const SLOW_MCP_DISPATCH_MS: u64 = 100;
 
 #[derive(Default)]
 struct McpHttpMetrics {
     requests_total: AtomicU64,
+    requests_completed: AtomicU64,
     requests_rejected: AtomicU64,
     requests_timed_out: AtomicU64,
+    slow_requests_total: AtomicU64,
+    total_latency_us: AtomicU64,
+    max_latency_us: AtomicU64,
+    last_latency_us: AtomicU64,
+}
+
+impl McpHttpMetrics {
+    fn record_latency(&self, elapsed: Duration) {
+        let us = elapsed.as_micros().min(u128::from(u64::MAX)) as u64;
+        self.requests_completed.fetch_add(1, Ordering::Relaxed);
+        self.total_latency_us.fetch_add(us, Ordering::Relaxed);
+        self.last_latency_us.store(us, Ordering::Relaxed);
+        self.max_latency_us.fetch_max(us, Ordering::Relaxed);
+        if elapsed.as_millis() as u64 >= SLOW_MCP_DISPATCH_MS {
+            self.slow_requests_total.fetch_add(1, Ordering::Relaxed);
+        }
+    }
 }
 
 /// Message sent from the local loopback MCP HTTP server to the live GUI main thread.
@@ -55,6 +75,7 @@ impl LiveMcpServerHandle {
                     Ok((mut stream, _)) => {
                         let _ = stream.set_nonblocking(false);
                         let _ = stream.set_read_timeout(Some(Duration::from_secs(3)));
+                        let _ = stream.set_write_timeout(Some(Duration::from_secs(5)));
                         let current_auth = auth_ref.read().map(|g| g.clone()).unwrap_or_default();
                         handle_http_connection(&mut stream, &current_auth, &tx, &metrics_ref);
                     }
@@ -78,9 +99,11 @@ impl LiveMcpServerHandle {
 
     /// Rotates the active bearer token in place without restarting the listening socket.
     pub fn set_token(&mut self, new_token: String) {
-        if let Ok(mut guard) = self.expected_auth.write() {
-            *guard = format!("Bearer {new_token}");
-        }
+        let mut guard = self
+            .expected_auth
+            .write()
+            .unwrap_or_else(|e| e.into_inner());
+        *guard = format!("Bearer {new_token}");
         self.token = new_token;
     }
 
@@ -120,6 +143,31 @@ pub fn generate_local_token() -> String {
     format!("tsl_{:016x}{:08x}", nanos ^ (pid << 32), pid)
 }
 
+const MAX_HTTP_HEADER_LINE_BYTES: u64 = 8 * 1024;
+const MAX_HTTP_HEADERS: usize = 64;
+const MAX_HTTP_READ_DEADLINE: Duration = Duration::from_secs(5);
+
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (&x, &y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
+fn is_loopback_host(host: &str) -> bool {
+    let bare = host
+        .trim()
+        .split(':')
+        .next()
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    matches!(bare.as_str(), "127.0.0.1" | "localhost" | "[::1]")
+}
+
 fn request_timeout_for_payload(payload: &Value) -> Duration {
     let tool_name = payload
         .get("params")
@@ -130,9 +178,19 @@ fn request_timeout_for_payload(payload: &Value) -> Duration {
         "viewport_render_turntable_gif"
         | "viewport_screenshot"
         | "project_export"
-        | "scene_batch" => Duration::from_secs(120),
+        | "scene_batch"
+        | "mesh_bake_maps"
+        | "mesh_fill_smart_material" => Duration::from_secs(120),
         _ => Duration::from_secs(15),
     }
+}
+
+fn read_bounded_line<R: BufRead>(reader: &mut R, out: &mut String) -> std::io::Result<usize> {
+    out.clear();
+    reader
+        .by_ref()
+        .take(MAX_HTTP_HEADER_LINE_BYTES)
+        .read_line(out)
 }
 
 fn handle_http_connection(
@@ -146,22 +204,37 @@ fn handle_http_connection(
     };
     let mut reader = BufReader::new(cloned);
 
+    let read_start = Instant::now();
     let mut request_line = String::new();
-    if reader.read_line(&mut request_line).is_err() {
+    if read_bounded_line(&mut reader, &mut request_line).is_err() {
         return;
     }
-    if request_line.starts_with("GET /health") {
+    if request_line.starts_with("GET /health ") {
+        let completed = metrics.requests_completed.load(Ordering::Relaxed);
+        let total_us = metrics.total_latency_us.load(Ordering::Relaxed);
+        let avg_latency_ms = if completed > 0 {
+            (total_us as f64 / completed as f64) / 1000.0
+        } else {
+            0.0
+        };
+        let max_latency_ms = metrics.max_latency_us.load(Ordering::Relaxed) as f64 / 1000.0;
+        let last_latency_ms = metrics.last_latency_us.load(Ordering::Relaxed) as f64 / 1000.0;
         let health = json!({
             "status": "ok",
             "queue_capacity": MAX_MCP_QUEUE,
             "requests_total": metrics.requests_total.load(Ordering::Relaxed),
+            "requests_completed": completed,
             "requests_rejected": metrics.requests_rejected.load(Ordering::Relaxed),
             "requests_timed_out": metrics.requests_timed_out.load(Ordering::Relaxed),
+            "slow_requests_total": metrics.slow_requests_total.load(Ordering::Relaxed),
+            "avg_latency_ms": avg_latency_ms,
+            "max_latency_ms": max_latency_ms,
+            "last_latency_ms": last_latency_ms,
         });
         write_http(stream, "200 OK", &health.to_string());
         return;
     }
-    if !request_line.starts_with("POST /mcp") {
+    if !request_line.starts_with("POST /mcp ") {
         metrics.requests_rejected.fetch_add(1, Ordering::Relaxed);
         write_http(
             stream,
@@ -174,22 +247,64 @@ fn handle_http_connection(
 
     let mut content_length: usize = 0;
     let mut authorized = false;
+    let mut bad_host_or_origin = false;
+    let mut header_count: usize = 0;
+    let mut header = String::new();
     loop {
-        let mut header = String::new();
-        if reader.read_line(&mut header).is_err() {
+        if read_start.elapsed() > MAX_HTTP_READ_DEADLINE {
+            metrics.requests_timed_out.fetch_add(1, Ordering::Relaxed);
+            write_http(
+                stream,
+                "408 Request Timeout",
+                r#"{"error":"header timeout"}"#,
+            );
+            return;
+        }
+        if read_bounded_line(&mut reader, &mut header).is_err() {
             return;
         }
         let trimmed = header.trim();
         if trimmed.is_empty() {
             break;
         }
+        header_count += 1;
+        if header_count > MAX_HTTP_HEADERS {
+            metrics.requests_rejected.fetch_add(1, Ordering::Relaxed);
+            write_http(
+                stream,
+                "431 Request Header Fields Too Large",
+                r#"{"error":"too many headers"}"#,
+            );
+            return;
+        }
         if let Some((k, v)) = trimmed.split_once(':') {
             if k.eq_ignore_ascii_case("content-length") {
                 content_length = v.trim().parse().unwrap_or(0);
-            } else if k.eq_ignore_ascii_case("authorization") && v.trim() == expected_auth {
+            } else if k.eq_ignore_ascii_case("authorization")
+                && constant_time_eq(v.trim().as_bytes(), expected_auth.as_bytes())
+            {
                 authorized = true;
+            } else if k.eq_ignore_ascii_case("host") && !is_loopback_host(v) {
+                bad_host_or_origin = true;
+            } else if k.eq_ignore_ascii_case("origin") {
+                let origin = v.trim();
+                let ok_origin = origin.starts_with("http://127.0.0.1")
+                    || origin.starts_with("http://localhost");
+                if !ok_origin {
+                    bad_host_or_origin = true;
+                }
             }
         }
+    }
+
+    if bad_host_or_origin {
+        metrics.requests_rejected.fetch_add(1, Ordering::Relaxed);
+        write_http(
+            stream,
+            "403 Forbidden",
+            r#"{"error":"loopback host/origin required"}"#,
+        );
+        return;
     }
 
     if !authorized {
@@ -231,6 +346,14 @@ fn handle_http_connection(
     };
 
     let timeout = request_timeout_for_payload(&payload);
+    let tool_label = payload
+        .get("params")
+        .and_then(|p| p.get("name"))
+        .and_then(Value::as_str)
+        .or_else(|| payload.get("method").and_then(Value::as_str))
+        .unwrap_or("unknown")
+        .to_string();
+    let started = Instant::now();
     let (reply_tx, reply_rx) = mpsc::channel();
     match tx.try_send(LiveMcpRequest { payload, reply_tx }) {
         Ok(()) => {}
@@ -259,11 +382,30 @@ fn handle_http_connection(
     }
 
     match reply_rx.recv_timeout(timeout) {
-        Ok(Some(resp)) => write_http(stream, "200 OK", &resp.to_string()),
-        Ok(None) => write_http(stream, "202 Accepted", "{}"),
+        Ok(Some(resp)) => {
+            let elapsed = started.elapsed();
+            metrics.record_latency(elapsed);
+            let elapsed_ms = elapsed.as_millis() as u64;
+            if elapsed_ms >= SLOW_MCP_DISPATCH_MS {
+                tracing::warn!(
+                    tool = %tool_label,
+                    elapsed_ms,
+                    "Slow live MCP HTTP dispatch on studio main thread"
+                );
+            }
+            write_http(stream, "200 OK", &resp.to_string())
+        }
+        Ok(None) => {
+            metrics.record_latency(started.elapsed());
+            write_http(stream, "202 Accepted", "{}")
+        }
         Err(_) => {
             metrics.requests_timed_out.fetch_add(1, Ordering::Relaxed);
-            tracing::warn!("MCP HTTP request timed out waiting for studio main thread");
+            tracing::warn!(
+                tool = %tool_label,
+                timeout_s = timeout.as_secs(),
+                "MCP HTTP request timed out waiting for studio main thread"
+            );
             write_http(
                 stream,
                 "504 Gateway Timeout",
@@ -337,7 +479,11 @@ mod tests {
         assert!(out3.starts_with("HTTP/1.1 200"));
         assert!(out3.contains("\"status\":\"ok\""));
         assert!(out3.contains("\"requests_total\":2"));
+        assert!(out3.contains("\"requests_completed\":1"));
         assert!(out3.contains("\"requests_rejected\":1"));
+        assert!(out3.contains("\"avg_latency_ms\":"));
+        assert!(out3.contains("\"max_latency_ms\":"));
+        assert!(out3.contains("\"slow_requests_total\":"));
     }
 
     #[test]

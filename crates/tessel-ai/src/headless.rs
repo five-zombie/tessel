@@ -388,6 +388,14 @@ pub fn screenshot_camera(args: &serde_json::Value) -> Result<OrbitCamera, AiErro
         }
         cam.distance = distance.clamp(0.25, 120.0);
     }
+    if let Some(telephoto) = args.get("telephoto").and_then(Value::as_bool) {
+        if telephoto {
+            cam.set_telephoto();
+        }
+    }
+    if let Some(ortho) = args.get("orthographic").and_then(Value::as_bool) {
+        cam.set_orthographic(ortho);
+    }
     Ok(cam)
 }
 
@@ -419,10 +427,19 @@ mod tests {
         let cam_deg = screenshot_camera(&serde_json::json!({
             "yaw_deg": 45.0,
             "pitch_deg": 30.0,
+            "telephoto": true,
         }))
         .unwrap();
         assert!((cam_deg.yaw - 45.0_f32.to_radians()).abs() < 1e-5);
         assert!((cam_deg.pitch - 30.0_f32.to_radians()).abs() < 1e-5);
+        assert!(!cam_deg.orthographic);
+        assert!((cam_deg.fov_y_radians.to_degrees() - 22.0).abs() < 1e-4);
+
+        let cam_ortho = screenshot_camera(&serde_json::json!({
+            "orthographic": true,
+        }))
+        .unwrap();
+        assert!(cam_ortho.orthographic);
     }
 
     #[test]

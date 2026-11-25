@@ -12,6 +12,7 @@ pub struct ProjectFileManager {
     pub current_path: Option<PathBuf>,
     pub recovery_path: PathBuf,
     last_saved_revision: u64,
+    last_autosaved_revision: u64,
     last_observed_revision: u64,
     last_change_at: Instant,
     last_autosave_at: Instant,
@@ -28,6 +29,7 @@ impl Default for ProjectFileManager {
             current_path: None,
             recovery_path,
             last_saved_revision: 0,
+            last_autosaved_revision: 0,
             last_observed_revision: 0,
             last_change_at: now,
             last_autosave_at: now,
@@ -43,6 +45,7 @@ impl ProjectFileManager {
             current_path: None,
             recovery_path,
             last_saved_revision: 0,
+            last_autosaved_revision: 0,
             last_observed_revision: 0,
             last_change_at: now,
             last_autosave_at: now,
@@ -52,6 +55,7 @@ impl ProjectFileManager {
 
     pub fn mark_baseline_revision(&mut self, revision: u64) {
         self.last_saved_revision = revision;
+        self.last_autosaved_revision = revision;
         self.last_observed_revision = revision;
         self.last_change_at = Instant::now();
     }
@@ -125,7 +129,10 @@ impl ProjectFileManager {
             self.last_observed_revision = scene.revision;
             self.last_change_at = now;
         }
-        if self.autosave_paused || scene.revision == self.last_saved_revision {
+        if self.autosave_paused
+            || scene.revision == self.last_saved_revision
+            || scene.revision == self.last_autosaved_revision
+        {
             return;
         }
         if now.duration_since(self.last_change_at) < AUTOSAVE_DEBOUNCE {
@@ -137,7 +144,7 @@ impl ProjectFileManager {
         self.last_autosave_at = now;
         match save_tessel_project_atomic(&self.recovery_path, scene) {
             Ok(()) => {
-                self.last_saved_revision = scene.revision;
+                self.last_autosaved_revision = scene.revision;
             }
             Err(err) => {
                 tracing::warn!("Autosave recovery snapshot failed: {err}");
@@ -198,6 +205,8 @@ mod tests {
         mgr.last_change_at = Instant::now() - (AUTOSAVE_DEBOUNCE + Duration::from_secs(1));
         mgr.tick_autosave(&scene);
         assert!(recovery_path.exists());
+        // Autosave must NOT clear has_unsaved_changes() (Close Guard must remain armed!)
+        assert!(mgr.has_unsaved_changes(scene.revision));
 
         let _ = std::fs::remove_dir_all(&dir);
     }

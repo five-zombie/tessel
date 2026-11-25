@@ -125,19 +125,25 @@ impl VoxelVolume {
         self.dirty_chunks.insert(c);
         let max_i = CHUNK_SIZE - 1;
         if lx == 0 {
-            self.dirty_chunks.insert(ChunkCoord::new(c.x - 1, c.y, c.z));
+            self.dirty_chunks
+                .insert(ChunkCoord::new(c.x.saturating_sub(1), c.y, c.z));
         } else if lx == max_i {
-            self.dirty_chunks.insert(ChunkCoord::new(c.x + 1, c.y, c.z));
+            self.dirty_chunks
+                .insert(ChunkCoord::new(c.x.saturating_add(1), c.y, c.z));
         }
         if ly == 0 {
-            self.dirty_chunks.insert(ChunkCoord::new(c.x, c.y - 1, c.z));
+            self.dirty_chunks
+                .insert(ChunkCoord::new(c.x, c.y.saturating_sub(1), c.z));
         } else if ly == max_i {
-            self.dirty_chunks.insert(ChunkCoord::new(c.x, c.y + 1, c.z));
+            self.dirty_chunks
+                .insert(ChunkCoord::new(c.x, c.y.saturating_add(1), c.z));
         }
         if lz == 0 {
-            self.dirty_chunks.insert(ChunkCoord::new(c.x, c.y, c.z - 1));
+            self.dirty_chunks
+                .insert(ChunkCoord::new(c.x, c.y, c.z.saturating_sub(1)));
         } else if lz == max_i {
-            self.dirty_chunks.insert(ChunkCoord::new(c.x, c.y, c.z + 1));
+            self.dirty_chunks
+                .insert(ChunkCoord::new(c.x, c.y, c.z.saturating_add(1)));
         }
     }
 
@@ -168,9 +174,9 @@ impl VoxelVolume {
         let mut found = false;
 
         for (&cc, chunk) in &self.chunks {
-            let ox = cc.x * (CHUNK_SIZE as i32);
-            let oy = cc.y * (CHUNK_SIZE as i32);
-            let oz = cc.z * (CHUNK_SIZE as i32);
+            let ox = cc.x.saturating_mul(CHUNK_SIZE as i32);
+            let oy = cc.y.saturating_mul(CHUNK_SIZE as i32);
+            let oz = cc.z.saturating_mul(CHUNK_SIZE as i32);
             for y in 0..CHUNK_SIZE {
                 for z in 0..CHUNK_SIZE {
                     for x in 0..CHUNK_SIZE {
@@ -201,9 +207,9 @@ impl VoxelVolume {
     pub fn iter_voxels(&self) -> Vec<(VoxelCoord, PaletteIndex)> {
         let mut out = Vec::with_capacity(self.voxel_count);
         for (&cc, chunk) in &self.chunks {
-            let ox = cc.x * (CHUNK_SIZE as i32);
-            let oy = cc.y * (CHUNK_SIZE as i32);
-            let oz = cc.z * (CHUNK_SIZE as i32);
+            let ox = cc.x.saturating_mul(CHUNK_SIZE as i32);
+            let oy = cc.y.saturating_mul(CHUNK_SIZE as i32);
+            let oz = cc.z.saturating_mul(CHUNK_SIZE as i32);
             for y in 0..CHUNK_SIZE {
                 for z in 0..CHUNK_SIZE {
                     for x in 0..CHUNK_SIZE {
