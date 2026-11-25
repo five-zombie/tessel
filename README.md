@@ -3,22 +3,22 @@
 # TESSEL
 
 **AI-First 2D & 3D Asset Studio in Pure Rust**  
-Create **Pixel**, **Voxel**, **Low-Poly**, and **Rigged Character Animations** — preview in **PBR** or **NPR / *Sumi-e*** — and export game-ready **`.glb`** in seconds.
+Create **Pixel**, **Voxel**, **Low-Poly**, and **Rigged Character Animations** — preview in **PBR** or **NPR / *Sumi-e*** — and export **`.glb`** with engine scale presets.
 
 [![License: Apache-2.0](https://img.shields.io/badge/License-Apache--2.0-orange.svg)](./LICENSE)
 [![Built with Rust](https://img.shields.io/badge/Pure%20Rust-wgpu%20%7C%20egui%20%7C%20winit-DEA584.svg)](https://www.rust-lang.org/)
 [![MCP Tools](https://img.shields.io/badge/MCP%20Tools-138%20Verified-4C8BF5.svg)](#quick-start)
 [![Platforms](https://img.shields.io/badge/Platforms-Linux%20%7C%20Windows%20%7C%20macOS-2EA043.svg)](#download--install)
 
-[**Download Latest Release**](https://github.com/five-zombie/tessel/releases/latest) • [**Showcase Gallery**](#-showcase-gallery-built-100-via-mcp) • [**Available Features**](#-available-features) • [**Quick Start**](#-quick-start)
+[**Download Latest Release**](https://github.com/five-zombie/tessel/releases/latest) • [**Showcase Gallery**](#-showcase-gallery-included-examples) • [**Available Features**](#-available-features) • [**Quick Start**](#-quick-start)
 
 </div>
 
 ---
 
-## 🎨 Showcase Gallery (Built 100% via MCP)
+## 🎨 Showcase Gallery (Included Examples)
 
-Every asset below was created end-to-end inside **Tessel** via MCP and is **bundled directly in the Welcome screen** — click any example on launch to explore, animate, or export as your own copy.
+The assets below are included in the repo and **bundled directly in the Welcome screen** — click any example on launch to explore, animate, or export as your own copy.
 
 <table>
   <tr>
@@ -114,9 +114,9 @@ Every release includes `SHA256SUMS.txt` checksums.
 - **Real-Time Shadows & NPR / *Sumi-e* Pipeline**:
   - **2048×2048 Directional Shadow Map** with *normal-offset bias*, 3×3 PCF, and per-mesh `cast_shadow`/`receive_shadow`.
   - **NPR / *Sumi-e* Foundation & Preview**: `COLOR_0` vertex colors, `AlphaMode::Opaque`/`Mask`/`Blend`, `KHR_materials_unlit`, baked smooth outline normals, `mesh_validate_topology`, automatic UV gutter dilation, `outline_hull.wgsl` inverted-hull outlines, 3-band ink ramp, dark Fresnel rim, triplanar *washi* paper grain, depth ink-fade, Orthographic/Telephoto camera modes, and `silhouette_check` / `luminance_value_check` modes.
-- **Built-In Welcome Showcase & Production Export**:
+- **Built-In Welcome Showcase & Export**:
   - **Welcome to Tessel** launcher ships with all 4 embedded `.tessel` examples (with live thumbnails) that always open as safe untitled copies.
-  - One-click export to **`.glb`** (Godot 4, Unity, Unreal Engine, Three.js, 3D Print presets), `.obj`, `.stl`, `.vox`, `.png`, `.gif`, 3D animated turntable `.gif`, and atomic `.tessel` archives — with an OS-native default output directory (`<home_dir>/tessel-project`) and folder browser.
+  - Export to **`.glb`** (engine scale presets for Godot 4, Unity, Unreal Engine, Three.js, 3D Print), `.obj`, `.stl`, `.vox`, `.png`, `.gif`, 3D animated turntable `.gif`, and atomic `.tessel` archives — with an OS-native default output directory (`<home_dir>/tessel-project`) and folder browser.
 
 ---
 
