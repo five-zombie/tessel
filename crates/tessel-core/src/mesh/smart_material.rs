@@ -178,7 +178,13 @@ mod tests {
     use crate::palette::PaletteIndex;
 
     fn avg_channel(tex: &MeshTexture, ch: usize) -> f32 {
-        let sum: u64 = tex.rgba.chunks_exact(4).map(|px| u64::from(px[ch])).sum();
+        let sum: u64 = tex
+            .rgba
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|px| u64::from(px[ch]))
+            .sum();
         sum as f32 / (tex.width as f32 * tex.height as f32 * 255.0)
     }
 

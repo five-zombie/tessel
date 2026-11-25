@@ -108,7 +108,7 @@ pub fn composite_paint_layers(layers: &[MeshPaintLayer]) -> Option<MeshTexture> 
     }
 
     let mut rgba = Vec::with_capacity(pixel_count * 4);
-    for px in out.chunks_exact(4) {
+    for px in out.as_chunks::<4>().0 {
         rgba.push((px[0].clamp(0.0, 1.0) * 255.0).round() as u8);
         rgba.push((px[1].clamp(0.0, 1.0) * 255.0).round() as u8);
         rgba.push((px[2].clamp(0.0, 1.0) * 255.0).round() as u8);
