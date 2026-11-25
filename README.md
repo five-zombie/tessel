@@ -30,9 +30,10 @@ Every asset below was created end-to-end inside **Tessel** via MCP and is **bund
       <a href="examples/pixel-ronin-fox/ronin_fox_256_sheet.png">sprite sheet</a>
     </td>
     <td align="center" width="50%">
-      <img src="examples/voxel-ramen-tortoise/kame_yatai_turntable.gif" width="260" alt="Kame-Yatai Voxel Tortoise" /><br/>
+      <img src="examples/voxel-ramen-tortoise/kame_yatai_hero.png" width="260" alt="Kame-Yatai Voxel Tortoise" /><br/>
       <strong>Kame-Yatai — Voxel Mode</strong><br/>
       <sub>19,166 voxels • Greedy Meshing + AO • Real Shadows • 360° turntable</sub><br/>
+      <a href="examples/voxel-ramen-tortoise/kame_yatai_turntable.gif">360° gif</a> •
       <a href="examples/voxel-ramen-tortoise/kame_yatai_voxel.tessel">.tessel</a> •
       <a href="examples/voxel-ramen-tortoise/kame_yatai_voxel.vox">.vox</a> •
       <a href="examples/voxel-ramen-tortoise/kame_yatai_voxel.glb">.glb</a>
