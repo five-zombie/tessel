@@ -365,7 +365,7 @@ fn start_card(ui: &mut egui::Ui, icon_glyph: &str, title: &str, subtitle: &str) 
         rect,
         CornerRadius::same(4),
         bg,
-        Stroke::new(1.0, border),
+        Stroke::new(1.0_f32, border),
         egui::StrokeKind::Inside,
     );
 
@@ -435,7 +435,7 @@ fn example_card(
         rect,
         CornerRadius::same(4),
         bg,
-        Stroke::new(1.0, border),
+        Stroke::new(1.0_f32, border),
         egui::StrokeKind::Inside,
     );
 
