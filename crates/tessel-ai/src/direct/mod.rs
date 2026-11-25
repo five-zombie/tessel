@@ -48,12 +48,30 @@ impl AiProviderKind {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct DirectAiConfig {
     pub provider: AiProviderKind,
     pub model: String,
     pub base_url: String,
     pub api_key: String,
+}
+
+impl std::fmt::Debug for DirectAiConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DirectAiConfig")
+            .field("provider", &self.provider)
+            .field("model", &self.model)
+            .field("base_url", &self.base_url)
+            .field(
+                "api_key",
+                &if self.api_key.is_empty() {
+                    "<empty>"
+                } else {
+                    "<redacted>"
+                },
+            )
+            .finish()
+    }
 }
 
 impl Default for DirectAiConfig {
@@ -128,7 +146,11 @@ pub fn parse_openai_tool_calls(message: &Value) -> Result<Vec<PlannedToolCall>, 
             continue;
         };
         let arguments = match func.get("arguments") {
-            Some(Value::String(raw)) => serde_json::from_str(raw).unwrap_or_else(|_| json!({})),
+            Some(Value::String(raw)) => serde_json::from_str(raw).map_err(|e| {
+                AiError::InvalidArguments(format!(
+                    "malformed tool arguments JSON for '{name}': {e}"
+                ))
+            })?,
             Some(other) => other.clone(),
             None => json!({}),
         };
@@ -141,6 +163,7 @@ pub fn parse_openai_tool_calls(message: &Value) -> Result<Vec<PlannedToolCall>, 
 }
 
 /// Resolves the final HTTP endpoint URL for any provider, honoring custom `base_url`.
+/// Gemini API keys are passed via the `x-goog-api-key` header (never in the URL query string).
 pub fn resolve_endpoint(config: &DirectAiConfig) -> String {
     let base = if config.base_url.trim().is_empty() {
         config.provider.default_base_url()
@@ -153,13 +176,33 @@ pub fn resolve_endpoint(config: &DirectAiConfig) -> String {
             base.to_string()
         }
         AiProviderKind::Gemini => {
-            format!(
-                "{base}/models/{}:generateContent?key={}",
-                config.model, config.api_key
-            )
+            format!("{base}/models/{}:generateContent", config.model.trim())
         }
     }
 }
+
+fn validate_direct_ai_config(config: &DirectAiConfig) -> Result<(), AiError> {
+    let base = config.base_url.trim();
+    if !base.is_empty() && !base.starts_with("http://") && !base.starts_with("https://") {
+        return Err(AiError::InvalidArguments(
+            "Direct AI base_url must start with http:// or https://".into(),
+        ));
+    }
+    let model = config.model.trim();
+    if model.is_empty()
+        || model.contains("..")
+        || model
+            .chars()
+            .any(|c| c.is_whitespace() || c.is_control() || matches!(c, '?' | '#' | '&'))
+    {
+        return Err(AiError::InvalidArguments(
+            "Direct AI model contains invalid characters".into(),
+        ));
+    }
+    Ok(())
+}
+
+const MAX_DIRECT_AI_RESPONSE_BYTES: u64 = 4 * 1024 * 1024;
 
 /// Sends a real HTTP chat completion request with Tessel tool definitions attached.
 /// Surfaces real network/auth errors with zero mocking.
@@ -171,6 +214,7 @@ pub async fn send_prompt(
     if config.provider != AiProviderKind::Ollama && config.api_key.trim().is_empty() {
         return Err(AiError::MissingApiKey);
     }
+    validate_direct_ai_config(config)?;
 
     let endpoint = resolve_endpoint(config);
 
@@ -198,6 +242,7 @@ pub async fn send_prompt(
         AiProviderKind::Gemini => {
             client
                 .post(&endpoint)
+                .header("x-goog-api-key", config.api_key.trim())
                 .json(&json!({
                     "system_instruction": { "parts": [{ "text": system_prompt }] },
                     "contents": [{ "parts": [{ "text": user_prompt }] }]
@@ -222,7 +267,21 @@ pub async fn send_prompt(
     };
 
     let status = response.status();
-    let body_text = response.text().await?;
+    if response
+        .content_length()
+        .is_some_and(|len| len > MAX_DIRECT_AI_RESPONSE_BYTES)
+    {
+        return Err(AiError::InvalidArguments(
+            "Direct AI response exceeded 4 MiB safety limit".into(),
+        ));
+    }
+    let body_bytes = response.bytes().await?;
+    if body_bytes.len() as u64 > MAX_DIRECT_AI_RESPONSE_BYTES {
+        return Err(AiError::InvalidArguments(
+            "Direct AI response exceeded 4 MiB safety limit".into(),
+        ));
+    }
+    let body_text = String::from_utf8_lossy(&body_bytes).into_owned();
     tracing::info!(
         provider = ?config.provider,
         model = %config.model,
@@ -315,7 +374,9 @@ mod tests {
         };
         assert_eq!(
             resolve_endpoint(&gemini_default),
-            "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=gk"
+            "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent"
         );
+        // Ensure API key is redacted in Debug output and never placed in URL
+        assert!(!format!("{gemini_default:?}").contains("gk"));
     }
 }

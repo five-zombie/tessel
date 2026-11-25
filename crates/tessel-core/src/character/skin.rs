@@ -298,10 +298,33 @@ impl SkinnedBoundsCache {
     /// Builds a skinned bounds cache for `rig` from all visible, non-overridden low-poly
     /// and voxel meshes in `scene`.
     pub fn from_scene(scene: &SceneState, rig: &CharacterRig) -> Option<Self> {
+        Self::from_scene_excluding(scene, rig, None)
+    }
+
+    /// Builds a skinned bounds cache while optionally excluding a static surface node
+    /// (e.g. a terrain mesh that the character is being grounded onto).
+    pub fn from_scene_excluding(
+        scene: &SceneState,
+        rig: &CharacterRig,
+        exclude_node: Option<NodeId>,
+    ) -> Option<Self> {
+        let excluded: Vec<NodeId> = exclude_node.into_iter().collect();
+        Self::from_scene_excluding_many(scene, rig, &excluded)
+    }
+
+    /// Precomputes skinned vertex weights while excluding multiple surface/terrain nodes.
+    pub fn from_scene_excluding_many(
+        scene: &SceneState,
+        rig: &CharacterRig,
+        excluded_nodes: &[NodeId],
+    ) -> Option<Self> {
         let solver = AutoSkinSolver::from_rig(rig, 1.0)?;
         let mut samples = Vec::new();
 
         let is_skinned_visible = |node_id: NodeId| -> bool {
+            if excluded_nodes.contains(&node_id) {
+                return false;
+            }
             if rig.node_parent_overrides.contains_key(&node_id) {
                 return false;
             }
@@ -315,7 +338,7 @@ impl SkinnedBoundsCache {
             if !is_skinned_visible(node_id) || mesh.vertices.is_empty() {
                 continue;
             }
-            let node_mat = scene.node_world_matrix(node_id);
+            let node_mat = scene.node_rest_world_matrix(node_id);
             samples.reserve(mesh.vertices.len());
             for &v in &mesh.vertices {
                 let wp = node_mat.transform_point3(v);
@@ -332,7 +355,7 @@ impl SkinnedBoundsCache {
             if !is_skinned_visible(node_id) || vol.is_empty() {
                 continue;
             }
-            let node_mat = scene.node_world_matrix(node_id);
+            let node_mat = scene.node_rest_world_matrix(node_id);
             let mesh = greedy_mesh_volume(vol, scene.unit_scale);
             samples.reserve(mesh.vertices.len());
             for v in mesh.vertices {
@@ -349,10 +372,9 @@ impl SkinnedBoundsCache {
         Some(Self { solver, samples })
     }
 
-    /// Evaluates the minimum world-space Y coordinate among all skinned vertices whose
-    /// dominant bone belongs to `bone_prefix`. Returns `None` if no vertices belong to
-    /// that sub-skeleton (callers should fall back to joint positions).
-    pub fn sub_skeleton_min_y(&self, rig: &CharacterRig, bone_prefix: &str) -> Option<f32> {
+    /// Evaluates the world-space position of the lowest skinned vertex whose dominant bone
+    /// belongs to `bone_prefix`.
+    pub fn sub_skeleton_min_point(&self, rig: &CharacterRig, bone_prefix: &str) -> Option<Vec3> {
         if self.samples.is_empty() {
             return None;
         }
@@ -374,7 +396,7 @@ impl SkinnedBoundsCache {
         }
 
         let skin_mats = self.solver.skin_matrices(rig);
-        let mut min_y = f32::INFINITY;
+        let mut min_pt: Option<Vec3> = None;
         for sample in &self.samples {
             if !in_sub
                 .get(usize::from(sample.dominant_joint))
@@ -383,7 +405,7 @@ impl SkinnedBoundsCache {
             {
                 continue;
             }
-            let mut y = 0.0f32;
+            let mut pos = Vec3::ZERO;
             let mut w_sum = 0.0f32;
             for k in 0..4 {
                 let w = sample.weights.weights[k];
@@ -391,21 +413,28 @@ impl SkinnedBoundsCache {
                     continue;
                 }
                 if let Some(&mat) = skin_mats.get(usize::from(sample.weights.joints[k])) {
-                    y += mat.transform_point3(sample.rest_world_pos).y * w;
+                    pos += mat.transform_point3(sample.rest_world_pos) * w;
                     w_sum += w;
                 }
             }
-            let deformed_y = if w_sum <= 1e-6 {
-                sample.rest_world_pos.y
+            let deformed = if w_sum <= 1e-6 {
+                sample.rest_world_pos
             } else {
-                y
+                pos
             };
-            if deformed_y.is_finite() {
-                min_y = min_y.min(deformed_y);
+            if deformed.is_finite() && min_pt.is_none_or(|best| deformed.y < best.y) {
+                min_pt = Some(deformed);
             }
         }
 
-        min_y.is_finite().then_some(min_y)
+        min_pt
+    }
+
+    /// Evaluates the minimum world-space Y coordinate among all skinned vertices whose
+    /// dominant bone belongs to `bone_prefix`. Returns `None` if no vertices belong to
+    /// that sub-skeleton (callers should fall back to joint positions).
+    pub fn sub_skeleton_min_y(&self, rig: &CharacterRig, bone_prefix: &str) -> Option<f32> {
+        self.sub_skeleton_min_point(rig, bone_prefix).map(|p| p.y)
     }
 }
 

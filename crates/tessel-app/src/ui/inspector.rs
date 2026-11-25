@@ -28,10 +28,14 @@ impl DirectAiUiState {
         history: &mut HistoryStack,
         allowed_export_dir: &Path,
     ) {
-        let received = self.pending.as_ref().and_then(|rx| rx.try_recv().ok());
-        let Some(result) = received else {
-            return;
+        let received = match self.pending.as_ref().map(|rx| rx.try_recv()) {
+            Some(Ok(res)) => res,
+            Some(Err(mpsc::TryRecvError::Disconnected)) => {
+                Err("Direct AI worker disconnected unexpectedly".into())
+            }
+            _ => return,
         };
+        let result = received;
         self.pending = None;
         self.cancel_handle = None;
 

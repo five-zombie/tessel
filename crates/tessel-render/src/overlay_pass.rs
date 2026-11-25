@@ -161,35 +161,93 @@ impl OverlayPass {
                 }
             }
             AppMode::LowPoly => {
+                let skin_solver = scene
+                    .character_rig
+                    .as_ref()
+                    .and_then(|r| tessel_core::AutoSkinSolver::from_rig(r, 1.0));
+                let skin_mats = skin_solver
+                    .as_ref()
+                    .zip(scene.character_rig.as_ref())
+                    .map(|(solver, rig)| solver.skin_matrices(rig));
+                let rig_pose_mats = scene
+                    .character_rig
+                    .as_ref()
+                    .filter(|r| !r.node_parent_overrides.is_empty())
+                    .map(|r| (r.world_pose_matrices(), r.world_rest_matrices()));
+
                 for (node_id, mesh) in &scene.lowpoly_meshes {
-                    let node_mat = scene
-                        .nodes
-                        .get(node_id)
-                        .map(|n| {
-                            glam::Mat4::from_scale_rotation_translation(
-                                n.transform.scale,
-                                n.transform.rotation,
-                                n.transform.translation,
+                    let visible = scene
+                        .character_rig
+                        .as_ref()
+                        .and_then(|r| r.node_visibility.get(node_id).copied())
+                        .unwrap_or_else(|| {
+                            scene.nodes.get(node_id).map(|n| n.visible).unwrap_or(true)
+                        });
+                    if !visible || mesh.faces.is_empty() {
+                        continue;
+                    }
+                    let base_node_mat = scene.node_world_matrix(*node_id);
+                    let parent_override = scene
+                        .character_rig
+                        .as_ref()
+                        .and_then(|r| r.node_parent_overrides.get(node_id).copied());
+                    let node_mat = match (parent_override, &rig_pose_mats) {
+                        (Some(ps_key), Some((world_mats, rest_mats))) => {
+                            tessel_core::CharacterRig::compute_node_override_matrix(
+                                ps_key,
+                                base_node_mat,
+                                world_mats,
+                                rest_mats,
                             )
-                        })
-                        .unwrap_or(glam::Mat4::IDENTITY);
+                        }
+                        _ => base_node_mat,
+                    };
+                    let skip_skin = parent_override.is_some();
+
+                    let mut world_verts: Vec<Vec3> = Vec::with_capacity(mesh.vertices.len());
+                    for (vi, &v) in mesh.vertices.iter().enumerate() {
+                        let mut lv = v;
+                        if let Some(rig) = scene.character_rig.as_ref() {
+                            for morph in &mesh.morphs {
+                                let w = rig
+                                    .morph_weights
+                                    .get(&(*node_id, morph.name.clone()))
+                                    .copied()
+                                    .unwrap_or(0.0);
+                                if w.abs() > 1e-5 {
+                                    if let Some(&delta) = morph.deltas.get(&vi) {
+                                        lv += delta * w;
+                                    }
+                                }
+                            }
+                        }
+                        let mut wp = node_mat.transform_point3(lv);
+                        if !skip_skin {
+                            if let (Some(solver), Some(mats)) = (&skin_solver, &skin_mats) {
+                                let w = mesh.skin_weights.get(&vi).copied().unwrap_or_else(|| {
+                                    solver.weights_for_vertex(Some(*node_id), wp)
+                                });
+                                let (sp, _) = solver.deform_point_normal(mats, w, wp, Vec3::Y);
+                                wp = sp;
+                            }
+                        }
+                        world_verts.push(wp);
+                    }
+
                     for (fi, face) in mesh.faces.iter().enumerate() {
-                        let color = if scene.selected_face == Some(tessel_core::FaceId(fi)) {
+                        let color = if scene.selected_node == Some(*node_id)
+                            && scene.selected_face == Some(tessel_core::FaceId(fi))
+                        {
                             amber
                         } else {
                             wire_color
                         };
                         let n = face.vertices.len();
                         for i in 0..n {
-                            let a = mesh.vertices.get(face.vertices[i]);
-                            let b = mesh.vertices.get(face.vertices[(i + 1) % n]);
+                            let a = world_verts.get(face.vertices[i]);
+                            let b = world_verts.get(face.vertices[(i + 1) % n]);
                             if let (Some(&pa), Some(&pb)) = (a, b) {
-                                push_line(
-                                    &mut lines,
-                                    node_mat.transform_point3(pa),
-                                    node_mat.transform_point3(pb),
-                                    color,
-                                );
+                                push_line(&mut lines, pa, pb, color);
                             }
                         }
                     }
@@ -242,8 +300,11 @@ impl OverlayPass {
 
         if scene.active_mode != AppMode::Pixel {
             if let Some(selected_id) = scene.selected_node {
-                if let Some(node) = scene.nodes.get(&selected_id) {
-                    push_move_gizmo(&mut lines, node.transform.translation, active_gizmo_axis);
+                if scene.nodes.contains_key(&selected_id) {
+                    let world_origin = scene
+                        .node_world_matrix(selected_id)
+                        .transform_point3(Vec3::ZERO);
+                    push_move_gizmo(&mut lines, world_origin, active_gizmo_axis);
                 }
             }
             push_light_direction_indicator(&mut lines, scene.light_azimuth, scene.light_elevation);
@@ -381,9 +442,9 @@ fn push_light_direction_indicator(out: &mut Vec<OverlayVertex>, azimuth: f32, el
     // Arrowhead pointing toward origin
     let inward = -dir;
     let ortho_a = if inward.y.abs() < 0.9 {
-        inward.cross(Vec3::Y).normalize()
+        inward.cross(Vec3::Y).normalize_or_zero()
     } else {
-        inward.cross(Vec3::X).normalize()
+        inward.cross(Vec3::X).normalize_or_zero()
     };
     let back = tip - inward * 0.1;
     push_line(out, tip, back + ortho_a * 0.04, sun_color);

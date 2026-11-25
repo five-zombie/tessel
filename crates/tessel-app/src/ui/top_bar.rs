@@ -4,6 +4,7 @@ use tessel_core::{AppMode, Command, HistoryStack, SceneState};
 use super::icons::{self, ToolIcon};
 use super::theme::tokens;
 
+#[derive(Default)]
 pub struct TopBarActions {
     pub open_mcp: bool,
     pub save_project: bool,
@@ -11,6 +12,8 @@ pub struct TopBarActions {
     pub new_project: bool,
     pub import_mesh: bool,
     pub open_settings: bool,
+    pub open_welcome: bool,
+    pub open_about: bool,
 }
 
 pub fn show_top_bar(
@@ -21,14 +24,7 @@ pub fn show_top_bar(
     export_open: &mut bool,
     mcp_port: Option<u16>,
 ) -> TopBarActions {
-    let mut actions = TopBarActions {
-        open_mcp: false,
-        save_project: false,
-        open_project: false,
-        new_project: false,
-        import_mesh: false,
-        open_settings: false,
-    };
+    let mut actions = TopBarActions::default();
     let frame = Frame::NONE
         .fill(tokens::SURFACE_LOW)
         .inner_margin(Margin::symmetric(12, 6))
@@ -111,6 +107,23 @@ pub fn show_top_bar(
                     if ui.add(export_btn).clicked() {
                         *export_open = true;
                     }
+                    let help_btn = ui.menu_button(
+                        RichText::new(egui_phosphor::regular::QUESTION)
+                            .size(16.0)
+                            .color(tokens::ON_SURFACE),
+                        |ui| {
+                            ui.set_min_width(140.0);
+                            if ui.button("Welcome").clicked() {
+                                actions.open_welcome = true;
+                                ui.close_menu();
+                            }
+                            if ui.button("About Tessel").clicked() {
+                                actions.open_about = true;
+                                ui.close_menu();
+                            }
+                        },
+                    );
+                    help_btn.response.on_hover_text("Help (Welcome & About)");
                     if icons::hud_icon_button(ui, ToolIcon::Settings, "Settings", false) {
                         actions.open_settings = true;
                     }

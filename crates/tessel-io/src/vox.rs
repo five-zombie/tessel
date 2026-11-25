@@ -7,12 +7,18 @@ pub fn export_vox_bytes(volume: &VoxelVolume, palette: &Palette) -> Result<Vec<u
     let Some((min_b, max_b)) = volume.bounds() else {
         return Err(IoError::EmptyCanvas);
     };
-    let size_x = (max_b.x - min_b.x + 1) as u32;
-    let size_y = (max_b.y - min_b.y + 1) as u32;
-    let size_z = (max_b.z - min_b.z + 1) as u32;
-    if size_x > 256 || size_y > 256 || size_z > 256 {
-        return Err(IoError::InvalidDimensions(size_x, size_y));
+    let dx = i64::from(max_b.x) - i64::from(min_b.x) + 1;
+    let dy = i64::from(max_b.y) - i64::from(min_b.y) + 1;
+    let dz = i64::from(max_b.z) - i64::from(min_b.z) + 1;
+    if dx <= 0 || dy <= 0 || dz <= 0 || dx > 256 || dy > 256 || dz > 256 {
+        return Err(IoError::InvalidDimensions(
+            dx.clamp(0, u32::MAX as i64) as u32,
+            dy.clamp(0, u32::MAX as i64) as u32,
+        ));
     }
+    let size_x = dx as u32;
+    let size_y = dy as u32;
+    let size_z = dz as u32;
 
     // MagicaVoxel uses Z-up; map Tessel (X, Y-up, Z) -> MagicaVoxel (X, Z, Y)
     let mut size_chunk = Vec::with_capacity(12);
@@ -75,15 +81,20 @@ pub fn import_vox_bytes(bytes: &[u8]) -> Result<(VoxelVolume, Palette), IoError>
     }
     let main_content = read_u32_le(bytes, offset + 4)? as usize;
     let main_children = read_u32_le(bytes, offset + 8)? as usize;
-    offset += 12 + main_content;
-    let end = (offset + main_children).min(bytes.len());
+    offset = offset
+        .checked_add(12)
+        .and_then(|o| o.checked_add(main_content))
+        .ok_or_else(|| IoError::InvalidFormat("VOX MAIN chunk offset overflow".into()))?;
+    let end = offset.saturating_add(main_children).min(bytes.len());
 
-    while offset + 12 <= end {
+    while offset.saturating_add(12) <= end {
         let id = &bytes[offset..offset + 4];
         let content_len = read_u32_le(bytes, offset + 4)? as usize;
         let children_len = read_u32_le(bytes, offset + 8)? as usize;
         let content_start = offset + 12;
-        let content_end = content_start + content_len;
+        let Some(content_end) = content_start.checked_add(content_len) else {
+            break;
+        };
         if content_end > end {
             break;
         }
@@ -91,12 +102,11 @@ pub fn import_vox_bytes(bytes: &[u8]) -> Result<(VoxelVolume, Palette), IoError>
 
         match id {
             b"XYZI" if content.len() >= 4 => {
-                let count = read_u32_le(content, 0)? as usize;
+                let raw_count = read_u32_le(content, 0)? as usize;
+                let max_count = (content.len() - 4) / 4;
+                let count = raw_count.min(max_count);
                 for i in 0..count {
                     let base = 4 + i * 4;
-                    if base + 4 > content.len() {
-                        break;
-                    }
                     let vx = i32::from(content[base]);
                     let vz = i32::from(content[base + 1]);
                     let vy = i32::from(content[base + 2]);
@@ -134,7 +144,10 @@ pub fn import_vox_bytes(bytes: &[u8]) -> Result<(VoxelVolume, Palette), IoError>
             _ => {}
         }
 
-        offset = content_end + children_len;
+        let Some(next_offset) = content_end.checked_add(children_len) else {
+            break;
+        };
+        offset = next_offset;
     }
 
     Ok((volume, palette))

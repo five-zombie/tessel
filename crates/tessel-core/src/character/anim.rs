@@ -86,6 +86,9 @@ pub struct AnimationClip {
     pub parent_switch_tracks: Vec<ParentSwitchTrack>,
     #[serde(default)]
     pub node_transform_tracks: Vec<NodeTransformTrack>,
+    /// Optional quantized playback FPS (e.g. `Some(12.0)` for animated-on-twos pose stepping).
+    #[serde(default)]
+    pub stepped_fps: Option<f32>,
 }
 
 impl AnimationClip {
@@ -98,7 +101,66 @@ impl AnimationClip {
             visibility_tracks: Vec::new(),
             parent_switch_tracks: Vec::new(),
             node_transform_tracks: Vec::new(),
+            stepped_fps: None,
         }
+    }
+
+    /// Quantizes `time_secs` when `stepped_fps` is configured (enables 8/12 FPS stepped poses
+    /// while the viewport camera continues rendering smoothly at 60 FPS).
+    pub fn effective_time(&self, time_secs: f32) -> f32 {
+        let t = time_secs.max(0.0);
+        match self.stepped_fps {
+            Some(fps) if fps.is_finite() && fps > 0.0 => (t * fps).floor() / fps,
+            _ => t,
+        }
+    }
+
+    /// Resamples all bone and node transform tracks at `fps` into `KeyframeInterpolation::Step`
+    /// keyframes for 1:1 glTF 2.0 `STEP` stepped-animation export.
+    pub fn bake_stepped(&self, fps: f32) -> Self {
+        let safe_fps = if fps.is_finite() {
+            fps.clamp(1.0, 60.0)
+        } else {
+            12.0
+        };
+        let duration = if self.duration_secs.is_finite() {
+            self.duration_secs.clamp(0.05, 600.0)
+        } else {
+            1.0
+        };
+        let steps = ((duration * safe_fps).round() as usize).clamp(1, 2048);
+
+        let mut src = self.clone();
+        src.stepped_fps = None;
+
+        let mut baked = Self::new_empty(self.name.clone(), duration);
+        baked.stepped_fps = Some(safe_fps);
+        baked.visibility_tracks = self.visibility_tracks.clone();
+        baked.parent_switch_tracks = self.parent_switch_tracks.clone();
+
+        for step in 0..=steps {
+            let t = if step == steps {
+                duration
+            } else {
+                (step as f32 / steps as f32) * duration
+            };
+            for ch in &src.channels {
+                if let Some(mut kf) = src.sample_bone(ch.bone_id, t) {
+                    kf.time_secs = t;
+                    kf.interpolation = super::nano::KeyframeInterpolation::Step;
+                    baked.upsert_keyframe(ch.bone_id, kf);
+                }
+            }
+            for (node, mut kf) in src.sample_node_transforms(t) {
+                kf.time_secs = t;
+                kf.interpolation = super::nano::KeyframeInterpolation::Step;
+                baked.upsert_node_transform_key(node, kf);
+            }
+            for (node, target, weight) in src.sample_morph_weights(t) {
+                baked.upsert_morph_weight(node, &target, t, weight);
+            }
+        }
+        baked
     }
 
     /// Starter 19-bone humanoid Idle animation (subtle breathing + head/arm relaxation).
@@ -306,6 +368,7 @@ impl AnimationClip {
 
     /// Samples every morph track at `time_secs` (linear interp, clamped ends).
     pub fn sample_morph_weights(&self, time_secs: f32) -> Vec<(NodeId, String, f32)> {
+        let time_secs = self.effective_time(time_secs);
         let mut out = Vec::with_capacity(self.morph_tracks.len());
         for track in &self.morph_tracks {
             if track.keys.is_empty() {
@@ -319,7 +382,7 @@ impl AnimationClip {
                 let mut w = track.keys.last().map(|k| k.weight).unwrap_or(0.0);
                 for pair in track.keys.windows(2) {
                     let (a, b) = (pair[0], pair[1]);
-                    if time_secs >= a.time_secs && time_secs <= b.time_secs {
+                    if time_secs >= a.time_secs && time_secs < b.time_secs {
                         let span = (b.time_secs - a.time_secs).max(1e-5);
                         let alpha = ((time_secs - a.time_secs) / span).clamp(0.0, 1.0);
                         w = a.weight + (b.weight - a.weight) * alpha;
@@ -368,6 +431,7 @@ impl AnimationClip {
 
     /// Samples every node visibility track at `time_secs` (step hold from latest key <= time_secs).
     pub fn sample_node_visibility(&self, time_secs: f32) -> Vec<(NodeId, bool)> {
+        let time_secs = self.effective_time(time_secs);
         let mut out = Vec::with_capacity(self.visibility_tracks.len());
         for track in &self.visibility_tracks {
             let Some(first) = track.keys.first() else {
@@ -426,6 +490,7 @@ impl AnimationClip {
     /// (including two detached `None` world-space keys for weapon drop / grenade throw arcs),
     /// and step-switches when changing parent bones.
     pub fn sample_parent_switches(&self, time_secs: f32) -> Vec<(NodeId, ParentSwitchKey)> {
+        let time_secs = self.effective_time(time_secs);
         let mut out = Vec::with_capacity(self.parent_switch_tracks.len());
         for track in &self.parent_switch_tracks {
             let Some(first) = track.keys.first().copied() else {
@@ -443,7 +508,7 @@ impl AnimationClip {
             let mut sampled = last;
             for pair in track.keys.windows(2) {
                 let (a, b) = (pair[0], pair[1]);
-                if time_secs >= a.time_secs && time_secs <= b.time_secs {
+                if time_secs >= a.time_secs && time_secs < b.time_secs {
                     if a.bone_id == b.bone_id {
                         let span = (b.time_secs - a.time_secs).max(1e-5);
                         let alpha = ((time_secs - a.time_secs) / span).clamp(0.0, 1.0);
@@ -502,6 +567,7 @@ impl AnimationClip {
 
     /// Samples every per-node transform track at `time_secs`.
     pub fn sample_node_transforms(&self, time_secs: f32) -> Vec<(NodeId, Keyframe)> {
+        let time_secs = self.effective_time(time_secs);
         let mut out = Vec::with_capacity(self.node_transform_tracks.len());
         for track in &self.node_transform_tracks {
             let Some(&first) = track.keyframes.first() else {
@@ -519,7 +585,7 @@ impl AnimationClip {
             let mut sampled = last;
             for pair in track.keyframes.windows(2) {
                 let (a, b) = (pair[0], pair[1]);
-                if time_secs >= a.time_secs && time_secs <= b.time_secs {
+                if time_secs >= a.time_secs && time_secs < b.time_secs {
                     let span = (b.time_secs - a.time_secs).max(1e-5);
                     let alpha = ((time_secs - a.time_secs) / span).clamp(0.0, 1.0);
                     let eased = a.interpolation.apply(alpha);
@@ -552,6 +618,7 @@ impl AnimationClip {
     }
 
     pub fn sample_bone(&self, bone_id: BoneId, time_secs: f32) -> Option<Keyframe> {
+        let time_secs = self.effective_time(time_secs);
         let channel = self.channels.iter().find(|c| c.bone_id == bone_id)?;
         if channel.keyframes.is_empty() {
             return None;
@@ -591,6 +658,7 @@ impl AnimationClip {
             visibility_tracks: Vec::new(),
             parent_switch_tracks: Vec::new(),
             node_transform_tracks: Vec::new(),
+            stepped_fps: None,
             channels: vec![BoneChannel {
                 bone_id: BoneId(1), // Torso subtle breathing
                 keyframes: vec![
@@ -630,6 +698,7 @@ impl AnimationClip {
             visibility_tracks: Vec::new(),
             parent_switch_tracks: Vec::new(),
             node_transform_tracks: Vec::new(),
+            stepped_fps: None,
             channels: vec![
                 BoneChannel {
                     bone_id: BoneId(3), // LeftArm
@@ -741,5 +810,53 @@ mod tests {
         assert_eq!(clip.remove_morph_weight(node, "Smile", 0.0), Some(0.0));
         assert_eq!(clip.remove_morph_weight(node, "Smile", 0.5), Some(0.9));
         assert!(clip.morph_tracks.is_empty());
+    }
+
+    #[test]
+    fn cubic_bezier_and_stepped_fps_quantize_and_bake() {
+        use crate::character::KeyframeInterpolation;
+
+        let mut clip = AnimationClip::new_empty("InkSlash", 1.0);
+        clip.stepped_fps = Some(8.0);
+        clip.upsert_keyframe(
+            BoneId(1),
+            Keyframe {
+                time_secs: 0.0,
+                translation: Vec3::ZERO,
+                rotation: Quat::IDENTITY,
+                scale: Vec3::ONE,
+                interpolation: KeyframeInterpolation::CubicBezier {
+                    p1x: 0.25,
+                    p1y: 0.1,
+                    p2x: 0.25,
+                    p2y: 1.0,
+                },
+            },
+        );
+        clip.upsert_keyframe(
+            BoneId(1),
+            Keyframe {
+                time_secs: 1.0,
+                translation: Vec3::new(0.0, 1.0, 0.0),
+                rotation: Quat::IDENTITY,
+                scale: Vec3::ONE,
+                interpolation: KeyframeInterpolation::Linear,
+            },
+        );
+        // Quantized at 8 FPS (0.125s steps): t=0.05 and t=0.10 both snap to 0.0s.
+        let s0 = clip.sample_bone(BoneId(1), 0.05).unwrap();
+        let s1 = clip.sample_bone(BoneId(1), 0.10).unwrap();
+        assert!((s0.translation.y - s1.translation.y).abs() < 1e-6);
+        // At t=0.25s (step 2), ease-out cubic bezier should be well ahead of linear 0.25.
+        let s2 = clip.sample_bone(BoneId(1), 0.25).unwrap();
+        assert!(s2.translation.y > 0.35);
+
+        let baked = clip.bake_stepped(8.0);
+        assert_eq!(baked.channels.len(), 1);
+        assert!(baked.channels[0].keyframes.len() >= 8);
+        assert!(baked.channels[0]
+            .keyframes
+            .iter()
+            .all(|k| k.interpolation == KeyframeInterpolation::Step));
     }
 }

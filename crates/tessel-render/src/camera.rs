@@ -46,6 +46,7 @@ pub struct OrbitCamera {
     pub fov_y_radians: f32,
     pub near: f32,
     pub far: f32,
+    pub orthographic: bool,
 }
 
 impl OrbitCamera {
@@ -58,7 +59,17 @@ impl OrbitCamera {
             fov_y_radians: 45.0_f32.to_radians(),
             near: 0.05,
             far: 200.0,
+            orthographic: false,
         }
+    }
+
+    pub fn set_orthographic(&mut self, orthographic: bool) {
+        self.orthographic = orthographic;
+    }
+
+    pub fn set_telephoto(&mut self) {
+        self.orthographic = false;
+        self.fov_y_radians = 22.0_f32.to_radians();
     }
 
     pub fn reset(&mut self) {
@@ -129,7 +140,13 @@ impl OrbitCamera {
     pub fn view_proj(&self, aspect: f32) -> Mat4 {
         let safe_aspect = aspect.max(0.01);
         let view = Mat4::look_at_rh(self.position(), self.target, Vec3::Y);
-        let proj = Mat4::perspective_rh(self.fov_y_radians, safe_aspect, self.near, self.far);
+        let proj = if self.orthographic {
+            let half_h = (self.distance * (self.fov_y_radians * 0.5).tan()).max(0.25);
+            let half_w = half_h * safe_aspect;
+            Mat4::orthographic_rh(-half_w, half_w, -half_h, half_h, -self.far * 0.5, self.far)
+        } else {
+            Mat4::perspective_rh(self.fov_y_radians, safe_aspect, self.near, self.far)
+        };
         proj * view
     }
 
@@ -242,5 +259,15 @@ mod tests {
         assert!(vp.is_finite());
         assert!(vp.inverse().is_finite());
         assert!(cam.distance >= MIN_DISTANCE && cam.distance <= MAX_DISTANCE);
+
+        cam.set_orthographic(true);
+        let ortho_vp = cam.view_proj(16.0 / 9.0);
+        assert!(ortho_vp.is_finite());
+        assert!(ortho_vp.inverse().is_finite());
+
+        cam.set_telephoto();
+        assert!(!cam.orthographic);
+        assert!((cam.fov_y_radians.to_degrees() - 22.0).abs() < 1e-4);
+        assert!(cam.view_proj(16.0 / 9.0).is_finite());
     }
 }

@@ -44,14 +44,23 @@ impl HistoryStack {
 
     pub fn undo(&mut self, scene: &mut SceneState) -> Result<(), CoreError> {
         let record = self.undo_stack.pop().ok_or(CoreError::EmptyHistory)?;
-        record.delta.revert(scene)?;
+        if let Err(err) = record.delta.revert(scene) {
+            self.undo_stack.push(record);
+            return Err(err);
+        }
         self.redo_stack.push(record.command);
         Ok(())
     }
 
     pub fn redo(&mut self, scene: &mut SceneState) -> Result<(), CoreError> {
         let command = self.redo_stack.pop().ok_or(CoreError::EmptyHistory)?;
-        let delta = command.apply(scene)?;
+        let delta = match command.apply(scene) {
+            Ok(d) => d,
+            Err(err) => {
+                self.redo_stack.push(command);
+                return Err(err);
+            }
+        };
         self.undo_stack.push(HistoryRecord { command, delta });
         Ok(())
     }

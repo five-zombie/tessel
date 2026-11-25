@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use glam::Vec3;
+use serde::{Deserialize, Serialize};
 
 use crate::character::VertexSkinWeights;
 use crate::error::CoreError;
@@ -13,6 +14,191 @@ use super::nano::{FaceId, PrimitiveKind};
 
 /// Minimum primitive size allowed by [`create_primitive`] (5 mm).
 pub const MIN_PRIMITIVE_SIZE: f32 = 0.005;
+
+/// Parameters for procedural low-poly heightmap / fBm noise terrain generation.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TerrainParams {
+    pub width: f32,
+    pub depth: f32,
+    pub subdiv_x: u32,
+    pub subdiv_z: u32,
+    pub height_scale: f32,
+    pub seed: u64,
+    pub octaves: u32,
+    pub frequency: f32,
+    pub island_falloff: f32,
+    pub heights: Option<Vec<f32>>,
+    pub palette_bands: Vec<PaletteIndex>,
+    pub default_material: PaletteIndex,
+    pub smooth_shading: bool,
+}
+
+/// Generates a faceted (or smooth) low-poly terrain mesh centered on X/Z from an explicit
+/// heightmap (`heights`) or deterministic seeded 2D fBm noise, with planar UVs and optional
+/// elevation-banded palette coloring.
+pub fn create_terrain_mesh(params: &TerrainParams) -> Result<LowPolyMesh, CoreError> {
+    if !params.width.is_finite()
+        || params.width < MIN_PRIMITIVE_SIZE
+        || !params.depth.is_finite()
+        || params.depth < MIN_PRIMITIVE_SIZE
+        || !params.height_scale.is_finite()
+        || !params.frequency.is_finite()
+        || params.frequency <= 0.0
+        || !params.island_falloff.is_finite()
+        || params.island_falloff < 0.0
+    {
+        return Err(CoreError::OutOfBounds);
+    }
+
+    let sx = params.subdiv_x.clamp(1, 128) as usize;
+    let sz = params.subdiv_z.clamp(1, 128) as usize;
+    let cols = sx + 1;
+    let rows = sz + 1;
+    let total_verts = cols * rows;
+
+    if let Some(ref h) = params.heights {
+        if h.len() != total_verts || h.iter().any(|v| !v.is_finite()) {
+            return Err(CoreError::OutOfBounds);
+        }
+    }
+
+    let octaves = params.octaves.clamp(1, 8);
+    let half_w = params.width * 0.5;
+    let half_d = params.depth * 0.5;
+
+    let mut vertices = Vec::with_capacity(total_verts);
+    let mut uvs = Vec::with_capacity(total_verts);
+    let mut min_y = f32::INFINITY;
+    let mut max_y = f32::NEG_INFINITY;
+
+    for iz in 0..rows {
+        let v = iz as f32 / sz as f32;
+        let z = -half_d + v * params.depth;
+        for ix in 0..cols {
+            let u = ix as f32 / sx as f32;
+            let x = -half_w + u * params.width;
+            let raw_h = if let Some(ref h) = params.heights {
+                h[iz * cols + ix]
+            } else {
+                let nx = x * params.frequency;
+                let nz = z * params.frequency;
+                let mut n = terrain_fbm_2d(nx, nz, params.seed, octaves);
+                if params.island_falloff > 0.0 {
+                    let rx = u * 2.0 - 1.0;
+                    let rz = v * 2.0 - 1.0;
+                    let r_sq = rx * rx + rz * rz;
+                    let mask = (1.0 - r_sq * params.island_falloff).clamp(0.0, 1.0);
+                    n *= mask;
+                }
+                n
+            };
+            let y = raw_h * params.height_scale;
+            min_y = min_y.min(y);
+            max_y = max_y.max(y);
+            vertices.push(Vec3::new(x, y, z));
+            uvs.push([u, v]);
+        }
+    }
+
+    let y_span = (max_y - min_y).max(1e-5);
+    let pick_material = |a: usize, b: usize, c: usize| -> PaletteIndex {
+        if params.palette_bands.is_empty() {
+            return params.default_material;
+        }
+        let avg_y = (vertices[a].y + vertices[b].y + vertices[c].y) / 3.0;
+        let t = ((avg_y - min_y) / y_span).clamp(0.0, 1.0);
+        let idx = ((t * (params.palette_bands.len() - 1) as f32).round() as usize)
+            .min(params.palette_bands.len() - 1);
+        params.palette_bands[idx]
+    };
+
+    let mut faces = Vec::with_capacity(sx * sz * 2);
+    for iz in 0..sz {
+        for ix in 0..sx {
+            let i00 = iz * cols + ix;
+            let i10 = i00 + 1;
+            let i01 = (iz + 1) * cols + ix;
+            let i11 = i01 + 1;
+
+            let tris = if (ix + iz) % 2 == 0 {
+                [[i01, i11, i10], [i01, i10, i00]]
+            } else {
+                [[i01, i11, i00], [i11, i10, i00]]
+            };
+            for [a, b, c] in tris {
+                let mat = pick_material(a, b, c);
+                faces.push(Face {
+                    vertices: vec![a, b, c],
+                    uvs: vec![uvs[a], uvs[b], uvs[c]],
+                    material: mat,
+                });
+            }
+        }
+    }
+
+    Ok(LowPolyMesh {
+        vertices,
+        faces,
+        texture: None,
+        normal_map: None,
+        ao_map: None,
+        paint_layers: Vec::new(),
+        active_paint_layer: None,
+        vertex_colors: BTreeMap::new(),
+        crease_edges: Vec::new(),
+        proxy_normals: BTreeMap::new(),
+        smooth_shading: params.smooth_shading,
+        material: Default::default(),
+        skin_weights: BTreeMap::new(),
+        morphs: Default::default(),
+    })
+}
+
+fn terrain_hash_2d(ix: i32, iz: i32, seed: u64) -> f32 {
+    let mut h = seed ^ ((ix as i64 as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15));
+    h ^= (iz as i64 as u64).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    h = (h ^ (h >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    h = (h ^ (h >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    h ^= h >> 31;
+    ((h >> 40) as f32) / ((1u32 << 24) as f32)
+}
+
+fn terrain_value_noise_2d(x: f32, z: f32, seed: u64) -> f32 {
+    let ix = x.floor() as i32;
+    let iz = z.floor() as i32;
+    let fx = x - ix as f32;
+    let fz = z - iz as f32;
+    let ux = fx * fx * (3.0 - 2.0 * fx);
+    let uz = fz * fz * (3.0 - 2.0 * fz);
+
+    let a = terrain_hash_2d(ix, iz, seed);
+    let b = terrain_hash_2d(ix.wrapping_add(1), iz, seed);
+    let c = terrain_hash_2d(ix, iz.wrapping_add(1), seed);
+    let d = terrain_hash_2d(ix.wrapping_add(1), iz.wrapping_add(1), seed);
+
+    let ab = a + (b - a) * ux;
+    let cd = c + (d - c) * ux;
+    ab + (cd - ab) * uz
+}
+
+fn terrain_fbm_2d(x: f32, z: f32, seed: u64, octaves: u32) -> f32 {
+    let mut sum = 0.0f32;
+    let mut amp = 0.5f32;
+    let mut freq = 1.0f32;
+    let mut norm = 0.0f32;
+    for o in 0..octaves {
+        let s = seed.wrapping_add((o as u64).wrapping_mul(0x517C_C1B7_2722_0A95));
+        sum += terrain_value_noise_2d(x * freq, z * freq, s) * amp;
+        norm += amp;
+        amp *= 0.5;
+        freq *= 2.0;
+    }
+    if norm > 0.0 {
+        sum / norm
+    } else {
+        0.0
+    }
+}
 
 /// Generates a starter low-poly primitive mesh centered on X/Z with base at Y = 0.
 pub fn create_primitive(kind: PrimitiveKind, size: f32, material: PaletteIndex) -> LowPolyMesh {
@@ -47,6 +233,12 @@ pub fn create_primitive(kind: PrimitiveKind, size: f32, material: PaletteIndex) 
                 faces,
                 texture: None,
                 normal_map: None,
+                ao_map: None,
+                paint_layers: Vec::new(),
+                active_paint_layer: None,
+                vertex_colors: BTreeMap::new(),
+                crease_edges: Vec::new(),
+                proxy_normals: BTreeMap::new(),
                 smooth_shading: false,
                 material: Default::default(),
                 skin_weights: BTreeMap::new(),
@@ -66,6 +258,12 @@ pub fn create_primitive(kind: PrimitiveKind, size: f32, material: PaletteIndex) 
                 faces,
                 texture: None,
                 normal_map: None,
+                ao_map: None,
+                paint_layers: Vec::new(),
+                active_paint_layer: None,
+                vertex_colors: BTreeMap::new(),
+                crease_edges: Vec::new(),
+                proxy_normals: BTreeMap::new(),
                 smooth_shading: false,
                 material: Default::default(),
                 skin_weights: BTreeMap::new(),
@@ -116,6 +314,12 @@ fn create_cylinder(
         faces,
         texture: None,
         normal_map: None,
+        ao_map: None,
+        paint_layers: Vec::new(),
+        active_paint_layer: None,
+        vertex_colors: BTreeMap::new(),
+        crease_edges: Vec::new(),
+        proxy_normals: BTreeMap::new(),
         smooth_shading: false,
         material: Default::default(),
         skin_weights: BTreeMap::new(),
@@ -145,6 +349,12 @@ fn create_cone(segments: usize, radius: f32, height: f32, material: PaletteIndex
         faces,
         texture: None,
         normal_map: None,
+        ao_map: None,
+        paint_layers: Vec::new(),
+        active_paint_layer: None,
+        vertex_colors: BTreeMap::new(),
+        crease_edges: Vec::new(),
+        proxy_normals: BTreeMap::new(),
         smooth_shading: false,
         material: Default::default(),
         skin_weights: BTreeMap::new(),
@@ -202,6 +412,12 @@ fn create_uv_sphere(
         faces,
         texture: None,
         normal_map: None,
+        ao_map: None,
+        paint_layers: Vec::new(),
+        active_paint_layer: None,
+        vertex_colors: BTreeMap::new(),
+        crease_edges: Vec::new(),
+        proxy_normals: BTreeMap::new(),
         smooth_shading: true,
         material: Default::default(),
         skin_weights: BTreeMap::new(),
@@ -244,6 +460,12 @@ fn create_torus(
         faces,
         texture: None,
         normal_map: None,
+        ao_map: None,
+        paint_layers: Vec::new(),
+        active_paint_layer: None,
+        vertex_colors: BTreeMap::new(),
+        crease_edges: Vec::new(),
+        proxy_normals: BTreeMap::new(),
         smooth_shading: true,
         material: Default::default(),
         skin_weights: BTreeMap::new(),
@@ -318,6 +540,12 @@ fn create_capsule(
         faces,
         texture: None,
         normal_map: None,
+        ao_map: None,
+        paint_layers: Vec::new(),
+        active_paint_layer: None,
+        vertex_colors: BTreeMap::new(),
+        crease_edges: Vec::new(),
+        proxy_normals: BTreeMap::new(),
         smooth_shading: true,
         material: Default::default(),
         skin_weights: BTreeMap::new(),
@@ -417,6 +645,12 @@ pub fn create_curve_tube(
         morphs: Default::default(),
         texture: None,
         normal_map: None,
+        ao_map: None,
+        paint_layers: Vec::new(),
+        active_paint_layer: None,
+        vertex_colors: BTreeMap::new(),
+        crease_edges: Vec::new(),
+        proxy_normals: BTreeMap::new(),
         smooth_shading: true,
         material: Default::default(),
     })
@@ -529,6 +763,12 @@ pub fn create_lathe_mesh(
         morphs: Default::default(),
         texture: None,
         normal_map: None,
+        ao_map: None,
+        paint_layers: Vec::new(),
+        active_paint_layer: None,
+        vertex_colors: BTreeMap::new(),
+        crease_edges: Vec::new(),
+        proxy_normals: BTreeMap::new(),
         smooth_shading: false,
         material: Default::default(),
     })
@@ -595,6 +835,12 @@ pub fn create_extruded_polygon(
         morphs: Default::default(),
         texture: None,
         normal_map: None,
+        ao_map: None,
+        paint_layers: Vec::new(),
+        active_paint_layer: None,
+        vertex_colors: BTreeMap::new(),
+        crease_edges: Vec::new(),
+        proxy_normals: BTreeMap::new(),
         smooth_shading: false,
         material: Default::default(),
     })
@@ -668,6 +914,12 @@ pub fn create_loft_mesh(
         morphs: Default::default(),
         texture: None,
         normal_map: None,
+        ao_map: None,
+        paint_layers: Vec::new(),
+        active_paint_layer: None,
+        vertex_colors: BTreeMap::new(),
+        crease_edges: Vec::new(),
+        proxy_normals: BTreeMap::new(),
         smooth_shading: false,
         material: Default::default(),
     })
@@ -742,6 +994,12 @@ pub fn decimate_mesh(mesh: &LowPolyMesh, target_ratio: f32) -> Result<LowPolyMes
         faces: new_faces,
         texture: mesh.texture.clone(),
         normal_map: mesh.normal_map.clone(),
+        ao_map: mesh.ao_map.clone(),
+        paint_layers: mesh.paint_layers.clone(),
+        active_paint_layer: mesh.active_paint_layer,
+        vertex_colors: BTreeMap::new(),
+        crease_edges: Vec::new(),
+        proxy_normals: BTreeMap::new(),
         smooth_shading: mesh.smooth_shading,
         material: mesh.material,
         skin_weights: BTreeMap::new(),
@@ -928,11 +1186,12 @@ pub fn add_morph_delta(
     let target = match next.morphs.iter_mut().find(|m| m.name == name) {
         Some(t) => t,
         None => {
+            let idx = next.morphs.len();
             next.morphs.push(MorphTarget {
                 name: name.to_string(),
                 deltas: BTreeMap::new(),
             });
-            next.morphs.last_mut().expect("just pushed")
+            &mut next.morphs[idx]
         }
     };
     for vi in unique_verts {
@@ -1153,6 +1412,12 @@ pub fn bevel_mesh(mesh: &LowPolyMesh, amount: f32) -> Result<LowPolyMesh, CoreEr
         faces: new_faces,
         texture: mesh.texture.clone(),
         normal_map: mesh.normal_map.clone(),
+        ao_map: mesh.ao_map.clone(),
+        paint_layers: mesh.paint_layers.clone(),
+        active_paint_layer: mesh.active_paint_layer,
+        vertex_colors: BTreeMap::new(),
+        crease_edges: Vec::new(),
+        proxy_normals: BTreeMap::new(),
         smooth_shading: mesh.smooth_shading,
         material: mesh.material,
         skin_weights: BTreeMap::new(),
@@ -1292,6 +1557,12 @@ pub fn smooth_subdivide_mesh(mesh: &LowPolyMesh) -> Result<LowPolyMesh, CoreErro
         faces: new_faces,
         texture: mesh.texture.clone(),
         normal_map: mesh.normal_map.clone(),
+        ao_map: mesh.ao_map.clone(),
+        paint_layers: mesh.paint_layers.clone(),
+        active_paint_layer: mesh.active_paint_layer,
+        vertex_colors: BTreeMap::new(),
+        crease_edges: Vec::new(),
+        proxy_normals: BTreeMap::new(),
         smooth_shading: mesh.smooth_shading,
         material: mesh.material,
         skin_weights: BTreeMap::new(),
@@ -1337,6 +1608,12 @@ pub fn voxel_to_lowpoly(volume: &VoxelVolume, unit_scale: f32) -> LowPolyMesh {
         morphs: Default::default(),
         texture: None,
         normal_map: None,
+        ao_map: None,
+        paint_layers: Vec::new(),
+        active_paint_layer: None,
+        vertex_colors: BTreeMap::new(),
+        crease_edges: Vec::new(),
+        proxy_normals: BTreeMap::new(),
         smooth_shading: false,
         material: Default::default(),
     }
@@ -1377,6 +1654,12 @@ pub fn create_raw_mesh(
         faces,
         texture: None,
         normal_map: None,
+        ao_map: None,
+        paint_layers: Vec::new(),
+        active_paint_layer: None,
+        vertex_colors: BTreeMap::new(),
+        crease_edges: Vec::new(),
+        proxy_normals: BTreeMap::new(),
         smooth_shading,
         material: Default::default(),
         skin_weights: BTreeMap::new(),
@@ -1591,6 +1874,12 @@ pub fn join_meshes(
         faces,
         texture: first.texture.clone(),
         normal_map: first.normal_map.clone(),
+        ao_map: first.ao_map.clone(),
+        paint_layers: first.paint_layers.clone(),
+        active_paint_layer: first.active_paint_layer,
+        vertex_colors: first.vertex_colors.clone(),
+        crease_edges: first.crease_edges.clone(),
+        proxy_normals: first.proxy_normals.clone(),
         smooth_shading: first.smooth_shading,
         material: first.material,
         skin_weights: BTreeMap::new(),
@@ -1836,6 +2125,9 @@ pub fn weld_vertices(
     if removed > 0 {
         out.skin_weights.clear();
         out.morphs.clear();
+        out.vertex_colors.clear();
+        out.crease_edges.clear();
+        out.proxy_normals.clear();
     }
     Ok((out, removed))
 }

@@ -7,6 +7,8 @@ use crate::character::VertexSkinWeights;
 use crate::palette::PaletteIndex;
 
 use super::face::Face;
+use super::layer::{composite_paint_layers, MeshPaintLayer};
+use super::npr::AlphaMode;
 use super::texture::{box_atlas_uv, MeshTexture};
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -27,6 +29,10 @@ pub struct TriangulatedMesh {
     pub source_indices: Vec<usize>,
 }
 
+fn default_true() -> bool {
+    true
+}
+
 /// Sub-Unit: PBR surface material properties for a `LowPolyMesh` (rendered live & exported to `.glb`).
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct MeshMaterial {
@@ -35,6 +41,14 @@ pub struct MeshMaterial {
     pub emissive: [f32; 3],
     #[serde(default)]
     pub double_sided: bool,
+    #[serde(default = "default_true")]
+    pub cast_shadow: bool,
+    #[serde(default = "default_true")]
+    pub receive_shadow: bool,
+    #[serde(default)]
+    pub alpha_mode: AlphaMode,
+    #[serde(default)]
+    pub unlit: bool,
 }
 
 impl Default for MeshMaterial {
@@ -44,6 +58,10 @@ impl Default for MeshMaterial {
             roughness: 0.85,
             emissive: [0.0, 0.0, 0.0],
             double_sided: false,
+            cast_shadow: true,
+            receive_shadow: true,
+            alpha_mode: AlphaMode::Opaque,
+            unlit: false,
         }
     }
 }
@@ -69,6 +87,8 @@ pub struct LowPolyMesh {
     #[serde(default)]
     pub normal_map: Option<MeshTexture>,
     #[serde(default)]
+    pub ao_map: Option<MeshTexture>,
+    #[serde(default)]
     pub smooth_shading: bool,
     #[serde(default)]
     pub material: MeshMaterial,
@@ -82,11 +102,56 @@ pub struct LowPolyMesh {
     /// Named morph targets (blend shapes) as sparse per-vertex deltas.
     #[serde(default)]
     pub morphs: Vec<MorphTarget>,
+    /// Optional non-destructive RGBA paint layer stack; when non-empty, `texture` holds the composited result.
+    #[serde(default)]
+    pub paint_layers: Vec<MeshPaintLayer>,
+    /// Active target layer id for paint commands when `paint_layers` is non-empty.
+    #[serde(default)]
+    pub active_paint_layer: Option<u32>,
+    /// Sparse per-vertex RGBA attributes (`COLOR_0` glTF: R=outline weight, G=shadow bias, B=ink density, A=cavity).
+    #[serde(default)]
+    pub vertex_colors: BTreeMap<usize, [f32; 4]>,
+    /// Explicit interior ink-crease edges `(vertex_a, vertex_b)` for NPR / stylized line art.
+    #[serde(default)]
+    pub crease_edges: Vec<(usize, usize)>,
+    /// Optional custom/proxy vertex normals (e.g. transferred sphere normals for clean anime/sumi-e faces).
+    #[serde(default)]
+    pub proxy_normals: BTreeMap<usize, Vec3>,
 }
 
 impl LowPolyMesh {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Recomputes the flattened `texture` cache from `paint_layers` when layers exist.
+    pub fn recomposite_paint_layers(&mut self) {
+        if !self.paint_layers.is_empty() {
+            self.texture = composite_paint_layers(&self.paint_layers);
+        }
+    }
+
+    /// Returns the index of the currently active paint layer (falling back to the top layer).
+    pub fn active_paint_layer_index(&self) -> Option<usize> {
+        if self.paint_layers.is_empty() {
+            return None;
+        }
+        if let Some(active_id) = self.active_paint_layer {
+            if let Some(pos) = self.paint_layers.iter().position(|l| l.id == active_id) {
+                return Some(pos);
+            }
+        }
+        Some(self.paint_layers.len() - 1)
+    }
+
+    /// Allocates the next monotonically increasing paint layer ID.
+    pub fn next_paint_layer_id(&self) -> u32 {
+        self.paint_layers
+            .iter()
+            .map(|l| l.id)
+            .max()
+            .unwrap_or(0)
+            .saturating_add(1)
     }
 
     pub fn bounds(&self) -> (Vec3, Vec3) {
@@ -176,24 +241,22 @@ impl LowPolyMesh {
                 if face_normal.length_squared() < 1e-8 {
                     continue;
                 }
-                let n0 = smooth_normals
-                    .as_ref()
-                    .and_then(|sn| sn.get(i0).copied())
-                    .filter(|n| n.length_squared() > 1e-6)
-                    .unwrap_or(face_normal)
-                    .to_array();
-                let n1 = smooth_normals
-                    .as_ref()
-                    .and_then(|sn| sn.get(i1).copied())
-                    .filter(|n| n.length_squared() > 1e-6)
-                    .unwrap_or(face_normal)
-                    .to_array();
-                let n2 = smooth_normals
-                    .as_ref()
-                    .and_then(|sn| sn.get(i2).copied())
-                    .filter(|n| n.length_squared() > 1e-6)
-                    .unwrap_or(face_normal)
-                    .to_array();
+                let resolve_n = |vi: usize| -> [f32; 3] {
+                    if let Some(&pn) = self.proxy_normals.get(&vi) {
+                        if pn.is_finite() && pn.length_squared() > 1e-6 {
+                            return pn.normalize().to_array();
+                        }
+                    }
+                    smooth_normals
+                        .as_ref()
+                        .and_then(|sn| sn.get(vi).copied())
+                        .filter(|n| n.length_squared() > 1e-6)
+                        .unwrap_or(face_normal)
+                        .to_array()
+                };
+                let n0 = resolve_n(i0);
+                let n1 = resolve_n(i1);
+                let n2 = resolve_n(i2);
                 let has_face_uvs = face.uvs.len() == face.vertices.len();
                 let uv0 = if has_face_uvs {
                     face.uvs[0]

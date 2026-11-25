@@ -40,6 +40,7 @@ pub struct ViewportRenderer {
     last_hover_voxel: Option<VoxelCoord>,
     last_gizmo_axis: Option<GizmoAxis>,
     last_light_angles: (f32, f32),
+    scene_bounds: ([f32; 3], [f32; 3]),
 }
 
 impl ViewportRenderer {
@@ -67,6 +68,7 @@ impl ViewportRenderer {
             last_hover_voxel: None,
             last_gizmo_axis: None,
             last_light_angles: (f32::NAN, f32::NAN),
+            scene_bounds: ([f32::INFINITY; 3], [f32::NEG_INFINITY; 3]),
         }
     }
 
@@ -156,8 +158,28 @@ impl ViewportRenderer {
             if !visible || vol.is_empty() {
                 continue;
             }
-            let node_mat = scene.node_world_matrix(*node_id);
-            let normal_mat = node_mat.inverse().transpose();
+            let base_node_mat = scene.node_world_matrix(*node_id);
+            let parent_override = scene
+                .character_rig
+                .as_ref()
+                .and_then(|r| r.node_parent_overrides.get(node_id).copied());
+            let node_mat = match (parent_override, &rig_pose_mats) {
+                (Some(ps_key), Some((world_mats, rest_mats))) => {
+                    tessel_core::CharacterRig::compute_node_override_matrix(
+                        ps_key,
+                        base_node_mat,
+                        world_mats,
+                        rest_mats,
+                    )
+                }
+                _ => base_node_mat,
+            };
+            let skip_skin = parent_override.is_some();
+            let normal_mat = if node_mat.determinant().abs() > 1e-8 {
+                node_mat.inverse().transpose()
+            } else {
+                glam::Mat4::IDENTITY
+            };
             let mesh = greedy_mesh_volume(vol, scene.unit_scale);
             let base = vertices.len() as u32;
             for v in mesh.vertices {
@@ -166,11 +188,16 @@ impl ViewportRenderer {
                 let mut wn = normal_mat
                     .transform_vector3(glam::Vec3::from_array(v.normal))
                     .normalize_or_zero();
-                if let (Some(solver), Some(mats)) = (&skin_solver, &skin_mats) {
-                    let w = solver.weights_for_vertex(Some(*node_id), wp);
-                    let (sp, sn) = solver.deform_point_normal(mats, w, wp, wn);
-                    wp = sp;
-                    wn = sn;
+                if !skip_skin {
+                    if let (Some(solver), Some(mats)) = (&skin_solver, &skin_mats) {
+                        let rest_wp = scene
+                            .node_rest_world_matrix(*node_id)
+                            .transform_point3(glam::Vec3::from_array(v.position));
+                        let w = solver.weights_for_vertex(Some(*node_id), rest_wp);
+                        let (sp, sn) = solver.deform_point_normal(mats, w, wp, wn);
+                        wp = sp;
+                        wn = sn;
+                    }
                 }
                 vertices.push(StudioVertex3D {
                     position: wp.to_array(),
@@ -206,7 +233,11 @@ impl ViewportRenderer {
                 _ => base_node_mat,
             };
             let skip_skin = parent_override.is_some();
-            let normal_mat = node_mat.inverse().transpose();
+            let normal_mat = if node_mat.determinant().abs() > 1e-8 {
+                node_mat.inverse().transpose()
+            } else {
+                glam::Mat4::IDENTITY
+            };
 
             // Apply live morph-target deformations when any morph weight for this node is non-zero.
             let morphed_mesh = scene.character_rig.as_ref().and_then(|rig| {
@@ -236,6 +267,7 @@ impl ViewportRenderer {
                 }
                 Some(deformed)
             });
+            let rest_node_mat = scene.node_rest_world_matrix(*node_id);
             let active_mesh = morphed_mesh.as_ref().unwrap_or(mesh);
             let tri = active_mesh.to_triangulated_flat();
             let has_custom = active_mesh.texture.is_some()
@@ -261,7 +293,15 @@ impl ViewportRenderer {
                                 .source_indices
                                 .get(corner)
                                 .and_then(|src| active_mesh.skin_weights.get(src).copied())
-                                .unwrap_or_else(|| solver.weights_for_vertex(Some(*node_id), wp));
+                                .unwrap_or_else(|| {
+                                    let rest_local = tri
+                                        .source_indices
+                                        .get(corner)
+                                        .and_then(|src| mesh.vertices.get(*src).copied())
+                                        .unwrap_or_else(|| glam::Vec3::from_array(v.position));
+                                    let rest_wp = rest_node_mat.transform_point3(rest_local);
+                                    solver.weights_for_vertex(Some(*node_id), rest_wp)
+                                });
                             let (sp, sn) = solver.deform_point_normal(mats, w, wp, wn);
                             let (_, st) = solver.deform_point_normal(mats, w, wp, wt);
                             wp = sp;
@@ -303,7 +343,15 @@ impl ViewportRenderer {
                                 .source_indices
                                 .get(corner)
                                 .and_then(|src| active_mesh.skin_weights.get(src).copied())
-                                .unwrap_or_else(|| solver.weights_for_vertex(Some(*node_id), wp));
+                                .unwrap_or_else(|| {
+                                    let rest_local = tri
+                                        .source_indices
+                                        .get(corner)
+                                        .and_then(|src| mesh.vertices.get(*src).copied())
+                                        .unwrap_or_else(|| glam::Vec3::from_array(v.position));
+                                    let rest_wp = rest_node_mat.transform_point3(rest_local);
+                                    solver.weights_for_vertex(Some(*node_id), rest_wp)
+                                });
                             let (sp, sn) = solver.deform_point_normal(mats, w, wp, wn);
                             wp = sp;
                             wn = sn;
@@ -335,6 +383,7 @@ impl ViewportRenderer {
                 bmax[axis] = bmax[axis].max(v.position[axis]);
             }
         }
+        self.scene_bounds = (bmin, bmax);
         self.shadow_pass
             .update_bounds(queue, &ShadowUniform::from_bounds(bmin, bmax));
         self.last_uploaded_revision = scene.revision;
@@ -405,6 +454,20 @@ impl ViewportRenderer {
                 self.mesh_pass.update_camera(queue, &uniform);
                 self.overlay_pass.update_camera(queue, &uniform);
 
+                let light_dir = glam::Vec3::new(
+                    uniform.light_dir[0],
+                    uniform.light_dir[1],
+                    uniform.light_dir[2],
+                );
+                self.mesh_pass.render_shadow_map(
+                    queue,
+                    encoder,
+                    light_dir,
+                    self.scene_bounds.0,
+                    self.scene_bounds.1,
+                    scene.shading_mode,
+                );
+
                 let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                     label: Some("tessel-3d-viewport-pass"),
                     color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -430,7 +493,7 @@ impl ViewportRenderer {
                     self.grid_pass.draw(&mut pass);
                 }
                 self.shadow_pass.draw(&mut pass);
-                self.mesh_pass.draw(&mut pass);
+                self.mesh_pass.draw(&mut pass, scene.shading_mode);
                 if !render_preview {
                     self.overlay_pass.draw(&mut pass);
                 }

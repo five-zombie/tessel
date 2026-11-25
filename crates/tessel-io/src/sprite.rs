@@ -2,9 +2,18 @@ use std::io::Cursor;
 
 use image::{ImageFormat, RgbaImage};
 use serde::{Deserialize, Serialize};
-use tessel_core::{Palette, PixelCanvas};
+use tessel_core::{MeshTexture, Palette, PixelCanvas};
 
 use crate::error::IoError;
+
+/// Encodes a `MeshTexture` (RGBA8) into PNG bytes.
+pub fn export_mesh_texture_png_bytes(tex: &MeshTexture) -> Result<Vec<u8>, IoError> {
+    let img = RgbaImage::from_raw(tex.width, tex.height, tex.rgba.clone())
+        .ok_or(IoError::InvalidDimensions(tex.width, tex.height))?;
+    let mut buf = Cursor::new(Vec::new());
+    img.write_to(&mut buf, ImageFormat::Png)?;
+    Ok(buf.into_inner())
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SpriteFrameRect {

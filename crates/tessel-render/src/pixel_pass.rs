@@ -200,8 +200,9 @@ impl PixelPass {
         height: u32,
         rgba: &[u8],
     ) {
-        let safe_w = width.max(1);
-        let safe_h = height.max(1);
+        let max_dim = device.limits().max_texture_dimension_2d.max(1);
+        let safe_w = width.clamp(1, max_dim);
+        let safe_h = height.clamp(1, max_dim);
         if (safe_w, safe_h) != self.canvas_size {
             self.canvas_size = (safe_w, safe_h);
             let (tex, view) = create_canvas_texture(device, safe_w, safe_h);
@@ -214,8 +215,10 @@ impl PixelPass {
             );
             self.canvas_texture = tex;
         }
-        let expected_len = (safe_w as usize) * (safe_h as usize) * 4;
-        if rgba.len() == expected_len {
+        let expected_len = (safe_w as usize)
+            .checked_mul(safe_h as usize)
+            .and_then(|n| n.checked_mul(4));
+        if expected_len == Some(rgba.len()) {
             queue.write_texture(
                 wgpu::TexelCopyTextureInfo {
                     texture: &self.canvas_texture,

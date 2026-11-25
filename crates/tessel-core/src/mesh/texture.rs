@@ -45,7 +45,16 @@ impl MeshTexture {
     ) -> Vec<(usize, [u8; 4])> {
         let w = self.width as i32;
         let h = self.height as i32;
-        if w <= 0 || h <= 0 || self.rgba.len() < (w as usize * h as usize * 4) {
+        let expected = (self.width as usize)
+            .checked_mul(self.height as usize)
+            .and_then(|n| n.checked_mul(4));
+        if w <= 0
+            || h <= 0
+            || expected.is_none_or(|e| self.rgba.len() < e)
+            || !uv[0].is_finite()
+            || !uv[1].is_finite()
+            || !radius_px.is_finite()
+        {
             return Vec::new();
         }
         let cx = (uv[0].clamp(0.0, 1.0) * (w - 1) as f32).round() as i32;
@@ -103,7 +112,18 @@ impl MeshTexture {
     ) -> Vec<(usize, [u8; 4])> {
         let w = self.width as i32;
         let h = self.height as i32;
-        if w <= 0 || h <= 0 || self.rgba.len() < (w as usize * h as usize * 4) {
+        let expected = (self.width as usize)
+            .checked_mul(self.height as usize)
+            .and_then(|n| n.checked_mul(4));
+        if w <= 0
+            || h <= 0
+            || expected.is_none_or(|e| self.rgba.len() < e)
+            || !uv_start[0].is_finite()
+            || !uv_start[1].is_finite()
+            || !uv_end[0].is_finite()
+            || !uv_end[1].is_finite()
+            || !width_px.is_finite()
+        {
             return Vec::new();
         }
         let x0 = uv_start[0].clamp(0.0, 1.0) * (w - 1) as f32;
@@ -164,7 +184,17 @@ impl MeshTexture {
     ) -> Vec<(usize, [u8; 4])> {
         let w = self.width as i32;
         let h = self.height as i32;
-        if w <= 0 || h <= 0 || self.rgba.len() < (w as usize * h as usize * 4) {
+        let expected = (self.width as usize)
+            .checked_mul(self.height as usize)
+            .and_then(|n| n.checked_mul(4));
+        if w <= 0
+            || h <= 0
+            || expected.is_none_or(|e| self.rgba.len() < e)
+            || !uv_min[0].is_finite()
+            || !uv_min[1].is_finite()
+            || !uv_max[0].is_finite()
+            || !uv_max[1].is_finite()
+        {
             return Vec::new();
         }
         let u0 = uv_min[0].min(uv_max[0]).clamp(0.0, 1.0);
