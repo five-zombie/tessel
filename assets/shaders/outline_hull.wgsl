@@ -23,6 +23,7 @@ struct VertexIn {
     @location(2) palette_uv: vec2<f32>,
     @location(3) ao: f32,
     @location(4) tangent: vec4<f32>,
+    @location(5) outline_normal: vec3<f32>,
 };
 
 struct VertexOut {
@@ -35,8 +36,10 @@ fn vs_main(in: VertexIn) -> VertexOut {
     var out: VertexOut;
     let dist = length(camera.camera_pos.xyz - in.position);
     let width = shadow_map.npr_params.y * clamp(dist * 0.08, 0.45, 2.5);
-    let n_len = length(in.normal);
-    let n_dir = select(vec3<f32>(0.0), in.normal / n_len, n_len > 1e-5);
+    let smooth_len = length(in.outline_normal);
+    let raw_n = select(in.normal, in.outline_normal, smooth_len > 1e-5);
+    let n_len = length(raw_n);
+    let n_dir = select(vec3<f32>(0.0), raw_n / max(n_len, 1e-5), n_len > 1e-5);
     let extruded = in.position + n_dir * width;
     out.clip_pos = camera.view_proj * vec4<f32>(extruded, 1.0);
     out.dist = dist;

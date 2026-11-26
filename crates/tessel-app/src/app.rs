@@ -1021,13 +1021,15 @@ impl GpuState {
             );
             ui::settings_dialog::show_settings_dialog(
                 ctx,
-                &mut studio.settings_dialog,
-                &mut studio.settings,
-                &studio.paths,
-                &mut studio.ai_state.config,
-                &mut studio.export_dialog.output_dir,
-                studio.live_mcp.as_ref(),
-                &mut studio.mcp_dialog.open,
+                ui::settings_dialog::SettingsDialogContext {
+                    state: &mut studio.settings_dialog,
+                    settings: &mut studio.settings,
+                    paths: &studio.paths,
+                    ai_config: &mut studio.ai_state.config,
+                    export_dir: &mut studio.export_dialog.output_dir,
+                    live_mcp: studio.live_mcp.as_ref(),
+                    mcp_dialog_open: &mut studio.mcp_dialog.open,
+                },
             );
             let mcp_action = ui::mcp_dialog::show_mcp_dialog(
                 ctx,
@@ -1046,14 +1048,16 @@ impl GpuState {
             ui::quick_start::show_about_dialog(ctx, &mut studio.about_open);
             ui::command_palette::show_command_palette(
                 ctx,
-                &mut studio.command_palette,
-                &mut studio.scene,
-                &mut studio.history,
-                &mut studio.camera_3d,
-                &mut studio.camera_2d,
-                &mut studio.export_dialog.open,
-                &mut top_actions.import_mesh,
-                &mut top_actions.new_project,
+                ui::command_palette::CommandPaletteContext {
+                    state: &mut studio.command_palette,
+                    scene: &mut studio.scene,
+                    history: &mut studio.history,
+                    camera_3d: &mut studio.camera_3d,
+                    camera_2d: &mut studio.camera_2d,
+                    export_open: &mut studio.export_dialog.open,
+                    import_mesh: &mut top_actions.import_mesh,
+                    new_project: &mut top_actions.new_project,
+                },
             );
             if let Some(ui_err) = ui::take_ui_error(ctx) {
                 studio.last_error = Some(ui_err);

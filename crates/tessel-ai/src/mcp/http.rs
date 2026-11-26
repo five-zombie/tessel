@@ -1,12 +1,23 @@
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpListener;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, RwLock};
 use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 
 const SLOW_MCP_DISPATCH_MS: u64 = 100;
+const MAX_CONCURRENT_HTTP_WORKERS: usize = 16;
+
+struct ActiveWorkerGuard {
+    active: Arc<AtomicUsize>,
+}
+
+impl Drop for ActiveWorkerGuard {
+    fn drop(&mut self) {
+        self.active.fetch_sub(1, Ordering::AcqRel);
+    }
+}
 
 #[derive(Default)]
 struct McpHttpMetrics {
@@ -57,39 +68,85 @@ impl LiveMcpServerHandle {
     }
 
     pub fn start_with_token(port: u16, token: String) -> std::io::Result<Self> {
+        let trimmed = token.trim().to_string();
+        if trimmed.is_empty() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "MCP bearer token must not be empty",
+            ));
+        }
         let listener = TcpListener::bind(("127.0.0.1", port))?;
         let bound_port = listener.local_addr()?.port();
         listener.set_nonblocking(true)?;
 
-        let expected_auth = Arc::new(RwLock::new(format!("Bearer {token}")));
+        let expected_auth = Arc::new(RwLock::new(format!("Bearer {trimmed}")));
         let auth_ref = Arc::clone(&expected_auth);
         let (tx, rx) = mpsc::sync_channel::<LiveMcpRequest>(MAX_MCP_QUEUE);
         let stop = Arc::new(AtomicBool::new(false));
         let stop_flag = Arc::clone(&stop);
         let metrics = Arc::new(McpHttpMetrics::default());
         let metrics_ref = Arc::clone(&metrics);
+        let active_workers = Arc::new(AtomicUsize::new(0));
 
         let join_handle = std::thread::spawn(move || {
             while !stop_flag.load(Ordering::Relaxed) {
                 match listener.accept() {
                     Ok((mut stream, _)) => {
-                        let _ = stream.set_nonblocking(false);
-                        let _ = stream.set_read_timeout(Some(Duration::from_secs(3)));
-                        let _ = stream.set_write_timeout(Some(Duration::from_secs(5)));
+                        let prev = active_workers.fetch_add(1, Ordering::AcqRel);
+                        if prev >= MAX_CONCURRENT_HTTP_WORKERS {
+                            active_workers.fetch_sub(1, Ordering::AcqRel);
+                            metrics_ref
+                                .requests_rejected
+                                .fetch_add(1, Ordering::Relaxed);
+                            let _ = stream.set_nonblocking(false);
+                            let _ = stream.set_write_timeout(Some(Duration::from_millis(100)));
+                            write_http(
+                                &mut stream,
+                                "503 Service Unavailable",
+                                r#"{"error":"too many concurrent MCP connections"}"#,
+                            );
+                            continue;
+                        }
+                        let guard = ActiveWorkerGuard {
+                            active: Arc::clone(&active_workers),
+                        };
                         let current_auth = auth_ref.read().map(|g| g.clone()).unwrap_or_default();
-                        handle_http_connection(&mut stream, &current_auth, &tx, &metrics_ref);
+                        let tx_clone = tx.clone();
+                        let metrics_clone = Arc::clone(&metrics_ref);
+                        let stop_clone = Arc::clone(&stop_flag);
+                        let spawn_res = std::thread::Builder::new()
+                            .name("tessel-mcp-http-worker".into())
+                            .spawn(move || {
+                                let _guard = guard;
+                                let _ = stream.set_nonblocking(false);
+                                let _ = stream.set_read_timeout(Some(Duration::from_secs(3)));
+                                let _ = stream.set_write_timeout(Some(Duration::from_secs(5)));
+                                handle_http_connection(
+                                    &mut stream,
+                                    &current_auth,
+                                    &tx_clone,
+                                    &metrics_clone,
+                                    &stop_clone,
+                                );
+                            });
+                        if let Err(err) = spawn_res {
+                            tracing::warn!(error = %err, "Failed to spawn MCP HTTP worker thread");
+                        }
                     }
                     Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                        std::thread::sleep(Duration::from_millis(25));
+                        std::thread::sleep(Duration::from_millis(15));
                     }
-                    Err(_) => break,
+                    Err(err) => {
+                        tracing::warn!(error = %err, "MCP HTTP listener accept error; stopping");
+                        break;
+                    }
                 }
             }
         });
 
         Ok(Self {
             port: bound_port,
-            token,
+            token: trimmed,
             rx,
             expected_auth,
             stop,
@@ -98,13 +155,19 @@ impl LiveMcpServerHandle {
     }
 
     /// Rotates the active bearer token in place without restarting the listening socket.
+    /// Ignores empty/whitespace-only tokens to prevent disabling authentication.
     pub fn set_token(&mut self, new_token: String) {
+        let trimmed = new_token.trim().to_string();
+        if trimmed.is_empty() {
+            tracing::warn!("Refused to rotate MCP bearer token to an empty value");
+            return;
+        }
         let mut guard = self
             .expected_auth
             .write()
             .unwrap_or_else(|e| e.into_inner());
-        *guard = format!("Bearer {new_token}");
-        self.token = new_token;
+        *guard = format!("Bearer {trimmed}");
+        self.token = trimmed;
     }
 
     pub fn stop(&self) {
@@ -122,30 +185,52 @@ impl Drop for LiveMcpServerHandle {
 }
 
 pub fn generate_local_token() -> String {
+    let mut bytes = [0u8; 16];
+    if getrandom::fill(&mut bytes).is_ok() {
+        return format_token_hex(&bytes);
+    }
     #[cfg(unix)]
     {
         if let Ok(mut f) = std::fs::File::open("/dev/urandom") {
-            let mut bytes = [0u8; 16];
             if f.read_exact(&mut bytes).is_ok() {
-                let mut hex = String::with_capacity(36);
-                hex.push_str("tsl_");
-                for b in bytes {
-                    let _ = std::fmt::Write::write_fmt(&mut hex, format_args!("{b:02x}"));
-                }
-                return hex;
+                return format_token_hex(&bytes);
             }
         }
     }
+    use std::collections::hash_map::RandomState;
+    use std::hash::{BuildHasher, Hasher};
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_nanos());
-    let pid = u128::from(std::process::id());
-    format!("tsl_{:016x}{:08x}", nanos ^ (pid << 32), pid)
+    let pid = u64::from(std::process::id());
+    let mut h1 = RandomState::new().build_hasher();
+    h1.write_u128(nanos);
+    h1.write_u64(pid);
+    let mut h2 = RandomState::new().build_hasher();
+    h2.write_u64(h1.finish());
+    h2.write_u128(nanos.rotate_left(17));
+    bytes[..8].copy_from_slice(&h1.finish().to_le_bytes());
+    bytes[8..].copy_from_slice(&h2.finish().to_le_bytes());
+    format_token_hex(&bytes)
+}
+
+fn format_token_hex(bytes: &[u8; 16]) -> String {
+    let mut hex = String::with_capacity(36);
+    hex.push_str("tsl_");
+    for b in bytes {
+        let _ = std::fmt::Write::write_fmt(&mut hex, format_args!("{b:02x}"));
+    }
+    hex
 }
 
 const MAX_HTTP_HEADER_LINE_BYTES: u64 = 8 * 1024;
 const MAX_HTTP_HEADERS: usize = 64;
 const MAX_HTTP_READ_DEADLINE: Duration = Duration::from_secs(5);
+
+enum LineReadError {
+    Io,
+    TooLong,
+}
 
 fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     if a.len() != b.len() {
@@ -159,13 +244,58 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
 }
 
 fn is_loopback_host(host: &str) -> bool {
-    let bare = host
-        .trim()
-        .split(':')
-        .next()
-        .unwrap_or("")
-        .to_ascii_lowercase();
-    matches!(bare.as_str(), "127.0.0.1" | "localhost" | "[::1]")
+    let trimmed = host.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    if let Some(rest) = trimmed.strip_prefix('[') {
+        let Some((addr, after)) = rest.split_once(']') else {
+            return false;
+        };
+        if !addr.eq_ignore_ascii_case("::1") {
+            return false;
+        }
+        return after.is_empty()
+            || after
+                .strip_prefix(':')
+                .is_some_and(|p| p.parse::<u16>().is_ok_and(|n| n > 0));
+    }
+    let (name, port) = match trimmed.split_once(':') {
+        Some((n, p)) => (n, Some(p)),
+        None => (trimmed, None),
+    };
+    if let Some(p) = port {
+        if !p.parse::<u16>().is_ok_and(|n| n > 0) {
+            return false;
+        }
+    }
+    matches!(
+        name.to_ascii_lowercase().as_str(),
+        "127.0.0.1" | "localhost"
+    )
+}
+
+fn is_loopback_origin(origin: &str) -> bool {
+    let trimmed = origin.trim();
+    let Ok(parsed) = url::Url::parse(trimmed) else {
+        return false;
+    };
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return false;
+    }
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return false;
+    }
+    if !matches!(parsed.path(), "" | "/") || parsed.query().is_some() || parsed.fragment().is_some()
+    {
+        return false;
+    }
+    match parsed.host() {
+        Some(url::Host::Domain(d)) => d.eq_ignore_ascii_case("localhost"),
+        Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
+        Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
+        None => false,
+    }
 }
 
 fn request_timeout_for_payload(payload: &Value) -> Duration {
@@ -185,12 +315,19 @@ fn request_timeout_for_payload(payload: &Value) -> Duration {
     }
 }
 
-fn read_bounded_line<R: BufRead>(reader: &mut R, out: &mut String) -> std::io::Result<usize> {
+fn read_bounded_line<R: BufRead>(reader: &mut R, out: &mut String) -> Result<usize, LineReadError> {
     out.clear();
-    reader
+    let n = reader
         .by_ref()
-        .take(MAX_HTTP_HEADER_LINE_BYTES)
+        .take(MAX_HTTP_HEADER_LINE_BYTES + 1)
         .read_line(out)
+        .map_err(|_| LineReadError::Io)?;
+    if n as u64 > MAX_HTTP_HEADER_LINE_BYTES
+        || (n > 0 && !out.ends_with('\n') && n as u64 >= MAX_HTTP_HEADER_LINE_BYTES)
+    {
+        return Err(LineReadError::TooLong);
+    }
+    Ok(n)
 }
 
 fn handle_http_connection(
@@ -198,6 +335,7 @@ fn handle_http_connection(
     expected_auth: &str,
     tx: &mpsc::SyncSender<LiveMcpRequest>,
     metrics: &McpHttpMetrics,
+    stop: &AtomicBool,
 ) {
     let Ok(cloned) = stream.try_clone() else {
         return;
@@ -206,10 +344,142 @@ fn handle_http_connection(
 
     let read_start = Instant::now();
     let mut request_line = String::new();
-    if read_bounded_line(&mut reader, &mut request_line).is_err() {
+    match read_bounded_line(&mut reader, &mut request_line) {
+        Ok(0) | Err(LineReadError::Io) => return,
+        Err(LineReadError::TooLong) => {
+            metrics.requests_rejected.fetch_add(1, Ordering::Relaxed);
+            write_http(
+                stream,
+                "431 Request Header Fields Too Large",
+                r#"{"error":"request line too long"}"#,
+            );
+            return;
+        }
+        Ok(_) => {}
+    }
+
+    let is_health = request_line.starts_with("GET /health ");
+    let is_mcp = request_line.starts_with("POST /mcp ");
+    if !is_health && !is_mcp {
+        metrics.requests_rejected.fetch_add(1, Ordering::Relaxed);
+        write_http(
+            stream,
+            "404 Not Found",
+            r#"{"error":"use POST /mcp or GET /health"}"#,
+        );
         return;
     }
-    if request_line.starts_with("GET /health ") {
+    if is_mcp {
+        metrics.requests_total.fetch_add(1, Ordering::Relaxed);
+    }
+
+    let mut content_length: Option<usize> = None;
+    let mut bad_framing = false;
+    let mut authorized = false;
+    let mut bad_host_or_origin = false;
+    let mut header_count: usize = 0;
+    let mut header = String::new();
+    loop {
+        if read_start.elapsed() > MAX_HTTP_READ_DEADLINE {
+            metrics.requests_timed_out.fetch_add(1, Ordering::Relaxed);
+            write_http(
+                stream,
+                "408 Request Timeout",
+                r#"{"error":"header timeout"}"#,
+            );
+            return;
+        }
+        match read_bounded_line(&mut reader, &mut header) {
+            Ok(0) => break,
+            Ok(_) => {}
+            Err(LineReadError::Io) => return,
+            Err(LineReadError::TooLong) => {
+                metrics.requests_rejected.fetch_add(1, Ordering::Relaxed);
+                write_http(
+                    stream,
+                    "431 Request Header Fields Too Large",
+                    r#"{"error":"header line too long"}"#,
+                );
+                return;
+            }
+        }
+        let trimmed = header.trim();
+        if trimmed.is_empty() {
+            break;
+        }
+        header_count += 1;
+        if header_count > MAX_HTTP_HEADERS {
+            metrics.requests_rejected.fetch_add(1, Ordering::Relaxed);
+            write_http(
+                stream,
+                "431 Request Header Fields Too Large",
+                r#"{"error":"too many headers"}"#,
+            );
+            return;
+        }
+        let Some((k, v)) = trimmed.split_once(':') else {
+            bad_framing = true;
+            continue;
+        };
+        if k.is_empty() || k.bytes().any(|b| b.is_ascii_whitespace()) {
+            bad_framing = true;
+            continue;
+        }
+        if k.eq_ignore_ascii_case("content-length") {
+            if content_length.is_some() {
+                bad_framing = true;
+            } else {
+                match v.trim().parse::<usize>() {
+                    Ok(n) => content_length = Some(n),
+                    Err(_) => bad_framing = true,
+                }
+            }
+        } else if k.eq_ignore_ascii_case("transfer-encoding") {
+            bad_framing = true;
+        } else if k.eq_ignore_ascii_case("authorization")
+            && !expected_auth.is_empty()
+            && constant_time_eq(v.trim().as_bytes(), expected_auth.as_bytes())
+        {
+            authorized = true;
+        } else if (k.eq_ignore_ascii_case("host") && !is_loopback_host(v))
+            || (k.eq_ignore_ascii_case("origin") && !is_loopback_origin(v))
+        {
+            bad_host_or_origin = true;
+        }
+    }
+
+    if bad_host_or_origin {
+        metrics.requests_rejected.fetch_add(1, Ordering::Relaxed);
+        write_http(
+            stream,
+            "403 Forbidden",
+            r#"{"error":"loopback host/origin required"}"#,
+        );
+        return;
+    }
+
+    if !authorized {
+        metrics.requests_rejected.fetch_add(1, Ordering::Relaxed);
+        tracing::warn!("Rejected unauthorized MCP HTTP request");
+        write_http(
+            stream,
+            "401 Unauthorized",
+            r#"{"error":"invalid bearer token"}"#,
+        );
+        return;
+    }
+
+    if bad_framing {
+        metrics.requests_rejected.fetch_add(1, Ordering::Relaxed);
+        write_http(
+            stream,
+            "400 Bad Request",
+            r#"{"error":"invalid or unsupported framing headers"}"#,
+        );
+        return;
+    }
+
+    if is_health {
         let completed = metrics.requests_completed.load(Ordering::Relaxed);
         let total_us = metrics.total_latency_us.load(Ordering::Relaxed);
         let avg_latency_ms = if completed > 0 {
@@ -234,90 +504,10 @@ fn handle_http_connection(
         write_http(stream, "200 OK", &health.to_string());
         return;
     }
-    if !request_line.starts_with("POST /mcp ") {
-        metrics.requests_rejected.fetch_add(1, Ordering::Relaxed);
-        write_http(
-            stream,
-            "404 Not Found",
-            r#"{"error":"use POST /mcp or GET /health"}"#,
-        );
-        return;
-    }
-    metrics.requests_total.fetch_add(1, Ordering::Relaxed);
 
-    let mut content_length: usize = 0;
-    let mut authorized = false;
-    let mut bad_host_or_origin = false;
-    let mut header_count: usize = 0;
-    let mut header = String::new();
-    loop {
-        if read_start.elapsed() > MAX_HTTP_READ_DEADLINE {
-            metrics.requests_timed_out.fetch_add(1, Ordering::Relaxed);
-            write_http(
-                stream,
-                "408 Request Timeout",
-                r#"{"error":"header timeout"}"#,
-            );
-            return;
-        }
-        if read_bounded_line(&mut reader, &mut header).is_err() {
-            return;
-        }
-        let trimmed = header.trim();
-        if trimmed.is_empty() {
-            break;
-        }
-        header_count += 1;
-        if header_count > MAX_HTTP_HEADERS {
-            metrics.requests_rejected.fetch_add(1, Ordering::Relaxed);
-            write_http(
-                stream,
-                "431 Request Header Fields Too Large",
-                r#"{"error":"too many headers"}"#,
-            );
-            return;
-        }
-        if let Some((k, v)) = trimmed.split_once(':') {
-            if k.eq_ignore_ascii_case("content-length") {
-                content_length = v.trim().parse().unwrap_or(0);
-            } else if k.eq_ignore_ascii_case("authorization")
-                && constant_time_eq(v.trim().as_bytes(), expected_auth.as_bytes())
-            {
-                authorized = true;
-            } else if k.eq_ignore_ascii_case("host") && !is_loopback_host(v) {
-                bad_host_or_origin = true;
-            } else if k.eq_ignore_ascii_case("origin") {
-                let origin = v.trim();
-                let ok_origin = origin.starts_with("http://127.0.0.1")
-                    || origin.starts_with("http://localhost");
-                if !ok_origin {
-                    bad_host_or_origin = true;
-                }
-            }
-        }
-    }
-
-    if bad_host_or_origin {
-        metrics.requests_rejected.fetch_add(1, Ordering::Relaxed);
-        write_http(
-            stream,
-            "403 Forbidden",
-            r#"{"error":"loopback host/origin required"}"#,
-        );
-        return;
-    }
-
-    if !authorized {
-        metrics.requests_rejected.fetch_add(1, Ordering::Relaxed);
-        tracing::warn!("Rejected unauthorized MCP HTTP request");
-        write_http(
-            stream,
-            "401 Unauthorized",
-            r#"{"error":"invalid bearer token"}"#,
-        );
-        return;
-    }
+    let content_length = content_length.unwrap_or(0);
     if content_length == 0 || content_length > 2 * 1024 * 1024 {
+        metrics.requests_rejected.fetch_add(1, Ordering::Relaxed);
         write_http(
             stream,
             "400 Bad Request",
@@ -326,10 +516,30 @@ fn handle_http_connection(
         return;
     }
 
-    let mut body = vec![0u8; content_length];
-    if reader.read_exact(&mut body).is_err() {
-        write_http(stream, "400 Bad Request", r#"{"error":"incomplete body"}"#);
-        return;
+    let mut body = Vec::with_capacity(content_length.min(64 * 1024));
+    let mut chunk_buf = [0u8; 4096];
+    while body.len() < content_length {
+        if read_start.elapsed() > MAX_HTTP_READ_DEADLINE {
+            metrics.requests_timed_out.fetch_add(1, Ordering::Relaxed);
+            write_http(
+                stream,
+                "408 Request Timeout",
+                r#"{"error":"body read timeout"}"#,
+            );
+            return;
+        }
+        let want = (content_length - body.len()).min(chunk_buf.len());
+        match reader.read(&mut chunk_buf[..want]) {
+            Ok(0) => {
+                write_http(stream, "400 Bad Request", r#"{"error":"incomplete body"}"#);
+                return;
+            }
+            Ok(n) => body.extend_from_slice(&chunk_buf[..n]),
+            Err(_) => {
+                write_http(stream, "400 Bad Request", r#"{"error":"incomplete body"}"#);
+                return;
+            }
+        }
     }
 
     let payload: Value = match serde_json::from_slice(&body) {
@@ -381,25 +591,18 @@ fn handle_http_connection(
         }
     }
 
-    match reply_rx.recv_timeout(timeout) {
-        Ok(Some(resp)) => {
-            let elapsed = started.elapsed();
-            metrics.record_latency(elapsed);
-            let elapsed_ms = elapsed.as_millis() as u64;
-            if elapsed_ms >= SLOW_MCP_DISPATCH_MS {
-                tracing::warn!(
-                    tool = %tool_label,
-                    elapsed_ms,
-                    "Slow live MCP HTTP dispatch on studio main thread"
-                );
-            }
-            write_http(stream, "200 OK", &resp.to_string())
+    let deadline = Instant::now() + timeout;
+    loop {
+        if stop.load(Ordering::Relaxed) {
+            write_http(
+                stream,
+                "503 Service Unavailable",
+                r#"{"error":"studio shutting down"}"#,
+            );
+            return;
         }
-        Ok(None) => {
-            metrics.record_latency(started.elapsed());
-            write_http(stream, "202 Accepted", "{}")
-        }
-        Err(_) => {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
             metrics.requests_timed_out.fetch_add(1, Ordering::Relaxed);
             tracing::warn!(
                 tool = %tool_label,
@@ -410,7 +613,39 @@ fn handle_http_connection(
                 stream,
                 "504 Gateway Timeout",
                 r#"{"error":"studio timeout"}"#,
-            )
+            );
+            return;
+        }
+        match reply_rx.recv_timeout(remaining.min(Duration::from_millis(50))) {
+            Ok(Some(resp)) => {
+                let elapsed = started.elapsed();
+                metrics.record_latency(elapsed);
+                let elapsed_ms = elapsed.as_millis() as u64;
+                if elapsed_ms >= SLOW_MCP_DISPATCH_MS {
+                    tracing::warn!(
+                        tool = %tool_label,
+                        elapsed_ms,
+                        "Slow live MCP HTTP dispatch on studio main thread"
+                    );
+                }
+                write_http(stream, "200 OK", &resp.to_string());
+                return;
+            }
+            Ok(None) => {
+                metrics.record_latency(started.elapsed());
+                write_http(stream, "202 Accepted", "{}");
+                return;
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                metrics.requests_rejected.fetch_add(1, Ordering::Relaxed);
+                write_http(
+                    stream,
+                    "503 Service Unavailable",
+                    r#"{"error":"studio unavailable"}"#,
+                );
+                return;
+            }
         }
     }
 }
@@ -470,20 +705,98 @@ mod tests {
         assert!(response_text.starts_with("HTTP/1.1 200"));
         assert!(response_text.contains("\"ok\":true"));
 
-        // GET /health returns 200 OK with counters reflecting both requests
-        let mut s3 = std::net::TcpStream::connect(&addr).unwrap();
-        s3.write_all(b"GET /health HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n")
+        // Unauthorized GET /health must get 401
+        let mut s3_unauth = std::net::TcpStream::connect(&addr).unwrap();
+        s3_unauth
+            .write_all(b"GET /health HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n")
             .unwrap();
+        let mut out3_unauth = String::new();
+        s3_unauth.read_to_string(&mut out3_unauth).unwrap();
+        assert!(out3_unauth.starts_with("HTTP/1.1 401"));
+
+        // Authorized GET /health returns 200 OK with counters
+        let mut s3 = std::net::TcpStream::connect(&addr).unwrap();
+        let health_req = format!(
+            "GET /health HTTP/1.1\r\nHost: [::1]:{}\r\nAuthorization: Bearer {}\r\n\r\n",
+            handle.port, handle.token
+        );
+        s3.write_all(health_req.as_bytes()).unwrap();
         let mut out3 = String::new();
         s3.read_to_string(&mut out3).unwrap();
         assert!(out3.starts_with("HTTP/1.1 200"));
         assert!(out3.contains("\"status\":\"ok\""));
         assert!(out3.contains("\"requests_total\":2"));
         assert!(out3.contains("\"requests_completed\":1"));
-        assert!(out3.contains("\"requests_rejected\":1"));
+        assert!(out3.contains("\"requests_rejected\":2"));
         assert!(out3.contains("\"avg_latency_ms\":"));
         assert!(out3.contains("\"max_latency_ms\":"));
         assert!(out3.contains("\"slow_requests_total\":"));
+    }
+
+    #[test]
+    fn hardening_rejects_spoofed_origin_bad_framing_oversized_header_and_empty_token() {
+        assert!(LiveMcpServerHandle::start_with_token(0, "   ".into()).is_err());
+        assert!(is_loopback_host("127.0.0.1:38421"));
+        assert!(is_loopback_host("localhost"));
+        assert!(is_loopback_host("[::1]"));
+        assert!(is_loopback_host("[::1]:38421"));
+        assert!(!is_loopback_host("localhost.attacker.example"));
+        assert!(!is_loopback_host("[::1]:0"));
+
+        assert!(is_loopback_origin("http://127.0.0.1:38421"));
+        assert!(is_loopback_origin("http://localhost:8080"));
+        assert!(is_loopback_origin("http://[::1]:38421"));
+        assert!(!is_loopback_origin("http://localhost.attacker.example"));
+        assert!(!is_loopback_origin("http://127.0.0.1.evil.com"));
+        assert!(!is_loopback_origin("http://user:pass@localhost"));
+
+        let handle = LiveMcpServerHandle::start(0).unwrap();
+        let addr = format!("127.0.0.1:{}", handle.port);
+
+        // Spoofed Origin -> 403
+        let mut s = std::net::TcpStream::connect(&addr).unwrap();
+        let req = format!(
+            "POST /mcp HTTP/1.1\r\nHost: 127.0.0.1\r\nOrigin: http://localhost.attacker.example\r\nAuthorization: Bearer {}\r\nContent-Length: 2\r\n\r\n{{}}",
+            handle.token
+        );
+        s.write_all(req.as_bytes()).unwrap();
+        let mut out = String::new();
+        s.read_to_string(&mut out).unwrap();
+        assert!(out.starts_with("HTTP/1.1 403"), "got: {out}");
+
+        // Duplicate Content-Length -> 400
+        let mut s = std::net::TcpStream::connect(&addr).unwrap();
+        let req = format!(
+            "POST /mcp HTTP/1.1\r\nHost: 127.0.0.1\r\nAuthorization: Bearer {}\r\nContent-Length: 2\r\nContent-Length: 2\r\n\r\n{{}}",
+            handle.token
+        );
+        s.write_all(req.as_bytes()).unwrap();
+        let mut out = String::new();
+        s.read_to_string(&mut out).unwrap();
+        assert!(out.starts_with("HTTP/1.1 400"), "got: {out}");
+
+        // Transfer-Encoding -> 400
+        let mut s = std::net::TcpStream::connect(&addr).unwrap();
+        let req = format!(
+            "POST /mcp HTTP/1.1\r\nHost: 127.0.0.1\r\nAuthorization: Bearer {}\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n",
+            handle.token
+        );
+        s.write_all(req.as_bytes()).unwrap();
+        let mut out = String::new();
+        s.read_to_string(&mut out).unwrap();
+        assert!(out.starts_with("HTTP/1.1 400"), "got: {out}");
+
+        // Oversized header > 8 KiB -> 431
+        let mut s = std::net::TcpStream::connect(&addr).unwrap();
+        let big = "a".repeat(9000);
+        let req = format!(
+            "POST /mcp HTTP/1.1\r\nHost: 127.0.0.1\r\nX-Big: {big}\r\nAuthorization: Bearer {}\r\nContent-Length: 2\r\n\r\n{{}}",
+            handle.token
+        );
+        s.write_all(req.as_bytes()).unwrap();
+        let mut out = String::new();
+        s.read_to_string(&mut out).unwrap();
+        assert!(out.starts_with("HTTP/1.1 431"), "got: {out}");
     }
 
     #[test]

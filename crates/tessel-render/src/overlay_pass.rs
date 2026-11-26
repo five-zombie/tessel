@@ -23,6 +23,7 @@ pub struct OverlayPass {
     camera_buffer: wgpu::Buffer,
     bind_group: wgpu::BindGroup,
     vertex_buffer: Option<wgpu::Buffer>,
+    vertex_capacity: usize,
     vertex_count: u32,
 }
 
@@ -135,6 +136,7 @@ impl OverlayPass {
             camera_buffer,
             bind_group,
             vertex_buffer: None,
+            vertex_capacity: 0,
             vertex_count: 0,
         }
     }
@@ -142,13 +144,13 @@ impl OverlayPass {
     pub fn update_lines(
         &mut self,
         device: &wgpu::Device,
+        queue: &wgpu::Queue,
         scene: &SceneState,
         hover_voxel: Option<VoxelCoord>,
         active_gizmo_axis: Option<GizmoAxis>,
     ) {
         let mut lines = Vec::new();
         let amber = [0.90, 0.54, 0.24, 0.95];
-        let bone_color = [1.0, 0.72, 0.50, 0.95];
         let wire_color = [0.85, 0.76, 0.70, 0.45];
 
         match scene.active_mode {
@@ -262,12 +264,34 @@ impl OverlayPass {
                         };
                         let joint = mat.transform_point3(Vec3::ZERO);
                         let is_selected = scene.selected_bone == Some(bone.id);
+                        let side_color = if bone.name.starts_with("Left")
+                            || bone.name.contains("_Left")
+                            || bone.name.ends_with("_L")
+                        {
+                            [0.35, 0.72, 1.0, 1.0]
+                        } else if bone.name.starts_with("Right")
+                            || bone.name.contains("_Right")
+                            || bone.name.ends_with("_R")
+                        {
+                            [1.0, 0.42, 0.42, 1.0]
+                        } else {
+                            amber
+                        };
                         let r = if is_selected { 0.08 } else { 0.04 };
                         let joint_color = if is_selected {
                             [1.0, 0.95, 0.70, 1.0]
                         } else {
-                            amber
+                            side_color
                         };
+                        if is_selected {
+                            let axis_len = 0.16;
+                            let rx = mat.transform_vector3(Vec3::X).normalize_or_zero() * axis_len;
+                            let ry = mat.transform_vector3(Vec3::Y).normalize_or_zero() * axis_len;
+                            let rz = mat.transform_vector3(Vec3::Z).normalize_or_zero() * axis_len;
+                            push_line(&mut lines, joint, joint + rx, [1.0, 0.25, 0.25, 1.0]);
+                            push_line(&mut lines, joint, joint + ry, [0.25, 1.0, 0.35, 1.0]);
+                            push_line(&mut lines, joint, joint + rz, [0.30, 0.60, 1.0, 1.0]);
+                        }
                         push_line(
                             &mut lines,
                             joint - Vec3::X * r,
@@ -293,7 +317,7 @@ impl OverlayPass {
                                     let stick_color = if is_selected {
                                         [1.0, 0.92, 0.45, 1.0]
                                     } else {
-                                        bone_color
+                                        side_color
                                     };
                                     push_octahedral_stick(
                                         &mut lines,
@@ -303,7 +327,7 @@ impl OverlayPass {
                                         is_selected,
                                     );
                                 } else {
-                                    push_line(&mut lines, parent_pos, joint, bone_color);
+                                    push_line(&mut lines, parent_pos, joint, side_color);
                                 }
                             }
                         }
@@ -326,17 +350,23 @@ impl OverlayPass {
         }
 
         if lines.is_empty() {
-            self.vertex_buffer = None;
             self.vertex_count = 0;
             return;
         }
-        self.vertex_buffer = Some(
-            device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        if lines.len() > self.vertex_capacity || self.vertex_buffer.is_none() {
+            let new_cap = lines.len().next_power_of_two().max(256);
+            let byte_size = (new_cap * std::mem::size_of::<OverlayVertex>()) as wgpu::BufferAddress;
+            self.vertex_buffer = Some(device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("tessel-overlay-vb"),
-                contents: bytemuck::cast_slice(&lines),
-                usage: wgpu::BufferUsages::VERTEX,
-            }),
-        );
+                size: byte_size,
+                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            }));
+            self.vertex_capacity = new_cap;
+        }
+        if let Some(vb) = &self.vertex_buffer {
+            queue.write_buffer(vb, 0, bytemuck::cast_slice(&lines));
+        }
         self.vertex_count = lines.len() as u32;
     }
 

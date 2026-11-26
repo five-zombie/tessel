@@ -46,6 +46,8 @@ pub struct ViewportRenderer {
     last_gizmo_axis: Option<GizmoAxis>,
     last_light_angles: (f32, f32),
     scene_bounds: ([f32; 3], [f32; 3]),
+    scratch_vertices: Vec<StudioVertex3D>,
+    scratch_indices: Vec<u32>,
 }
 
 impl ViewportRenderer {
@@ -75,6 +77,8 @@ impl ViewportRenderer {
             last_gizmo_axis: None,
             last_light_angles: (f32::NAN, f32::NAN),
             scene_bounds: ([f32::INFINITY; 3], [f32::NEG_INFINITY; 3]),
+            scratch_vertices: Vec::new(),
+            scratch_indices: Vec::new(),
         }
     }
 
@@ -123,7 +127,7 @@ impl ViewportRenderer {
         let light_changed = self.last_light_angles != light_angles;
         if scene_changed || hover_changed || gizmo_changed || light_changed {
             self.overlay_pass
-                .update_lines(device, scene, hover_voxel, active_gizmo_axis);
+                .update_lines(device, queue, scene, hover_voxel, active_gizmo_axis);
             self.last_hover_voxel = hover_voxel;
             self.last_gizmo_axis = active_gizmo_axis;
             self.last_light_angles = light_angles;
@@ -137,8 +141,12 @@ impl ViewportRenderer {
         if let Some(node_id) = scene.active_pixel_node() {
             if let Some(canvas) = scene.pixel_canvases.get(&node_id) {
                 let rgba = canvas.composite_viewport_rgba(&scene.palette);
-                self.pixel_pass
-                    .upload_canvas(device, queue, canvas.width, canvas.height, &rgba);
+                if let Err(err) =
+                    self.pixel_pass
+                        .upload_canvas(device, queue, canvas.width, canvas.height, &rgba)
+                {
+                    tracing::warn!(error = %err, "Skipping pixel canvas GPU upload");
+                }
             }
         }
 
@@ -164,8 +172,10 @@ impl ViewportRenderer {
             .filter(|r| !r.node_parent_overrides.is_empty())
             .map(|r| (r.world_pose_matrices(), r.world_rest_matrices()));
 
-        let mut vertices = Vec::new();
-        let mut indices = Vec::new();
+        self.scratch_vertices.clear();
+        self.scratch_indices.clear();
+        let vertices = &mut self.scratch_vertices;
+        let indices = &mut self.scratch_indices;
         for (node_id, vol) in &scene.voxel_volumes {
             let visible = is_visible(*node_id);
             if !visible || vol.is_empty() {
@@ -218,6 +228,7 @@ impl ViewportRenderer {
                     palette_uv: [u, 0.5],
                     ao: v.ao,
                     tangent: [1.0, 0.0, 0.0, 1.0],
+                    outline_normal: wn.to_array(),
                 });
             }
             indices.extend(mesh.indices.into_iter().map(|idx| idx + base));
@@ -399,8 +410,10 @@ impl ViewportRenderer {
                         palette_uv: uv,
                         ao: 1.0,
                         tangent: [wt.x, wt.y, wt.z, v.tangent[3]],
+                        outline_normal: wn.to_array(),
                     });
                 }
+                fill_smooth_outline_normals(&mut t_verts);
                 custom_items.push(crate::mesh_pass::CustomMeshUpload {
                     texture: mesh.texture.as_ref(),
                     normal_map: mesh.normal_map.as_ref(),
@@ -442,12 +455,14 @@ impl ViewportRenderer {
                         palette_uv: [u, 0.5],
                         ao: 1.0,
                         tangent: [1.0, 0.0, 0.0, 1.0],
+                        outline_normal: wn.to_array(),
                     });
                 }
                 indices.extend(tri.indices.into_iter().map(|idx| idx + base));
             }
         }
-        self.mesh_pass.upload_mesh(device, &vertices, &indices);
+        fill_smooth_outline_normals(vertices);
+        self.mesh_pass.upload_mesh(device, queue, vertices, indices);
         self.mesh_pass
             .upload_custom_meshes(device, queue, &custom_items);
 
@@ -672,6 +687,48 @@ impl ViewportRenderer {
         img.write_to(&mut out, ImageFormat::Png)
             .map_err(|e| RenderError::PreviewEncode(e.to_string()))?;
         Ok(out.into_inner())
+    }
+}
+
+fn quantize_outline_key(pos: [f32; 3]) -> Option<[i64; 3]> {
+    if !pos.iter().all(|c| c.is_finite()) {
+        return None;
+    }
+    const MAX_COORD: f32 = 1e10;
+    Some([
+        (pos[0].clamp(-MAX_COORD, MAX_COORD) * 10_000.0).round() as i64,
+        (pos[1].clamp(-MAX_COORD, MAX_COORD) * 10_000.0).round() as i64,
+        (pos[2].clamp(-MAX_COORD, MAX_COORD) * 10_000.0).round() as i64,
+    ])
+}
+
+/// Computes position-welded smooth extrusion normals for `outline_hull.wgsl` so flat-shaded
+/// low-poly and voxel meshes never split apart at sharp corners.
+fn fill_smooth_outline_normals(vertices: &mut [StudioVertex3D]) {
+    if vertices.is_empty() {
+        return;
+    }
+    let mut accum: std::collections::HashMap<[i64; 3], glam::Vec3> =
+        std::collections::HashMap::with_capacity(vertices.len());
+    for v in vertices.iter() {
+        let Some(key) = quantize_outline_key(v.position) else {
+            continue;
+        };
+        let n = glam::Vec3::from_array(v.normal);
+        if n.is_finite() {
+            *accum.entry(key).or_insert(glam::Vec3::ZERO) += n;
+        }
+    }
+    for v in vertices.iter_mut() {
+        let Some(key) = quantize_outline_key(v.position) else {
+            continue;
+        };
+        if let Some(sum) = accum.get(&key) {
+            let smooth = sum.normalize_or_zero();
+            if smooth.length_squared() > 1e-6 {
+                v.outline_normal = smooth.to_array();
+            }
+        }
     }
 }
 

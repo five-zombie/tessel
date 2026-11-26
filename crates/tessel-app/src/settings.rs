@@ -56,6 +56,10 @@ impl AppPaths {
                 ),
                 None => {
                     let base = std::env::temp_dir().join("tessel");
+                    tracing::warn!(
+                        fallback_dir = %base.display(),
+                        "OS config/cache directories unavailable; falling back to temp_dir"
+                    );
                     (base.join("config"), base.join("cache"))
                 }
             };
@@ -196,10 +200,29 @@ fn keyring_account(provider: AiProviderKind) -> &'static str {
 }
 
 pub fn load_api_key_from_keyring(provider: AiProviderKind) -> String {
-    let Ok(entry) = keyring::Entry::new("tessel", keyring_account(provider)) else {
-        return String::new();
+    let entry = match keyring::Entry::new("tessel", keyring_account(provider)) {
+        Ok(e) => e,
+        Err(err) => {
+            tracing::warn!(
+                provider = ?provider,
+                error = %err,
+                "Failed to open OS keyring entry for Direct AI provider"
+            );
+            return String::new();
+        }
     };
-    entry.get_password().unwrap_or_default()
+    match entry.get_password() {
+        Ok(key) => key,
+        Err(keyring::Error::NoEntry) => String::new(),
+        Err(err) => {
+            tracing::warn!(
+                provider = ?provider,
+                error = %err,
+                "Failed to read Direct AI API key from OS keyring"
+            );
+            String::new()
+        }
+    }
 }
 
 pub fn save_api_key_to_keyring(provider: AiProviderKind, key: &str) -> Result<(), String> {
@@ -262,20 +285,49 @@ fn save_mcp_token(paths: &AppPaths, token: &str) {
     #[cfg(unix)]
     {
         use std::io::Write;
-        use std::os::unix::fs::OpenOptionsExt;
-        if let Ok(mut file) = fs::OpenOptions::new()
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        match fs::OpenOptions::new()
             .write(true)
             .create(true)
             .truncate(true)
             .mode(0o600)
             .open(&token_path)
         {
-            let _ = file.write_all(token.as_bytes());
+            Ok(mut file) => {
+                if let Err(err) = file.set_permissions(fs::Permissions::from_mode(0o600)) {
+                    tracing::warn!(
+                        path = %token_path.display(),
+                        error = %err,
+                        "Failed to enforce 0o600 permissions on MCP token file; skipping write"
+                    );
+                    return;
+                }
+                if let Err(err) = file.write_all(token.as_bytes()) {
+                    tracing::warn!(
+                        path = %token_path.display(),
+                        error = %err,
+                        "Failed to write MCP token file"
+                    );
+                }
+            }
+            Err(err) => {
+                tracing::warn!(
+                    path = %token_path.display(),
+                    error = %err,
+                    "Failed to open MCP token file for writing"
+                );
+            }
         }
     }
     #[cfg(not(unix))]
     {
-        let _ = fs::write(&token_path, token);
+        if let Err(err) = fs::write(&token_path, token) {
+            tracing::warn!(
+                path = %token_path.display(),
+                error = %err,
+                "Failed to write MCP token file"
+            );
+        }
     }
 }
 

@@ -199,13 +199,38 @@ impl PixelPass {
         width: u32,
         height: u32,
         rgba: &[u8],
-    ) {
+    ) -> Result<(), crate::error::RenderError> {
         let max_dim = device.limits().max_texture_dimension_2d.max(1);
-        let safe_w = width.clamp(1, max_dim);
-        let safe_h = height.clamp(1, max_dim);
-        if (safe_w, safe_h) != self.canvas_size {
-            self.canvas_size = (safe_w, safe_h);
-            let (tex, view) = create_canvas_texture(device, safe_w, safe_h);
+        if width == 0 || height == 0 || width > max_dim || height > max_dim {
+            tracing::warn!(
+                width,
+                height,
+                max_dim,
+                "PixelPass::upload_canvas rejected out-of-range canvas dimensions"
+            );
+            return Err(crate::error::RenderError::InvalidTextureUpload(format!(
+                "pixel canvas dimensions {width}x{height} exceed valid range 1..={max_dim}"
+            )));
+        }
+        let expected_len = (width as usize)
+            .checked_mul(height as usize)
+            .and_then(|n| n.checked_mul(4));
+        if expected_len != Some(rgba.len()) {
+            tracing::warn!(
+                width,
+                height,
+                actual_len = rgba.len(),
+                ?expected_len,
+                "PixelPass::upload_canvas rejected mismatched RGBA buffer length"
+            );
+            return Err(crate::error::RenderError::InvalidTextureUpload(format!(
+                "pixel canvas RGBA buffer length {} does not match {width}x{height}x4",
+                rgba.len()
+            )));
+        }
+        if (width, height) != self.canvas_size {
+            self.canvas_size = (width, height);
+            let (tex, view) = create_canvas_texture(device, width, height);
             self.bind_group = create_bind_group(
                 device,
                 &self.bind_group_layout,
@@ -215,30 +240,26 @@ impl PixelPass {
             );
             self.canvas_texture = tex;
         }
-        let expected_len = (safe_w as usize)
-            .checked_mul(safe_h as usize)
-            .and_then(|n| n.checked_mul(4));
-        if expected_len == Some(rgba.len()) {
-            queue.write_texture(
-                wgpu::TexelCopyTextureInfo {
-                    texture: &self.canvas_texture,
-                    mip_level: 0,
-                    origin: wgpu::Origin3d::ZERO,
-                    aspect: wgpu::TextureAspect::All,
-                },
-                rgba,
-                wgpu::TexelCopyBufferLayout {
-                    offset: 0,
-                    bytes_per_row: Some(safe_w * 4),
-                    rows_per_image: Some(safe_h),
-                },
-                wgpu::Extent3d {
-                    width: safe_w,
-                    height: safe_h,
-                    depth_or_array_layers: 1,
-                },
-            );
-        }
+        queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &self.canvas_texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            rgba,
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(width * 4),
+                rows_per_image: Some(height),
+            },
+            wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+        );
+        Ok(())
     }
 
     pub fn update_view(

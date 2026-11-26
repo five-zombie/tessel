@@ -134,7 +134,7 @@ fn direct_ai_e2e_openai_tool_calls_execute_and_undo_on_scene() {
         .contains("authorization: bearer sk-e2e-test-key"));
     let sent_body: Value = serde_json::from_str(&req.body).expect("valid JSON request body");
     assert_eq!(sent_body["model"], "gpt-4o-mini");
-    assert_eq!(sent_body["tools"].as_array().unwrap().len(), 146);
+    assert_eq!(sent_body["tools"].as_array().unwrap().len(), 160);
 
     assert_eq!(resp.tool_calls.len(), 2);
     for call in &resp.tool_calls {

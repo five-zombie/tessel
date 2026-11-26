@@ -70,10 +70,17 @@ pub fn dispatch_mcp_message_with_preview(
         })),
         "tools/call" => {
             let tool_name = params.get("name").and_then(Value::as_str).unwrap_or("");
-            let args = params
-                .get("arguments")
-                .cloned()
-                .unwrap_or_else(|| json!({}));
+            let args = match params.get("arguments") {
+                None | Some(Value::Null) => json!({}),
+                Some(v) if v.is_object() => v.clone(),
+                Some(_) => {
+                    return Some(json!({
+                        "jsonrpc": "2.0",
+                        "id": id.unwrap_or(Value::Null),
+                        "error": { "code": -32602, "message": "'arguments' must be a JSON object" }
+                    }));
+                }
+            };
             let started = std::time::Instant::now();
             match execute_tool_call(tool_name, &args, scene, history, allowed_export_dir) {
                 Ok(val) => {
@@ -419,27 +426,23 @@ impl McpServer {
     fn call_viewport_screenshot(&mut self, request: &Value) -> Value {
         use crate::error::AiError;
         let id = request.get("id").cloned().unwrap_or(Value::Null);
-        let args = request
-            .get("params")
-            .and_then(|p| p.get("arguments"))
-            .cloned()
-            .unwrap_or_else(|| json!({}));
+        let args = match request.get("params").and_then(|p| p.get("arguments")) {
+            None | Some(Value::Null) => json!({}),
+            Some(v) if v.is_object() => v.clone(),
+            Some(_) => {
+                return json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "error": { "code": -32602, "message": "'arguments' must be a JSON object" }
+                });
+            }
+        };
         let result = (|| -> Result<Value, AiError> {
-            let w = args
-                .get("width")
-                .and_then(Value::as_u64)
-                .unwrap_or(640)
-                .clamp(16, 1024) as u32;
-            let h = args
-                .get("height")
-                .and_then(Value::as_u64)
-                .unwrap_or(480)
-                .clamp(16, 1024) as u32;
-            let preview = args
-                .get("preview")
-                .and_then(Value::as_bool)
-                .unwrap_or(false);
-            let cam = crate::headless::screenshot_camera(&args)?;
+            let parsed = crate::headless::parse_screenshot_args(&args)?;
+            let w = parsed.width;
+            let h = parsed.height;
+            let preview = parsed.preview;
+            let cam = parsed.camera;
             let renderer = match self.headless.as_mut() {
                 Some(r) => r,
                 None => self
@@ -473,11 +476,17 @@ impl McpServer {
     fn call_viewport_turntable_gif(&mut self, request: &Value) -> Value {
         use crate::error::AiError;
         let id = request.get("id").cloned().unwrap_or(Value::Null);
-        let args = request
-            .get("params")
-            .and_then(|p| p.get("arguments"))
-            .cloned()
-            .unwrap_or_else(|| json!({}));
+        let args = match request.get("params").and_then(|p| p.get("arguments")) {
+            None | Some(Value::Null) => json!({}),
+            Some(v) if v.is_object() => v.clone(),
+            Some(_) => {
+                return json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "error": { "code": -32602, "message": "'arguments' must be a JSON object" }
+                });
+            }
+        };
         let result = (|| -> Result<Value, AiError> {
             let parsed = crate::headless::parse_turntable_args(&self.allowed_export_dir, &args)?;
             if self.headless.is_none() {

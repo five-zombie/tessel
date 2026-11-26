@@ -85,7 +85,9 @@ pub struct MeshPass {
     shadow_depth_bg: wgpu::BindGroup,
     shadow_sample_bg: wgpu::BindGroup,
     vertex_buffer: Option<wgpu::Buffer>,
+    vertex_capacity: usize,
     index_buffer: Option<wgpu::Buffer>,
+    index_capacity: usize,
     index_count: u32,
     textured_draws: Vec<TexturedMeshDraw>,
 }
@@ -377,6 +379,11 @@ impl MeshPass {
                     shader_location: 4,
                     format: wgpu::VertexFormat::Float32x4,
                 },
+                wgpu::VertexAttribute {
+                    offset: 52,
+                    shader_location: 5,
+                    format: wgpu::VertexFormat::Float32x3,
+                },
             ],
         };
 
@@ -454,6 +461,11 @@ impl MeshPass {
                     offset: 36,
                     shader_location: 4,
                     format: wgpu::VertexFormat::Float32x4,
+                },
+                wgpu::VertexAttribute {
+                    offset: 52,
+                    shader_location: 5,
+                    format: wgpu::VertexFormat::Float32x3,
                 },
             ],
         };
@@ -585,7 +597,9 @@ impl MeshPass {
             shadow_depth_bg,
             shadow_sample_bg,
             vertex_buffer: None,
+            vertex_capacity: 0,
             index_buffer: None,
+            index_capacity: 0,
             index_count: 0,
             textured_draws: Vec::new(),
         }
@@ -648,29 +662,43 @@ impl MeshPass {
     pub fn upload_mesh(
         &mut self,
         device: &wgpu::Device,
+        queue: &wgpu::Queue,
         vertices: &[StudioVertex3D],
         indices: &[u32],
     ) {
         if vertices.is_empty() || indices.is_empty() {
-            self.vertex_buffer = None;
-            self.index_buffer = None;
             self.index_count = 0;
             return;
         }
-        self.vertex_buffer = Some(
-            device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        if vertices.len() > self.vertex_capacity || self.vertex_buffer.is_none() {
+            let new_cap = vertices.len().next_power_of_two().max(256);
+            let byte_size =
+                (new_cap * std::mem::size_of::<StudioVertex3D>()) as wgpu::BufferAddress;
+            self.vertex_buffer = Some(device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("tessel-mesh-vb"),
-                contents: bytemuck::cast_slice(vertices),
-                usage: wgpu::BufferUsages::VERTEX,
-            }),
-        );
-        self.index_buffer = Some(
-            device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                size: byte_size,
+                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            }));
+            self.vertex_capacity = new_cap;
+        }
+        if indices.len() > self.index_capacity || self.index_buffer.is_none() {
+            let new_cap = indices.len().next_power_of_two().max(512);
+            let byte_size = (new_cap * std::mem::size_of::<u32>()) as wgpu::BufferAddress;
+            self.index_buffer = Some(device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("tessel-mesh-ib"),
-                contents: bytemuck::cast_slice(indices),
-                usage: wgpu::BufferUsages::INDEX,
-            }),
-        );
+                size: byte_size,
+                usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            }));
+            self.index_capacity = new_cap;
+        }
+        if let Some(vb) = &self.vertex_buffer {
+            queue.write_buffer(vb, 0, bytemuck::cast_slice(vertices));
+        }
+        if let Some(ib) = &self.index_buffer {
+            queue.write_buffer(ib, 0, bytemuck::cast_slice(indices));
+        }
         self.index_count = indices.len() as u32;
     }
 

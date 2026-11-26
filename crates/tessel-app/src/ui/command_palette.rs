@@ -165,18 +165,28 @@ fn step_selection(current: usize, len: usize, delta: isize) -> usize {
     (cur + delta).rem_euclid(len as isize) as usize
 }
 
-#[allow(clippy::too_many_arguments)]
-pub fn show_command_palette(
-    ctx: &egui::Context,
-    state: &mut CommandPaletteState,
-    scene: &mut SceneState,
-    history: &mut HistoryStack,
-    camera_3d: &mut OrbitCamera,
-    camera_2d: &mut PixelCamera2D,
-    export_open: &mut bool,
-    import_mesh: &mut bool,
-    new_project: &mut bool,
-) {
+pub struct CommandPaletteContext<'a> {
+    pub state: &'a mut CommandPaletteState,
+    pub scene: &'a mut SceneState,
+    pub history: &'a mut HistoryStack,
+    pub camera_3d: &'a mut OrbitCamera,
+    pub camera_2d: &'a mut PixelCamera2D,
+    pub export_open: &'a mut bool,
+    pub import_mesh: &'a mut bool,
+    pub new_project: &'a mut bool,
+}
+
+pub fn show_command_palette(ctx: &egui::Context, c: CommandPaletteContext<'_>) {
+    let CommandPaletteContext {
+        state,
+        scene,
+        history,
+        camera_3d,
+        camera_2d,
+        export_open,
+        import_mesh,
+        new_project,
+    } = c;
     if !state.open {
         return;
     }
@@ -271,13 +281,15 @@ pub fn show_command_palette(
         execute_action(
             ctx,
             action,
-            scene,
-            history,
-            camera_3d,
-            camera_2d,
-            export_open,
-            import_mesh,
-            new_project,
+            CommandPaletteExec {
+                scene,
+                history,
+                camera_3d,
+                camera_2d,
+                export_open,
+                import_mesh,
+                new_project,
+            },
         );
         state.open = false;
         state.query.clear();
@@ -287,18 +299,26 @@ pub fn show_command_palette(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-fn execute_action(
-    ctx: &egui::Context,
-    action: PaletteAction,
-    scene: &mut SceneState,
-    history: &mut HistoryStack,
-    camera_3d: &mut OrbitCamera,
-    camera_2d: &mut PixelCamera2D,
-    export_open: &mut bool,
-    import_mesh: &mut bool,
-    new_project: &mut bool,
-) {
+struct CommandPaletteExec<'a> {
+    scene: &'a mut SceneState,
+    history: &'a mut HistoryStack,
+    camera_3d: &'a mut OrbitCamera,
+    camera_2d: &'a mut PixelCamera2D,
+    export_open: &'a mut bool,
+    import_mesh: &'a mut bool,
+    new_project: &'a mut bool,
+}
+
+fn execute_action(ctx: &egui::Context, action: PaletteAction, e: CommandPaletteExec<'_>) {
+    let CommandPaletteExec {
+        scene,
+        history,
+        camera_3d,
+        camera_2d,
+        export_open,
+        import_mesh,
+        new_project,
+    } = e;
     match action {
         PaletteAction::Mode(mode) => {
             if scene.active_mode != mode {
@@ -529,13 +549,15 @@ mod tests {
         execute_action(
             &ctx,
             PaletteAction::ApplyHumanoidRig,
-            &mut scene,
-            &mut history,
-            &mut cam3d,
-            &mut cam2d,
-            &mut export_open,
-            &mut import_mesh,
-            &mut new_project,
+            CommandPaletteExec {
+                scene: &mut scene,
+                history: &mut history,
+                camera_3d: &mut cam3d,
+                camera_2d: &mut cam2d,
+                export_open: &mut export_open,
+                import_mesh: &mut import_mesh,
+                new_project: &mut new_project,
+            },
         );
         assert_eq!(scene.active_mode, AppMode::Character);
         assert_eq!(
@@ -546,13 +568,15 @@ mod tests {
         execute_action(
             &ctx,
             PaletteAction::NewProject,
-            &mut scene,
-            &mut history,
-            &mut cam3d,
-            &mut cam2d,
-            &mut export_open,
-            &mut import_mesh,
-            &mut new_project,
+            CommandPaletteExec {
+                scene: &mut scene,
+                history: &mut history,
+                camera_3d: &mut cam3d,
+                camera_2d: &mut cam2d,
+                export_open: &mut export_open,
+                import_mesh: &mut import_mesh,
+                new_project: &mut new_project,
+            },
         );
         assert!(new_project);
     }

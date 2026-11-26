@@ -42,7 +42,6 @@ pub fn status_bar_hints(mode: AppMode, free_view: bool) -> &'static str {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 pub fn show_status_bar(
     ctx: &egui::Context,
     scene: &SceneState,

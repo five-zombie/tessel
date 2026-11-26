@@ -123,6 +123,9 @@ pub struct LowPolyMesh {
     /// Optional custom/proxy vertex normals (e.g. transferred sphere normals for clean anime/sumi-e faces).
     #[serde(default)]
     pub proxy_normals: BTreeMap<usize, Vec3>,
+    /// Non-destructive modifier stack evaluated on top of base mesh (`v5.9`).
+    #[serde(default)]
+    pub modifiers: Vec<super::pipeline::MeshModifier>,
 }
 
 impl LowPolyMesh {

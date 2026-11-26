@@ -10,6 +10,55 @@ use crate::voxel::{Symmetry3D, VoxelTool, VoxelVolume};
 
 use super::nano::{AppMode, NodeId, NodeKind, Transform};
 
+/// Look-Dev viewport environment lighting preset (`v5.9`, preview-only).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LookDevPreset {
+    #[default]
+    Daylight,
+    Night,
+    Indoor,
+    Sunset,
+}
+
+/// Saved look-dev camera bookmark (`v5.9`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CameraBookmark {
+    pub name: String,
+    pub target: [f32; 3],
+    pub yaw: f32,
+    pub pitch: f32,
+    pub distance: f32,
+}
+
+/// 3D viewport reference image plane for 2D->3D authoring (`E7`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ReferenceImagePlane {
+    pub name: String,
+    pub path: String,
+    pub position: [f32; 3],
+    pub size: [f32; 2],
+    pub opacity: f32,
+}
+
+/// Extended NPR / look-dev viewport parameters (`E8` / `v5.9`).
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct NprLookParams {
+    pub hatching_strength: f32,
+    pub bloom_strength: f32,
+    pub msaa_samples: u32,
+}
+
+impl Default for NprLookParams {
+    fn default() -> Self {
+        Self {
+            hatching_strength: 0.0,
+            bloom_strength: 0.0,
+            msaa_samples: 1,
+        }
+    }
+}
+
 /// Sub-Unit: Single scene graph node metadata.
 /// Viewport shading & NPR preview mode (shared by live GUI, headless screenshots, and turntables).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -81,6 +130,20 @@ pub struct SceneState {
     pub weight_brush_strength: f32,
     #[serde(default)]
     pub stick_gizmo: crate::character::StickGizmoSettings,
+    #[serde(default)]
+    pub lookdev_preset: LookDevPreset,
+    #[serde(default)]
+    pub camera_bookmarks: Vec<CameraBookmark>,
+    #[serde(default)]
+    pub reference_planes: Vec<ReferenceImagePlane>,
+    #[serde(default)]
+    pub node_extras: BTreeMap<NodeId, BTreeMap<String, String>>,
+    #[serde(default)]
+    pub collision_hulls: BTreeMap<NodeId, crate::mesh::CollisionHull>,
+    #[serde(default)]
+    pub mesh_instances: BTreeMap<NodeId, Vec<Transform>>,
+    #[serde(default)]
+    pub npr_look: NprLookParams,
     pub nodes: BTreeMap<NodeId, SceneNode>,
     pub pixel_canvases: BTreeMap<NodeId, PixelCanvas>,
     pub voxel_volumes: BTreeMap<NodeId, VoxelVolume>,
@@ -136,6 +199,13 @@ impl SceneState {
             weight_brush_radius: default_weight_brush_radius(),
             weight_brush_strength: default_weight_brush_strength(),
             stick_gizmo: crate::character::StickGizmoSettings::default(),
+            lookdev_preset: LookDevPreset::Daylight,
+            camera_bookmarks: Vec::new(),
+            reference_planes: Vec::new(),
+            node_extras: BTreeMap::new(),
+            collision_hulls: BTreeMap::new(),
+            mesh_instances: BTreeMap::new(),
+            npr_look: NprLookParams::default(),
             nodes: BTreeMap::new(),
             pixel_canvases: BTreeMap::new(),
             voxel_volumes: BTreeMap::new(),

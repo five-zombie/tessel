@@ -67,11 +67,12 @@ impl Default for GroundingOptions {
     }
 }
 
-/// Single surface source (either a `LowPolyMesh` or a `VoxelVolume`) in world space.
-#[derive(Debug, Clone, Copy)]
+/// Single surface source (either a `LowPolyMesh` with a prebuilt `MeshBvh`, or a `VoxelVolume`) in world space.
+#[derive(Debug, Clone)]
 pub enum SurfaceSource<'a> {
     Mesh {
         mesh: &'a crate::mesh::LowPolyMesh,
+        bvh: crate::mesh::MeshBvh,
         world_mat: Mat4,
         world_inv: Mat4,
         normal_mat: Mat4,
@@ -85,7 +86,17 @@ pub enum SurfaceSource<'a> {
     },
 }
 
-/// World-space collection of target surface meshes and/or voxel volumes for vertical raycast grounding.
+/// Parameter bundle for clamping an animation clip onto flat or mesh/voxel surfaces.
+#[derive(Debug, Clone, Copy)]
+pub struct ClipGroundingRequest<'a> {
+    pub clip_index: usize,
+    pub bone_prefix: &'a str,
+    pub fallback_floor_y: f32,
+    pub fps: f32,
+    pub bounds: Option<&'a super::skin::SkinnedBoundsCache>,
+    pub surface: Option<&'a SurfaceTarget<'a>>,
+    pub options: &'a GroundingOptions,
+}
 #[derive(Debug, Clone)]
 pub struct SurfaceTarget<'a> {
     pub sources: Vec<SurfaceSource<'a>>,
@@ -113,6 +124,7 @@ impl<'a> SurfaceTarget<'a> {
                 if !mesh.faces.is_empty() {
                     sources.push(SurfaceSource::Mesh {
                         mesh,
+                        bvh: crate::mesh::MeshBvh::from_mesh(mesh),
                         world_mat,
                         world_inv,
                         normal_mat,
@@ -164,34 +176,32 @@ impl<'a> SurfaceTarget<'a> {
         let mut best: Option<SurfaceHit> = None;
 
         for source in &self.sources {
-            let candidate = match *source {
+            let candidate = match source {
                 SurfaceSource::Mesh {
-                    mesh,
+                    mesh: _,
+                    bvh,
                     world_mat,
                     world_inv,
                     normal_mat,
                 } => {
                     let local_orig = world_inv.transform_point3(ray_origin_w);
                     let local_dir = world_inv.transform_vector3(-Vec3::Y).normalize_or_zero();
-                    crate::mesh::ops::raycast_mesh_hit(mesh, local_orig, local_dir).and_then(
-                        |hit| {
-                            let wp = world_mat.transform_point3(hit.point);
-                            if !wp.y.is_finite() || wp.y > start_y + 1e-2 {
-                                return None;
-                            }
-                            let mut wn =
-                                normal_mat.transform_vector3(hit.normal).normalize_or_zero();
-                            if wn.length_squared() < 1e-6 {
-                                wn = Vec3::Y;
-                            } else if wn.y < 0.0 {
-                                wn = -wn;
-                            }
-                            Some(SurfaceHit {
-                                y: wp.y,
-                                normal: wn,
-                            })
-                        },
-                    )
+                    bvh.raycast(local_orig, local_dir).and_then(|hit| {
+                        let wp = world_mat.transform_point3(hit.point);
+                        if !wp.y.is_finite() || wp.y > start_y + 1e-2 {
+                            return None;
+                        }
+                        let mut wn = normal_mat.transform_vector3(hit.normal).normalize_or_zero();
+                        if wn.length_squared() < 1e-6 {
+                            wn = Vec3::Y;
+                        } else if wn.y < 0.0 {
+                            wn = -wn;
+                        }
+                        Some(SurfaceHit {
+                            y: wp.y,
+                            normal: wn,
+                        })
+                    })
                 }
                 SurfaceSource::Voxel {
                     volume,
@@ -200,6 +210,8 @@ impl<'a> SurfaceTarget<'a> {
                     world_inv,
                     normal_mat,
                 } => {
+                    let volume = *volume;
+                    let unit_scale = *unit_scale;
                     let local_orig = world_inv.transform_point3(ray_origin_w);
                     let local_dir = world_inv.transform_vector3(-Vec3::Y).normalize_or_zero();
                     crate::voxel::ops::raycast_voxels(
@@ -338,6 +350,24 @@ pub struct CharacterRig {
     /// Optional per-prefix clip layers evaluated on top of `active_animation`.
     #[serde(default)]
     pub clip_layers: Vec<ClipLayer>,
+    /// Persistent per-chain IK pole vectors keyed by end-effector `BoneId` (`v5.5`).
+    #[serde(default)]
+    pub chain_poles: BTreeMap<BoneId, Vec3>,
+    /// Deterministic rig constraints evaluated during pose sampling (`v5.6`).
+    #[serde(default)]
+    pub constraints: Vec<super::constraints::BoneConstraint>,
+    /// Named bone groups / visibility & lock layers (`v5.6`).
+    #[serde(default)]
+    pub bone_groups: BTreeMap<String, super::constraints::BoneGroup>,
+    /// Named attachment sockets anchored to bones (`v5.6`).
+    #[serde(default)]
+    pub sockets: Vec<super::constraints::RigSocket>,
+    /// Named saved poses for one-click apply / X-flipped paste (`v5.7`).
+    #[serde(default)]
+    pub pose_library: BTreeMap<String, BTreeMap<BoneId, Transform>>,
+    /// Optional dedicated root-motion bone ID (`v5.6`).
+    #[serde(default)]
+    pub root_motion_bone: Option<BoneId>,
 }
 
 impl CharacterRig {
@@ -380,6 +410,7 @@ impl CharacterRig {
             node_parent_overrides: BTreeMap::new(),
             node_transform_overrides: BTreeMap::new(),
             clip_layers: Vec::new(),
+            ..Self::default()
         }
     }
 
@@ -440,6 +471,7 @@ impl CharacterRig {
             node_parent_overrides: BTreeMap::new(),
             node_transform_overrides: BTreeMap::new(),
             clip_layers: Vec::new(),
+            ..Self::default()
         }
     }
 
@@ -471,7 +503,7 @@ impl CharacterRig {
 
     /// Computes world-space transform matrices for every bone in hierarchy order.
     pub fn world_pose_matrices(&self) -> BTreeMap<BoneId, Mat4> {
-        let mut world = BTreeMap::new();
+        let mut world: BTreeMap<BoneId, Mat4> = BTreeMap::new();
         for bone in &self.bones {
             let local = Mat4::from_scale_rotation_translation(
                 bone.pose_local.scale,
@@ -479,7 +511,25 @@ impl CharacterRig {
                 bone.pose_local.translation,
             );
             let mat = match bone.parent.and_then(|pid| world.get(&pid)) {
-                Some(&parent_mat) => parent_mat * local,
+                Some(&parent_mat) => {
+                    if bone.inherit_rotation && bone.inherit_scale {
+                        parent_mat * local
+                    } else {
+                        let (ps, pr, pt) = parent_mat.to_scale_rotation_translation();
+                        let eff_s = if bone.inherit_scale { ps } else { Vec3::ONE };
+                        let eff_r = if bone.inherit_rotation {
+                            pr
+                        } else {
+                            Quat::IDENTITY
+                        };
+                        let world_pos = pt + pr * (ps * bone.pose_local.translation);
+                        Mat4::from_scale_rotation_translation(
+                            eff_s * bone.pose_local.scale,
+                            (eff_r * bone.pose_local.rotation).normalize(),
+                            world_pos,
+                        )
+                    }
+                }
                 None => local,
             };
             world.insert(bone.id, mat);
@@ -610,6 +660,9 @@ impl CharacterRig {
             for (node, kf) in layer_clip.sample_node_transforms(lt) {
                 self.node_transform_overrides.insert(node, kf);
             }
+        }
+        if !self.constraints.is_empty() {
+            super::constraints::evaluate_rig_constraints(self);
         }
     }
 
@@ -1115,50 +1168,33 @@ impl CharacterRig {
         fps: f32,
         bounds: Option<&super::skin::SkinnedBoundsCache>,
     ) -> Option<AnimationClip> {
-        self.clamp_clip_to_surface(clip_index, bone_prefix, floor_y, fps, bounds, None, false)
+        let opts = GroundingOptions::default();
+        self.clamp_clip_to_surface_with(ClipGroundingRequest {
+            clip_index,
+            bone_prefix,
+            fallback_floor_y: floor_y,
+            fps,
+            bounds,
+            surface: None,
+            options: &opts,
+        })
     }
 
-    /// Samples in-between frames of `clip_index` at `fps` and grounds the sub-skeleton onto
-    /// either a flat `fallback_floor_y` or a target surface mesh `surface` (with optional two-bone
-    /// leg IK on slopes).
-    #[allow(clippy::too_many_arguments)]
-    pub fn clamp_clip_to_surface(
+    /// Grounding v2 clip baker: samples in-between frames at `fps` and grounds onto multi-surface
+    /// targets with overhang clearance, footprint sweep, optional foot IK, normal alignment, and pelvis tilt.
+    pub fn clamp_clip_to_surface_with(
         &self,
-        clip_index: usize,
-        bone_prefix: &str,
-        fallback_floor_y: f32,
-        fps: f32,
-        bounds: Option<&super::skin::SkinnedBoundsCache>,
-        surface: Option<&SurfaceTarget<'_>>,
-        solve_foot_ik: bool,
+        req: ClipGroundingRequest<'_>,
     ) -> Option<AnimationClip> {
-        self.clamp_clip_to_surface_v2(
+        let ClipGroundingRequest {
             clip_index,
             bone_prefix,
             fallback_floor_y,
             fps,
             bounds,
             surface,
-            &GroundingOptions {
-                solve_foot_ik,
-                ..GroundingOptions::default()
-            },
-        )
-    }
-
-    /// Grounding v2 clip baker: samples in-between frames at `fps` and grounds onto multi-surface
-    /// targets with overhang clearance, footprint sweep, optional foot IK, normal alignment, and pelvis tilt.
-    #[allow(clippy::too_many_arguments)]
-    pub fn clamp_clip_to_surface_v2(
-        &self,
-        clip_index: usize,
-        bone_prefix: &str,
-        fallback_floor_y: f32,
-        fps: f32,
-        bounds: Option<&super::skin::SkinnedBoundsCache>,
-        surface: Option<&SurfaceTarget<'_>>,
-        options: &GroundingOptions,
-    ) -> Option<AnimationClip> {
+            options,
+        } = req;
         let mut clip = self.animations.get(clip_index)?.clone();
         let (root_id, _) = self.sub_skeleton_root_and_bones(bone_prefix)?;
         let duration = if clip.duration_secs.is_finite() {

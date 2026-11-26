@@ -5,6 +5,57 @@ use tessel_render::{OrbitCamera, PixelCamera2D, ViewportRenderer};
 
 use crate::error::AiError;
 
+fn parse_opt_u32_clamped(
+    args: &Value,
+    field: &str,
+    default: u32,
+    min: u32,
+    max: u32,
+) -> Result<u32, AiError> {
+    match args.get(field) {
+        None | Some(Value::Null) => Ok(default),
+        Some(v) => {
+            let n = v.as_u64().ok_or_else(|| {
+                AiError::InvalidArguments(format!("'{field}' must be a non-negative integer"))
+            })?;
+            let clamped = n.clamp(u64::from(min), u64::from(max)) as u32;
+            Ok(clamped)
+        }
+    }
+}
+
+fn parse_opt_bool_default(args: &Value, field: &str, default: bool) -> Result<bool, AiError> {
+    match args.get(field) {
+        None | Some(Value::Null) => Ok(default),
+        Some(Value::Bool(b)) => Ok(*b),
+        Some(_) => Err(AiError::InvalidArguments(format!(
+            "'{field}' must be a boolean"
+        ))),
+    }
+}
+
+/// Validated parameters for `viewport_screenshot`.
+pub struct ScreenshotArgs {
+    pub width: u32,
+    pub height: u32,
+    pub preview: bool,
+    pub camera: OrbitCamera,
+}
+
+/// Parses and strictly validates `viewport_screenshot` arguments.
+pub fn parse_screenshot_args(args: &Value) -> Result<ScreenshotArgs, AiError> {
+    let width = parse_opt_u32_clamped(args, "width", 640, 16, 1024)?;
+    let height = parse_opt_u32_clamped(args, "height", 480, 16, 1024)?;
+    let preview = parse_opt_bool_default(args, "preview", false)?;
+    let camera = screenshot_camera(args)?;
+    Ok(ScreenshotArgs {
+        width,
+        height,
+        preview,
+        camera,
+    })
+}
+
 /// Renders `scene` offscreen using any `wgpu::Device`/`Queue` + `ViewportRenderer` and returns
 /// the MCP `content` array (text + sRGB PNG image block). Shared by stdio MCP and live GUI HTTP MCP.
 pub fn render_screenshot_mcp_content(
@@ -14,21 +65,11 @@ pub fn render_screenshot_mcp_content(
     scene: &SceneState,
     args: &Value,
 ) -> Result<Value, AiError> {
-    let w = args
-        .get("width")
-        .and_then(Value::as_u64)
-        .unwrap_or(640)
-        .clamp(16, 1024) as u32;
-    let h = args
-        .get("height")
-        .and_then(Value::as_u64)
-        .unwrap_or(480)
-        .clamp(16, 1024) as u32;
-    let preview = args
-        .get("preview")
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
-    let cam = screenshot_camera(args)?;
+    let parsed = parse_screenshot_args(args)?;
+    let w = parsed.width;
+    let h = parsed.height;
+    let preview = parsed.preview;
+    let cam = parsed.camera;
     viewport.resize(device, w, h);
     viewport.sync_scene(device, queue, scene, None, None);
     let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -76,35 +117,32 @@ pub fn parse_turntable_args(
         .and_then(Value::as_str)
         .ok_or_else(|| AiError::InvalidArguments("missing 'filename'".into()))?;
     let target_path = tessel_io::resolve_safe_export_path(allowed_export_dir, filename)?;
-    let width = args
-        .get("width")
-        .and_then(Value::as_u64)
-        .unwrap_or(320)
-        .clamp(64, 512) as u32;
-    let height = args
-        .get("height")
-        .and_then(Value::as_u64)
-        .unwrap_or(320)
-        .clamp(64, 512) as u32;
-    let frames = args
-        .get("frames")
-        .and_then(Value::as_u64)
-        .unwrap_or(16)
-        .clamp(4, 36) as u32;
-    let fps = args
-        .get("fps")
-        .and_then(Value::as_u64)
-        .unwrap_or(12)
-        .clamp(2, 30) as u32;
-    let preview = args.get("preview").and_then(Value::as_bool).unwrap_or(true);
-    let clip_name = args
-        .get("clip_name")
-        .and_then(Value::as_str)
-        .map(ToString::to_string);
-    let clip_index = args
-        .get("clip_index")
-        .and_then(Value::as_u64)
-        .map(|v| v as usize);
+    let width = parse_opt_u32_clamped(args, "width", 320, 64, 512)?;
+    let height = parse_opt_u32_clamped(args, "height", 320, 64, 512)?;
+    let frames = parse_opt_u32_clamped(args, "frames", 16, 4, 36)?;
+    let fps = parse_opt_u32_clamped(args, "fps", 12, 2, 30)?;
+    let preview = parse_opt_bool_default(args, "preview", true)?;
+    let clip_name = match args.get("clip_name") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(s)) => Some(s.clone()),
+        Some(_) => {
+            return Err(AiError::InvalidArguments(
+                "'clip_name' must be a string".into(),
+            ))
+        }
+    };
+    let clip_index = match args.get("clip_index") {
+        None | Some(Value::Null) => None,
+        Some(v) => {
+            let raw = v.as_u64().ok_or_else(|| {
+                AiError::InvalidArguments("'clip_index' must be a non-negative integer".into())
+            })?;
+            Some(
+                usize::try_from(raw)
+                    .map_err(|_| AiError::InvalidArguments("'clip_index' out of range".into()))?,
+            )
+        }
+    };
     let camera = screenshot_camera(args)?;
     Ok(TurntableArgs {
         target_path,
@@ -331,7 +369,7 @@ pub fn screenshot_camera(args: &serde_json::Value) -> Result<OrbitCamera, AiErro
     let mut cam = OrbitCamera::new();
     cam.distance = 3.0;
     cam.target = glam::Vec3::new(0.0, 0.5, 0.0);
-    if let Some(t) = args.get("target") {
+    if let Some(t) = args.get("target").filter(|v| !v.is_null()) {
         let arr = t.as_array().ok_or_else(|| {
             AiError::InvalidArguments("screenshot 'target' must be [x, y, z]".into())
         })?;
@@ -356,7 +394,7 @@ pub fn screenshot_camera(args: &serde_json::Value) -> Result<OrbitCamera, AiErro
     }
     let num = |key: &str| -> Result<Option<f32>, AiError> {
         match args.get(key) {
-            None => Ok(None),
+            None | Some(Value::Null) => Ok(None),
             Some(v) => {
                 let n = v.as_f64().ok_or_else(|| {
                     AiError::InvalidArguments(format!("screenshot '{key}' must be a number"))
@@ -388,13 +426,11 @@ pub fn screenshot_camera(args: &serde_json::Value) -> Result<OrbitCamera, AiErro
         }
         cam.distance = distance.clamp(0.25, 120.0);
     }
-    if let Some(telephoto) = args.get("telephoto").and_then(Value::as_bool) {
-        if telephoto {
-            cam.set_telephoto();
-        }
+    if parse_opt_bool_default(args, "telephoto", false)? {
+        cam.set_telephoto();
     }
-    if let Some(ortho) = args.get("orthographic").and_then(Value::as_bool) {
-        cam.set_orthographic(ortho);
+    if parse_opt_bool_default(args, "orthographic", false)? {
+        cam.set_orthographic(true);
     }
     Ok(cam)
 }

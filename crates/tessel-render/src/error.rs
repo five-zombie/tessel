@@ -22,4 +22,7 @@ pub enum RenderError {
 
     #[error("viewport GPU readback timed out after {0:?}")]
     ReadbackTimeout(std::time::Duration),
+
+    #[error("invalid GPU texture upload: {0}")]
+    InvalidTextureUpload(String),
 }

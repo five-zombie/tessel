@@ -41,17 +41,26 @@ impl SettingsDialogState {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-pub fn show_settings_dialog(
-    ctx: &egui::Context,
-    state: &mut SettingsDialogState,
-    settings: &mut AppSettings,
-    paths: &AppPaths,
-    ai_config: &mut DirectAiConfig,
-    export_dir: &mut PathBuf,
-    live_mcp: Option<&LiveMcpServerHandle>,
-    mcp_dialog_open: &mut bool,
-) {
+pub struct SettingsDialogContext<'a> {
+    pub state: &'a mut SettingsDialogState,
+    pub settings: &'a mut AppSettings,
+    pub paths: &'a AppPaths,
+    pub ai_config: &'a mut DirectAiConfig,
+    pub export_dir: &'a mut PathBuf,
+    pub live_mcp: Option<&'a LiveMcpServerHandle>,
+    pub mcp_dialog_open: &'a mut bool,
+}
+
+pub fn show_settings_dialog(ctx: &egui::Context, d: SettingsDialogContext<'_>) {
+    let SettingsDialogContext {
+        state,
+        settings,
+        paths,
+        ai_config,
+        export_dir,
+        live_mcp,
+        mcp_dialog_open,
+    } = d;
     match state.folder_picker.poll() {
         Ok(Some(Some(folder))) => {
             state.export_dir_text = folder.display().to_string();

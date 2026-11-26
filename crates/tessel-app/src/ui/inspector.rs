@@ -1,8 +1,8 @@
 use std::path::Path;
-use std::sync::mpsc;
+use std::sync::{mpsc, OnceLock};
 
 use egui::{Color32, CornerRadius, Frame, Margin, RichText, Stroke};
-use tessel_ai::direct::DirectAiResponse;
+use tessel_ai::direct::{tool_call_requires_confirmation, DirectAiResponse, PlannedToolCall};
 use tessel_ai::{AiProviderKind, DirectAiConfig};
 use tessel_core::{
     AppMode, BoneId, Command, FrameIndex, HistoryStack, Keyframe, NodeId, PaletteEntry,
@@ -12,12 +12,29 @@ use tessel_core::{
 use super::icons::{self, ToolIcon};
 use super::theme::tokens;
 
+static DIRECT_AI_RUNTIME: OnceLock<Result<tokio::runtime::Runtime, String>> = OnceLock::new();
+
+fn direct_ai_runtime() -> Result<&'static tokio::runtime::Runtime, String> {
+    match DIRECT_AI_RUNTIME.get_or_init(|| {
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .thread_name("tessel-direct-ai")
+            .enable_all()
+            .build()
+            .map_err(|e| format!("async runtime error: {e}"))
+    }) {
+        Ok(rt) => Ok(rt),
+        Err(e) => Err(e.clone()),
+    }
+}
+
 #[derive(Default)]
 pub struct DirectAiUiState {
     pub config: DirectAiConfig,
     pub prompt: String,
     pub pending: Option<mpsc::Receiver<Result<DirectAiResponse, String>>>,
     pub cancel_handle: Option<tokio::task::AbortHandle>,
+    pub pending_confirm_calls: Vec<PlannedToolCall>,
     pub last_result: Option<Result<String, String>>,
 }
 
@@ -42,7 +59,15 @@ impl DirectAiUiState {
         match result {
             Ok(resp) => {
                 let mut summary_lines = Vec::new();
-                for call in &resp.tool_calls {
+                self.pending_confirm_calls.clear();
+                for (idx, call) in resp.tool_calls.iter().enumerate() {
+                    if tool_call_requires_confirmation(call) {
+                        for remaining in &resp.tool_calls[idx..] {
+                            self.pending_confirm_calls.push(remaining.clone());
+                            summary_lines.push(format!("[CONFIRM REQUIRED] {}", remaining.name));
+                        }
+                        break;
+                    }
                     match tessel_ai::translator::execute_tool_call(
                         &call.name,
                         &call.arguments,
@@ -70,6 +95,31 @@ impl DirectAiUiState {
             Err(err) => {
                 self.last_result = Some(Err(err));
             }
+        }
+    }
+
+    pub fn approve_pending_confirm_calls(
+        &mut self,
+        scene: &mut SceneState,
+        history: &mut HistoryStack,
+        allowed_export_dir: &Path,
+    ) {
+        let calls = std::mem::take(&mut self.pending_confirm_calls);
+        let mut lines = Vec::new();
+        for call in &calls {
+            match tessel_ai::translator::execute_tool_call(
+                &call.name,
+                &call.arguments,
+                scene,
+                history,
+                allowed_export_dir,
+            ) {
+                Ok(_) => lines.push(format!("[APPROVED OK] {}", call.name)),
+                Err(err) => lines.push(format!("[APPROVED ERR] {}: {err}", call.name)),
+            }
+        }
+        if !lines.is_empty() {
+            self.last_result = Some(Ok(lines.join("\n")));
         }
     }
 }
@@ -120,7 +170,7 @@ pub fn show_inspector(
                 ui.add_space(10.0);
                 ui.separator();
                 ui.add_space(8.0);
-                show_direct_ai_section(ui, scene, ai_state, settings);
+                show_direct_ai_section(ui, scene, history, ai_state, allowed_export_dir, settings);
             });
         });
 }
@@ -1379,8 +1429,10 @@ fn apply_provider_selection(
 
 fn show_direct_ai_section(
     ui: &mut egui::Ui,
-    scene: &SceneState,
+    scene: &mut SceneState,
+    history: &mut HistoryStack,
     ai_state: &mut DirectAiUiState,
+    allowed_export_dir: &Path,
     settings: &crate::settings::AppSettings,
 ) {
     ui.label(
@@ -1446,42 +1498,66 @@ fn show_direct_ai_section(
     let can_send = !busy && !ai_state.prompt.trim().is_empty();
     ui.horizontal(|ui| {
         if icons::hud_icon_button_enabled(ui, ToolIcon::Send, "Send Prompt", false, can_send) {
-            let (tx, rx) = mpsc::channel();
-            let (abort_tx, abort_rx) = mpsc::channel();
-            let config = ai_state.config.clone();
-            let scene_clone = scene.clone();
-            let prompt = ai_state.prompt.clone();
-            ai_state.pending = Some(rx);
-            std::thread::spawn(move || {
-                let res = match tokio::runtime::Runtime::new() {
-                    Ok(rt) => rt.block_on(async move {
-                        let task = tokio::spawn(async move {
-                            tessel_ai::direct::send_prompt(&config, &scene_clone, &prompt)
-                                .await
-                                .map_err(|e| e.to_string())
-                        });
-                        let _ = abort_tx.send(task.abort_handle());
-                        match task.await {
-                            Ok(inner) => inner,
-                            Err(err) if err.is_cancelled() => Err("request cancelled".into()),
-                            Err(err) => Err(format!("worker join error: {err}")),
-                        }
-                    }),
-                    Err(e) => Err(format!("async runtime error: {e}")),
-                };
-                let _ = tx.send(res);
-            });
-            ai_state.cancel_handle = abort_rx
-                .recv_timeout(std::time::Duration::from_millis(200))
-                .ok();
+            ai_state.pending_confirm_calls.clear();
+            match direct_ai_runtime() {
+                Ok(rt) => {
+                    let (tx, rx) = mpsc::channel();
+                    let config = ai_state.config.clone();
+                    let scene_clone = scene.clone();
+                    let prompt = ai_state.prompt.clone();
+                    let handle = rt.spawn(async move {
+                        let res = tessel_ai::direct::send_prompt(&config, &scene_clone, &prompt)
+                            .await
+                            .map_err(|e| e.to_string());
+                        let _ = tx.send(res);
+                    });
+                    ai_state.cancel_handle = Some(handle.abort_handle());
+                    ai_state.pending = Some(rx);
+                }
+                Err(err) => {
+                    ai_state.last_result = Some(Err(err));
+                }
+            }
         }
         if busy && icons::hud_icon_button(ui, ToolIcon::Close, "Cancel", false) {
             if let Some(handle) = ai_state.cancel_handle.take() {
                 handle.abort();
             }
             ai_state.pending = None;
+            ai_state.last_result = Some(Err("Direct AI request cancelled".into()));
         }
     });
+
+    if !ai_state.pending_confirm_calls.is_empty() {
+        ui.add_space(4.0);
+        let names: Vec<String> = ai_state
+            .pending_confirm_calls
+            .iter()
+            .map(|c| {
+                let arg_str = c.arguments.to_string();
+                let preview: String = arg_str.chars().take(48).collect();
+                format!("{}({preview})", c.name)
+            })
+            .collect();
+        ui.label(
+            RichText::new(format!(
+                "Confirm destructive/file tool(s): {}",
+                names.join(", ")
+            ))
+            .size(11.0)
+            .color(tokens::ERROR),
+        );
+        ui.horizontal(|ui| {
+            if ui.small_button("Approve").clicked() {
+                ai_state.approve_pending_confirm_calls(scene, history, allowed_export_dir);
+            }
+            if ui.small_button("Reject").clicked() {
+                ai_state.pending_confirm_calls.clear();
+                ai_state.last_result =
+                    Some(Ok("Rejected pending destructive/file tool calls.".into()));
+            }
+        });
+    }
 
     ui.add_space(4.0);
     if busy {

@@ -1,4 +1,5 @@
 pub mod bake;
+pub mod bvh;
 pub mod cage;
 mod face;
 pub mod layer;
@@ -7,12 +8,14 @@ mod nano;
 pub mod npr;
 pub mod ops;
 pub mod paint;
+pub mod pipeline;
 pub mod ribbon;
 pub mod smart_material;
 pub mod texture;
 pub mod vat;
 
 pub use bake::{bake_mesh_maps, BakeMapKind, BakeParams, BakedMaps};
+pub use bvh::MeshBvh;
 pub use cage::ProxyCage;
 pub use face::Face;
 pub use layer::{composite_paint_layers, MeshPaintLayer};
@@ -24,6 +27,11 @@ pub use npr::{
 };
 pub use ops::{apply_primitive_anchor, TerrainParams};
 pub use paint::{paint_mesh_spot_3d, PaintSpot3DParams};
+pub use pipeline::{
+    cleanup_mesh, evaluate_modifier_stack, extract_rgba_silhouette_and_palette, pack_orm_texture,
+    preflight_check_scene, CollisionHull, ImageSilhouettePalette, MeshModifier, PreflightIssue,
+    PreflightReport, PreflightSeverity,
+};
 pub use ribbon::{
     build_ribbon_visibility_track, generate_ribbon_mesh, sample_trajectory_points, RibbonParams,
 };

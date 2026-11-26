@@ -89,6 +89,9 @@ pub struct AnimationClip {
     /// Optional quantized playback FPS (e.g. `Some(12.0)` for animated-on-twos pose stepping).
     #[serde(default)]
     pub stepped_fps: Option<f32>,
+    /// Optional animation event/notify markers exported as glTF `extras` (`v5.7`).
+    #[serde(default)]
+    pub events: Vec<super::constraints::AnimationEventKey>,
 }
 
 impl AnimationClip {
@@ -102,6 +105,7 @@ impl AnimationClip {
             parent_switch_tracks: Vec::new(),
             node_transform_tracks: Vec::new(),
             stepped_fps: None,
+            events: Vec::new(),
         }
     }
 
@@ -659,6 +663,7 @@ impl AnimationClip {
             parent_switch_tracks: Vec::new(),
             node_transform_tracks: Vec::new(),
             stepped_fps: None,
+            events: Vec::new(),
             channels: vec![BoneChannel {
                 bone_id: BoneId(1), // Torso subtle breathing
                 keyframes: vec![
@@ -699,6 +704,7 @@ impl AnimationClip {
             parent_switch_tracks: Vec::new(),
             node_transform_tracks: Vec::new(),
             stepped_fps: None,
+            events: Vec::new(),
             channels: vec![
                 BoneChannel {
                     bone_id: BoneId(3), // LeftArm
