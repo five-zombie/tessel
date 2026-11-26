@@ -110,10 +110,9 @@ pub fn find_mirror_bone(rig: &CharacterRig, bone_id: BoneId) -> Option<BoneId> {
         format!("{rest}_L")
     } else if let Some(rest) = name.strip_suffix(".L") {
         format!("{rest}.R")
-    } else if let Some(rest) = name.strip_suffix(".R") {
-        format!("{rest}.L")
     } else {
-        return None;
+        let rest = name.strip_suffix(".R")?;
+        format!("{rest}.L")
     };
     rig.bones
         .iter()
