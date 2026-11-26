@@ -496,28 +496,35 @@ pub fn apply_quick_start_preset(
     action: &QuickStartAction,
     scene: &mut SceneState,
     history: &mut HistoryStack,
-) {
+) -> Result<(), String> {
     match action {
         QuickStartAction::NewPixel => {
-            let _ = history.execute(scene, Command::SetMode(AppMode::Pixel));
+            history
+                .execute(scene, Command::SetMode(AppMode::Pixel))
+                .map_err(|e| e.to_string())?;
         }
         QuickStartAction::NewVoxel | QuickStartAction::OpenAiWorkspace => {
-            let _ = history.execute(scene, Command::SetMode(AppMode::Voxel));
+            history
+                .execute(scene, Command::SetMode(AppMode::Voxel))
+                .map_err(|e| e.to_string())?;
         }
         QuickStartAction::NewCharacter => {
-            let _ = history.execute(
-                scene,
-                Command::Transaction(vec![
-                    Command::ApplyBipedRig,
-                    Command::SetMode(AppMode::Character),
-                ]),
-            );
+            history
+                .execute(
+                    scene,
+                    Command::Transaction(vec![
+                        Command::ApplyBipedRig,
+                        Command::SetMode(AppMode::Character),
+                    ]),
+                )
+                .map_err(|e| e.to_string())?;
         }
         QuickStartAction::None
         | QuickStartAction::OpenExample(_)
         | QuickStartAction::RecoverSession
         | QuickStartAction::OpenRecent(_) => {}
     }
+    Ok(())
 }
 
 pub fn show_about_dialog(ctx: &egui::Context, open: &mut bool) {

@@ -27,6 +27,7 @@ pub struct ExportDialogState {
     pub turntable_fps: u32,
     pub turntable_clip: Option<usize>,
     pub status_message: Option<Result<String, String>>,
+    pub folder_picker: super::AsyncJobSlot<Option<PathBuf>>,
 }
 
 impl Default for ExportDialogState {
@@ -42,6 +43,7 @@ impl Default for ExportDialogState {
             turntable_fps: 12,
             turntable_clip: None,
             status_message: None,
+            folder_picker: super::AsyncJobSlot::default(),
         }
     }
 }
@@ -78,6 +80,17 @@ pub fn show_export_dialog(
     camera_3d: &OrbitCamera,
     state: &mut ExportDialogState,
 ) -> ExportAction {
+    match state.folder_picker.poll() {
+        Ok(Some(Some(chosen))) => {
+            state.output_dir = chosen;
+        }
+        Ok(Some(None)) | Ok(None) => {}
+        Err(err) => state.status_message = Some(Err(err.into())),
+    }
+    if state.folder_picker.is_busy() {
+        ctx.request_repaint_after(std::time::Duration::from_millis(50));
+    }
+
     if !state.open {
         return ExportAction::None;
     }
@@ -207,17 +220,22 @@ pub fn show_export_dialog(
                     }
                 }
                 if ui.button("Browse…").clicked() {
-                    let mut picker = rfd::FileDialog::new();
-                    if state.output_dir.exists() {
-                        picker = picker.set_directory(&state.output_dir);
-                    } else if let Some(parent) = state.output_dir.parent() {
-                        if parent.exists() {
-                            picker = picker.set_directory(parent);
+                    let initial_dir = if state.output_dir.exists() {
+                        Some(state.output_dir.clone())
+                    } else {
+                        state
+                            .output_dir
+                            .parent()
+                            .filter(|p| p.exists())
+                            .map(PathBuf::from)
+                    };
+                    state.folder_picker.spawn(move || {
+                        let mut picker = rfd::FileDialog::new();
+                        if let Some(dir) = initial_dir {
+                            picker = picker.set_directory(&dir);
                         }
-                    }
-                    if let Some(chosen) = picker.pick_folder() {
-                        state.output_dir = chosen;
-                    }
+                        picker.pick_folder()
+                    });
                 }
             });
 

@@ -201,10 +201,16 @@ pub fn show_viewport(
                                                         color,
                                                     });
                                                 }
-                                                let _ = history
-                                                    .execute(scene, Command::Transaction(cmds));
+                                                super::exec_history(
+                                                    ui.ctx(),
+                                                    history,
+                                                    scene,
+                                                    Command::Transaction(cmds),
+                                                );
                                             } else {
-                                                let _ = history.execute(
+                                                super::exec_history(
+                                                    ui.ctx(),
+                                                    history,
                                                     scene,
                                                     Command::PaintMeshTexture {
                                                         node_id,
@@ -242,8 +248,12 @@ pub fn show_viewport(
                                     }
                                     if let Some((_, hit_nid, face_id)) = best {
                                         if scene.selected_node != Some(hit_nid) {
-                                            let _ = history
-                                                .execute(scene, Command::SelectNode(Some(hit_nid)));
+                                            super::exec_history(
+                                                ui.ctx(),
+                                                history,
+                                                scene,
+                                                Command::SelectNode(Some(hit_nid)),
+                                            );
                                         }
                                         scene.selected_face = Some(face_id);
                                         scene.mark_modified();
@@ -495,7 +505,9 @@ fn handle_gizmo_drag_input(
                 if let Some(node) = scene.nodes.get_mut(&drag.node_id) {
                     node.transform = drag.start_transform;
                 }
-                let _ = history.execute(
+                super::exec_history(
+                    &response.ctx,
+                    history,
                     scene,
                     Command::SetNodeTransform {
                         node_id: drag.node_id,
@@ -750,7 +762,9 @@ fn handle_pixel_viewport_input(
                         }
                     }
                     if !edits.is_empty() {
-                        let _ = history.execute(
+                        super::exec_history(
+                            ui.ctx(),
+                            history,
                             scene,
                             Command::DrawPixels {
                                 node_id,
@@ -829,7 +843,9 @@ fn handle_pixel_viewport_input(
     };
 
     if !edits.is_empty() {
-        let _ = history.execute(
+        super::exec_history(
+            ui.ctx(),
+            history,
             scene,
             Command::DrawPixels {
                 node_id,
@@ -888,7 +904,12 @@ fn handle_voxel_click_input(
                 .or_else(|| {
                     if ray_dir.y.abs() > 1e-5 {
                         let t = -ray_origin.y / ray_dir.y;
-                        if t > 0.0 && t < 80.0 {
+                        let max_t = if camera.orthographic {
+                            camera.far * 1.5
+                        } else {
+                            80.0
+                        };
+                        if t > 0.0 && t < max_t {
                             let p = (ray_origin + ray_dir * t) / scene.unit_scale;
                             return Some((
                                 VoxelCoord::new(p.x.floor() as i32, 0, p.z.floor() as i32),
@@ -911,7 +932,9 @@ fn handle_voxel_click_input(
     if scene.voxel_tool == VoxelTool::BoxFill {
         let min = VoxelCoord::new(base_coord.x - 1, base_coord.y, base_coord.z - 1);
         let max = VoxelCoord::new(base_coord.x + 1, base_coord.y + 2, base_coord.z + 1);
-        let _ = history.execute(
+        super::exec_history(
+            ui.ctx(),
+            history,
             scene,
             Command::FillVoxelBox {
                 node_id,
@@ -930,7 +953,12 @@ fn handle_voxel_click_input(
         .collect();
 
     if !edits.is_empty() {
-        let _ = history.execute(scene, Command::SetVoxels { node_id, edits });
+        super::exec_history(
+            ui.ctx(),
+            history,
+            scene,
+            Command::SetVoxels { node_id, edits },
+        );
     }
 }
 
@@ -1037,9 +1065,7 @@ pub fn project_bounds_to_screen_rect(
     let w = viewport_rect.width().max(1.0);
     let h = viewport_rect.height().max(1.0);
     let aspect = w / h;
-    let view = glam::Mat4::look_at_rh(camera.position(), camera.target, glam::Vec3::Y);
-    let proj = glam::Mat4::perspective_rh(camera.fov_y_radians, aspect, camera.near, camera.far);
-    let vp = proj * view;
+    let vp = camera.view_proj(aspect);
 
     let mut smin = egui::pos2(f32::INFINITY, f32::INFINITY);
     let mut smax = egui::pos2(f32::NEG_INFINITY, f32::NEG_INFINITY);
@@ -1153,9 +1179,7 @@ pub fn project_world_point(
     let w = viewport_rect.width().max(1.0);
     let h = viewport_rect.height().max(1.0);
     let aspect = w / h;
-    let view = glam::Mat4::look_at_rh(camera.position(), camera.target, glam::Vec3::Y);
-    let proj = glam::Mat4::perspective_rh(camera.fov_y_radians, aspect, camera.near, camera.far);
-    let clip = (proj * view) * glam::Vec4::new(pt.x, pt.y, pt.z, 1.0);
+    let clip = camera.view_proj(aspect) * glam::Vec4::new(pt.x, pt.y, pt.z, 1.0);
     if clip.w <= 1e-4 {
         return None;
     }
@@ -1249,7 +1273,9 @@ fn handle_scene_gadget_input(
                     let final_el = scene.light_elevation;
                     scene.light_azimuth = start_azimuth;
                     scene.light_elevation = start_elevation;
-                    let _ = history.execute(
+                    super::exec_history(
+                        ui.ctx(),
+                        history,
                         scene,
                         Command::SetLightDirection {
                             azimuth: final_az,
@@ -1486,5 +1512,30 @@ mod tests {
 
         let behind = cam.position() + (cam.position() - cam.target).normalize() * 2.0;
         assert!(project_world_point(behind, &cam, vp).is_none());
+    }
+
+    #[test]
+    fn project_world_point_and_bounds_match_orthographic_camera() {
+        let mut cam = OrbitCamera::new();
+        cam.orthographic = true;
+        cam.distance = 8.0;
+        let vp = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 600.0));
+
+        let center = project_world_point(cam.target, &cam, vp).unwrap();
+        assert!((center.x - 400.0).abs() < 2.0);
+        assert!((center.y - 300.0).abs() < 2.0);
+
+        // In orthographic projection, a point offset perpendicular to view does not scale with depth.
+        let p_near = cam.target + glam::Vec3::new(0.0, 1.0, 0.0);
+        let s_ortho = project_world_point(p_near, &cam, vp).unwrap();
+        let rect = project_bounds_to_screen_rect(
+            cam.target - glam::Vec3::splat(0.5),
+            cam.target + glam::Vec3::splat(0.5),
+            &cam,
+            vp,
+        )
+        .unwrap();
+        assert!(rect.contains(center));
+        assert!(s_ortho.y < center.y);
     }
 }

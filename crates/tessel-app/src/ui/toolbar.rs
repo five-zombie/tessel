@@ -1,10 +1,78 @@
+use std::sync::{Arc, Mutex};
+
 use egui::{Frame, Margin, RichText, Stroke};
-use tessel_core::{AppMode, Command, FaceId, HistoryStack, SceneState};
+use tessel_core::{AppMode, Command, FaceId, HistoryStack, NodeId, SceneState};
 
 use super::icons::{self, IconItem, ToolbarAction};
 use super::theme::tokens;
+use super::AsyncJobSlot;
+
+type TextureLoadResult = Option<(
+    NodeId,
+    String,
+    bool,
+    Result<tessel_core::MeshTexture, String>,
+)>;
+
+fn poll_texture_load_job(ctx: &egui::Context, scene: &mut SceneState, history: &mut HistoryStack) {
+    let slot_id = egui::Id::new("toolbar_texture_load_slot");
+    let Some(slot) =
+        ctx.data(|d| d.get_temp::<Arc<Mutex<AsyncJobSlot<TextureLoadResult>>>>(slot_id))
+    else {
+        return;
+    };
+    let mut guard = slot.lock().unwrap_or_else(|e| e.into_inner());
+    let polled = guard.poll();
+    let busy = guard.is_busy();
+    drop(guard);
+    if busy {
+        ctx.request_repaint_after(std::time::Duration::from_millis(50));
+    }
+    match polled {
+        Ok(Some(Some((node_id, node_name, normal, res)))) => {
+            let same_node = scene
+                .nodes
+                .get(&node_id)
+                .is_some_and(|n| n.name == node_name)
+                && scene.lowpoly_meshes.contains_key(&node_id);
+            if !same_node {
+                super::push_ui_error(
+                    ctx,
+                    "Target mesh no longer exists in the current scene; texture load skipped.",
+                );
+                return;
+            }
+            match res {
+                Ok(tex) => {
+                    super::exec_history(
+                        ctx,
+                        history,
+                        scene,
+                        if normal {
+                            Command::SetMeshNormalMap {
+                                node_id,
+                                normal_map: Some(tex),
+                            }
+                        } else {
+                            Command::SetMeshTexture {
+                                node_id,
+                                texture: Some(tex),
+                            }
+                        },
+                    );
+                }
+                Err(err) => {
+                    super::push_ui_error(ctx, format!("Load custom texture failed: {err}"));
+                }
+            }
+        }
+        Ok(Some(None)) | Ok(None) => {}
+        Err(err) => super::push_ui_error(ctx, err),
+    }
+}
 
 pub fn show_toolbar(ctx: &egui::Context, scene: &mut SceneState, history: &mut HistoryStack) {
+    poll_texture_load_job(ctx, scene, history);
     let frame = Frame::NONE
         .fill(tokens::SURFACE_LOW)
         .inner_margin(Margin::symmetric(6, 10))
@@ -30,7 +98,7 @@ pub fn show_toolbar(ctx: &egui::Context, scene: &mut SceneState, history: &mut H
                         })
                         .collect();
                     if let Some(action) = icons::icon_group(ui, "pixel_tools", "TOOLS", &items) {
-                        fire_toolbar_action(action, scene, history);
+                        fire_toolbar_action(ui.ctx(), action, scene, history);
                     }
                     ui.separator();
                     let sym = [
@@ -48,7 +116,7 @@ pub fn show_toolbar(ctx: &egui::Context, scene: &mut SceneState, history: &mut H
                         },
                     ];
                     if let Some(action) = icons::icon_group(ui, "pixel_sym", "SYM", &sym) {
-                        fire_toolbar_action(action, scene, history);
+                        fire_toolbar_action(ui.ctx(), action, scene, history);
                     }
                     ui.separator();
                     if scene.active_pixel_node().is_some() {
@@ -61,7 +129,7 @@ pub fn show_toolbar(ctx: &egui::Context, scene: &mut SceneState, history: &mut H
                         if let Some(action) =
                             icons::icon_group(ui, "pixel_convert", "CONVERT", &convert)
                         {
-                            fire_toolbar_action(action, scene, history);
+                            fire_toolbar_action(ui.ctx(), action, scene, history);
                         }
                     }
                 }
@@ -79,7 +147,7 @@ pub fn show_toolbar(ctx: &egui::Context, scene: &mut SceneState, history: &mut H
                         })
                         .collect();
                     if let Some(action) = icons::icon_group(ui, "voxel_tools", "TOOLS", &items) {
-                        fire_toolbar_action(action, scene, history);
+                        fire_toolbar_action(ui.ctx(), action, scene, history);
                     }
                     ui.separator();
                     let mirror = [
@@ -103,7 +171,7 @@ pub fn show_toolbar(ctx: &egui::Context, scene: &mut SceneState, history: &mut H
                         },
                     ];
                     if let Some(action) = icons::icon_group(ui, "voxel_mirror", "MIRROR", &mirror) {
-                        fire_toolbar_action(action, scene, history);
+                        fire_toolbar_action(ui.ctx(), action, scene, history);
                     }
                     ui.separator();
                     if scene.active_voxel_node().is_some() {
@@ -116,7 +184,7 @@ pub fn show_toolbar(ctx: &egui::Context, scene: &mut SceneState, history: &mut H
                         if let Some(action) =
                             icons::icon_group(ui, "voxel_convert", "CONVERT", &convert)
                         {
-                            fire_toolbar_action(action, scene, history);
+                            fire_toolbar_action(ui.ctx(), action, scene, history);
                         }
                     }
                 }
@@ -134,7 +202,7 @@ pub fn show_toolbar(ctx: &egui::Context, scene: &mut SceneState, history: &mut H
                         })
                         .collect();
                     if let Some(action) = icons::icon_group(ui, "prim_shapes", "SHAPE", &shapes) {
-                        fire_toolbar_action(action, scene, history);
+                        fire_toolbar_action(ui.ctx(), action, scene, history);
                     }
                     if icons::text_icon_button(
                         ui,
@@ -142,7 +210,7 @@ pub fn show_toolbar(ctx: &egui::Context, scene: &mut SceneState, history: &mut H
                         "Create Low-Poly Terrain (v4.1)",
                         false,
                     ) {
-                        fire_toolbar_action(ToolbarAction::CreateTerrain, scene, history);
+                        fire_toolbar_action(ui.ctx(), ToolbarAction::CreateTerrain, scene, history);
                     }
                     ui.separator();
                     if scene.active_lowpoly_node().is_some() {
@@ -181,7 +249,7 @@ pub fn show_toolbar(ctx: &egui::Context, scene: &mut SceneState, history: &mut H
                             });
                         }
                         if let Some(action) = icons::icon_group(ui, "mesh_paint", "PAINT", &paint) {
-                            fire_toolbar_action(action, scene, history);
+                            fire_toolbar_action(ui.ctx(), action, scene, history);
                         }
                         ui.separator();
                         let is_smooth = scene
@@ -251,7 +319,7 @@ pub fn show_toolbar(ctx: &egui::Context, scene: &mut SceneState, history: &mut H
                             },
                         ];
                         if let Some(action) = icons::icon_group(ui, "mesh_edit", "EDIT", &edit) {
-                            fire_toolbar_action(action, scene, history);
+                            fire_toolbar_action(ui.ctx(), action, scene, history);
                         }
                         if scene.lowpoly_paint_mode {
                             ui.label(
@@ -283,7 +351,7 @@ pub fn show_toolbar(ctx: &egui::Context, scene: &mut SceneState, history: &mut H
                         },
                     ];
                     if let Some(action) = icons::icon_group(ui, "char_rig", "RIG", &rig) {
-                        fire_toolbar_action(action, scene, history);
+                        fire_toolbar_action(ui.ctx(), action, scene, history);
                     }
                     if scene.character_rig.is_some() && scene.active_lowpoly_node().is_some() {
                         ui.separator();
@@ -304,7 +372,7 @@ pub fn show_toolbar(ctx: &egui::Context, scene: &mut SceneState, history: &mut H
                         if let Some(action) =
                             icons::icon_group(ui, "char_weights", "WEIGHT", &weight_tools)
                         {
-                            fire_toolbar_action(action, scene, history);
+                            fire_toolbar_action(ui.ctx(), action, scene, history);
                         }
                         if scene.weight_paint_mode {
                             ui.label(
@@ -340,12 +408,19 @@ pub fn show_toolbar(ctx: &egui::Context, scene: &mut SceneState, history: &mut H
 /// Executes a toolbar action. To add a button, add one [`IconItem`] line to a
 /// group above with either an existing action or a new [`ToolbarAction`]
 /// variant handled here.
-fn fire_toolbar_action(action: ToolbarAction, scene: &mut SceneState, history: &mut HistoryStack) {
+fn fire_toolbar_action(
+    ctx: &egui::Context,
+    action: ToolbarAction,
+    scene: &mut SceneState,
+    history: &mut HistoryStack,
+) {
     match action {
         ToolbarAction::PixelTool(tool) => scene.pixel_tool = tool,
         ToolbarAction::VoxelTool(tool) => scene.voxel_tool = tool,
         ToolbarAction::Primitive(kind) => {
-            let _ = history.execute(
+            super::exec_history(
+                ctx,
+                history,
                 scene,
                 Command::CreatePrimitiveMesh {
                     name: kind.label().into(),
@@ -356,7 +431,9 @@ fn fire_toolbar_action(action: ToolbarAction, scene: &mut SceneState, history: &
             );
         }
         ToolbarAction::CreateTerrain => {
-            let _ = history.execute(
+            super::exec_history(
+                ctx,
+                history,
                 scene,
                 Command::CreateTerrainMesh {
                     name: "Terrain".into(),
@@ -381,7 +458,9 @@ fn fire_toolbar_action(action: ToolbarAction, scene: &mut SceneState, history: &
         }
         ToolbarAction::ConvertToVoxel => {
             if let Some(pixel_node_id) = scene.active_pixel_node() {
-                let _ = history.execute(
+                super::exec_history(
+                    ctx,
+                    history,
                     scene,
                     Command::Transaction(vec![
                         Command::ConvertPixelToVoxel {
@@ -396,7 +475,9 @@ fn fire_toolbar_action(action: ToolbarAction, scene: &mut SceneState, history: &
         }
         ToolbarAction::ConvertToMesh => {
             if let Some(voxel_node_id) = scene.active_voxel_node() {
-                let _ = history.execute(
+                super::exec_history(
+                    ctx,
+                    history,
                     scene,
                     Command::Transaction(vec![
                         Command::ConvertVoxelToLowPoly {
@@ -415,34 +496,33 @@ fn fire_toolbar_action(action: ToolbarAction, scene: &mut SceneState, history: &
             let Some(node_id) = scene.active_lowpoly_node() else {
                 return;
             };
+            let Some(node_name) = scene.nodes.get(&node_id).map(|n| n.name.clone()) else {
+                return;
+            };
             let (kind, exts) = if normal {
                 ("Normal Map (.png, .jpg)", &["png", "jpg", "jpeg"][..])
             } else {
                 ("Texture Image (.png, .jpg)", &["png", "jpg", "jpeg"][..])
             };
-            if let Some(path) = rfd::FileDialog::new().add_filter(kind, exts).pick_file() {
-                match tessel_io::import_mesh_texture_from_path(&path) {
-                    Ok(tex) => {
-                        let _ = history.execute(
-                            scene,
-                            if normal {
-                                Command::SetMeshNormalMap {
-                                    node_id,
-                                    normal_map: Some(tex),
-                                }
-                            } else {
-                                Command::SetMeshTexture {
-                                    node_id,
-                                    texture: Some(tex),
-                                }
-                            },
-                        );
-                    }
-                    Err(err) => {
-                        tracing::error!("Load custom texture failed: {err}");
-                    }
-                }
+            let slot_id = egui::Id::new("toolbar_texture_load_slot");
+            let slot = ctx.data_mut(|d| {
+                d.get_temp_mut_or_insert_with(slot_id, || {
+                    Arc::new(Mutex::new(AsyncJobSlot::<TextureLoadResult>::default()))
+                })
+                .clone()
+            });
+            let mut guard = slot.lock().unwrap_or_else(|e| e.into_inner());
+            if guard.is_busy() {
+                super::push_ui_error(ctx, "A texture file dialog is already open.");
+                return;
             }
+            guard.spawn(move || {
+                let path = rfd::FileDialog::new().add_filter(kind, exts).pick_file()?;
+                let res =
+                    tessel_io::import_mesh_texture_from_path(&path).map_err(|e| e.to_string());
+                Some((node_id, node_name, normal, res))
+            });
+            ctx.request_repaint_after(std::time::Duration::from_millis(50));
         }
         ToolbarAction::FillTexture => {
             if let Some(node_id) = scene.active_lowpoly_node() {
@@ -451,13 +531,20 @@ fn fire_toolbar_action(action: ToolbarAction, scene: &mut SceneState, history: &
                     .get(scene.active_color)
                     .map(|e| e.color)
                     .unwrap_or(tessel_core::Rgba8::rgb(225, 226, 235));
-                let _ = history.execute(scene, Command::FillMeshTexture { node_id, color });
+                super::exec_history(
+                    ctx,
+                    history,
+                    scene,
+                    Command::FillMeshTexture { node_id, color },
+                );
             }
         }
         ToolbarAction::Extrude => {
             if let Some(node_id) = scene.active_lowpoly_node() {
                 let face_id = scene.selected_face.unwrap_or(FaceId(0));
-                let _ = history.execute(
+                super::exec_history(
+                    ctx,
+                    history,
                     scene,
                     Command::ExtrudeMeshFace {
                         node_id,
@@ -470,7 +557,9 @@ fn fire_toolbar_action(action: ToolbarAction, scene: &mut SceneState, history: &
         ToolbarAction::Inset => {
             if let Some(node_id) = scene.active_lowpoly_node() {
                 let face_id = scene.selected_face.unwrap_or(FaceId(0));
-                let _ = history.execute(
+                super::exec_history(
+                    ctx,
+                    history,
                     scene,
                     Command::InsetMeshFace {
                         node_id,
@@ -482,7 +571,9 @@ fn fire_toolbar_action(action: ToolbarAction, scene: &mut SceneState, history: &
         }
         ToolbarAction::Bevel => {
             if let Some(node_id) = scene.active_lowpoly_node() {
-                let _ = history.execute(
+                super::exec_history(
+                    ctx,
+                    history,
                     scene,
                     Command::BevelMesh {
                         node_id,
@@ -493,12 +584,19 @@ fn fire_toolbar_action(action: ToolbarAction, scene: &mut SceneState, history: &
         }
         ToolbarAction::Smooth => {
             if let Some(node_id) = scene.active_lowpoly_node() {
-                let _ = history.execute(scene, Command::SmoothSubdivideMesh { node_id });
+                super::exec_history(
+                    ctx,
+                    history,
+                    scene,
+                    Command::SmoothSubdivideMesh { node_id },
+                );
             }
         }
         ToolbarAction::Decimate => {
             if let Some(node_id) = scene.active_lowpoly_node() {
-                let _ = history.execute(
+                super::exec_history(
+                    ctx,
+                    history,
                     scene,
                     Command::DecimateMesh {
                         node_id,
@@ -513,7 +611,9 @@ fn fire_toolbar_action(action: ToolbarAction, scene: &mut SceneState, history: &
                     .lowpoly_meshes
                     .get(&node_id)
                     .is_some_and(|m| m.smooth_shading);
-                let _ = history.execute(
+                super::exec_history(
+                    ctx,
+                    history,
                     scene,
                     Command::SetMeshSmoothShading {
                         node_id,
@@ -525,12 +625,19 @@ fn fire_toolbar_action(action: ToolbarAction, scene: &mut SceneState, history: &
         ToolbarAction::SubdivideFace => {
             if let Some(node_id) = scene.active_lowpoly_node() {
                 let face_id = scene.selected_face.unwrap_or(FaceId(0));
-                let _ = history.execute(scene, Command::SubdivideMeshFace { node_id, face_id });
+                super::exec_history(
+                    ctx,
+                    history,
+                    scene,
+                    Command::SubdivideMeshFace { node_id, face_id },
+                );
             }
         }
         ToolbarAction::MirrorMeshX => {
             if let Some(node_id) = scene.active_lowpoly_node() {
-                let _ = history.execute(
+                super::exec_history(
+                    ctx,
+                    history,
                     scene,
                     Command::MirrorLowPolyMesh {
                         node_id,
@@ -542,12 +649,14 @@ fn fire_toolbar_action(action: ToolbarAction, scene: &mut SceneState, history: &
         }
         ToolbarAction::ApplyTransform => {
             if let Some(node_id) = scene.active_lowpoly_node() {
-                let _ = history.execute(scene, Command::ApplyMeshTransform { node_id });
+                super::exec_history(ctx, history, scene, Command::ApplyMeshTransform { node_id });
             }
         }
         ToolbarAction::ProjectUvs => {
             if let Some(node_id) = scene.active_lowpoly_node() {
-                let _ = history.execute(
+                super::exec_history(
+                    ctx,
+                    history,
                     scene,
                     Command::ProjectMeshUvs {
                         node_id,
@@ -557,25 +666,25 @@ fn fire_toolbar_action(action: ToolbarAction, scene: &mut SceneState, history: &
             }
         }
         ToolbarAction::ApplyBipedRig => {
-            let _ = history.execute(scene, Command::ApplyBipedRig);
+            super::exec_history(ctx, history, scene, Command::ApplyBipedRig);
         }
         ToolbarAction::ApplyHumanoidRig => {
-            let _ = history.execute(scene, Command::ApplyHumanoidRig);
+            super::exec_history(ctx, history, scene, Command::ApplyHumanoidRig);
         }
         ToolbarAction::ToggleWeightPaint => {
             scene.weight_paint_mode = !scene.weight_paint_mode;
         }
         ToolbarAction::ClearMeshWeights => {
             if let Some(node_id) = scene.active_lowpoly_node() {
-                if let Err(err) = history.execute(
+                super::exec_history(
+                    ctx,
+                    history,
                     scene,
                     Command::ClearMeshVertexWeights {
                         node_id,
                         vertex_ids: None,
                     },
-                ) {
-                    tracing::warn!("clear mesh weights failed: {err}");
-                }
+                );
             }
         }
         ToolbarAction::TogglePixelSymX => {

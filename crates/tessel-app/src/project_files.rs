@@ -85,40 +85,15 @@ impl ProjectFileManager {
         Ok(loaded)
     }
 
-    pub fn save_with_dialog(
-        &mut self,
-        scene: &SceneState,
-        thumbnail_png: Option<&[u8]>,
-    ) -> Result<Option<PathBuf>, String> {
-        let target = match &self.current_path {
-            Some(p) => Some(p.clone()),
-            None => rfd::FileDialog::new()
-                .add_filter("Tessel Project", &["tessel"])
-                .set_file_name("untitled.tessel")
-                .save_file(),
-        };
-        let Some(path) = target else {
-            return Ok(None);
-        };
-        tessel_io::save_tessel_project_with_thumbnail(&path, scene, thumbnail_png)
-            .map_err(|e| e.to_string())?;
-        self.current_path = Some(path.clone());
-        self.last_saved_revision = scene.revision;
+    pub fn finish_save(&mut self, path: PathBuf, saved_revision: u64) {
+        self.current_path = Some(path);
+        self.last_saved_revision = saved_revision;
         let _ = std::fs::remove_file(&self.recovery_path);
-        Ok(Some(path))
     }
 
-    pub fn open_with_dialog(&mut self) -> Result<Option<SceneState>, String> {
-        let Some(path) = rfd::FileDialog::new()
-            .add_filter("Tessel Project", &["tessel"])
-            .pick_file()
-        else {
-            return Ok(None);
-        };
-        let loaded = load_tessel_project(&path).map_err(|e| e.to_string())?;
+    pub fn finish_open(&mut self, path: PathBuf, loaded_revision: u64) {
         self.current_path = Some(path);
-        self.last_saved_revision = loaded.revision;
-        Ok(Some(loaded))
+        self.last_saved_revision = loaded_revision;
     }
 
     /// Writes a debounced atomic recovery snapshot after edits settle (`AUTOSAVE_DEBOUNCE`)

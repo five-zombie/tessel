@@ -69,7 +69,7 @@ pub fn show_top_bar(
                     };
                     let selected = scene.active_mode == mode;
                     if icons::hud_icon_button(ui, icon, mode.label(), selected) && !selected {
-                        let _ = history.execute(scene, Command::SetMode(mode));
+                        super::exec_history(ui.ctx(), history, scene, Command::SetMode(mode));
                     }
                 }
 
@@ -82,7 +82,7 @@ pub fn show_top_bar(
                     false,
                     history.can_undo(),
                 ) {
-                    let _ = history.undo(scene);
+                    super::undo_history(ui.ctx(), history, scene);
                 }
 
                 if icons::hud_icon_button_enabled(
@@ -92,7 +92,7 @@ pub fn show_top_bar(
                     false,
                     history.can_redo(),
                 ) {
-                    let _ = history.redo(scene);
+                    super::redo_history(ui.ctx(), history, scene);
                 }
 
                 if scene.active_mode != AppMode::Pixel {
@@ -113,7 +113,12 @@ pub fn show_top_bar(
                                     .clicked()
                                     && cur != mode
                                 {
-                                    let _ = history.execute(scene, Command::SetShadingMode(mode));
+                                    super::exec_history(
+                                        ui.ctx(),
+                                        history,
+                                        scene,
+                                        Command::SetShadingMode(mode),
+                                    );
                                 }
                             }
                         });

@@ -18,6 +18,7 @@ pub struct SettingsDialogState {
     pub api_keys: BTreeMap<AiProviderKind, String>,
     pub export_dir_text: String,
     pub status_message: Option<Result<String, String>>,
+    pub folder_picker: super::AsyncJobSlot<Option<PathBuf>>,
 }
 
 impl SettingsDialogState {
@@ -35,6 +36,7 @@ impl SettingsDialogState {
             api_keys,
             export_dir_text: settings.allowed_export_dir.display().to_string(),
             status_message: None,
+            folder_picker: super::AsyncJobSlot::default(),
         }
     }
 }
@@ -50,6 +52,17 @@ pub fn show_settings_dialog(
     live_mcp: Option<&LiveMcpServerHandle>,
     mcp_dialog_open: &mut bool,
 ) {
+    match state.folder_picker.poll() {
+        Ok(Some(Some(folder))) => {
+            state.export_dir_text = folder.display().to_string();
+        }
+        Ok(Some(None)) | Ok(None) => {}
+        Err(err) => state.status_message = Some(Err(err.into())),
+    }
+    if state.folder_picker.is_busy() {
+        ctx.request_repaint_after(std::time::Duration::from_millis(50));
+    }
+
     if !state.open {
         return;
     }
@@ -141,9 +154,9 @@ pub fn show_settings_dialog(
                 ui.label("Allowed Export Dir:");
                 ui.add(egui::TextEdit::singleline(&mut state.export_dir_text).desired_width(220.0));
                 if icons::hud_icon_button(ui, ToolIcon::Open, "Browse folders", false) {
-                    if let Some(folder) = rfd::FileDialog::new().pick_folder() {
-                        state.export_dir_text = folder.display().to_string();
-                    }
+                    state
+                        .folder_picker
+                        .spawn(|| rfd::FileDialog::new().pick_folder());
                 }
             });
 

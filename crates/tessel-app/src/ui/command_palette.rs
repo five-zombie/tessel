@@ -269,6 +269,7 @@ pub fn show_command_palette(
 
     if let Some(action) = triggered {
         execute_action(
+            ctx,
             action,
             scene,
             history,
@@ -288,6 +289,7 @@ pub fn show_command_palette(
 
 #[allow(clippy::too_many_arguments)]
 fn execute_action(
+    ctx: &egui::Context,
     action: PaletteAction,
     scene: &mut SceneState,
     history: &mut HistoryStack,
@@ -300,7 +302,7 @@ fn execute_action(
     match action {
         PaletteAction::Mode(mode) => {
             if scene.active_mode != mode {
-                let _ = history.execute(scene, Command::SetMode(mode));
+                super::exec_history(ctx, history, scene, Command::SetMode(mode));
             }
         }
         PaletteAction::NewProject => {
@@ -313,17 +315,19 @@ fn execute_action(
             *import_mesh = true;
         }
         PaletteAction::Undo => {
-            let _ = history.undo(scene);
+            super::undo_history(ctx, history, scene);
         }
         PaletteAction::Redo => {
-            let _ = history.redo(scene);
+            super::redo_history(ctx, history, scene);
         }
         PaletteAction::ResetCamera => match scene.active_mode {
             AppMode::Pixel => camera_2d.reset(),
             _ => camera_3d.reset(),
         },
         PaletteAction::NewPixelCanvas => {
-            let _ = history.execute(
+            super::exec_history(
+                ctx,
+                history,
                 scene,
                 Command::Transaction(vec![
                     Command::CreatePixelCanvas {
@@ -336,7 +340,9 @@ fn execute_action(
             );
         }
         PaletteAction::NewLowPolyCube => {
-            let _ = history.execute(
+            super::exec_history(
+                ctx,
+                history,
                 scene,
                 Command::Transaction(vec![
                     Command::CreatePrimitiveMesh {
@@ -350,7 +356,9 @@ fn execute_action(
             );
         }
         PaletteAction::ApplyHumanoidRig => {
-            let _ = history.execute(
+            super::exec_history(
+                ctx,
+                history,
                 scene,
                 Command::Transaction(vec![
                     Command::ApplyHumanoidRig,
@@ -359,7 +367,9 @@ fn execute_action(
             );
         }
         PaletteAction::ApplyBipedRig => {
-            let _ = history.execute(
+            super::exec_history(
+                ctx,
+                history,
                 scene,
                 Command::Transaction(vec![
                     Command::ApplyBipedRig,
@@ -368,11 +378,13 @@ fn execute_action(
             );
         }
         PaletteAction::ResetCharacterPose => {
-            let _ = history.execute(scene, Command::ResetCharacterPose);
+            super::exec_history(ctx, history, scene, Command::ResetCharacterPose);
         }
         PaletteAction::WeldMeshVertices => {
             if let Some(node_id) = scene.active_lowpoly_node() {
-                let _ = history.execute(
+                super::exec_history(
+                    ctx,
+                    history,
                     scene,
                     Command::WeldMeshVertices {
                         node_id,
@@ -383,7 +395,9 @@ fn execute_action(
         }
         PaletteAction::FlipMeshNormals => {
             if let Some(node_id) = scene.active_lowpoly_node() {
-                let _ = history.execute(
+                super::exec_history(
+                    ctx,
+                    history,
                     scene,
                     Command::FlipMeshNormals {
                         node_id,
@@ -394,7 +408,9 @@ fn execute_action(
         }
         PaletteAction::MirrorMeshX => {
             if let Some(node_id) = scene.active_lowpoly_node() {
-                let _ = history.execute(
+                super::exec_history(
+                    ctx,
+                    history,
                     scene,
                     Command::MirrorLowPolyMesh {
                         node_id,
@@ -406,14 +422,16 @@ fn execute_action(
         }
         PaletteAction::ApplyMeshTransform => {
             if let Some(node_id) = scene.active_lowpoly_node() {
-                let _ = history.execute(scene, Command::ApplyMeshTransform { node_id });
+                super::exec_history(ctx, history, scene, Command::ApplyMeshTransform { node_id });
             }
         }
         PaletteAction::ClearScene => {
-            let _ = history.execute(scene, Command::ClearScene);
+            super::exec_history(ctx, history, scene, Command::ClearScene);
         }
         PaletteAction::SpawnStarterBipedVoxel => {
-            let _ = history.execute(
+            super::exec_history(
+                ctx,
+                history,
                 scene,
                 Command::CreateVoxelVolume {
                     name: "Starter Biped".into(),
@@ -423,7 +441,9 @@ fn execute_action(
                 let c_body = PaletteIndex::new(7).unwrap_or(scene.active_color);
                 let c_head = PaletteIndex::new(8).unwrap_or(scene.active_color);
                 let c_legs = PaletteIndex::new(2).unwrap_or(scene.active_color);
-                let _ = history.execute(
+                super::exec_history(
+                    ctx,
+                    history,
                     scene,
                     Command::Transaction(vec![
                         // Left & Right Legs
@@ -505,7 +525,9 @@ mod tests {
         let mut import_mesh = false;
         let mut new_project = false;
 
+        let ctx = egui::Context::default();
         execute_action(
+            &ctx,
             PaletteAction::ApplyHumanoidRig,
             &mut scene,
             &mut history,
@@ -522,6 +544,7 @@ mod tests {
         );
 
         execute_action(
+            &ctx,
             PaletteAction::NewProject,
             &mut scene,
             &mut history,

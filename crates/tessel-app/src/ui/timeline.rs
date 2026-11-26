@@ -119,7 +119,9 @@ fn show_pixel_timeline(ctx: &egui::Context, scene: &mut SceneState, history: &mu
                     .fill(fill)
                     .corner_radius(CornerRadius::same(4));
                     if ui.add(btn).clicked() && !selected {
-                        let _ = history.execute(
+                        super::exec_history(
+                            ctx,
+                            history,
                             scene,
                             Command::SetActivePixelFrame {
                                 node_id,
@@ -130,7 +132,7 @@ fn show_pixel_timeline(ctx: &egui::Context, scene: &mut SceneState, history: &mu
                 }
 
                 if icons::hud_icon_button(ui, ToolIcon::Add, "+ Frame", false) {
-                    let _ = history.execute(scene, Command::AddPixelFrame { node_id });
+                    super::exec_history(ctx, history, scene, Command::AddPixelFrame { node_id });
                 }
 
                 ui.separator();
@@ -184,7 +186,7 @@ fn show_character_timeline(
                 });
             });
         if let Some(cmd) = pending_cmd {
-            let _ = history.execute(scene, cmd);
+            super::exec_history(ctx, history, scene, cmd);
         }
         return;
     }
@@ -557,7 +559,7 @@ fn show_character_timeline(
     ctx.data_mut(|d| d.insert_temp(prefs_id, prefs));
 
     if let Some(cmd) = pending_cmd {
-        let _ = history.execute(scene, cmd);
+        super::exec_history(ctx, history, scene, cmd);
     } else if modified {
         scene.mark_modified();
     }

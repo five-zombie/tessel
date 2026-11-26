@@ -71,18 +71,43 @@ pub struct McpDialogAction {
     pub rotate_token: bool,
 }
 
-/// Copies text to both egui's clipboard and the OS native clipboard tool for reliable Wayland/X11/macOS/Windows support.
+#[cfg(target_os = "linux")]
+const LINUX_CLIPBOARD_CANDIDATES: &[(&str, &[&str])] = &[
+    ("wl-copy", &[]),
+    ("xclip", &["-selection", "clipboard"]),
+    ("xsel", &["--clipboard", "--input"]),
+];
+
+fn wait_child_bounded(child: &mut std::process::Child, timeout: std::time::Duration) -> bool {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return status.success(),
+            Ok(None) => {
+                if std::time::Instant::now() >= deadline {
+                    // Tool stayed alive (e.g. X11 xclip/xsel holding selection): treat as active.
+                    return true;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            Err(err) => {
+                tracing::warn!("clipboard helper wait failed: {err}");
+                return false;
+            }
+        }
+    }
+}
+
+/// Copies text to both egui's clipboard and the OS native clipboard tool on a background thread
+/// so slow or selection-holding clipboard helpers never block the UI thread.
 pub fn copy_text_reliable(ctx: &egui::Context, text: &str) {
     ctx.copy_text(text.to_string());
+    let owned = text.to_string();
+    let timeout = std::time::Duration::from_millis(250);
 
     #[cfg(target_os = "linux")]
-    {
-        let candidates: &[(&str, &[&str])] = &[
-            ("wl-copy", &[]),
-            ("xclip", &["-selection", "clipboard"]),
-            ("xsel", &["--clipboard", "--input"]),
-        ];
-        for (bin, args) in candidates {
+    std::thread::spawn(move || {
+        for (bin, args) in LINUX_CLIPBOARD_CANDIDATES {
             if let Ok(mut child) = ProcessCommand::new(bin)
                 .args(*args)
                 .stdin(Stdio::piped())
@@ -91,16 +116,19 @@ pub fn copy_text_reliable(ctx: &egui::Context, text: &str) {
                 .spawn()
             {
                 if let Some(mut stdin) = child.stdin.take() {
-                    let _ = stdin.write_all(text.as_bytes());
+                    if let Err(err) = stdin.write_all(owned.as_bytes()) {
+                        tracing::warn!("clipboard write to {bin} failed: {err}");
+                    }
                 }
-                let _ = child.wait();
-                break;
+                if wait_child_bounded(&mut child, timeout) {
+                    break;
+                }
             }
         }
-    }
+    });
 
     #[cfg(target_os = "macos")]
-    {
+    std::thread::spawn(move || {
         if let Ok(mut child) = ProcessCommand::new("pbcopy")
             .stdin(Stdio::piped())
             .stdout(Stdio::null())
@@ -108,14 +136,16 @@ pub fn copy_text_reliable(ctx: &egui::Context, text: &str) {
             .spawn()
         {
             if let Some(mut stdin) = child.stdin.take() {
-                let _ = stdin.write_all(text.as_bytes());
+                if let Err(err) = stdin.write_all(owned.as_bytes()) {
+                    tracing::warn!("clipboard write to pbcopy failed: {err}");
+                }
             }
-            let _ = child.wait();
+            let _ = wait_child_bounded(&mut child, timeout);
         }
-    }
+    });
 
     #[cfg(target_os = "windows")]
-    {
+    std::thread::spawn(move || {
         if let Ok(mut child) = ProcessCommand::new("clip")
             .stdin(Stdio::piped())
             .stdout(Stdio::null())
@@ -123,11 +153,13 @@ pub fn copy_text_reliable(ctx: &egui::Context, text: &str) {
             .spawn()
         {
             if let Some(mut stdin) = child.stdin.take() {
-                let _ = stdin.write_all(text.as_bytes());
+                if let Err(err) = stdin.write_all(owned.as_bytes()) {
+                    tracing::warn!("clipboard write to clip failed: {err}");
+                }
             }
-            let _ = child.wait();
+            let _ = wait_child_bounded(&mut child, timeout);
         }
-    }
+    });
 }
 
 pub fn build_mcp_config_snippet(
@@ -443,6 +475,21 @@ mod tests {
                 build_mcp_config_snippet(client, McpTransportMode::LiveHttp, None, tok, dir, true);
             assert!(revealed.contains(tok));
             assert!(!revealed.contains(REDACTED_TOKEN_PLACEHOLDER));
+        }
+    }
+
+    #[test]
+    fn clipboard_fallback_stops_only_on_zero_exit_or_running_daemon() {
+        let mut ok_child = std::process::Command::new("true").spawn().unwrap();
+        let mut fail_child = std::process::Command::new("false").spawn().unwrap();
+        let timeout = std::time::Duration::from_millis(250);
+        assert!(wait_child_bounded(&mut ok_child, timeout));
+        assert!(!wait_child_bounded(&mut fail_child, timeout));
+
+        #[cfg(target_os = "linux")]
+        {
+            let bins: Vec<&str> = LINUX_CLIPBOARD_CANDIDATES.iter().map(|(b, _)| *b).collect();
+            assert_eq!(bins, vec!["wl-copy", "xclip", "xsel"]);
         }
     }
 }

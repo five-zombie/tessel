@@ -68,6 +68,37 @@ struct StudioState {
     settings: AppSettings,
     mcp_token: String,
     live_mcp: Option<LiveMcpServerHandle>,
+    jobs: BackgroundJobs,
+}
+
+struct SaveJobOutcome {
+    path: std::path::PathBuf,
+    revision: u64,
+    save_and_quit: bool,
+    result: Result<(), String>,
+}
+
+type ImportMeshJobResult = Option<(
+    std::path::PathBuf,
+    Result<(String, tessel_core::LowPolyMesh), String>,
+)>;
+type OpenProjectJobResult = Option<(std::path::PathBuf, Result<SceneState, String>)>;
+
+#[derive(Default)]
+struct BackgroundJobs {
+    import_mesh: ui::AsyncJobSlot<ImportMeshJobResult>,
+    open_project: ui::AsyncJobSlot<OpenProjectJobResult>,
+    save_project: ui::AsyncJobSlot<Option<SaveJobOutcome>>,
+    turntable_gif: ui::AsyncJobSlot<Result<String, String>>,
+}
+
+impl BackgroundJobs {
+    fn any_busy(&self) -> bool {
+        self.import_mesh.is_busy()
+            || self.open_project.is_busy()
+            || self.save_project.is_busy()
+            || self.turntable_gif.is_busy()
+    }
 }
 
 /// Live-viewport camera tools for MCP agents (orbit/zoom/pan/preset/look-at).
@@ -588,9 +619,10 @@ impl Default for StudioState {
         let settings_dialog = ui::settings_dialog::SettingsDialogState::from_settings(&settings);
 
         let mut ai_state = ui::inspector::DirectAiUiState::default();
+        let active_profile = settings.profile_for(settings.ai_provider);
         ai_state.config.provider = settings.ai_provider;
-        ai_state.config.model = settings.ai_model.clone();
-        ai_state.config.base_url = settings.ai_base_url.clone();
+        ai_state.config.model = active_profile.model;
+        ai_state.config.base_url = active_profile.base_url;
         ai_state.config.api_key = load_api_key_from_keyring(settings.ai_provider);
 
         let display_light_azimuth = scene.light_azimuth;
@@ -632,6 +664,7 @@ impl Default for StudioState {
             settings,
             mcp_token,
             live_mcp: None,
+            jobs: BackgroundJobs::default(),
         }
     }
 }
@@ -917,6 +950,7 @@ impl GpuState {
                 &mut studio.history,
                 &mut studio.ai_state,
                 &studio.export_dialog.output_dir,
+                &studio.settings,
             );
             let (vp_size, hv, g_axis) = ui::viewport::show_viewport(
                 ctx,
@@ -980,6 +1014,9 @@ impl GpuState {
                 &mut top_actions.import_mesh,
                 &mut top_actions.new_project,
             );
+            if let Some(ui_err) = ui::take_ui_error(ctx) {
+                studio.last_error = Some(ui_err);
+            }
             if top_actions.new_project {
                 studio.confirm_new_project = true;
                 top_actions.new_project = false;
@@ -1171,42 +1208,148 @@ impl GpuState {
                 }
             }
             other => {
-                ui::quick_start::apply_quick_start_preset(
+                if let Err(err) = ui::quick_start::apply_quick_start_preset(
                     &other,
                     &mut studio.scene,
                     &mut studio.history,
-                );
+                ) {
+                    studio.last_error = Some(err);
+                }
             }
         }
 
-        if let ui::export_dialog::ExportAction::TurntableGif(args) = export_action {
-            let vp = self.offscreen_screenshot_renderer.get_or_insert_with(|| {
-                ViewportRenderer::new(&self.device, args.width, args.height)
-            });
-            match tessel_ai::headless::render_turntable_gif_with_renderer(
-                vp,
-                &self.device,
-                &self.queue,
-                &studio.scene,
-                &args,
-            ) {
-                Ok(val) => {
-                    let path = val
-                        .get("output_path")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("turntable.gif");
-                    let bytes = val
-                        .get("file_size_bytes")
-                        .and_then(|v| v.as_u64())
-                        .unwrap_or(0);
-                    studio.export_dialog.status_message = Some(Ok(format!(
-                        "Saved {path} ({bytes} bytes, {} frames @ {} fps)",
-                        args.frames, args.fps
-                    )));
+        match studio.jobs.turntable_gif.poll() {
+            Ok(Some(res)) => studio.export_dialog.status_message = Some(res),
+            Ok(None) => {}
+            Err(err) => studio.export_dialog.status_message = Some(Err(err.into())),
+        }
+        match studio.jobs.import_mesh.poll() {
+            Ok(Some(Some((_path, res)))) => match res {
+                Ok((name, mesh)) => {
+                    if let Err(err) = studio.history.execute(
+                        &mut studio.scene,
+                        Command::Transaction(vec![
+                            Command::ImportLowPolyMesh { name, mesh },
+                            Command::SetMode(tessel_core::AppMode::LowPoly),
+                        ]),
+                    ) {
+                        let msg = format!("Import 3D mesh failed: {err}");
+                        tracing::error!("{msg}");
+                        studio.last_error = Some(msg);
+                    }
                 }
                 Err(err) => {
-                    studio.export_dialog.status_message = Some(Err(err.to_string()));
+                    let msg = format!("Import 3D mesh failed: {err}");
+                    tracing::error!("{msg}");
+                    studio.last_error = Some(msg);
                 }
+            },
+            Ok(Some(None)) | Ok(None) => {}
+            Err(err) => studio.last_error = Some(err.into()),
+        }
+        match studio.jobs.open_project.poll() {
+            Ok(Some(Some((path, res)))) => match res {
+                Ok(loaded) => {
+                    let rev = loaded.revision;
+                    studio.scene = loaded;
+                    studio.history = HistoryStack::new();
+                    studio.camera_3d_target = None;
+                    studio.showcase_camera_target = None;
+                    studio.pixel_drag_start = None;
+                    studio.gizmo_drag = None;
+                    studio.scene_gadget_drag = None;
+                    studio.export_dialog.status_message = None;
+                    studio.confirm_exit = false;
+                    studio.confirm_new_project = false;
+                    studio.project_files.finish_open(path.clone(), rev);
+                    studio.settings.record_recent_project(path);
+                    if let Err(err) = studio.settings.save(&studio.paths) {
+                        tracing::error!("{err}");
+                        studio.last_error = Some(err.to_string());
+                    }
+                }
+                Err(err) => {
+                    let msg = format!("Open project failed: {err}");
+                    tracing::error!("{msg}");
+                    studio.last_error = Some(msg);
+                }
+            },
+            Ok(Some(None)) | Ok(None) => {}
+            Err(err) => studio.last_error = Some(err.into()),
+        }
+        match studio.jobs.save_project.poll() {
+            Ok(Some(Some(outcome))) => match outcome.result {
+                Ok(()) => {
+                    let up_to_date = studio.scene.revision == outcome.revision;
+                    if up_to_date {
+                        studio
+                            .project_files
+                            .finish_save(outcome.path.clone(), outcome.revision);
+                    } else {
+                        studio.project_files.current_path = Some(outcome.path.clone());
+                    }
+                    studio.settings.record_recent_project(outcome.path);
+                    if let Err(err) = studio.settings.save(&studio.paths) {
+                        tracing::error!("{err}");
+                        studio.last_error = Some(err.to_string());
+                    }
+                    if outcome.save_and_quit {
+                        if up_to_date {
+                            studio.quit_confirmed = true;
+                        } else {
+                            studio.confirm_exit = true;
+                            studio.last_error = Some(
+                                "Scene was modified while saving; please save again before quitting."
+                                    .into(),
+                            );
+                        }
+                    }
+                }
+                Err(err) => {
+                    let msg = format!("Save project failed: {err}");
+                    tracing::error!("{msg}");
+                    studio.last_error = Some(msg);
+                }
+            },
+            Ok(Some(None)) | Ok(None) => {}
+            Err(err) => studio.last_error = Some(err.into()),
+        }
+        if studio.jobs.any_busy() {
+            self.egui_ctx
+                .request_repaint_after(std::time::Duration::from_millis(50));
+        }
+
+        if let ui::export_dialog::ExportAction::TurntableGif(args) = export_action {
+            if studio.jobs.turntable_gif.is_busy() {
+                studio.export_dialog.status_message =
+                    Some(Err("A turntable GIF render is already in progress.".into()));
+            } else {
+                let device = self.device.clone();
+                let queue = self.queue.clone();
+                let scene = studio.scene.clone();
+                studio.export_dialog.status_message =
+                    Some(Ok("Rendering turntable GIF in background...".into()));
+                studio.jobs.turntable_gif.spawn(move || {
+                    let mut vp = ViewportRenderer::new(&device, args.width, args.height);
+                    tessel_ai::headless::render_turntable_gif_with_renderer(
+                        &mut vp, &device, &queue, &scene, &args,
+                    )
+                    .map(|val| {
+                        let path = val
+                            .get("output_path")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("turntable.gif");
+                        let bytes = val
+                            .get("file_size_bytes")
+                            .and_then(|v| v.as_u64())
+                            .unwrap_or(0);
+                        format!(
+                            "Saved {path} ({bytes} bytes, {} frames @ {} fps)",
+                            args.frames, args.fps
+                        )
+                    })
+                    .map_err(|e| e.to_string())
+                });
             }
         }
 
@@ -1221,31 +1364,15 @@ impl GpuState {
             studio.about_open = true;
         }
         if top_actions.import_mesh {
-            if let Some(path) = rfd::FileDialog::new()
-                .add_filter("3D Mesh (.obj, .glb)", &["obj", "glb"])
-                .pick_file()
-            {
-                match tessel_io::import_mesh_from_path(&path, studio.scene.active_color) {
-                    Ok((name, mesh)) => {
-                        if let Err(err) = studio.history.execute(
-                            &mut studio.scene,
-                            Command::Transaction(vec![
-                                Command::ImportLowPolyMesh { name, mesh },
-                                Command::SetMode(tessel_core::AppMode::LowPoly),
-                            ]),
-                        ) {
-                            let msg = format!("Import 3D mesh failed: {err}");
-                            tracing::error!("{msg}");
-                            studio.last_error = Some(msg);
-                        }
-                    }
-                    Err(err) => {
-                        let msg = format!("Import 3D mesh failed: {err}");
-                        tracing::error!("{msg}");
-                        studio.last_error = Some(msg);
-                    }
-                }
-            }
+            let active_color = studio.scene.active_color;
+            studio.jobs.import_mesh.spawn(move || {
+                let path = rfd::FileDialog::new()
+                    .add_filter("3D Mesh (.obj, .glb)", &["obj", "glb"])
+                    .pick_file()?;
+                let res = tessel_io::import_mesh_from_path(&path, active_color)
+                    .map_err(|e| e.to_string());
+                Some((path, res))
+            });
         }
         if top_actions.open_mcp {
             studio.mcp_dialog.open = true;
@@ -1263,53 +1390,52 @@ impl GpuState {
                 Some("Rotated MCP token. Update your client config.".into());
         }
         if top_actions.save_project || save_and_quit {
-            let thumb = self
-                .viewport_renderer
-                .capture_png_bytes(&self.device, &self.queue)
-                .map_err(|err| tracing::warn!("project thumbnail PNG capture failed: {err}"))
-                .ok();
-            match studio
-                .project_files
-                .save_with_dialog(&studio.scene, thumb.as_deref())
-            {
-                Ok(Some(path)) => {
-                    studio.settings.record_recent_project(path);
-                    if let Err(err) = studio.settings.save(&studio.paths) {
-                        tracing::error!("{err}");
-                        studio.last_error = Some(err.to_string());
-                    }
-                    if save_and_quit {
-                        studio.quit_confirmed = true;
-                    }
+            if studio.jobs.save_project.is_busy() {
+                if save_and_quit {
+                    studio.confirm_exit = true;
                 }
-                Ok(None) => {}
-                Err(err) => {
-                    let msg = format!("Save project failed: {err}");
-                    tracing::error!("{msg}");
-                    studio.last_error = Some(msg);
-                }
+                studio.last_error = Some("A save operation is already in progress.".into());
+            } else {
+                let thumb = self
+                    .viewport_renderer
+                    .capture_png_bytes(&self.device, &self.queue)
+                    .map_err(|err| tracing::warn!("project thumbnail PNG capture failed: {err}"))
+                    .ok();
+                let current_path = studio.project_files.current_path.clone();
+                let scene_snapshot = studio.scene.clone();
+                studio.jobs.save_project.spawn(move || {
+                    let target = match current_path {
+                        Some(p) => Some(p),
+                        None => rfd::FileDialog::new()
+                            .add_filter("Tessel Project", &["tessel"])
+                            .set_file_name("untitled.tessel")
+                            .save_file(),
+                    };
+                    let path = target?;
+                    let revision = scene_snapshot.revision;
+                    let result = tessel_io::save_tessel_project_with_thumbnail(
+                        &path,
+                        &scene_snapshot,
+                        thumb.as_deref(),
+                    )
+                    .map_err(|e| e.to_string());
+                    Some(SaveJobOutcome {
+                        path,
+                        revision,
+                        save_and_quit,
+                        result,
+                    })
+                });
             }
         }
         if top_actions.open_project {
-            match studio.project_files.open_with_dialog() {
-                Ok(Some(loaded)) => {
-                    studio.scene = loaded;
-                    studio.history = HistoryStack::new();
-                    if let Some(path) = studio.project_files.current_path.clone() {
-                        studio.settings.record_recent_project(path);
-                        if let Err(err) = studio.settings.save(&studio.paths) {
-                            tracing::error!("{err}");
-                            studio.last_error = Some(err.to_string());
-                        }
-                    }
-                }
-                Ok(None) => {}
-                Err(err) => {
-                    let msg = format!("Open project failed: {err}");
-                    tracing::error!("{msg}");
-                    studio.last_error = Some(msg);
-                }
-            }
+            studio.jobs.open_project.spawn(|| {
+                let path = rfd::FileDialog::new()
+                    .add_filter("Tessel Project", &["tessel"])
+                    .pick_file()?;
+                let res = tessel_io::load_tessel_project(&path).map_err(|e| e.to_string());
+                Some((path, res))
+            });
         }
         if top_actions.new_project {
             studio.scene = SceneState::new();

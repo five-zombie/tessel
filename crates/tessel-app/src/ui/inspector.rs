@@ -80,6 +80,7 @@ pub fn show_inspector(
     history: &mut HistoryStack,
     ai_state: &mut DirectAiUiState,
     allowed_export_dir: &Path,
+    settings: &crate::settings::AppSettings,
 ) {
     ai_state.poll_response(scene, history, allowed_export_dir);
 
@@ -119,7 +120,7 @@ pub fn show_inspector(
                 ui.add_space(10.0);
                 ui.separator();
                 ui.add_space(8.0);
-                show_direct_ai_section(ui, scene, ai_state);
+                show_direct_ai_section(ui, scene, ai_state, settings);
             });
         });
 }
@@ -141,7 +142,9 @@ fn show_palette_section(ui: &mut egui::Ui, scene: &mut SceneState, history: &mut
                 });
                 if let Some(raw) = next_raw {
                     if let Ok(idx) = PaletteIndex::new(raw) {
-                        let _ = history.execute(
+                        super::exec_history(
+                            ui.ctx(),
+                            history,
                             scene,
                             Command::SetPaletteEntry {
                                 index: idx,
@@ -228,7 +231,9 @@ fn show_palette_section(ui: &mut egui::Ui, scene: &mut SceneState, history: &mut
             if ui.color_edit_button_srgba(&mut srgba).changed() {
                 let mut updated = active_entry;
                 updated.color = Rgba8::rgba(srgba.r(), srgba.g(), srgba.b(), srgba.a());
-                let _ = history.execute(
+                super::exec_history(
+                    ui.ctx(),
+                    history,
                     scene,
                     Command::SetPaletteEntry {
                         index: scene.active_color,
@@ -266,7 +271,9 @@ fn show_pixel_layers_section(
                         .and_then(|c| c.frames.get(frame_idx))
                         .map(|f| f.layers.len() + 1)
                         .unwrap_or(1);
-                    let _ = history.execute(
+                    super::exec_history(
+                        ui.ctx(),
+                        history,
                         scene,
                         Command::AddPixelLayer {
                             node_id,
@@ -326,7 +333,9 @@ fn show_pixel_layers_section(
         .corner_radius(egui::CornerRadius::same(4))
         .min_size(egui::vec2(ui.available_width(), 28.0));
         if ui.add(create_btn).clicked() {
-            let _ = history.execute(
+            super::exec_history(
+                ui.ctx(),
+                history,
                 scene,
                 Command::CreatePixelCanvas {
                     name: format!("Sprite {w}x{h}"),
@@ -361,7 +370,9 @@ fn show_pixel_layers_section(
                     (ToolIcon::EyeClosed, "Show layer")
                 };
                 if icons::hud_icon_button(ui, vis_icon, vis_tip, false) {
-                    let _ = history.execute(
+                    super::exec_history(
+                        ui.ctx(),
+                        history,
                         scene,
                         Command::SetPixelLayerVisible {
                             node_id,
@@ -406,7 +417,7 @@ fn show_character_rig_section(
                 .color(tokens::ON_SURFACE_VARIANT),
         );
         if icons::hud_icon_button(ui, ToolIcon::BipedRig, "Apply Biped Skeleton", false) {
-            let _ = history.execute(scene, Command::ApplyBipedRig);
+            super::exec_history(ui.ctx(), history, scene, Command::ApplyBipedRig);
         }
         return;
     };
@@ -448,7 +459,9 @@ fn show_character_rig_section(
                     .selectable_label(current_binding.is_none(), "None")
                     .clicked()
                 {
-                    let _ = history.execute(
+                    super::exec_history(
+                        ui.ctx(),
+                        history,
                         scene,
                         Command::BindNodeToBone {
                             node_id: selected_id,
@@ -461,7 +474,9 @@ fn show_character_rig_section(
                         .selectable_label(current_binding == Some(*bid), bname)
                         .clicked()
                     {
-                        let _ = history.execute(
+                        super::exec_history(
+                            ui.ctx(),
+                            history,
                             scene,
                             Command::BindNodeToBone {
                                 node_id: selected_id,
@@ -480,7 +495,9 @@ fn show_character_rig_section(
             );
             ui.horizontal_wrapped(|ui| {
                 if ui.selectable_label(current_mask.is_none(), "All").clicked() {
-                    let _ = history.execute(
+                    super::exec_history(
+                        ui.ctx(),
+                        history,
                         scene,
                         Command::SetNodeBoneMask {
                             node_id: selected_id,
@@ -492,7 +509,9 @@ fn show_character_rig_section(
                     let in_mask = current_mask.as_ref().is_some_and(|list| list.contains(bid));
                     if ui.selectable_label(in_mask, bname).clicked() {
                         let next_mask = toggle_bone_in_mask(current_mask.as_deref(), *bid);
-                        let _ = history.execute(
+                        super::exec_history(
+                            ui.ctx(),
+                            history,
                             scene,
                             Command::SetNodeBoneMask {
                                 node_id: selected_id,
@@ -514,16 +533,21 @@ fn show_character_rig_section(
         );
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             if icons::hud_icon_button(ui, ToolIcon::Reset, "Reset all bones to rest pose", false) {
-                let _ = history.execute(scene, Command::ResetCharacterPose);
+                super::exec_history(ui.ctx(), history, scene, Command::ResetCharacterPose);
             }
             if icons::text_icon_button(ui, "Floor", "Clamp rig to floor (y=0)", false) {
                 if let Some(rig_ref) = &scene.character_rig {
                     let mut clamped = rig_ref.clone();
                     let bounds = tessel_core::SkinnedBoundsCache::from_scene(scene, rig_ref);
-                    let _ =
-                        clamped.clamp_sub_skeleton_to_floor_with_bounds("", 0.0, bounds.as_ref());
-                    if let Some(root) = clamped.bones.first() {
-                        let _ = history.execute(
+                    if clamped
+                        .clamp_sub_skeleton_to_floor_with_bounds("", 0.0, bounds.as_ref())
+                        .is_none()
+                    {
+                        super::push_ui_error(ui.ctx(), "Floor clamp found no bones to adjust.");
+                    } else if let Some(root) = clamped.bones.first() {
+                        super::exec_history(
+                            ui.ctx(),
+                            history,
                             scene,
                             Command::SetBoneTranslation {
                                 bone_id: root.id,
@@ -566,7 +590,9 @@ fn show_character_rig_section(
             );
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if icons::hud_icon_button(ui, ToolIcon::Keyframe, "Key", false) {
-                    let _ = history.execute(
+                    super::exec_history(
+                        ui.ctx(),
+                        history,
                         scene,
                         Command::SetAnimationKeyframe {
                             clip_index: active_clip,
@@ -576,7 +602,9 @@ fn show_character_rig_section(
                     );
                 }
                 if icons::hud_icon_button(ui, ToolIcon::Reset, "Reset bone pose", false) {
-                    let _ = history.execute(
+                    super::exec_history(
+                        ui.ctx(),
+                        history,
                         scene,
                         Command::SetBoneRotation {
                             bone_id,
@@ -588,24 +616,41 @@ fn show_character_rig_section(
         });
 
         let mut changed = false;
-        changed |= ui
-            .add(egui::Slider::new(&mut rx_deg, -180.0..=180.0).text("Pitch"))
-            .changed();
-        changed |= ui
-            .add(egui::Slider::new(&mut ry_deg, -180.0..=180.0).text("Yaw"))
-            .changed();
-        changed |= ui
-            .add(egui::Slider::new(&mut rz_deg, -180.0..=180.0).text("Roll"))
-            .changed();
-        if changed {
+        let mut dragging = false;
+        let mut drag_stopped = false;
+        for resp in [
+            ui.add(egui::Slider::new(&mut rx_deg, -180.0..=180.0).text("Pitch")),
+            ui.add(egui::Slider::new(&mut ry_deg, -180.0..=180.0).text("Yaw")),
+            ui.add(egui::Slider::new(&mut rz_deg, -180.0..=180.0).text("Roll")),
+        ] {
+            changed |= resp.changed();
+            dragging |= resp.dragged();
+            drag_stopped |= resp.drag_stopped();
+        }
+        if changed || drag_stopped {
             let next_delta = glam::Quat::from_euler(
                 glam::EulerRot::XYZ,
                 rx_deg.to_radians(),
                 ry_deg.to_radians(),
                 rz_deg.to_radians(),
             );
-            let _ = history.execute(
+            super::commit_debounced_command(
+                ui.ctx(),
+                egui::Id::new(("bone_pose_debounce", bone_id)),
+                history,
                 scene,
+                changed,
+                dragging,
+                drag_stopped,
+                |s| {
+                    s.character_rig
+                        .as_ref()
+                        .and_then(|r| r.bone(bone_id))
+                        .map(|b| Command::SetBoneRotation {
+                            bone_id,
+                            rotation: b.pose_local.rotation,
+                        })
+                },
                 Command::SetBoneRotation {
                     bone_id,
                     rotation: rest_rot * next_delta,
@@ -675,7 +720,12 @@ fn show_character_rig_section(
                         mirror_lr: scene.stick_gizmo.mirror_lr,
                         axis_lock: scene.stick_gizmo.axis_lock,
                     };
-                    let _ = history.execute(scene, Command::ApplyStickGizmoPose { params });
+                    super::exec_history(
+                        ui.ctx(),
+                        history,
+                        scene,
+                        Command::ApplyStickGizmoPose { params },
+                    );
                 }
             }
         });
@@ -777,7 +827,7 @@ fn show_outliner_section(ui: &mut egui::Ui, scene: &mut SceneState, history: &mu
                     RichText::new(label_text).color(tokens::ON_SURFACE_VARIANT)
                 };
                 if ui.selectable_label(selected, text).clicked() && !selected {
-                    let _ = history.execute(scene, Command::SelectNode(Some(id)));
+                    super::exec_history(ui.ctx(), history, scene, Command::SelectNode(Some(id)));
                 }
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -792,7 +842,7 @@ fn show_outliner_section(ui: &mut egui::Ui, scene: &mut SceneState, history: &mu
                     if renaming.as_ref().is_some_and(|(rid, _)| *rid == id) {
                         renaming = None;
                     }
-                    let _ = history.execute(scene, Command::DeleteNode(id));
+                    super::exec_history(ui.ctx(), history, scene, Command::DeleteNode(id));
                 }
                 if icons::hud_icon_button_full(
                     ui,
@@ -816,7 +866,9 @@ fn show_outliner_section(ui: &mut egui::Ui, scene: &mut SceneState, history: &mu
                     (ToolIcon::EyeClosed, "Show node")
                 };
                 if icons::hud_icon_button_full(ui, vis_icon, vis_tip, !visible, true, true) {
-                    let _ = history.execute(
+                    super::exec_history(
+                        ui.ctx(),
+                        history,
                         scene,
                         Command::SetNodeVisibility {
                             node_id: id,
@@ -862,7 +914,9 @@ fn show_transform_and_lighting_section(
                 );
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if icons::hud_icon_button(ui, ToolIcon::Reset, "Reset transform", false) {
-                        let _ = history.execute(
+                        super::exec_history(
+                            ui.ctx(),
+                            history,
                             scene,
                             Command::SetNodeTransform {
                                 node_id,
@@ -874,33 +928,40 @@ fn show_transform_and_lighting_section(
             });
 
             let mut changed = false;
+            let mut dragging = false;
+            let mut drag_stopped = false;
+            let mut track = |r: egui::Response| {
+                changed |= r.changed();
+                dragging |= r.dragged();
+                drag_stopped |= r.drag_stopped();
+            };
             ui.horizontal(|ui| {
                 ui.label(
                     RichText::new("Pos")
                         .size(11.0)
                         .color(tokens::ON_SURFACE_VARIANT),
                 );
-                changed |= ui
-                    .add(
+                track(
+                    ui.add(
                         egui::DragValue::new(&mut tx.translation.x)
                             .speed(0.05)
                             .prefix("X "),
-                    )
-                    .changed();
-                changed |= ui
-                    .add(
+                    ),
+                );
+                track(
+                    ui.add(
                         egui::DragValue::new(&mut tx.translation.y)
                             .speed(0.05)
                             .prefix("Y "),
-                    )
-                    .changed();
-                changed |= ui
-                    .add(
+                    ),
+                );
+                track(
+                    ui.add(
                         egui::DragValue::new(&mut tx.translation.z)
                             .speed(0.05)
                             .prefix("Z "),
-                    )
-                    .changed();
+                    ),
+                );
             });
             ui.horizontal(|ui| {
                 ui.label(
@@ -908,15 +969,9 @@ fn show_transform_and_lighting_section(
                         .size(11.0)
                         .color(tokens::ON_SURFACE_VARIANT),
                 );
-                changed |= ui
-                    .add(egui::DragValue::new(&mut rx_deg).speed(1.0).prefix("X "))
-                    .changed();
-                changed |= ui
-                    .add(egui::DragValue::new(&mut ry_deg).speed(1.0).prefix("Y "))
-                    .changed();
-                changed |= ui
-                    .add(egui::DragValue::new(&mut rz_deg).speed(1.0).prefix("Z "))
-                    .changed();
+                track(ui.add(egui::DragValue::new(&mut rx_deg).speed(1.0).prefix("X ")));
+                track(ui.add(egui::DragValue::new(&mut ry_deg).speed(1.0).prefix("Y ")));
+                track(ui.add(egui::DragValue::new(&mut rz_deg).speed(1.0).prefix("Z ")));
             });
             ui.horizontal(|ui| {
                 ui.label(
@@ -924,39 +979,51 @@ fn show_transform_and_lighting_section(
                         .size(11.0)
                         .color(tokens::ON_SURFACE_VARIANT),
                 );
-                changed |= ui
-                    .add(
+                track(
+                    ui.add(
                         egui::DragValue::new(&mut tx.scale.x)
                             .speed(0.02)
                             .range(0.005..=100.0)
                             .prefix("X "),
-                    )
-                    .changed();
-                changed |= ui
-                    .add(
+                    ),
+                );
+                track(
+                    ui.add(
                         egui::DragValue::new(&mut tx.scale.y)
                             .speed(0.02)
                             .range(0.005..=100.0)
                             .prefix("Y "),
-                    )
-                    .changed();
-                changed |= ui
-                    .add(
+                    ),
+                );
+                track(
+                    ui.add(
                         egui::DragValue::new(&mut tx.scale.z)
                             .speed(0.02)
                             .range(0.005..=100.0)
                             .prefix("Z "),
-                    )
-                    .changed();
+                    ),
+                );
             });
 
-            if changed {
+            if changed || drag_stopped {
                 rx = rx_deg.to_radians();
                 ry = ry_deg.to_radians();
                 rz = rz_deg.to_radians();
                 tx.rotation = glam::Quat::from_euler(glam::EulerRot::XYZ, rx, ry, rz);
-                let _ = history.execute(
+                super::commit_debounced_command(
+                    ui.ctx(),
+                    egui::Id::new(("node_transform_debounce", node_id)),
+                    history,
                     scene,
+                    changed,
+                    dragging,
+                    drag_stopped,
+                    |s| {
+                        s.nodes.get(&node_id).map(|n| Command::SetNodeTransform {
+                            node_id,
+                            transform: n.transform,
+                        })
+                    },
                     Command::SetNodeTransform {
                         node_id,
                         transform: tx,
@@ -979,7 +1046,9 @@ fn show_transform_and_lighting_section(
                     );
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if icons::hud_icon_button(ui, ToolIcon::Reset, "Reset material", false) {
-                            let _ = history.execute(
+                            super::exec_history(
+                                ui.ctx(),
+                                history,
                                 scene,
                                 Command::SetMeshMaterial {
                                     node_id,
@@ -990,12 +1059,16 @@ fn show_transform_and_lighting_section(
                     });
                 });
                 let mut changed = false;
-                changed |= ui
-                    .add(egui::Slider::new(&mut mat.metallic, 0.0..=1.0).text("Metallic"))
-                    .changed();
-                changed |= ui
-                    .add(egui::Slider::new(&mut mat.roughness, 0.05..=1.0).text("Roughness"))
-                    .changed();
+                let mut dragging = false;
+                let mut drag_stopped = false;
+                for r in [
+                    ui.add(egui::Slider::new(&mut mat.metallic, 0.0..=1.0).text("Metallic")),
+                    ui.add(egui::Slider::new(&mut mat.roughness, 0.05..=1.0).text("Roughness")),
+                ] {
+                    changed |= r.changed();
+                    dragging |= r.dragged();
+                    drag_stopped |= r.drag_stopped();
+                }
                 ui.horizontal(|ui| {
                     ui.label(
                         RichText::new("Emissive Glow")
@@ -1035,13 +1108,28 @@ fn show_transform_and_lighting_section(
                     }
                 });
                 if let tessel_core::AlphaMode::Mask { ref mut cutoff } = mat.alpha_mode {
-                    changed |= ui
-                        .add(egui::Slider::new(cutoff, 0.0..=1.0).text("Cutoff"))
-                        .changed();
+                    let r = ui.add(egui::Slider::new(cutoff, 0.0..=1.0).text("Cutoff"));
+                    changed |= r.changed();
+                    dragging |= r.dragged();
+                    drag_stopped |= r.drag_stopped();
                 }
-                if changed {
-                    let _ = history.execute(
+                if changed || drag_stopped {
+                    super::commit_debounced_command(
+                        ui.ctx(),
+                        egui::Id::new(("mesh_material_debounce", node_id)),
+                        history,
                         scene,
+                        changed,
+                        dragging,
+                        drag_stopped,
+                        |s| {
+                            s.lowpoly_meshes
+                                .get(&node_id)
+                                .map(|m| Command::SetMeshMaterial {
+                                    node_id,
+                                    material: m.material,
+                                })
+                        },
                         Command::SetMeshMaterial {
                             node_id,
                             material: mat,
@@ -1056,7 +1144,9 @@ fn show_transform_and_lighting_section(
                                 mesh,
                                 &tessel_core::BakeParams::default(),
                             ) {
-                                let _ = history.execute(
+                                super::exec_history(
+                                    ui.ctx(),
+                                    history,
                                     scene,
                                     Command::SetMeshAoMap {
                                         node_id,
@@ -1081,7 +1171,9 @@ fn show_transform_and_lighting_section(
                             if let Ok(out) =
                                 tessel_core::generate_smart_material_texture(mesh, &params)
                             {
-                                let _ = history.execute(
+                                super::exec_history(
+                                    ui.ctx(),
+                                    history,
                                     scene,
                                     Command::SetMeshTexture {
                                         node_id,
@@ -1145,7 +1237,9 @@ fn show_transform_and_lighting_section(
                         ] {
                             if icons::text_icon_button(ui, lbl, &format!("Nudge face {lbl}"), false)
                             {
-                                let _ = history.execute(
+                                super::exec_history(
+                                    ui.ctx(),
+                                    history,
                                     scene,
                                     Command::TranslateMeshFace {
                                         node_id,
@@ -1179,12 +1273,24 @@ fn show_transform_and_lighting_section(
                 for (m_name, cur_w) in morph_entries {
                     let mut w = cur_w;
                     ui.horizontal(|ui| {
-                        if ui
-                            .add(egui::Slider::new(&mut w, 0.0..=1.0).text(&m_name))
-                            .changed()
-                        {
-                            let _ = history.execute(
+                        let resp = ui.add(egui::Slider::new(&mut w, 0.0..=1.0).text(&m_name));
+                        if resp.changed() || resp.drag_stopped() {
+                            let target_name = m_name.clone();
+                            super::commit_debounced_command(
+                                ui.ctx(),
+                                egui::Id::new(("morph_weight_debounce", node_id, &m_name)),
+                                history,
                                 scene,
+                                resp.changed(),
+                                resp.dragged(),
+                                resp.drag_stopped(),
+                                |_| {
+                                    Some(Command::SetMorphDefaultWeight {
+                                        node_id,
+                                        name: target_name.clone(),
+                                        weight: cur_w,
+                                    })
+                                },
                                 Command::SetMorphDefaultWeight {
                                     node_id,
                                     name: m_name.clone(),
@@ -1200,7 +1306,9 @@ fn show_transform_and_lighting_section(
                             if let Some(rig) = &scene.character_rig {
                                 let clip_index = rig.active_animation;
                                 let time_secs = rig.playback_time;
-                                let _ = history.execute(
+                                super::exec_history(
+                                    ui.ctx(),
+                                    history,
                                     scene,
                                     Command::SetMorphWeightKeyframe {
                                         clip_index,
@@ -1228,22 +1336,53 @@ fn show_transform_and_lighting_section(
         );
         let mut az_deg = scene.light_azimuth.to_degrees();
         let mut el_deg = scene.light_elevation.to_degrees();
-        if ui
-            .add(egui::Slider::new(&mut az_deg, -180.0..=180.0).text("Azimuth"))
-            .changed()
-        {
-            scene.light_azimuth = az_deg.to_radians();
-        }
-        if ui
-            .add(egui::Slider::new(&mut el_deg, 5.0..=89.0).text("Elevation"))
-            .changed()
-        {
-            scene.light_elevation = el_deg.to_radians();
+        let r_az = ui.add(egui::Slider::new(&mut az_deg, -180.0..=180.0).text("Azimuth"));
+        let r_el = ui.add(egui::Slider::new(&mut el_deg, 5.0..=89.0).text("Elevation"));
+        let changed = r_az.changed() || r_el.changed();
+        let dragging = r_az.dragged() || r_el.dragged();
+        let drag_stopped = r_az.drag_stopped() || r_el.drag_stopped();
+        if changed || drag_stopped {
+            super::commit_debounced_command(
+                ui.ctx(),
+                egui::Id::new("studio_lighting_debounce"),
+                history,
+                scene,
+                changed,
+                dragging,
+                drag_stopped,
+                |s| {
+                    Some(Command::SetLightDirection {
+                        azimuth: s.light_azimuth,
+                        elevation: s.light_elevation,
+                    })
+                },
+                Command::SetLightDirection {
+                    azimuth: az_deg.to_radians(),
+                    elevation: el_deg.to_radians(),
+                },
+            );
         }
     }
 }
 
-fn show_direct_ai_section(ui: &mut egui::Ui, scene: &SceneState, ai_state: &mut DirectAiUiState) {
+fn apply_provider_selection(
+    ai_state: &mut DirectAiUiState,
+    settings: &crate::settings::AppSettings,
+    provider: AiProviderKind,
+) {
+    let profile = settings.profile_for(provider);
+    ai_state.config.provider = provider;
+    ai_state.config.model = profile.model;
+    ai_state.config.base_url = profile.base_url;
+    ai_state.config.api_key = crate::settings::load_api_key_from_keyring(provider);
+}
+
+fn show_direct_ai_section(
+    ui: &mut egui::Ui,
+    scene: &SceneState,
+    ai_state: &mut DirectAiUiState,
+    settings: &crate::settings::AppSettings,
+) {
     ui.label(
         RichText::new("Direct AI")
             .strong()
@@ -1261,11 +1400,7 @@ fn show_direct_ai_section(ui: &mut egui::Ui, scene: &SceneState, ai_state: &mut 
                         .selectable_label(ai_state.config.provider == provider, provider.label())
                         .clicked()
                     {
-                        ai_state.config.provider = provider;
-                        ai_state.config.model = provider.default_model().into();
-                        ai_state.config.base_url = provider.default_base_url().into();
-                        ai_state.config.api_key =
-                            crate::settings::load_api_key_from_keyring(provider);
+                        apply_provider_selection(ai_state, settings, provider);
                     }
                 }
             });
@@ -1797,5 +1932,26 @@ mod tests {
         ));
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn apply_provider_selection_uses_saved_settings_profile() {
+        let target_provider = AiProviderKind::ALL
+            .into_iter()
+            .find(|p| *p != AiProviderKind::Ollama)
+            .unwrap();
+        let mut settings = crate::settings::AppSettings::default();
+        settings.set_profile(
+            target_provider,
+            crate::settings::ProviderProfile {
+                model: "custom-model-v2".into(),
+                base_url: "http://127.0.0.1:9999/v1".into(),
+            },
+        );
+        let mut ai_state = DirectAiUiState::default();
+        apply_provider_selection(&mut ai_state, &settings, target_provider);
+        assert_eq!(ai_state.config.provider, target_provider);
+        assert_eq!(ai_state.config.model, "custom-model-v2");
+        assert_eq!(ai_state.config.base_url, "http://127.0.0.1:9999/v1");
     }
 }
