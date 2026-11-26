@@ -248,8 +248,9 @@ pub fn import_glb_bytes(bytes: &[u8], material: PaletteIndex) -> Result<LowPolyM
                     }
                 }
             }
-            // Round-trip blend shapes: target POSITION deltas become morphs.
-            for (positions, _, _) in reader.read_morph_targets() {
+            // Round-trip blend shapes: target POSITION + NORMAL deltas and mesh default weights.
+            let mesh_weights = mesh.weights().unwrap_or(&[]);
+            for (t_idx, (positions, normals, _)) in reader.read_morph_targets().enumerate() {
                 let Some(positions) = positions else {
                     continue;
                 };
@@ -264,8 +265,31 @@ pub fn import_glb_bytes(bytes: &[u8], material: PaletteIndex) -> Result<LowPolyM
                         map.insert(base + i, v);
                     }
                 }
-                if !map.is_empty() {
-                    morphs.push(MorphTarget { name, deltas: map });
+                let mut normal_map = BTreeMap::new();
+                if let Some(normals) = normals {
+                    for (i, nd) in normals.enumerate() {
+                        if i >= added {
+                            break;
+                        }
+                        let v = Vec3::from_array(nd);
+                        if v.is_finite() && v.length_squared() > 1e-12 {
+                            normal_map.insert(base + i, v);
+                        }
+                    }
+                }
+                let default_weight = mesh_weights
+                    .get(t_idx)
+                    .copied()
+                    .filter(|w| w.is_finite())
+                    .unwrap_or(0.0)
+                    .clamp(0.0, 1.0);
+                if !map.is_empty() || !normal_map.is_empty() {
+                    morphs.push(MorphTarget {
+                        name,
+                        deltas: map,
+                        normal_deltas: normal_map,
+                        default_weight,
+                    });
                 }
             }
             let prim_uvs: Vec<[f32; 2]> = reader

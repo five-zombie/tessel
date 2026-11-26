@@ -3,19 +3,28 @@ use std::io::{Cursor, Read, Write};
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
-use tessel_core::SceneState;
+use tessel_core::{AppMode, SceneState};
 use zip::write::SimpleFileOptions;
-use zip::{CompressionMethod, ZipArchive, ZipWriter};
+use zip::{CompressionMethod, DateTime, ZipArchive, ZipWriter};
 
 use crate::error::IoError;
 
+pub const PROJECT_FORMAT_ID: &str = "tessel-project";
 pub const CURRENT_SCHEMA_VERSION: u32 = 1;
+
+fn default_unit_scale() -> f32 {
+    0.1
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProjectManifest {
     pub format: String,
     pub schema_version: u32,
     pub app_version: String,
+    #[serde(default)]
+    pub active_mode: AppMode,
+    #[serde(default = "default_unit_scale")]
+    pub unit_scale: f32,
 }
 
 /// Serializes `SceneState` into `.tessel` ZIP archive bytes.
@@ -23,21 +32,25 @@ pub fn encode_tessel_project(scene: &SceneState) -> Result<Vec<u8>, IoError> {
     encode_tessel_project_with_thumbnail(scene, None)
 }
 
-/// Serializes `SceneState` and optional `thumbnail.png` into `.tessel` ZIP archive bytes.
+/// Serializes `SceneState` and optional `thumbnail.png` into deterministic `.tessel` ZIP archive bytes.
 pub fn encode_tessel_project_with_thumbnail(
     scene: &SceneState,
     thumbnail_png: Option<&[u8]>,
 ) -> Result<Vec<u8>, IoError> {
     let manifest = ProjectManifest {
-        format: "tessel-project".into(),
+        format: PROJECT_FORMAT_ID.into(),
         schema_version: CURRENT_SCHEMA_VERSION,
         app_version: env!("CARGO_PKG_VERSION").into(),
+        active_mode: scene.active_mode,
+        unit_scale: scene.unit_scale,
     };
 
     let mut cursor = Cursor::new(Vec::new());
     {
         let mut zip = ZipWriter::new(&mut cursor);
-        let opts = SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
+        let opts = SimpleFileOptions::default()
+            .compression_method(CompressionMethod::Deflated)
+            .last_modified_time(DateTime::default());
 
         zip.start_file("manifest.json", opts)?;
         zip.write_all(&serde_json::to_vec_pretty(&manifest)?)?;
@@ -68,7 +81,13 @@ pub fn decode_tessel_project(bytes: &[u8]) -> Result<SceneState, IoError> {
         .take(MAX_MANIFEST_JSON_BYTES)
         .read_to_string(&mut manifest_buf)?;
     let manifest: ProjectManifest = serde_json::from_str(&manifest_buf)?;
-    if manifest.schema_version > CURRENT_SCHEMA_VERSION {
+    if manifest.format != PROJECT_FORMAT_ID {
+        return Err(IoError::InvalidFormat(format!(
+            "unexpected project format '{}' (expected '{PROJECT_FORMAT_ID}')",
+            manifest.format
+        )));
+    }
+    if manifest.schema_version == 0 || manifest.schema_version > CURRENT_SCHEMA_VERSION {
         return Err(IoError::UnsupportedSchemaVersion(manifest.schema_version));
     }
 
@@ -170,5 +189,119 @@ mod tests {
         let decoded = decode_tessel_project(&encoded).unwrap();
         assert_eq!(decoded.voxel_volumes[&id].voxel_count(), 8);
         assert_eq!(decoded.nodes[&id].name, "Statue");
+    }
+
+    #[test]
+    fn tessel_project_zip_is_byte_stable_with_pinned_mtime() {
+        let mut scene = SceneState::new();
+        Command::CreateVoxelVolume {
+            name: "DeterminismCheck".into(),
+        }
+        .apply(&mut scene)
+        .unwrap();
+        let id = scene.active_voxel_node().unwrap();
+        Command::FillVoxelBox {
+            node_id: id,
+            min: VoxelCoord::new(0, 0, 0),
+            max: VoxelCoord::new(2, 1, 1),
+            color: Some(PaletteIndex::new(2).unwrap()),
+            hollow: false,
+        }
+        .apply(&mut scene)
+        .unwrap();
+
+        let thumb = [0x89u8, 0x50, 0x4E, 0x47, 0x0D, 0x0A];
+        let first = encode_tessel_project_with_thumbnail(&scene, Some(&thumb)).unwrap();
+        let second = encode_tessel_project_with_thumbnail(&scene, Some(&thumb)).unwrap();
+        assert_eq!(
+            first, second,
+            "identical scenes must produce identical ZIP bytes"
+        );
+
+        let mut archive = ZipArchive::new(Cursor::new(&first)).unwrap();
+        for name in ["manifest.json", "scene.json", "thumbnail.png"] {
+            let entry = archive.by_name(name).unwrap();
+            assert_eq!(
+                entry.last_modified(),
+                Some(DateTime::default()),
+                "ZIP entry '{name}' must use pinned epoch mtime"
+            );
+        }
+    }
+
+    #[test]
+    fn tessel_project_validates_manifest_and_preserves_legacy_v1_compat() {
+        let scene = SceneState::new();
+        let scene_json = serde_json::to_vec(&scene).unwrap();
+        let opts = SimpleFileOptions::default()
+            .compression_method(CompressionMethod::Deflated)
+            .last_modified_time(DateTime::default());
+
+        // Legacy minimal v1 manifest without active_mode / unit_scale must still decode.
+        let mut legacy_buf = Cursor::new(Vec::new());
+        {
+            let mut zip = ZipWriter::new(&mut legacy_buf);
+            zip.start_file("manifest.json", opts).unwrap();
+            zip.write_all(
+                br#"{"format":"tessel-project","schema_version":1,"app_version":"0.1.0"}"#,
+            )
+            .unwrap();
+            zip.start_file("scene.json", opts).unwrap();
+            zip.write_all(&scene_json).unwrap();
+            zip.finish().unwrap();
+        }
+        assert!(decode_tessel_project(&legacy_buf.into_inner()).is_ok());
+
+        // Future schema_version must be rejected with UnsupportedSchemaVersion.
+        let mut future_buf = Cursor::new(Vec::new());
+        {
+            let mut zip = ZipWriter::new(&mut future_buf);
+            zip.start_file("manifest.json", opts).unwrap();
+            zip.write_all(
+                br#"{"format":"tessel-project","schema_version":99,"app_version":"9.0.0"}"#,
+            )
+            .unwrap();
+            zip.start_file("scene.json", opts).unwrap();
+            zip.write_all(&scene_json).unwrap();
+            zip.finish().unwrap();
+        }
+        assert!(matches!(
+            decode_tessel_project(&future_buf.into_inner()),
+            Err(IoError::UnsupportedSchemaVersion(99))
+        ));
+
+        // Zero schema_version must also be rejected with UnsupportedSchemaVersion(0).
+        let mut zero_buf = Cursor::new(Vec::new());
+        {
+            let mut zip = ZipWriter::new(&mut zero_buf);
+            zip.start_file("manifest.json", opts).unwrap();
+            zip.write_all(
+                br#"{"format":"tessel-project","schema_version":0,"app_version":"0.1.0"}"#,
+            )
+            .unwrap();
+            zip.start_file("scene.json", opts).unwrap();
+            zip.write_all(&scene_json).unwrap();
+            zip.finish().unwrap();
+        }
+        assert!(matches!(
+            decode_tessel_project(&zero_buf.into_inner()),
+            Err(IoError::UnsupportedSchemaVersion(0))
+        ));
+
+        // Unexpected format identifier must be rejected with InvalidFormat.
+        let mut bad_fmt_buf = Cursor::new(Vec::new());
+        {
+            let mut zip = ZipWriter::new(&mut bad_fmt_buf);
+            zip.start_file("manifest.json", opts).unwrap();
+            zip.write_all(br#"{"format":"other-app","schema_version":1,"app_version":"0.1.0"}"#)
+                .unwrap();
+            zip.start_file("scene.json", opts).unwrap();
+            zip.write_all(&scene_json).unwrap();
+            zip.finish().unwrap();
+        }
+        assert!(matches!(
+            decode_tessel_project(&bad_fmt_buf.into_inner()),
+            Err(IoError::InvalidFormat(_))
+        ));
     }
 }

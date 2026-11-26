@@ -8,18 +8,20 @@ use serde_json::{json, Value};
 use tessel_core::{HistoryStack, SceneState};
 
 use crate::tools::tool_definitions;
-use crate::translator::{execute_tool_call, palette_summary_json, scene_summary_json};
+use crate::translator::{
+    canonical_export_dir_string, execute_tool_call, palette_summary_json, scene_summary_json,
+};
 
 pub use http::{LiveMcpRequest, LiveMcpServerHandle};
 
 const MCP_SERVER_INSTRUCTIONS: &str = "\
 Tessel is a 3D & 2D asset creation studio (Pixel, Voxel, Low-Poly, Character) using a Right-Handed +Y Up, +Z Front coordinate system (1 voxel = 0.1m; Left = +X, Right = -X).
 Recommended workflow:
-1. Call `scene_inspect` (or read `tessel://scene/summary` and `tessel://palette/current`) before editing, or call `scene_clear` to start fresh. Add custom colors to slots 1..=255 with `palette_set_color` (`rgb` or `hex` `#RRGGBB`/`#RRGGBBAA`, optional `alpha`/`roughness`/`metallic`/`emissive`). Use `scene_batch` (up to 512 calls, atomic rollback, supports `\"$N.field\"` chaining like `\"$0.node_id\"`) for fast multi-step builds, `scene_select_node` to focus a node, `scene_rename_node` to label parts, `scene_set_node_transform` to pose nodes, `scene_set_parent` to group, and `scene_set_lighting` for studio key light.
+1. Call `scene_inspect` (or read `tessel://scene/summary`, `tessel://palette/current`, and `tessel://recipes/scene_batch` for curated templates) before editing, or call `scene_clear` to start fresh. Add custom colors to slots 1..=255 with `palette_set_color` (`rgb` or `hex` `#RRGGBB`/`#RRGGBBAA`, optional `alpha`/`roughness`/`metallic`/`emissive`). Use `scene_batch` (up to 512 calls, atomic rollback, supports `\"$N.field\"` chaining like `\"$0.node_id\"`) for fast multi-step builds, `scene_select_node` to focus a node, `scene_rename_node` to label parts, `scene_set_node_transform` to pose nodes, `scene_set_parent` to group, and `scene_set_lighting` for studio key light.
 2. Pixel & Voxel modes: in Pixel mode use `pixel_create_canvas`, `pixel_add_layer`, `pixel_set_layer` (`visible`/`opacity`), `pixel_set_onion_skin`, `pixel_draw` (`mirror_x`/`mirror_y`, `palette_index: null` to erase), `pixel_draw_line`, `pixel_draw_rect`, `pixel_flood_fill`, `pixel_add_frame`, `pixel_set_active_frame`, `pixel_set_fps`, `pixel_inspect`, `pixel_export_sprite_sheet`, and `pixel_convert_to_voxel`. In Voxel mode use `voxel_create_volume`, `voxel_set_voxels`, `voxel_fill_box`, `voxel_fill_ellipsoid` (bounds ±256, `palette_index: null` to carve, `mirror_x`/`mirror_y`/`mirror_z`), `voxel_inspect`, `voxel_import` (`.vox`), and `voxel_convert_to_lowpoly`. Pixel mode: use `pixel_create_canvas` (default 32×32, one transparent layer; canvas Top-Left origin), set custom colors with `palette_set_color`, add layers with `pixel_add_layer`, paint/erase with `pixel_draw` (`palette_index` 1..255, omit for eraser), grow animation with `pixel_add_frame` (each frame owns its layers), verify with `pixel_inspect`, set `pixel_set_fps`, and export with `project_export` (`png` single frame / `gif` full animation) or `pixel_export_sprite_sheet` (all frames side-by-side).
 3. Low-Poly mode: build rotational shapes (helmets, visors, boots, domes) with `mesh_create_lathe` (`profile`, `segments`, `angle_deg`, `cap_ends`), build flat/extruded silhouettes (neckties, armor plates, buckles, weapons) with `mesh_create_extruded_polygon` (`points`, `depth`), build tapered organic shapes (torsos, limbs, backpacks, stocks) with `mesh_create_loft` (`sections`, `cap_ends`), generate low-poly heightmap/fBm terrains with `mesh_create_terrain` (`width`, `depth`, `subdiv_x`, `subdiv_z`, `height_scale`, `heights`, `palette_bands`), create bespoke geometry via `mesh_create_raw` (`vertices`, `faces` with per-face `palette_index` & optional `uvs`), compose primitives via `mesh_create_primitive` (`cube`, `plane`, `cylinder`, `cone`, `sphere`, `torus`, `capsule`; `size` accepts scalar >= 0.005 or `[sx, sy, sz]`; bottom-anchored), generate curved straps/cables with `mesh_create_curve_tube`, join parts with `mesh_join`, bake transforms before mirroring/bending via `mesh_apply_transform`, mirror symmetrically with `mesh_mirror`, collapse center seams with `mesh_weld_vertices`, fix inside-out faces with `mesh_flip_normals`, deform with `mesh_taper` / `mesh_bend`, shift pivots with `mesh_set_origin`, subdivide locally with `mesh_subdivide_face`, paint per-face colors with `mesh_set_face_material`, batch-update vertices with `mesh_set_vertices`, inspect with `mesh_inspect`, bevel/inset/extrude (`mesh_inset_face`, `mesh_extrude_face`, `mesh_bevel`), sculpt (`mesh_translate_face`, `mesh_move_vertices`, `mesh_set_vertex`), author blend shapes (`mesh_morph_delta` with `vertex_ids` or spatial `bounds_min`/`bounds_max`), project UVs (`mesh_project_uvs`), bake CPU AO/Curvature/Thickness maps (`mesh_bake_maps`, auto-attaches glTF `occlusionTexture`), generate procedural wear/dirt textures (`mesh_fill_smart_material`), manage non-destructive paint layers (`mesh_layer_add`, `mesh_layer_set`, `mesh_layer_delete`, `mesh_layer_list`), paint 3D textures (`mesh_fill_texture`, `mesh_paint_spot` with `mirror_x: true`, `across_seams: true`, `radius_world`, and `camera_pos` visibility culling, `mesh_paint_line`, `mesh_paint_rect`, `mesh_load_texture` & `mesh_load_normal_map` supporting `.png`/`.jpg`/`.tga`/`.tiff`/`.exr`), author NPR data (`mesh_set_vertex_colors` for `COLOR_0`, `mesh_set_crease_edges`, `mesh_validate_topology`), tune PBR/NPR (`mesh_set_material` with `cast_shadow`, `receive_shadow`, `alpha_mode`, `alpha_cutoff`, `unlit`), and smooth (`mesh_smooth_subdivide`, `mesh_set_shading`).
 4. Character & Prop Rigging mode: call `character_apply_biped_rig` (`preset: \"starter\"` 7-bone or `preset: \"humanoid\"` 19-bone with built-in Idle & Walk; Left=+X, Right=-X; pass `append: true`, `prefix`, `offset`, `yaw_deg`, `include_default_clips: true` for multi-character scenes), adjust rest positions (`character_set_bone_rest_position`), isolate limbs (`character_set_node_bone_mask`), bind rigid gear (`character_bind_node`), inspect weights (`character_inspect_weights`), pose (`character_set_bone_pose` with `rotation_deg` and/or `translation`, `character_clamp_to_floor` with `surface_node_ids`, `solve_foot_ik`, `align_foot_normal`, `pelvis_tilt`, `step_up_clearance`, `contact_chains`, `character_solve_ik` (`pole_target`, `end_world_rotation_deg`) for 2-bone analytic IK, `character_solve_chain_ik` for 2..=32 multi-bone CCD chains), bake live/IK poses into keyframes (`character_snapshot_pose_to_keyframe` with `interpolation` including `cubic_bezier`), configure stepped playback FPS (`character_set_clip_stepped_fps`), clamp in-between clip frames to floor or terrain (`character_clamp_clip_to_floor`), layer per-character clips (`character_set_clip_layer`) and bake them into one exportable clip (`character_bake_clip_layers`), dynamically switch/detach props or drop weapons mid-clip (`character_set_parent_switch_keyframe`), toggle prop/muzzle visibility over time (`character_set_visibility_keyframe`), scrub live animations (`character_set_playback_time`, `character_reset_pose`), author keyframes (`character_set_keyframe`), and animate blend shapes (`character_set_morph_weight`). Both live viewport rendering and `viewport_screenshot` deform meshes in real time.
-5. Verify visually with `viewport_set_shading_mode` (`pbr` | `npr_sumie` | `silhouette_check` | `luminance_value_check`), `viewport_screenshot` (`width`, `height`, `target`, `yaw_deg`/`pitch_deg` in degrees or `yaw`/`pitch` in radians, `distance >= 0.25`, `preview: true`, `orthographic`, `telephoto`), or render 360° animated showcases with `viewport_render_turntable_gif` (`filename`, `frames`, `fps`, `clip_name`, `orthographic`, `telephoto`). Save editable projects with `project_save` / `project_open` (`.tessel`), automate headless builds via `tessel batch`, and export game-ready assets with `project_export` (`.glb` with automatic PBR material deduplication, `occlusionTexture`, `COLOR_0`, `KHR_materials_unlit`, & `CUBICSPLINE`, `.obj`, `.stl`, `.vox`, `.png`, `.gif`).
+5. Verify visually with `viewport_set_shading_mode` (`pbr` | `npr_sumie` | `silhouette_check` | `luminance_value_check`), `viewport_screenshot` (`width`, `height`, `target`, `yaw_deg`/`pitch_deg` in degrees or `yaw`/`pitch` in radians, `distance >= 0.25`, `preview: true`, `orthographic`, `telephoto`), or render 360° animated showcases with `viewport_render_turntable_gif` (`filename`, `frames`, `fps`, `clip_name`, `orthographic`, `telephoto`). Save editable projects with `project_save` / `project_open` (`.tessel`), automate headless builds via `tessel batch`, and export game-ready assets with `project_export` (format matrix: `.glb`/`.obj`/`.stl` for 3D scenes; `.vox` for active `VoxelVolume`; `.png`/`.gif` for active `PixelCanvas` ONLY — for 3D PNG/GIF use `viewport_screenshot` / `viewport_render_turntable_gif`). Key conventions: `mesh_create_primitive` is bottom-anchored (`y in [0, size_y]`, centered in X/Z); `character_set_bone_pose` `rotation_deg` `[pitch, yaw, roll]` uses Right-Handed `+Y Up, +Z Front, +X Left` (`+X` pitch tilts forward, `+Y` yaw turns toward `+X`/Left).
 6. Live GUI viewport only: frame subjects smoothly with `camera_get`, `camera_set_pose` (`target`, `yaw_deg`, `pitch_deg`, `distance`, `orthographic`, `telephoto`), `camera_look_at`, `camera_zoom`, `camera_orbit`, `camera_pan`, `camera_preset`, `camera_reset` (pass `camera: \"viewport\" | \"scene\"` to move either the live viewport or the 3D projector camera), and `viewport_set_preview`.";
 
 /// Processes a single JSON-RPC 2.0 MCP request directly against any live `SceneState` & `HistoryStack`.
@@ -60,6 +62,7 @@ pub fn dispatch_mcp_message_with_preview(
                 "name": "tessel-mcp",
                 "version": env!("CARGO_PKG_VERSION")
             },
+            "export_dir": canonical_export_dir_string(allowed_export_dir),
             "instructions": MCP_SERVER_INSTRUCTIONS
         })),
         "tools/list" => Ok(json!({
@@ -126,6 +129,11 @@ pub fn dispatch_mcp_message_with_preview(
                     "uri": "tessel://viewport/preview",
                     "name": "Viewport Preview Snapshot",
                     "mimeType": "image/png"
+                },
+                {
+                    "uri": "tessel://recipes/scene_batch",
+                    "name": "Curated scene_batch Recipes",
+                    "mimeType": "application/json"
                 }
             ]
         })),
@@ -159,6 +167,13 @@ pub fn dispatch_mcp_message_with_preview(
                         "viewport preview is only available when the Tessel GUI is running".into(),
                     )),
                 },
+                "tessel://recipes/scene_batch" => Ok(json!({
+                    "contents": [{
+                        "uri": uri,
+                        "mimeType": "application/json",
+                        "text": curated_scene_batch_recipes_json().to_string()
+                    }]
+                })),
                 _ => Err((-32602, format!("unknown resource URI '{uri}'"))),
             }
         }
@@ -522,6 +537,52 @@ impl McpServer {
     }
 }
 
+/// Curated `scene_batch` recipes exposed via `tessel://recipes/scene_batch`.
+fn curated_scene_batch_recipes_json() -> Value {
+    json!({
+        "max_calls_per_batch": 512,
+        "chaining_syntax": "\"$N.field\" (e.g. \"$1.node_id\" references result of call index 1)",
+        "conventions": {
+            "mesh_create_primitive": "bottom-anchored: y in [0, size_y], centered in X/Z",
+            "character_set_bone_pose": "Right-Handed +Y Up, +Z Front, +X Left; +X pitch tilts forward, +Y yaw turns toward +X (Left)",
+            "png_export": "project_export format=png requires active PixelCanvas; use viewport_screenshot for 3D PNG"
+        },
+        "recipes": [
+            {
+                "id": "lowpoly-crate-prop",
+                "title": "Low-Poly Crate Prop (Palette + Bottom-Anchored Primitive + Material + Bevel)",
+                "calls": [
+                    { "name": "scene_clear", "arguments": {} },
+                    { "name": "palette_set_color", "arguments": { "palette_index": 10, "hex": "#8B5A2B", "roughness": 0.75, "metallic": 0.0 } },
+                    { "name": "mesh_create_primitive", "arguments": { "name": "CrateBase", "kind": "cube", "size": [1.0, 1.0, 1.0], "palette_index": 10 } },
+                    { "name": "mesh_set_material", "arguments": { "node_id": "$2.node_id", "roughness": 0.75, "metallic": 0.0 } },
+                    { "name": "mesh_bevel", "arguments": { "node_id": "$2.node_id", "amount": 0.12 } }
+                ]
+            },
+            {
+                "id": "voxel-monolith",
+                "title": "Voxel Monolith (Palette + Voxel Box + Lighting)",
+                "calls": [
+                    { "name": "scene_clear", "arguments": {} },
+                    { "name": "palette_set_color", "arguments": { "palette_index": 12, "hex": "#3B82F6", "emissive": 0.5 } },
+                    { "name": "voxel_fill_box", "arguments": { "min": [-2, 0, -2], "max": [2, 8, 2], "palette_index": 12 } },
+                    { "name": "scene_set_lighting", "arguments": { "azimuth_deg": 40.0, "elevation_deg": 55.0 } }
+                ]
+            },
+            {
+                "id": "humanoid-rig-and-pose",
+                "title": "Low-Poly Torso + Humanoid Rig + Bone Pose",
+                "calls": [
+                    { "name": "scene_clear", "arguments": {} },
+                    { "name": "mesh_create_primitive", "arguments": { "name": "Body", "kind": "capsule", "size": [0.5, 1.8, 0.4], "palette_index": 4 } },
+                    { "name": "character_apply_biped_rig", "arguments": { "preset": "humanoid" } },
+                    { "name": "character_set_bone_pose", "arguments": { "bone_id": 2, "rotation_deg": [10.0, 15.0, 0.0] } }
+                ]
+            }
+        ]
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -536,6 +597,10 @@ mod tests {
             .handle_message(&json!({ "jsonrpc": "2.0", "id": 1, "method": "initialize" }))
             .unwrap();
         assert_eq!(init["result"]["serverInfo"]["name"], "tessel-mcp");
+        assert_eq!(
+            init["result"]["export_dir"],
+            canonical_export_dir_string(&export_dir)
+        );
 
         let list = server
             .handle_message(&json!({ "jsonrpc": "2.0", "id": 2, "method": "tools/list" }))
@@ -793,5 +858,57 @@ mod tests {
             .unwrap();
         assert!(text.contains("cyber knight"));
         assert!(text.contains("voxel_fill_box"));
+    }
+
+    #[test]
+    fn b2_curated_scene_batch_recipes_resource_is_valid_and_executable() {
+        let dir = std::env::temp_dir().join("tessel_b2_recipes_test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut server = McpServer::new(dir.clone());
+
+        let list = server
+            .handle_message(&json!({ "jsonrpc": "2.0", "id": 1, "method": "resources/list" }))
+            .unwrap();
+        let resources = list["result"]["resources"].as_array().unwrap();
+        assert!(resources
+            .iter()
+            .any(|r| r["uri"] == "tessel://recipes/scene_batch"));
+
+        let read = server
+            .handle_message(&json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "resources/read",
+                "params": { "uri": "tessel://recipes/scene_batch" }
+            }))
+            .unwrap();
+        let text = read["result"]["contents"][0]["text"].as_str().unwrap();
+        let doc: Value = serde_json::from_str(text).unwrap();
+        let recipes = doc["recipes"].as_array().unwrap();
+        assert!(recipes.len() >= 3);
+
+        // Execute every curated recipe via scene_batch to verify all run atomically.
+        for recipe in recipes {
+            let calls = recipe["calls"].clone();
+            let batch = server
+                .handle_message(&json!({
+                    "jsonrpc": "2.0",
+                    "id": 3,
+                    "method": "tools/call",
+                    "params": {
+                        "name": "scene_batch",
+                        "arguments": { "calls": calls }
+                    }
+                }))
+                .unwrap();
+            assert_eq!(
+                batch["result"]["isError"], false,
+                "recipe {} failed: {batch}",
+                recipe["id"]
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

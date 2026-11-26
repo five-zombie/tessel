@@ -55,11 +55,14 @@ impl McpTransportMode {
     }
 }
 
+pub const REDACTED_TOKEN_PLACEHOLDER: &str = "<REDACTED_MCP_TOKEN>";
+
 #[derive(Default)]
 pub struct McpDialogState {
     pub open: bool,
     pub client: McpClientTarget,
     pub transport: McpTransportMode,
+    pub reveal_token: bool,
     pub status_message: Option<String>,
 }
 
@@ -133,15 +136,21 @@ pub fn build_mcp_config_snippet(
     live_mcp: Option<&LiveMcpServerHandle>,
     mcp_token: &str,
     export_dir: &Path,
+    reveal_token: bool,
 ) -> String {
     let export_dir_escaped = export_dir
         .display()
         .to_string()
         .replace('\\', "\\\\")
         .replace('"', "\\\"");
-    let (port, token) = match live_mcp {
+    let (port, raw_token) = match live_mcp {
         Some(mcp) => (mcp.port, mcp.token.as_str()),
         None => (38421, mcp_token),
+    };
+    let token = if reveal_token {
+        raw_token
+    } else {
+        REDACTED_TOKEN_PLACEHOLDER
     };
     let url = format!("http://127.0.0.1:{port}/mcp");
 
@@ -184,6 +193,7 @@ pub fn show_mcp_dialog(
 
     if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
         state.open = false;
+        state.reveal_token = false;
         return action;
     }
 
@@ -235,9 +245,18 @@ pub fn show_mcp_dialog(
                 );
                 ui.add(
                     egui::TextEdit::singleline(&mut token_display)
-                        .desired_width(235.0)
+                        .password(!state.reveal_token)
+                        .desired_width(210.0)
                         .code_editor(),
                 );
+                let (eye_icon, eye_tip) = if state.reveal_token {
+                    (ToolIcon::EyeClosed, "Hide Bearer Token")
+                } else {
+                    (ToolIcon::EyeOpen, "Reveal Bearer Token")
+                };
+                if icons::hud_icon_button(ui, eye_icon, eye_tip, state.reveal_token) {
+                    state.reveal_token = !state.reveal_token;
+                }
                 if icons::hud_icon_button(ui, ToolIcon::Copy, "Copy", false) {
                     copy_text_reliable(ui.ctx(), active_token);
                     state.status_message = Some("Copied Bearer Token to clipboard.".into());
@@ -301,6 +320,7 @@ pub fn show_mcp_dialog(
                 live_mcp,
                 mcp_token,
                 export_dir,
+                state.reveal_token,
             );
             let mut snippet_display = snippet.clone();
 
@@ -317,18 +337,28 @@ pub fn show_mcp_dialog(
 
             ui.add_space(10.0);
             ui.horizontal(|ui| {
-                if icons::hud_icon_button(
-                    ui,
-                    ToolIcon::Copy,
-                    &format!("Copy {} Config", state.client.label()),
-                    false,
-                ) {
+                let copy_tip = if state.reveal_token || state.transport == McpTransportMode::Stdio {
+                    format!("Copy {} Config", state.client.label())
+                } else {
+                    format!("Copy {} Config (token redacted)", state.client.label())
+                };
+                if icons::hud_icon_button(ui, ToolIcon::Copy, &copy_tip, false) {
                     copy_text_reliable(ui.ctx(), &snippet);
-                    state.status_message = Some(format!(
-                        "Copied {} ({}) config to clipboard.",
-                        state.client.label(),
-                        state.transport.label()
-                    ));
+                    state.status_message = if state.reveal_token
+                        || state.transport == McpTransportMode::Stdio
+                    {
+                        Some(format!(
+                            "Copied {} ({}) config to clipboard.",
+                            state.client.label(),
+                            state.transport.label()
+                        ))
+                    } else {
+                        Some(format!(
+                            "Copied {} ({}) config with redacted token (reveal token to copy full secret).",
+                            state.client.label(),
+                            state.transport.label()
+                        ))
+                    };
                 }
 
                 if icons::hud_icon_button(ui, ToolIcon::Close, "Close", false) {
@@ -343,6 +373,9 @@ pub fn show_mcp_dialog(
         });
 
     state.open = open && state.open;
+    if !state.open {
+        state.reveal_token = false;
+    }
     action
 }
 
@@ -360,7 +393,7 @@ mod tests {
             McpClientTarget::Claude,
         ] {
             for mode in [McpTransportMode::LiveHttp, McpTransportMode::Stdio] {
-                let snippet = build_mcp_config_snippet(client, mode, None, tok, dir);
+                let snippet = build_mcp_config_snippet(client, mode, None, tok, dir, true);
                 let parsed: serde_json::Value = serde_json::from_str(&snippet).unwrap();
                 assert!(parsed.is_object());
             }
@@ -372,6 +405,7 @@ mod tests {
             None,
             tok,
             dir,
+            true,
         );
         assert!(codex_http.contains("[mcp_servers.tessel]"));
         assert!(codex_http.contains("[mcp_servers.tessel.http_headers]"));
@@ -383,7 +417,32 @@ mod tests {
             None,
             tok,
             dir,
+            true,
         );
         assert!(codex_stdio.contains("command = \"tessel\""));
+    }
+
+    #[test]
+    fn mcp_config_snippets_redact_token_when_hidden() {
+        let dir = Path::new("/tmp/tessel_exports");
+        let tok = "tsl_supersecret987654";
+        assert!(!McpDialogState::default().reveal_token);
+
+        for client in McpClientTarget::ALL {
+            let redacted =
+                build_mcp_config_snippet(client, McpTransportMode::LiveHttp, None, tok, dir, false);
+            assert!(!redacted.contains(tok));
+            assert!(redacted.contains(REDACTED_TOKEN_PLACEHOLDER));
+
+            if client != McpClientTarget::Codex {
+                let parsed: serde_json::Value = serde_json::from_str(&redacted).unwrap();
+                assert!(parsed.is_object());
+            }
+
+            let revealed =
+                build_mcp_config_snippet(client, McpTransportMode::LiveHttp, None, tok, dir, true);
+            assert!(revealed.contains(tok));
+            assert!(!revealed.contains(REDACTED_TOKEN_PLACEHOLDER));
+        }
     }
 }

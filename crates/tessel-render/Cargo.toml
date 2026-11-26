@@ -12,3 +12,6 @@ tessel-core = { path = "../tessel-core" }
 thiserror.workspace = true
 tracing.workspace = true
 wgpu.workspace = true
+
+[dev-dependencies]
+pollster.workspace = true

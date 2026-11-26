@@ -190,7 +190,7 @@ pub fn show_settings_dialog(
                         settings.allowed_export_dir = next_export.clone();
                         *export_dir = next_export;
                     }
-                    settings.save(paths);
+                    let save_err = settings.save(paths).err().map(|err| err.to_string());
 
                     ai_config.provider = settings.ai_provider;
                     ai_config.model = active_prof.model;
@@ -201,11 +201,19 @@ pub fn show_settings_dialog(
                         .cloned()
                         .unwrap_or_default();
 
-                    state.status_message = match keyring_err {
-                        Some(err) => Some(Err(format!(
-                            "Settings saved, but OS Keyring returned: {err}"
+                    state.status_message = match (save_err, keyring_err) {
+                        (Some(s_err), Some(k_err)) => {
+                            tracing::error!("{s_err}; OS Keyring: {k_err}");
+                            Some(Err(format!("{s_err}; OS Keyring: {k_err}")))
+                        }
+                        (Some(s_err), None) => {
+                            tracing::error!("{s_err}");
+                            Some(Err(s_err))
+                        }
+                        (None, Some(k_err)) => Some(Err(format!(
+                            "Settings saved, but OS Keyring returned: {k_err}"
                         ))),
-                        None => Some(Ok("Settings & API keys saved.".into())),
+                        (None, None) => Some(Ok("Settings & API keys saved.".into())),
                     };
                 }
 

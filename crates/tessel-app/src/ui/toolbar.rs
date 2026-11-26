@@ -136,6 +136,14 @@ pub fn show_toolbar(ctx: &egui::Context, scene: &mut SceneState, history: &mut H
                     if let Some(action) = icons::icon_group(ui, "prim_shapes", "SHAPE", &shapes) {
                         fire_toolbar_action(action, scene, history);
                     }
+                    if icons::text_icon_button(
+                        ui,
+                        "Terrain",
+                        "Create Low-Poly Terrain (v4.1)",
+                        false,
+                    ) {
+                        fire_toolbar_action(ToolbarAction::CreateTerrain, scene, history);
+                    }
                     ui.separator();
                     if scene.active_lowpoly_node().is_some() {
                         let mut paint: Vec<IconItem> = vec![
@@ -277,6 +285,53 @@ pub fn show_toolbar(ctx: &egui::Context, scene: &mut SceneState, history: &mut H
                     if let Some(action) = icons::icon_group(ui, "char_rig", "RIG", &rig) {
                         fire_toolbar_action(action, scene, history);
                     }
+                    if scene.character_rig.is_some() && scene.active_lowpoly_node().is_some() {
+                        ui.separator();
+                        let weight_tools = [
+                            IconItem {
+                                icon: icons::ToolIcon::Brush,
+                                tip: "Weight Paint",
+                                active: scene.weight_paint_mode,
+                                action: ToolbarAction::ToggleWeightPaint,
+                            },
+                            IconItem {
+                                icon: icons::ToolIcon::Eraser,
+                                tip: "Clear Weights",
+                                active: false,
+                                action: ToolbarAction::ClearMeshWeights,
+                            },
+                        ];
+                        if let Some(action) =
+                            icons::icon_group(ui, "char_weights", "WEIGHT", &weight_tools)
+                        {
+                            fire_toolbar_action(action, scene, history);
+                        }
+                        if scene.weight_paint_mode {
+                            ui.label(
+                                RichText::new(format!("R: {:.2}m", scene.weight_brush_radius))
+                                    .monospace()
+                                    .size(10.0)
+                                    .color(tokens::ON_SURFACE_VARIANT),
+                            );
+                            ui.add(
+                                egui::Slider::new(&mut scene.weight_brush_radius, 0.05..=2.0)
+                                    .show_value(false),
+                            );
+                            ui.label(
+                                RichText::new(format!(
+                                    "S: {:.0}%",
+                                    scene.weight_brush_strength * 100.0
+                                ))
+                                .monospace()
+                                .size(10.0)
+                                .color(tokens::ON_SURFACE_VARIANT),
+                            );
+                            ui.add(
+                                egui::Slider::new(&mut scene.weight_brush_strength, 0.05..=1.0)
+                                    .show_value(false),
+                            );
+                        }
+                    }
                 }
             });
         });
@@ -297,6 +352,30 @@ fn fire_toolbar_action(action: ToolbarAction, scene: &mut SceneState, history: &
                     kind,
                     size: 0.8,
                     material: scene.active_color,
+                },
+            );
+        }
+        ToolbarAction::CreateTerrain => {
+            let _ = history.execute(
+                scene,
+                Command::CreateTerrainMesh {
+                    name: "Terrain".into(),
+                    params: tessel_core::TerrainParams {
+                        width: 8.0,
+                        depth: 8.0,
+                        subdiv_x: 16,
+                        subdiv_z: 16,
+                        height_scale: 1.5,
+                        seed: 42,
+                        octaves: 3,
+                        frequency: 0.35,
+                        island_falloff: 0.3,
+                        heights: None,
+                        palette_bands: Vec::new(),
+                        default_material: scene.active_color,
+                        smooth_shading: false,
+                    },
+                    transform: tessel_core::Transform::default(),
                 },
             );
         }
@@ -482,6 +561,22 @@ fn fire_toolbar_action(action: ToolbarAction, scene: &mut SceneState, history: &
         }
         ToolbarAction::ApplyHumanoidRig => {
             let _ = history.execute(scene, Command::ApplyHumanoidRig);
+        }
+        ToolbarAction::ToggleWeightPaint => {
+            scene.weight_paint_mode = !scene.weight_paint_mode;
+        }
+        ToolbarAction::ClearMeshWeights => {
+            if let Some(node_id) = scene.active_lowpoly_node() {
+                if let Err(err) = history.execute(
+                    scene,
+                    Command::ClearMeshVertexWeights {
+                        node_id,
+                        vertex_ids: None,
+                    },
+                ) {
+                    tracing::warn!("clear mesh weights failed: {err}");
+                }
+            }
         }
         ToolbarAction::TogglePixelSymX => {
             scene.pixel_symmetry.x = !scene.pixel_symmetry.x;

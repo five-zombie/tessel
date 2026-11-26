@@ -74,6 +74,12 @@ impl Default for MeshMaterial {
 pub struct MorphTarget {
     pub name: String,
     pub deltas: BTreeMap<usize, Vec3>,
+    /// Optional sparse per-vertex normal deltas exported as glTF `targets[].NORMAL`.
+    #[serde(default)]
+    pub normal_deltas: BTreeMap<usize, Vec3>,
+    /// Default rest weight (`0.0..=1.0`) exported as glTF `mesh.weights[]` and previewed live.
+    #[serde(default)]
+    pub default_weight: f32,
 }
 
 /// Unit Anchor: Editable indexed low-poly mesh supporting triangles & quads with flat/smooth shading,

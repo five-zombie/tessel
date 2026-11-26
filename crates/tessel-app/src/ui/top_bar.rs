@@ -1,5 +1,5 @@
 use egui::{CornerRadius, Frame, Margin, RichText, Stroke};
-use tessel_core::{AppMode, Command, HistoryStack, SceneState};
+use tessel_core::{AppMode, Command, HistoryStack, SceneState, ViewportShadingMode};
 
 use super::icons::{self, ToolIcon};
 use super::theme::tokens;
@@ -95,6 +95,30 @@ pub fn show_top_bar(
                     let _ = history.redo(scene);
                 }
 
+                if scene.active_mode != AppMode::Pixel {
+                    ui.separator();
+                    let cur = scene.shading_mode;
+                    egui::ComboBox::from_id_salt("top_bar_shading_mode")
+                        .width(96.0)
+                        .selected_text(shading_mode_label(cur))
+                        .show_ui(ui, |ui| {
+                            for mode in [
+                                ViewportShadingMode::Pbr,
+                                ViewportShadingMode::NprSumie,
+                                ViewportShadingMode::SilhouetteCheck,
+                                ViewportShadingMode::LuminanceValueCheck,
+                            ] {
+                                if ui
+                                    .selectable_label(cur == mode, shading_mode_label(mode))
+                                    .clicked()
+                                    && cur != mode
+                                {
+                                    let _ = history.execute(scene, Command::SetShadingMode(mode));
+                                }
+                            }
+                        });
+                }
+
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     let export_btn = egui::Button::new(
                         RichText::new("Export .glb")
@@ -160,4 +184,13 @@ pub fn show_top_bar(
         });
 
     actions
+}
+
+fn shading_mode_label(mode: ViewportShadingMode) -> &'static str {
+    match mode {
+        ViewportShadingMode::Pbr => "PBR",
+        ViewportShadingMode::NprSumie => "NPR Sumi-e",
+        ViewportShadingMode::SilhouetteCheck => "Silhouette",
+        ViewportShadingMode::LuminanceValueCheck => "Luminance",
+    }
 }

@@ -3430,6 +3430,7 @@ dependencies = [
  "bytemuck",
  "glam",
  "image",
+ "pollster",
  "tessel-core",
  "thiserror 2.0.21",
  "tracing",

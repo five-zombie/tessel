@@ -43,3 +43,26 @@ impl PrimitiveKind {
         }
     }
 }
+
+/// Nano-Unit: Vertical pivot anchor for generated low-poly primitives.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PrimitiveAnchor {
+    /// Base sits at `y = 0`, mesh extends upward (`y in [0, height]`). Default.
+    #[default]
+    Bottom,
+    /// Bounding-box center sits at `y = 0` (`y in [-height/2, +height/2]`).
+    Center,
+    /// Top sits at `y = 0`, mesh hangs downward (`y in [-height, 0]`).
+    Top,
+}
+
+impl PrimitiveAnchor {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Bottom => "bottom",
+            Self::Center => "center",
+            Self::Top => "top",
+        }
+    }
+}

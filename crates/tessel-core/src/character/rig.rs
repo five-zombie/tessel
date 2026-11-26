@@ -315,8 +315,9 @@ pub struct CharacterRig {
     pub playback_time: f32,
     pub playing: bool,
     /// Live sampled morph weights `(node, target) -> weight`, refreshed by
-    /// `apply_active_animation` and applied live in `tessel-render` as well as glTF export.
-    #[serde(default)]
+    /// `apply_active_animation` and applied live in `tessel-render`.
+    /// Transient runtime cache — skipped in JSON serialization because tuple keys are not valid JSON object keys.
+    #[serde(skip)]
     pub morph_weights: BTreeMap<(NodeId, String), f32>,
     /// Optional per-node bone allowlist restricting `AutoSkinSolver` influences
     /// (e.g. isolate leg/pelvis meshes from hanging arm bones).

@@ -3,6 +3,7 @@ pub mod gltf;
 pub mod mesh_io;
 pub mod project;
 pub mod sprite;
+pub mod vat;
 pub mod vox;
 
 use std::fs;
@@ -26,6 +27,7 @@ pub use sprite::{
     export_gif_bytes, export_mesh_texture_png_bytes, export_png_bytes, export_sprite_sheet_bytes,
     SpriteSheetMetadata,
 };
+pub use vat::{export_vat_bundle, VatExportReport};
 pub use vox::{export_vox_bytes, import_vox_bytes};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

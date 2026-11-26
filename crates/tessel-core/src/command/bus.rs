@@ -201,6 +201,13 @@ pub enum Command {
         joints: [u16; 4],
         weights: [f32; 4],
     },
+    PaintMeshWeights {
+        node_id: NodeId,
+        hit_point: [f32; 3],
+        radius: f32,
+        bone_id: BoneId,
+        strength: f32,
+    },
     ClearMeshVertexWeights {
         node_id: NodeId,
         vertex_ids: Option<Vec<usize>>,
@@ -460,6 +467,40 @@ pub enum Command {
         clear_color: bool,
         clear_normal: bool,
     },
+    /// Batches multiple commands into one atomic undoable transaction.
+    CreateBoneGrid {
+        spec: crate::character::BoneGridSpec,
+        bind_node: Option<NodeId>,
+    },
+    BakeClothGridAnimation {
+        bone_prefix: String,
+        params: crate::character::ClothWindParams,
+    },
+    SetMorphTargetDeltas {
+        node_id: NodeId,
+        name: String,
+        position_deltas: Vec<(usize, glam::Vec3)>,
+        normal_deltas: Vec<(usize, glam::Vec3)>,
+        replace: bool,
+    },
+    SetMorphDefaultWeight {
+        node_id: NodeId,
+        name: String,
+        weight: f32,
+    },
+    ApplyProxyCageDeform {
+        node_id: NodeId,
+        divisions: [usize; 3],
+        control_deltas: Vec<(usize, glam::Vec3)>,
+        floor_y: Option<f32>,
+        bake_as_morph: Option<String>,
+    },
+    BakeProceduralRibbon {
+        params: crate::mesh::RibbonParams,
+    },
+    ApplyStickGizmoPose {
+        params: crate::character::StickGizmoParams,
+    },
     Transaction(Vec<Command>),
 }
 
@@ -583,6 +624,13 @@ pub enum UndoDelta {
         bone_id: BoneId,
         previous: Quat,
     },
+    RestoreBoneRotations(Vec<(BoneId, Quat)>),
+    RestoreMorphDefaultWeight {
+        node_id: NodeId,
+        name: String,
+        previous_mesh: LowPolyMesh,
+        previous_rig_weight: Option<Option<f32>>,
+    },
     RestoreBoneTranslation {
         bone_id: BoneId,
         previous: glam::Vec3,
@@ -635,6 +683,31 @@ pub enum UndoDelta {
     Transaction(Vec<UndoDelta>),
 }
 
+fn insert_validated_scene_node(
+    scene: &mut SceneState,
+    raw_name: &str,
+    kind: NodeKind,
+    parent: Option<NodeId>,
+    transform: Transform,
+) -> Result<(NodeId, Option<NodeId>), CoreError> {
+    let name = crate::scene::validate_node_name(raw_name)?;
+    let id = scene.allocate_node_id();
+    let previous_selection = scene.selected_node;
+    scene.nodes.insert(
+        id,
+        SceneNode {
+            id,
+            name,
+            kind,
+            visible: true,
+            parent,
+            transform,
+        },
+    );
+    scene.selected_node = Some(id);
+    Ok((id, previous_selection))
+}
+
 impl Command {
     pub fn apply(&self, scene: &mut SceneState) -> Result<UndoDelta, CoreError> {
         let delta = match self {
@@ -648,26 +721,18 @@ impl Command {
                 kind,
                 transform,
             } => {
-                let id = scene.allocate_node_id();
-                let previous_selection = scene.selected_node;
-                scene.nodes.insert(
-                    id,
-                    SceneNode {
-                        id,
-                        name: name.clone(),
-                        kind: *kind,
-                        visible: true,
-                        parent: None,
-                        transform: *transform,
-                    },
-                );
-                if *kind == NodeKind::PixelCanvas {
-                    let canvas = PixelCanvas::new(32, 32)?;
+                let maybe_canvas = if *kind == NodeKind::PixelCanvas {
+                    Some(PixelCanvas::new(32, 32)?)
+                } else {
+                    None
+                };
+                let (id, previous_selection) =
+                    insert_validated_scene_node(scene, name, *kind, None, *transform)?;
+                if let Some(canvas) = maybe_canvas {
                     scene.pixel_canvases.insert(id, canvas);
                 } else if *kind == NodeKind::VoxelVolume {
                     scene.voxel_volumes.insert(id, VoxelVolume::new());
                 }
-                scene.selected_node = Some(id);
                 UndoDelta::RemoveNode {
                     id,
                     previous_selection,
@@ -679,21 +744,14 @@ impl Command {
                 height,
             } => {
                 let canvas = PixelCanvas::new(*width, *height)?;
-                let id = scene.allocate_node_id();
-                let previous_selection = scene.selected_node;
-                scene.nodes.insert(
-                    id,
-                    SceneNode {
-                        id,
-                        name: name.clone(),
-                        kind: NodeKind::PixelCanvas,
-                        visible: true,
-                        parent: None,
-                        transform: Transform::default(),
-                    },
-                );
+                let (id, previous_selection) = insert_validated_scene_node(
+                    scene,
+                    name,
+                    NodeKind::PixelCanvas,
+                    None,
+                    Transform::default(),
+                )?;
                 scene.pixel_canvases.insert(id, canvas);
-                scene.selected_node = Some(id);
                 UndoDelta::RemoveNode {
                     id,
                     previous_selection,
@@ -927,21 +985,14 @@ impl Command {
                 }
             }
             Self::CreateVoxelVolume { name } => {
-                let id = scene.allocate_node_id();
-                let previous_selection = scene.selected_node;
-                scene.nodes.insert(
-                    id,
-                    SceneNode {
-                        id,
-                        name: name.clone(),
-                        kind: NodeKind::VoxelVolume,
-                        visible: true,
-                        parent: None,
-                        transform: Transform::default(),
-                    },
-                );
+                let (id, previous_selection) = insert_validated_scene_node(
+                    scene,
+                    name,
+                    NodeKind::VoxelVolume,
+                    None,
+                    Transform::default(),
+                )?;
                 scene.voxel_volumes.insert(id, VoxelVolume::new());
-                scene.selected_node = Some(id);
                 UndoDelta::RemoveNode {
                     id,
                     previous_selection,
@@ -1000,21 +1051,14 @@ impl Command {
                     .get(pixel_node_id)
                     .ok_or(CoreError::PixelCanvasNotFound(*pixel_node_id))?;
                 let vol = voxel_ops::pixel_to_voxel_volume(canvas, *depth);
-                let id = scene.allocate_node_id();
-                let previous_selection = scene.selected_node;
-                scene.nodes.insert(
-                    id,
-                    SceneNode {
-                        id,
-                        name: name.clone(),
-                        kind: NodeKind::VoxelVolume,
-                        visible: true,
-                        parent: None,
-                        transform: Transform::default(),
-                    },
-                );
+                let (id, previous_selection) = insert_validated_scene_node(
+                    scene,
+                    name,
+                    NodeKind::VoxelVolume,
+                    None,
+                    Transform::default(),
+                )?;
                 scene.voxel_volumes.insert(id, vol);
-                scene.selected_node = Some(id);
                 UndoDelta::RemoveNode {
                     id,
                     previous_selection,
@@ -1027,21 +1071,14 @@ impl Command {
                 material,
             } => {
                 let mesh = mesh_ops::create_primitive(*kind, *size, *material);
-                let id = scene.allocate_node_id();
-                let previous_selection = scene.selected_node;
-                scene.nodes.insert(
-                    id,
-                    SceneNode {
-                        id,
-                        name: name.clone(),
-                        kind: NodeKind::LowPolyMesh,
-                        visible: true,
-                        parent: None,
-                        transform: Transform::default(),
-                    },
-                );
+                let (id, previous_selection) = insert_validated_scene_node(
+                    scene,
+                    name,
+                    NodeKind::LowPolyMesh,
+                    None,
+                    Transform::default(),
+                )?;
                 scene.lowpoly_meshes.insert(id, mesh);
-                scene.selected_node = Some(id);
                 UndoDelta::RemoveNode {
                     id,
                     previous_selection,
@@ -1053,21 +1090,14 @@ impl Command {
                 transform,
             } => {
                 let mesh = mesh_ops::create_terrain_mesh(params)?;
-                let id = scene.allocate_node_id();
-                let previous_selection = scene.selected_node;
-                scene.nodes.insert(
-                    id,
-                    SceneNode {
-                        id,
-                        name: name.clone(),
-                        kind: NodeKind::LowPolyMesh,
-                        visible: true,
-                        parent: None,
-                        transform: *transform,
-                    },
-                );
+                let (id, previous_selection) = insert_validated_scene_node(
+                    scene,
+                    name,
+                    NodeKind::LowPolyMesh,
+                    None,
+                    *transform,
+                )?;
                 scene.lowpoly_meshes.insert(id, mesh);
-                scene.selected_node = Some(id);
                 UndoDelta::RemoveNode {
                     id,
                     previous_selection,
@@ -1081,42 +1111,28 @@ impl Command {
                 material,
             } => {
                 let mesh = mesh_ops::create_curve_tube(points, *radius, *flatness, *material)?;
-                let id = scene.allocate_node_id();
-                let previous_selection = scene.selected_node;
-                scene.nodes.insert(
-                    id,
-                    SceneNode {
-                        id,
-                        name: name.clone(),
-                        kind: NodeKind::LowPolyMesh,
-                        visible: true,
-                        parent: None,
-                        transform: Transform::default(),
-                    },
-                );
+                let (id, previous_selection) = insert_validated_scene_node(
+                    scene,
+                    name,
+                    NodeKind::LowPolyMesh,
+                    None,
+                    Transform::default(),
+                )?;
                 scene.lowpoly_meshes.insert(id, mesh);
-                scene.selected_node = Some(id);
                 UndoDelta::RemoveNode {
                     id,
                     previous_selection,
                 }
             }
             Self::ImportLowPolyMesh { name, mesh } => {
-                let id = scene.allocate_node_id();
-                let previous_selection = scene.selected_node;
-                scene.nodes.insert(
-                    id,
-                    SceneNode {
-                        id,
-                        name: name.clone(),
-                        kind: NodeKind::LowPolyMesh,
-                        visible: true,
-                        parent: None,
-                        transform: Transform::default(),
-                    },
-                );
+                let (id, previous_selection) = insert_validated_scene_node(
+                    scene,
+                    name,
+                    NodeKind::LowPolyMesh,
+                    None,
+                    Transform::default(),
+                )?;
                 scene.lowpoly_meshes.insert(id, mesh.clone());
-                scene.selected_node = Some(id);
                 UndoDelta::RemoveNode {
                     id,
                     previous_selection,
@@ -1131,21 +1147,14 @@ impl Command {
                     .get(voxel_node_id)
                     .ok_or(CoreError::VoxelVolumeNotFound(*voxel_node_id))?;
                 let mesh = mesh_ops::voxel_to_lowpoly(vol, scene.unit_scale);
-                let id = scene.allocate_node_id();
-                let previous_selection = scene.selected_node;
-                scene.nodes.insert(
-                    id,
-                    SceneNode {
-                        id,
-                        name: name.clone(),
-                        kind: NodeKind::LowPolyMesh,
-                        visible: true,
-                        parent: None,
-                        transform: Transform::default(),
-                    },
-                );
+                let (id, previous_selection) = insert_validated_scene_node(
+                    scene,
+                    name,
+                    NodeKind::LowPolyMesh,
+                    None,
+                    Transform::default(),
+                )?;
                 scene.lowpoly_meshes.insert(id, mesh);
-                scene.selected_node = Some(id);
                 UndoDelta::RemoveNode {
                     id,
                     previous_selection,
@@ -1479,6 +1488,58 @@ impl Command {
                     .ok_or(CoreError::LowPolyMeshNotFound(*node_id))?
                     .clone();
                 let next = mesh_ops::set_vertex_weights(&current, vertex_ids, *joints, *weights)?;
+                scene.lowpoly_meshes.insert(*node_id, next);
+                UndoDelta::RestoreLowPolyMesh {
+                    node_id: *node_id,
+                    previous_mesh: current,
+                }
+            }
+            Self::PaintMeshWeights {
+                node_id,
+                hit_point,
+                radius,
+                bone_id,
+                strength,
+            } => {
+                let rig = scene
+                    .character_rig
+                    .as_ref()
+                    .ok_or(CoreError::CharacterRigNotFound)?;
+                let joint_idx = rig
+                    .bones
+                    .iter()
+                    .position(|b| b.id == *bone_id)
+                    .and_then(|i| u16::try_from(i).ok())
+                    .ok_or(CoreError::OutOfBounds)?;
+                let current = scene
+                    .lowpoly_meshes
+                    .get(node_id)
+                    .ok_or(CoreError::LowPolyMeshNotFound(*node_id))?
+                    .clone();
+                let solver = crate::character::AutoSkinSolver::from_rig(rig, 1.0);
+                let rest_mat = scene.node_rest_world_matrix(*node_id);
+                let fallback = |_vi: usize, local_pos: glam::Vec3| {
+                    if let Some(ref s) = solver {
+                        let world_pos = rest_mat.transform_point3(local_pos);
+                        s.weights_for_vertex(Some(*node_id), world_pos)
+                    } else {
+                        crate::character::VertexSkinWeights {
+                            joints: [joint_idx, 0, 0, 0],
+                            weights: [1.0, 0.0, 0.0, 0.0],
+                        }
+                    }
+                };
+                let Some(next) = mesh_ops::paint_vertex_weights_brush(
+                    &current,
+                    glam::Vec3::from_array(*hit_point),
+                    *radius,
+                    joint_idx,
+                    *strength,
+                    Some(&fallback),
+                )?
+                else {
+                    return Err(CoreError::OutOfBounds);
+                };
                 scene.lowpoly_meshes.insert(*node_id, next);
                 UndoDelta::RestoreLowPolyMesh {
                     node_id: *node_id,
@@ -2779,20 +2840,8 @@ impl Command {
                         return Err(CoreError::NodeNotFound(pid));
                     }
                 }
-                let id = scene.allocate_node_id();
-                let previous_selection = scene.selected_node;
-                scene.nodes.insert(
-                    id,
-                    SceneNode {
-                        id,
-                        name: name.clone(),
-                        kind: NodeKind::Group,
-                        visible: true,
-                        parent: *parent,
-                        transform: *transform,
-                    },
-                );
-                scene.selected_node = Some(id);
+                let (id, previous_selection) =
+                    insert_validated_scene_node(scene, name, NodeKind::Group, *parent, *transform)?;
                 UndoDelta::RemoveNode {
                     id,
                     previous_selection,
@@ -2837,13 +2886,22 @@ impl Command {
                     .get(node_id)
                     .ok_or(CoreError::NodeNotFound(*node_id))?
                     .clone();
+                let next_name = match name {
+                    Some(custom) => crate::scene::validate_node_name(custom)?,
+                    None => {
+                        let base: String = source
+                            .name
+                            .chars()
+                            .take(crate::scene::MAX_NODE_NAME_LEN.saturating_sub(5))
+                            .collect();
+                        format!("{base} Copy")
+                    }
+                };
                 let id = scene.allocate_node_id();
                 let previous_selection = scene.selected_node;
                 let mut node = source.clone();
                 node.id = id;
-                node.name = name
-                    .clone()
-                    .unwrap_or_else(|| format!("{} Copy", source.name));
+                node.name = next_name;
                 node.transform.translation += glam::Vec3::new(0.5, 0.0, 0.0);
                 scene.nodes.insert(id, node);
                 if let Some(mesh) = scene.lowpoly_meshes.get(node_id).cloned() {
@@ -2888,15 +2946,12 @@ impl Command {
                 }
             }
             Self::RenameNode { node_id, name } => {
-                let trimmed = name.trim();
-                if trimmed.is_empty() {
-                    return Err(CoreError::OutOfBounds);
-                }
+                let validated = crate::scene::validate_node_name(name)?;
                 let node = scene
                     .nodes
                     .get_mut(node_id)
                     .ok_or(CoreError::NodeNotFound(*node_id))?;
-                let previous = std::mem::replace(&mut node.name, trimmed.to_string());
+                let previous = std::mem::replace(&mut node.name, validated);
                 UndoDelta::RestoreNodeName {
                     node_id: *node_id,
                     previous,
@@ -3002,6 +3057,263 @@ impl Command {
                     (Some(a), Some(b)) => UndoDelta::Transaction(vec![a, b]),
                     _ => return Err(CoreError::OutOfBounds),
                 }
+            }
+            Self::CreateBoneGrid { spec, bind_node } => {
+                let previous = scene.character_rig.clone();
+                let rig = scene
+                    .character_rig
+                    .get_or_insert_with(CharacterRig::default);
+                let result = crate::character::create_bone_grid(rig, spec)?;
+                if let Some(nid) = *bind_node {
+                    if !scene.nodes.contains_key(&nid) {
+                        scene.character_rig = previous;
+                        return Err(CoreError::NodeNotFound(nid));
+                    }
+                    crate::character::assign_bone_grid_mask(rig, nid, result.all_bone_ids());
+                }
+                UndoDelta::RestoreCharacterRig(previous)
+            }
+            Self::BakeClothGridAnimation {
+                bone_prefix,
+                params,
+            } => {
+                let previous = scene.character_rig.clone();
+                let rig = scene
+                    .character_rig
+                    .as_mut()
+                    .ok_or(CoreError::CharacterRigNotFound)?;
+                let prefix_tag = format!("{}_c", bone_prefix.trim());
+                let mut col_map: std::collections::BTreeMap<usize, Vec<(usize, BoneId)>> =
+                    std::collections::BTreeMap::new();
+                for bone in &rig.bones {
+                    if let Some(rest) = bone.name.strip_prefix(&prefix_tag) {
+                        if let Some((c_str, r_str)) = rest.split_once("_r") {
+                            if let (Ok(c), Ok(r)) = (c_str.parse::<usize>(), r_str.parse::<usize>())
+                            {
+                                col_map.entry(c).or_default().push((r, bone.id));
+                            }
+                        }
+                    }
+                }
+                if col_map.is_empty() {
+                    return Err(CoreError::OutOfBounds);
+                }
+                let mut columns = Vec::with_capacity(col_map.len());
+                for (_, mut rows) in col_map {
+                    rows.sort_by_key(|(r, _)| *r);
+                    columns.push(rows.into_iter().map(|(_, id)| id).collect());
+                }
+                let clip_idx = crate::character::bake_cloth_grid_animation(rig, &columns, params)?;
+                rig.active_animation = clip_idx;
+                rig.apply_active_animation();
+                UndoDelta::RestoreCharacterRig(previous)
+            }
+            Self::SetMorphTargetDeltas {
+                node_id,
+                name,
+                position_deltas,
+                normal_deltas,
+                replace,
+            } => {
+                let trimmed = name.trim();
+                if trimmed.is_empty() {
+                    return Err(CoreError::OutOfBounds);
+                }
+                let current = scene
+                    .lowpoly_meshes
+                    .get(node_id)
+                    .ok_or(CoreError::LowPolyMeshNotFound(*node_id))?
+                    .clone();
+                let mut next = current.clone();
+                let vcount = next.vertices.len();
+                for &(vi, d) in position_deltas {
+                    if vi >= vcount || !d.is_finite() {
+                        return Err(CoreError::OutOfBounds);
+                    }
+                }
+                for &(vi, d) in normal_deltas {
+                    if vi >= vcount || !d.is_finite() {
+                        return Err(CoreError::OutOfBounds);
+                    }
+                }
+                let target = if let Some(t) = next.morphs.iter_mut().find(|m| m.name == trimmed) {
+                    if *replace {
+                        t.deltas.clear();
+                        t.normal_deltas.clear();
+                    }
+                    t
+                } else {
+                    next.morphs.push(crate::mesh::MorphTarget {
+                        name: trimmed.to_string(),
+                        deltas: std::collections::BTreeMap::new(),
+                        normal_deltas: std::collections::BTreeMap::new(),
+                        default_weight: 0.0,
+                    });
+                    next.morphs.last_mut().ok_or(CoreError::OutOfBounds)?
+                };
+                for &(vi, d) in position_deltas {
+                    if *replace {
+                        if d.length_squared() > 1e-10 {
+                            target.deltas.insert(vi, d);
+                        }
+                    } else {
+                        let entry = target.deltas.entry(vi).or_insert(glam::Vec3::ZERO);
+                        *entry += d;
+                    }
+                }
+                for &(vi, d) in normal_deltas {
+                    if *replace {
+                        if d.length_squared() > 1e-10 {
+                            target.normal_deltas.insert(vi, d);
+                        }
+                    } else {
+                        let entry = target.normal_deltas.entry(vi).or_insert(glam::Vec3::ZERO);
+                        *entry += d;
+                    }
+                }
+                scene.lowpoly_meshes.insert(*node_id, next);
+                UndoDelta::RestoreLowPolyMesh {
+                    node_id: *node_id,
+                    previous_mesh: current,
+                }
+            }
+            Self::SetMorphDefaultWeight {
+                node_id,
+                name,
+                weight,
+            } => {
+                if !weight.is_finite() {
+                    return Err(CoreError::OutOfBounds);
+                }
+                let current = scene
+                    .lowpoly_meshes
+                    .get(node_id)
+                    .ok_or(CoreError::LowPolyMeshNotFound(*node_id))?
+                    .clone();
+                let mut next = current.clone();
+                let target = next
+                    .morphs
+                    .iter_mut()
+                    .find(|m| m.name == name.as_str())
+                    .ok_or(CoreError::OutOfBounds)?;
+                let clamped = weight.clamp(0.0, 1.0);
+                target.default_weight = clamped;
+                scene.lowpoly_meshes.insert(*node_id, next);
+                let previous_rig_weight = scene
+                    .character_rig
+                    .as_mut()
+                    .map(|rig| rig.morph_weights.insert((*node_id, name.clone()), clamped));
+                UndoDelta::RestoreMorphDefaultWeight {
+                    node_id: *node_id,
+                    name: name.clone(),
+                    previous_mesh: current,
+                    previous_rig_weight,
+                }
+            }
+            Self::ApplyProxyCageDeform {
+                node_id,
+                divisions,
+                control_deltas,
+                floor_y,
+                bake_as_morph,
+            } => {
+                let current = scene
+                    .lowpoly_meshes
+                    .get(node_id)
+                    .ok_or(CoreError::LowPolyMeshNotFound(*node_id))?
+                    .clone();
+                let mut cage = crate::mesh::ProxyCage::from_mesh_bounds(&current, *divisions, 0.0);
+                cage.apply_control_deltas(control_deltas)?;
+                let mut next = current.clone();
+                if let Some(morph_name) = bake_as_morph {
+                    let trimmed = morph_name.trim();
+                    if trimmed.is_empty() {
+                        return Err(CoreError::OutOfBounds);
+                    }
+                    let baked = cage.bake_to_morph_target(&current, trimmed, *floor_y);
+                    if let Some(existing) = next.morphs.iter_mut().find(|m| m.name == trimmed) {
+                        *existing = baked;
+                    } else {
+                        next.morphs.push(baked);
+                    }
+                } else {
+                    next.vertices = cage.apply_to_mesh(&current, *floor_y);
+                }
+                scene.lowpoly_meshes.insert(*node_id, next);
+                UndoDelta::RestoreLowPolyMesh {
+                    node_id: *node_id,
+                    previous_mesh: current,
+                }
+            }
+            Self::BakeProceduralRibbon { params } => {
+                let points = crate::mesh::sample_trajectory_points(scene, params)?;
+                let mesh = crate::mesh::generate_ribbon_mesh(
+                    &points,
+                    params.width_start,
+                    params.width_end,
+                    params.material,
+                )?;
+                let (id, previous_selection) = if params.name.trim().is_empty() {
+                    let id = scene.allocate_node_id();
+                    let previous_selection = scene.selected_node;
+                    scene.nodes.insert(
+                        id,
+                        SceneNode {
+                            id,
+                            name: format!("Ribbon_{}", id.0),
+                            kind: NodeKind::LowPolyMesh,
+                            visible: true,
+                            parent: None,
+                            transform: Transform::default(),
+                        },
+                    );
+                    scene.selected_node = Some(id);
+                    (id, previous_selection)
+                } else {
+                    insert_validated_scene_node(
+                        scene,
+                        &params.name,
+                        NodeKind::LowPolyMesh,
+                        None,
+                        Transform::default(),
+                    )?
+                };
+                scene.lowpoly_meshes.insert(id, mesh);
+                scene.selected_node = Some(id);
+                if params.bake_visibility_track {
+                    let previous_rig = scene.character_rig.clone();
+                    if let Some(rig) = scene.character_rig.as_mut() {
+                        if let Some(clip) = rig.animations.get_mut(params.clip_index) {
+                            let track = crate::mesh::build_ribbon_visibility_track(
+                                id,
+                                params.start_time,
+                                params.end_time,
+                            );
+                            clip.visibility_tracks.retain(|t| t.node != id);
+                            clip.visibility_tracks.push(track);
+                        }
+                    }
+                    UndoDelta::Transaction(vec![
+                        UndoDelta::RemoveNode {
+                            id,
+                            previous_selection,
+                        },
+                        UndoDelta::RestoreCharacterRig(previous_rig),
+                    ])
+                } else {
+                    UndoDelta::RemoveNode {
+                        id,
+                        previous_selection,
+                    }
+                }
+            }
+            Self::ApplyStickGizmoPose { params } => {
+                let rig = scene
+                    .character_rig
+                    .as_mut()
+                    .ok_or(CoreError::CharacterRigNotFound)?;
+                let previous = crate::character::apply_stick_gizmo_pose(rig, params)?;
+                UndoDelta::RestoreBoneRotations(previous)
             }
             Self::Transaction(commands) => {
                 if commands.is_empty() {
@@ -3429,6 +3741,37 @@ impl UndoDelta {
                     .ok_or(CoreError::NodeNotFound(*node_id))?;
                 node.name = previous.clone();
             }
+            Self::RestoreBoneRotations(entries) => {
+                let rig = scene
+                    .character_rig
+                    .as_mut()
+                    .ok_or(CoreError::CharacterRigNotFound)?;
+                for &(bone_id, prev_rot) in entries {
+                    if let Some(bone) = rig.bone_mut(bone_id) {
+                        bone.pose_local.rotation = prev_rot;
+                    }
+                }
+            }
+            Self::RestoreMorphDefaultWeight {
+                node_id,
+                name,
+                previous_mesh,
+                previous_rig_weight,
+            } => {
+                scene.lowpoly_meshes.insert(*node_id, previous_mesh.clone());
+                if let (Some(rig), Some(prev_w)) =
+                    (scene.character_rig.as_mut(), previous_rig_weight)
+                {
+                    match prev_w {
+                        Some(w) => {
+                            rig.morph_weights.insert((*node_id, name.clone()), *w);
+                        }
+                        None => {
+                            rig.morph_weights.remove(&(*node_id, name.clone()));
+                        }
+                    }
+                }
+            }
             Self::Transaction(deltas) => {
                 for delta in deltas.iter().rev() {
                     delta.revert(scene)?;
@@ -3437,5 +3780,97 @@ impl UndoDelta {
         }
         scene.mark_modified();
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod e2_node_name_tests {
+    use super::*;
+    use crate::scene::MAX_NODE_NAME_LEN;
+
+    #[test]
+    fn rename_and_duplicate_enforce_node_name_bounds() {
+        let mut scene = SceneState::new();
+        let mut history = crate::HistoryStack::default();
+        history
+            .execute(
+                &mut scene,
+                Command::CreatePrimitiveMesh {
+                    name: "Cube".into(),
+                    kind: crate::PrimitiveKind::Cube,
+                    size: 1.0,
+                    material: PaletteIndex::DEFAULT_ACTIVE,
+                },
+            )
+            .unwrap();
+        let nid = scene.selected_node.unwrap();
+
+        let too_long = "x".repeat(MAX_NODE_NAME_LEN + 1);
+        assert!(matches!(
+            history.execute(
+                &mut scene,
+                Command::CreatePrimitiveMesh {
+                    name: too_long.clone(),
+                    kind: crate::PrimitiveKind::Cube,
+                    size: 1.0,
+                    material: PaletteIndex::DEFAULT_ACTIVE,
+                },
+            ),
+            Err(CoreError::OutOfBounds)
+        ));
+        assert!(matches!(
+            history.execute(
+                &mut scene,
+                Command::CreateGroupNode {
+                    name: "   ".into(),
+                    transform: Transform::default(),
+                    parent: None,
+                },
+            ),
+            Err(CoreError::OutOfBounds)
+        ));
+        assert!(matches!(
+            history.execute(
+                &mut scene,
+                Command::RenameNode {
+                    node_id: nid,
+                    name: too_long.clone(),
+                },
+            ),
+            Err(CoreError::OutOfBounds)
+        ));
+        assert!(matches!(
+            history.execute(
+                &mut scene,
+                Command::DuplicateNode {
+                    node_id: nid,
+                    name: Some(too_long),
+                },
+            ),
+            Err(CoreError::OutOfBounds)
+        ));
+
+        let max_name = "m".repeat(MAX_NODE_NAME_LEN);
+        history
+            .execute(
+                &mut scene,
+                Command::RenameNode {
+                    node_id: nid,
+                    name: max_name,
+                },
+            )
+            .unwrap();
+        history
+            .execute(
+                &mut scene,
+                Command::DuplicateNode {
+                    node_id: nid,
+                    name: None,
+                },
+            )
+            .unwrap();
+        let copy_id = scene.selected_node.unwrap();
+        assert!(scene.nodes[&copy_id].name.chars().count() <= MAX_NODE_NAME_LEN);
+        assert!(scene.nodes[&copy_id].name.ends_with(" Copy"));
     }
 }

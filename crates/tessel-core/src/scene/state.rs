@@ -33,7 +33,24 @@ pub struct SceneNode {
     pub transform: Transform,
 }
 
+/// Maximum character length allowed for a `SceneNode` name.
+pub const MAX_NODE_NAME_LEN: usize = 128;
+
+/// Trims and validates a `SceneNode` name against `1..=MAX_NODE_NAME_LEN` characters.
+pub fn validate_node_name(raw: &str) -> Result<String, crate::error::CoreError> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() || trimmed.chars().count() > MAX_NODE_NAME_LEN {
+        return Err(crate::error::CoreError::OutOfBounds);
+    }
+    Ok(trimmed.to_string())
+}
+
 /// Root Anchor: Single source of truth for the entire Tessel workspace state.
+///
+/// # Mutation Discipline
+/// External crates (`tessel-app`, `tessel-ai`, `tessel-io`) must mutate scene state exclusively
+/// through [`crate::Command`] and [`crate::HistoryStack`] so every edit remains deterministic and
+/// undoable. `pub` fields are exposed for read-only rendering, inspection, and serialization.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SceneState {
     pub active_mode: AppMode,
@@ -56,6 +73,14 @@ pub struct SceneState {
     pub lowpoly_mirror_x: bool,
     #[serde(default = "default_lowpoly_brush_radius")]
     pub lowpoly_brush_radius: f32,
+    #[serde(default)]
+    pub weight_paint_mode: bool,
+    #[serde(default = "default_weight_brush_radius")]
+    pub weight_brush_radius: f32,
+    #[serde(default = "default_weight_brush_strength")]
+    pub weight_brush_strength: f32,
+    #[serde(default)]
+    pub stick_gizmo: crate::character::StickGizmoSettings,
     pub nodes: BTreeMap<NodeId, SceneNode>,
     pub pixel_canvases: BTreeMap<NodeId, PixelCanvas>,
     pub voxel_volumes: BTreeMap<NodeId, VoxelVolume>,
@@ -81,15 +106,17 @@ fn default_lowpoly_brush_radius() -> f32 {
     10.0
 }
 
+fn default_weight_brush_radius() -> f32 {
+    0.35
+}
+
+fn default_weight_brush_strength() -> f32 {
+    0.5
+}
+
 impl SceneState {
     pub fn new() -> Self {
-        let active_color = PaletteIndex::new(4).unwrap_or_else(|_| {
-            PaletteIndex::new(1)
-                .ok()
-                .into_iter()
-                .next()
-                .unwrap_or_else(|| unreachable!())
-        });
+        let active_color = PaletteIndex::DEFAULT_ACTIVE;
         Self {
             active_mode: AppMode::Voxel,
             unit_scale: 0.1,
@@ -105,6 +132,10 @@ impl SceneState {
             lowpoly_paint_mode: false,
             lowpoly_mirror_x: false,
             lowpoly_brush_radius: default_lowpoly_brush_radius(),
+            weight_paint_mode: false,
+            weight_brush_radius: default_weight_brush_radius(),
+            weight_brush_strength: default_weight_brush_strength(),
+            stick_gizmo: crate::character::StickGizmoSettings::default(),
             nodes: BTreeMap::new(),
             pixel_canvases: BTreeMap::new(),
             voxel_volumes: BTreeMap::new(),
@@ -218,5 +249,27 @@ impl SceneState {
 impl Default for SceneState {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn scene_state_new_uses_default_active_palette_and_validates_node_names() {
+        let state = SceneState::new();
+        assert_eq!(state.active_color, PaletteIndex::DEFAULT_ACTIVE);
+        assert_eq!(state.active_color.get(), 4);
+
+        assert!(validate_node_name("").is_err());
+        assert!(validate_node_name("   \t\n ").is_err());
+        let max_name = "a".repeat(MAX_NODE_NAME_LEN);
+        assert_eq!(
+            validate_node_name(&format!("  {max_name}  ")).unwrap(),
+            max_name
+        );
+        let too_long = "a".repeat(MAX_NODE_NAME_LEN + 1);
+        assert!(validate_node_name(&too_long).is_err());
     }
 }

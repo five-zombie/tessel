@@ -1,4 +1,6 @@
 use std::io::Cursor;
+use std::sync::mpsc::{Receiver, RecvTimeoutError, TryRecvError};
+use std::time::{Duration, Instant};
 
 use image::{ImageFormat, RgbaImage};
 use tessel_core::voxel::greedy_mesh_volume;
@@ -23,6 +25,8 @@ const VIEWPORT_CLEAR_COLOR: wgpu::Color = wgpu::Color {
 
 pub const VIEWPORT_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8UnormSrgb;
 pub const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
+/// Default upper bound for synchronous GPU-to-CPU viewport readback before timing out.
+pub const DEFAULT_READBACK_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Owns the offscreen viewport render target and orchestrates 2D/3D viewport passes.
 pub struct ViewportRenderer {
@@ -239,34 +243,100 @@ impl ViewportRenderer {
                 glam::Mat4::IDENTITY
             };
 
-            // Apply live morph-target deformations when any morph weight for this node is non-zero.
-            let morphed_mesh = scene.character_rig.as_ref().and_then(|rig| {
+            // Apply live morph-target deformations (position + normal deltas) using active rig
+            // weight or each morph target's `default_weight`.
+            let morphed_mesh = {
                 let has_active_morph = mesh.morphs.iter().any(|m| {
-                    rig.morph_weights
-                        .get(&(*node_id, m.name.clone()))
-                        .is_some_and(|&w| w.abs() > 1e-5)
+                    let w = scene
+                        .character_rig
+                        .as_ref()
+                        .and_then(|rig| rig.morph_weights.get(&(*node_id, m.name.clone())).copied())
+                        .unwrap_or(m.default_weight);
+                    w.abs() > 1e-5
                 });
                 if !has_active_morph {
-                    return None;
-                }
-                let mut deformed = mesh.clone();
-                for morph in &mesh.morphs {
-                    let w = rig
-                        .morph_weights
-                        .get(&(*node_id, morph.name.clone()))
-                        .copied()
-                        .unwrap_or(0.0);
-                    if w.abs() <= 1e-5 {
-                        continue;
-                    }
-                    for (&vi, &delta) in &morph.deltas {
-                        if let Some(pos) = deformed.vertices.get_mut(vi) {
-                            *pos += delta * w;
+                    None
+                } else {
+                    let mut deformed = mesh.clone();
+                    let has_normal_deltas = mesh.morphs.iter().any(|m| !m.normal_deltas.is_empty());
+                    let computed_base_normals = if has_normal_deltas {
+                        let mut acc = vec![glam::Vec3::ZERO; deformed.vertices.len()];
+                        for face in &deformed.faces {
+                            if face.vertices.len() < 3 {
+                                continue;
+                            }
+                            let Some(&i0) = face.vertices.first() else {
+                                continue;
+                            };
+                            let Some(&p0) = deformed.vertices.get(i0) else {
+                                continue;
+                            };
+                            for fan in 1..(face.vertices.len() - 1) {
+                                let (Some(&i1), Some(&i2)) =
+                                    (face.vertices.get(fan), face.vertices.get(fan + 1))
+                                else {
+                                    continue;
+                                };
+                                let (Some(&p1), Some(&p2)) =
+                                    (deformed.vertices.get(i1), deformed.vertices.get(i2))
+                                else {
+                                    continue;
+                                };
+                                let cross = (p1 - p0).cross(p2 - p0);
+                                if cross.length_squared() > 1e-10 {
+                                    acc[i0] += cross;
+                                    acc[i1] += cross;
+                                    acc[i2] += cross;
+                                }
+                            }
+                        }
+                        for n in &mut acc {
+                            *n = n.normalize_or_zero();
+                            if n.length_squared() < 1e-6 {
+                                *n = glam::Vec3::Y;
+                            }
+                        }
+                        Some(acc)
+                    } else {
+                        None
+                    };
+                    for morph in &mesh.morphs {
+                        let w = scene
+                            .character_rig
+                            .as_ref()
+                            .and_then(|rig| {
+                                rig.morph_weights
+                                    .get(&(*node_id, morph.name.clone()))
+                                    .copied()
+                            })
+                            .unwrap_or(morph.default_weight);
+                        if w.abs() <= 1e-5 {
+                            continue;
+                        }
+                        for (&vi, &delta) in &morph.deltas {
+                            if let Some(pos) = deformed.vertices.get_mut(vi) {
+                                *pos += delta * w;
+                            }
+                        }
+                        for (&vi, &nd) in &morph.normal_deltas {
+                            let base_n = deformed
+                                .proxy_normals
+                                .get(&vi)
+                                .copied()
+                                .or_else(|| {
+                                    computed_base_normals
+                                        .as_ref()
+                                        .and_then(|bn| bn.get(vi).copied())
+                                })
+                                .unwrap_or(glam::Vec3::Y);
+                            deformed
+                                .proxy_normals
+                                .insert(vi, (base_n + nd * w).normalize_or_zero());
                         }
                     }
+                    Some(deformed)
                 }
-                Some(deformed)
-            });
+            };
             let rest_node_mat = scene.node_rest_world_matrix(*node_id);
             let active_mesh = morphed_mesh.as_ref().unwrap_or(mesh);
             let tri = active_mesh.to_triangulated_flat();
@@ -502,10 +572,24 @@ impl ViewportRenderer {
     }
 
     /// Captures the current offscreen viewport texture as raw sRGB RGBA8 bytes `(width, height, rgba)`.
+    ///
+    /// Fails with [`RenderError::ReadbackTimeout`] if GPU readback does not complete within
+    /// [`DEFAULT_READBACK_TIMEOUT`].
     pub fn capture_rgba_bytes(
         &self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
+    ) -> Result<(u32, u32, Vec<u8>), RenderError> {
+        self.capture_rgba_bytes_with_timeout(device, queue, DEFAULT_READBACK_TIMEOUT)
+    }
+
+    /// Captures the current offscreen viewport texture as raw sRGB RGBA8 bytes `(width, height, rgba)`,
+    /// aborting with [`RenderError::ReadbackTimeout`] if mapping does not finish within `timeout`.
+    pub fn capture_rgba_bytes_with_timeout(
+        &self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        timeout: Duration,
     ) -> Result<(u32, u32, Vec<u8>), RenderError> {
         let (width, height) = self.size;
         let bytes_per_pixel = 4u32;
@@ -551,10 +635,9 @@ impl ViewportRenderer {
         slice.map_async(wgpu::MapMode::Read, move |res| {
             let _ = tx.send(res);
         });
-        device.poll(wgpu::Maintain::Wait);
-        rx.recv()
-            .map_err(|e| RenderError::PreviewEncode(e.to_string()))?
-            .map_err(|e| RenderError::PreviewEncode(e.to_string()))?;
+        wait_for_map_with_timeout(&rx, timeout, || {
+            device.poll(wgpu::Maintain::Poll);
+        })?;
 
         let mapped = slice.get_mapped_range();
         let mut rgba = Vec::with_capacity((width as usize) * (height as usize) * 4);
@@ -629,4 +712,111 @@ fn create_depth_target(
     });
     let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
     (texture, view)
+}
+
+fn wait_for_map_with_timeout<E, F>(
+    rx: &Receiver<Result<(), E>>,
+    timeout: Duration,
+    mut poll_device: F,
+) -> Result<(), RenderError>
+where
+    E: std::fmt::Display,
+    F: FnMut(),
+{
+    let deadline = Instant::now().checked_add(timeout);
+    loop {
+        poll_device();
+        match rx.try_recv() {
+            Ok(Ok(())) => return Ok(()),
+            Ok(Err(e)) => return Err(RenderError::PreviewEncode(e.to_string())),
+            Err(TryRecvError::Disconnected) => {
+                return Err(RenderError::PreviewEncode(
+                    "GPU readback channel disconnected".into(),
+                ));
+            }
+            Err(TryRecvError::Empty) => {
+                let wait_step = match deadline {
+                    Some(dl) => {
+                        let Some(remaining) = dl.checked_duration_since(Instant::now()) else {
+                            return Err(RenderError::ReadbackTimeout(timeout));
+                        };
+                        if remaining.is_zero() {
+                            return Err(RenderError::ReadbackTimeout(timeout));
+                        }
+                        remaining.min(Duration::from_millis(1))
+                    }
+                    None => Duration::from_millis(1),
+                };
+                match rx.recv_timeout(wait_step) {
+                    Ok(Ok(())) => return Ok(()),
+                    Ok(Err(e)) => return Err(RenderError::PreviewEncode(e.to_string())),
+                    Err(RecvTimeoutError::Disconnected) => {
+                        return Err(RenderError::PreviewEncode(
+                            "GPU readback channel disconnected".into(),
+                        ));
+                    }
+                    Err(RecvTimeoutError::Timeout) => {}
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn wait_for_map_times_out_when_gpu_never_signals() {
+        let (_tx, rx) = std::sync::mpsc::channel::<Result<(), &'static str>>();
+        let mut polls = 0usize;
+        let timeout = Duration::from_millis(15);
+        let err = wait_for_map_with_timeout(&rx, timeout, || {
+            polls += 1;
+        })
+        .unwrap_err();
+        assert!(matches!(err, RenderError::ReadbackTimeout(d) if d == timeout));
+        assert!(polls >= 1);
+    }
+
+    #[test]
+    fn wait_for_map_succeeds_after_poll_triggers_callback() {
+        let (tx, rx) = std::sync::mpsc::channel::<Result<(), &'static str>>();
+        let mut polls = 0usize;
+        let res = wait_for_map_with_timeout(&rx, Duration::from_millis(100), || {
+            polls += 1;
+            if polls == 2 {
+                let _ = tx.send(Ok(()));
+            }
+        });
+        assert!(res.is_ok());
+        assert_eq!(polls, 2);
+    }
+
+    #[test]
+    fn wait_for_map_errors_on_disconnected_channel() {
+        let (tx, rx) = std::sync::mpsc::channel::<Result<(), &'static str>>();
+        drop(tx);
+        let err = wait_for_map_with_timeout(&rx, Duration::from_millis(50), || {}).unwrap_err();
+        assert!(matches!(err, RenderError::PreviewEncode(_)));
+    }
+
+    #[test]
+    fn wait_for_map_handles_zero_max_duration_and_map_error() {
+        let (_tx0, rx0) = std::sync::mpsc::channel::<Result<(), &'static str>>();
+        let err0 = wait_for_map_with_timeout(&rx0, Duration::ZERO, || {}).unwrap_err();
+        assert!(matches!(err0, RenderError::ReadbackTimeout(d) if d.is_zero()));
+
+        let (tx_max, rx_max) = std::sync::mpsc::channel::<Result<(), &'static str>>();
+        let res_max = wait_for_map_with_timeout(&rx_max, Duration::MAX, || {
+            let _ = tx_max.send(Ok(()));
+        });
+        assert!(res_max.is_ok());
+
+        let (tx_err, rx_err) = std::sync::mpsc::channel::<Result<(), &'static str>>();
+        tx_err.send(Err("buffer map failed")).unwrap();
+        let err_map =
+            wait_for_map_with_timeout(&rx_err, Duration::from_millis(50), || {}).unwrap_err();
+        assert!(matches!(err_map, RenderError::PreviewEncode(msg) if msg.contains("map failed")));
+    }
 }

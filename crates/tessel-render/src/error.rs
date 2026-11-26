@@ -19,4 +19,7 @@ pub enum RenderError {
 
     #[error("failed to encode viewport preview PNG: {0}")]
     PreviewEncode(String),
+
+    #[error("viewport GPU readback timed out after {0:?}")]
+    ReadbackTimeout(std::time::Duration),
 }

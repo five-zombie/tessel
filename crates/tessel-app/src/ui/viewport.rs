@@ -119,9 +119,7 @@ pub fn show_viewport(
                 )
             };
             let any_gadget_consumed = gadget_consumed || gizmo_consumed;
-            let allow_primary_orbit = *free_view
-                && !any_gadget_consumed
-                && !(scene.active_mode == AppMode::LowPoly && scene.lowpoly_paint_mode);
+            let allow_primary_orbit = *free_view && !any_gadget_consumed;
             if !gadget_consumed {
                 handle_3d_viewport_input(
                     ui,
@@ -258,7 +256,63 @@ pub fn show_viewport(
                         }
                     }
                     AppMode::Character => {
-                        if response.clicked_by(egui::PointerButton::Primary) {
+                        let weight_paint_active = scene.weight_paint_mode
+                            && (response.clicked_by(egui::PointerButton::Primary)
+                                || (response.dragged_by(egui::PointerButton::Primary)
+                                    && response.drag_delta().length_sq() > 0.0));
+                        let pick_bone_active = !scene.weight_paint_mode
+                            && response.clicked_by(egui::PointerButton::Primary);
+                        if weight_paint_active {
+                            if let Some(pointer) = response.interact_pointer_pos() {
+                                let uv = [
+                                    (pointer.x - rect.min.x) / rect.width().max(1.0),
+                                    (pointer.y - rect.min.y) / rect.height().max(1.0),
+                                ];
+                                let aspect = rect.width() / rect.height().max(1.0);
+                                let (orig, dir) = camera_3d.screen_ray(uv, aspect);
+                                let target_bone = scene.selected_bone.or_else(|| {
+                                    scene
+                                        .character_rig
+                                        .as_ref()
+                                        .and_then(|r| r.bones.first().map(|b| b.id))
+                                });
+                                if let (Some(node_id), Some(bone_id)) =
+                                    (scene.active_lowpoly_node(), target_bone)
+                                {
+                                    let node_mat = scene.node_world_matrix(node_id);
+                                    if node_mat.determinant().abs() > 1e-8 {
+                                        let inv = node_mat.inverse();
+                                        let local_orig = inv.transform_point3(orig);
+                                        let local_dir =
+                                            inv.transform_vector3(dir).normalize_or_zero();
+                                        let hit =
+                                            scene.lowpoly_meshes.get(&node_id).and_then(|mesh| {
+                                                tessel_core::mesh::ops::raycast_mesh_hit(
+                                                    mesh, local_orig, local_dir,
+                                                )
+                                            });
+                                        if let Some(h) = hit {
+                                            if let Err(err) = history.execute(
+                                                scene,
+                                                Command::PaintMeshWeights {
+                                                    node_id,
+                                                    hit_point: h.point.to_array(),
+                                                    radius: scene.weight_brush_radius,
+                                                    bone_id,
+                                                    strength: scene.weight_brush_strength,
+                                                },
+                                            ) {
+                                                if err != tessel_core::CoreError::OutOfBounds {
+                                                    tracing::warn!(
+                                                        "weight paint stroke failed: {err}"
+                                                    );
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        } else if pick_bone_active {
                             if let Some(pointer) = response.interact_pointer_pos() {
                                 let uv = [
                                     (pointer.x - rect.min.x) / rect.width().max(1.0),

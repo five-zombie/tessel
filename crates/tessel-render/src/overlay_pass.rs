@@ -289,7 +289,22 @@ impl OverlayPass {
                         if let Some(pid) = bone.parent {
                             if let Some(&pmat) = mats.get(&pid) {
                                 let parent_pos = pmat.transform_point3(Vec3::ZERO);
-                                push_line(&mut lines, parent_pos, joint, bone_color);
+                                if scene.stick_gizmo.enabled {
+                                    let stick_color = if is_selected {
+                                        [1.0, 0.92, 0.45, 1.0]
+                                    } else {
+                                        bone_color
+                                    };
+                                    push_octahedral_stick(
+                                        &mut lines,
+                                        parent_pos,
+                                        joint,
+                                        stick_color,
+                                        is_selected,
+                                    );
+                                } else {
+                                    push_line(&mut lines, parent_pos, joint, bone_color);
+                                }
                             }
                         }
                     }
@@ -340,6 +355,52 @@ impl OverlayPass {
         pass.set_bind_group(0, &self.bind_group, &[]);
         pass.set_vertex_buffer(0, vb.slice(..));
         pass.draw(0..self.vertex_count, 0..1);
+    }
+}
+
+fn push_octahedral_stick(
+    out: &mut Vec<OverlayVertex>,
+    base: Vec3,
+    tip: Vec3,
+    color: [f32; 4],
+    selected: bool,
+) {
+    let dir = tip - base;
+    let len = dir.length();
+    if len < 1e-5 {
+        return;
+    }
+    let axis = dir / len;
+    let ref_up = if axis.y.abs() < 0.9 { Vec3::Y } else { Vec3::X };
+    let u = axis.cross(ref_up).normalize_or_zero();
+    let v = axis.cross(u).normalize_or_zero();
+    let shoulder = base + axis * (len * 0.2);
+    let radius = (len * 0.14).clamp(0.015, 0.08);
+    let corners = [
+        shoulder + u * radius,
+        shoulder + v * radius,
+        shoulder - u * radius,
+        shoulder - v * radius,
+    ];
+    for i in 0..4 {
+        let a = corners[i];
+        let b = corners[(i + 1) % 4];
+        push_line(out, base, a, color);
+        push_line(out, a, tip, color);
+        push_line(out, a, b, color);
+    }
+    if selected {
+        // Explicit orientation roll/twist fin ring at shoulder for active stick handle
+        let ring_color = [0.35, 0.92, 1.0, 0.95];
+        let fin_r = radius * 1.65;
+        let segs = 12usize;
+        for i in 0..segs {
+            let a0 = (i as f32 / segs as f32) * std::f32::consts::TAU;
+            let a1 = ((i + 1) as f32 / segs as f32) * std::f32::consts::TAU;
+            let p0 = shoulder + (u * a0.cos() + v * a0.sin()) * fin_r;
+            let p1 = shoulder + (u * a1.cos() + v * a1.sin()) * fin_r;
+            push_line(out, p0, p1, ring_color);
+        }
     }
 }
 

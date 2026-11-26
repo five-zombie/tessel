@@ -10,7 +10,7 @@ use crate::voxel::{greedy_mesh_volume, VoxelVolume};
 
 use super::face::Face;
 use super::lowpoly::{LowPolyMesh, MorphTarget};
-use super::nano::{FaceId, PrimitiveKind};
+use super::nano::{FaceId, PrimitiveAnchor, PrimitiveKind};
 
 /// Minimum primitive size allowed by [`create_primitive`] (5 mm).
 pub const MIN_PRIMITIVE_SIZE: f32 = 0.005;
@@ -197,6 +197,24 @@ fn terrain_fbm_2d(x: f32, z: f32, seed: u64, octaves: u32) -> f32 {
         sum / norm
     } else {
         0.0
+    }
+}
+
+/// Shifts `mesh` vertices vertically so its local `Y = 0` pivot matches `anchor` (`Bottom`, `Center`, or `Top`).
+pub fn apply_primitive_anchor(mesh: &mut LowPolyMesh, anchor: PrimitiveAnchor) {
+    if anchor == PrimitiveAnchor::Bottom || mesh.vertices.is_empty() {
+        return;
+    }
+    let (lo, hi) = mesh.bounds();
+    let dy = match anchor {
+        PrimitiveAnchor::Bottom => 0.0,
+        PrimitiveAnchor::Center => -0.5 * (lo.y + hi.y),
+        PrimitiveAnchor::Top => -hi.y,
+    };
+    if dy.abs() > 1e-7 {
+        for v in &mut mesh.vertices {
+            v.y += dy;
+        }
     }
 }
 
@@ -806,6 +824,9 @@ pub fn create_extruded_polygon(
     if area2 < 0.0 {
         poly.reverse();
     }
+    if polygon_is_self_intersecting_2d(&poly) {
+        return Err(CoreError::OutOfBounds);
+    }
 
     let n = poly.len();
     let half_z = depth * 0.5;
@@ -817,11 +838,16 @@ pub fn create_extruded_polygon(
         vertices.push(Vec3::new(x, y, -half_z));
     }
 
-    let mut faces = Vec::with_capacity(n + 2);
-    // Front (+Z) cap
-    faces.push(Face::new((0..n).collect(), material));
-    // Back (-Z) cap
-    faces.push(Face::new((0..n).rev().map(|i| n + i).collect(), material));
+    let cap_tris = ear_clip_ccw(&poly, area2.abs());
+    let mut faces = Vec::with_capacity(n + cap_tris.len() * 2);
+    // Front (+Z) cap (ear-clipped CCW triangles so concave polygons never produce diagonal webs)
+    for &[a, b, c] in &cap_tris {
+        faces.push(Face::new(vec![a, b, c], material));
+    }
+    // Back (-Z) cap (reversed winding for outward -Z normals)
+    for &[a, b, c] in &cap_tris {
+        faces.push(Face::new(vec![n + a, n + c, n + b], material));
+    }
     // Perimeter side walls (outward CCW)
     for i in 0..n {
         let j = (i + 1) % n;
@@ -844,6 +870,147 @@ pub fn create_extruded_polygon(
         smooth_shading: false,
         material: Default::default(),
     })
+}
+
+fn cross_2d(a: [f32; 2], b: [f32; 2], c: [f32; 2]) -> f32 {
+    (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0])
+}
+
+fn point_in_ccw_triangle_2d(p: [f32; 2], a: [f32; 2], b: [f32; 2], c: [f32; 2], eps: f32) -> bool {
+    cross_2d(a, b, p) >= -eps && cross_2d(b, c, p) >= -eps && cross_2d(c, a, p) >= -eps
+}
+
+fn segments_properly_intersect_2d(
+    a1: [f32; 2],
+    a2: [f32; 2],
+    b1: [f32; 2],
+    b2: [f32; 2],
+    eps: f32,
+) -> bool {
+    let d1 = cross_2d(a1, a2, b1);
+    let d2 = cross_2d(a1, a2, b2);
+    let d3 = cross_2d(b1, b2, a1);
+    let d4 = cross_2d(b1, b2, a2);
+    ((d1 > eps && d2 < -eps) || (d1 < -eps && d2 > eps))
+        && ((d3 > eps && d4 < -eps) || (d3 < -eps && d4 > eps))
+}
+
+fn polygon_is_self_intersecting_2d(poly: &[[f32; 2]]) -> bool {
+    let n = poly.len();
+    if n <= 3 {
+        return false;
+    }
+    let mut min_x = f32::INFINITY;
+    let mut max_x = f32::NEG_INFINITY;
+    let mut min_y = f32::INFINITY;
+    let mut max_y = f32::NEG_INFINITY;
+    for &[x, y] in poly {
+        min_x = min_x.min(x);
+        max_x = max_x.max(x);
+        min_y = min_y.min(y);
+        max_y = max_y.max(y);
+    }
+    let diag_sq = (max_x - min_x).powi(2) + (max_y - min_y).powi(2);
+    let eps = (diag_sq * 1e-9).max(1e-12);
+    for i in 0..n {
+        let i_next = (i + 1) % n;
+        for j in (i + 2)..n {
+            let j_next = (j + 1) % n;
+            if j_next == i {
+                continue;
+            }
+            if segments_properly_intersect_2d(poly[i], poly[i_next], poly[j], poly[j_next], eps) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Triangulates a simple 2D polygon in CCW winding order using ear clipping with scale-relative epsilon.
+fn ear_clip_ccw(poly: &[[f32; 2]], area2: f32) -> Vec<[usize; 3]> {
+    let n = poly.len();
+    if n < 3 {
+        return Vec::new();
+    }
+    if n == 3 {
+        return vec![[0, 1, 2]];
+    }
+
+    let mut min_x = f32::INFINITY;
+    let mut max_x = f32::NEG_INFINITY;
+    let mut min_y = f32::INFINITY;
+    let mut max_y = f32::NEG_INFINITY;
+    for &[x, y] in poly {
+        min_x = min_x.min(x);
+        max_x = max_x.max(x);
+        min_y = min_y.min(y);
+        max_y = max_y.max(y);
+    }
+    let diag_sq = (max_x - min_x).powi(2) + (max_y - min_y).powi(2);
+    let eps = (area2 * 1e-6).clamp(1e-12, 1e-6);
+    let min_tri_area = (area2 * 1e-9).clamp(1e-14, 1e-10);
+    let near_eps_sq = (diag_sq * 1e-12).max(1e-18);
+
+    let mut remaining: Vec<usize> = (0..n).collect();
+    let mut tris = Vec::with_capacity(n - 2);
+
+    while remaining.len() > 3 {
+        let m = remaining.len();
+        let mut ear_pos: Option<usize> = None;
+
+        for strict in [true, false] {
+            for k in 0..m {
+                let prev = remaining[(k + m - 1) % m];
+                let curr = remaining[k];
+                let next = remaining[(k + 1) % m];
+                let a = poly[prev];
+                let b = poly[curr];
+                let c = poly[next];
+                let area = cross_2d(a, b, c);
+                if (strict && area <= eps) || (!strict && area < -eps * 0.1) {
+                    continue;
+                }
+                let contains_other = remaining.iter().copied().any(|idx| {
+                    if idx == prev || idx == curr || idx == next {
+                        return false;
+                    }
+                    let p = poly[idx];
+                    let near_corner = [a, b, c].iter().any(|&v| {
+                        let dx = p[0] - v[0];
+                        let dy = p[1] - v[1];
+                        dx * dx + dy * dy <= near_eps_sq
+                    });
+                    !near_corner && point_in_ccw_triangle_2d(p, a, b, c, eps)
+                });
+                if !contains_other {
+                    ear_pos = Some(k);
+                    break;
+                }
+            }
+            if ear_pos.is_some() {
+                break;
+            }
+        }
+
+        let k = ear_pos.unwrap_or(1);
+        let prev = remaining[(k + m - 1) % m];
+        let curr = remaining[k];
+        let next = remaining[(k + 1) % m];
+        if cross_2d(poly[prev], poly[curr], poly[next]) > min_tri_area {
+            tris.push([prev, curr, next]);
+        }
+        remaining.remove(k);
+    }
+
+    if remaining.len() == 3 {
+        let [a, b, c] = [remaining[0], remaining[1], remaining[2]];
+        if cross_2d(poly[a], poly[b], poly[c]) > min_tri_area || tris.is_empty() {
+            tris.push([a, b, c]);
+        }
+    }
+
+    tris
 }
 
 /// Connects 2..=32 closed cross-section rings of equal vertex count (`3..=64`) into a lofted
@@ -1102,6 +1269,96 @@ pub fn set_face_uvs(
 /// normalized to sum 1. At least one weight must be positive. Export prefers
 /// these over the auto solver. Survives index-stable edits; cleared by
 /// bevel/subdivide/decimate.
+/// Paints smooth radial skin-weight influence onto vertices of `mesh` within `radius`
+/// of local-space `hit_point` for `joint_index` with `strength` in `(0.0..=1.0]`.
+/// Blends smoothly with existing manual or `fallback_weights` (from `AutoSkinSolver`),
+/// keeping up to 4 normalized influences per vertex. Returns `Ok(None)` if no vertex falls
+/// within `radius`.
+pub fn paint_vertex_weights_brush(
+    mesh: &LowPolyMesh,
+    hit_point: Vec3,
+    radius: f32,
+    joint_index: u16,
+    strength: f32,
+    fallback_weights: Option<&dyn Fn(usize, Vec3) -> VertexSkinWeights>,
+) -> Result<Option<LowPolyMesh>, CoreError> {
+    if !hit_point.is_finite()
+        || !radius.is_finite()
+        || radius <= 0.0
+        || !strength.is_finite()
+        || !(0.0..=1.0).contains(&strength)
+    {
+        return Err(CoreError::OutOfBounds);
+    }
+    if strength <= 1e-6 {
+        return Ok(None);
+    }
+
+    let mut next = mesh.clone();
+    let mut touched = false;
+
+    for (vi, &vpos) in mesh.vertices.iter().enumerate() {
+        if !vpos.is_finite() {
+            continue;
+        }
+        let dist = (vpos - hit_point).length();
+        if !dist.is_finite() || dist > radius {
+            continue;
+        }
+        let falloff = (1.0 - dist / radius).clamp(0.0, 1.0);
+        let alpha = (strength * falloff).clamp(0.0, 1.0);
+        if !alpha.is_finite() || alpha <= 1e-6 {
+            continue;
+        }
+
+        let base = next
+            .skin_weights
+            .get(&vi)
+            .copied()
+            .or_else(|| fallback_weights.map(|f| f(vi, vpos)))
+            .unwrap_or(VertexSkinWeights {
+                joints: [joint_index, 0, 0, 0],
+                weights: [1.0, 0.0, 0.0, 0.0],
+            });
+
+        let mut merged: BTreeMap<u16, f32> = BTreeMap::new();
+        for (&j, &w) in base.joints.iter().zip(base.weights.iter()) {
+            if !w.is_finite() || w <= 0.0 {
+                continue;
+            }
+            let scaled = w * (1.0 - alpha);
+            if scaled.is_finite() && scaled > 1e-6 {
+                *merged.entry(j).or_insert(0.0) += scaled;
+            }
+        }
+        *merged.entry(joint_index).or_insert(0.0) += alpha;
+
+        let mut pairs: Vec<(u16, f32)> = merged.into_iter().collect();
+        pairs.sort_by(|a, b| b.1.total_cmp(&a.1));
+        pairs.truncate(4);
+        let sum: f32 = pairs.iter().map(|(_, w)| *w).sum();
+        if !sum.is_finite() || sum <= 1e-6 {
+            continue;
+        }
+
+        let mut joints = [0u16; 4];
+        let mut weights = [0.0f32; 4];
+        for (slot, (j, w)) in pairs.into_iter().enumerate() {
+            joints[slot] = j;
+            weights[slot] = w / sum;
+        }
+        next.skin_weights
+            .insert(vi, VertexSkinWeights { joints, weights });
+        touched = true;
+    }
+
+    if touched {
+        Ok(Some(next))
+    } else {
+        Ok(None)
+    }
+}
+
 pub fn set_vertex_weights(
     mesh: &LowPolyMesh,
     vertex_ids: &[usize],
@@ -1190,6 +1447,8 @@ pub fn add_morph_delta(
             next.morphs.push(MorphTarget {
                 name: name.to_string(),
                 deltas: BTreeMap::new(),
+                normal_deltas: BTreeMap::new(),
+                default_weight: 0.0,
             });
             &mut next.morphs[idx]
         }
@@ -2309,12 +2568,97 @@ mod tests {
         let cw = [[0.0, 0.0], [0.0, 1.0], [1.0, 1.0], [1.0, 0.0]];
         let mesh = create_extruded_polygon(&cw, 0.2, mat).unwrap();
         assert_eq!(mesh.vertices.len(), 8);
-        assert_eq!(mesh.faces.len(), 6);
+        assert_eq!(mesh.faces.len(), 8); // 2 front tris + 2 back tris + 4 side quads
         let tri = mesh.to_triangulated_flat();
         // Front cap normal must point +Z
         assert!(tri.vertices[0].normal[2] > 0.99);
         // Reject degenerate collinear polygon
         assert!(create_extruded_polygon(&[[0.0, 0.0], [1.0, 0.0], [2.0, 0.0]], 0.2, mat).is_err());
+    }
+
+    #[test]
+    fn extruded_concave_polygon_ear_clips_without_bridging_concavity() {
+        let mat = PaletteIndex::new(3).unwrap();
+        // Concave C-shape polygon (CCW) with a deep notch at x in [0.4, 1.0], y in [0.3, 0.7]
+        let c_shape = [
+            [0.0, 0.0],
+            [1.0, 0.0],
+            [1.0, 0.3],
+            [0.4, 0.3],
+            [0.4, 0.7],
+            [1.0, 0.7],
+            [1.0, 1.0],
+            [0.0, 1.0],
+        ];
+        let mesh = create_extruded_polygon(&c_shape, 0.2, mat).unwrap();
+        let n = c_shape.len();
+        assert_eq!(mesh.vertices.len(), n * 2);
+        // Expected area of C-shape = 1.0 - (0.6 * 0.4) = 0.76
+        let front_cap_area: f32 = mesh
+            .faces
+            .iter()
+            .take(n - 2)
+            .map(|f| {
+                let a = mesh.vertices[f.vertices[0]];
+                let b = mesh.vertices[f.vertices[1]];
+                let c = mesh.vertices[f.vertices[2]];
+                let area_z = (b.x - a.x) * (c.y - a.y) - (b.y - a.y) * (c.x - a.x);
+                assert!(area_z > 0.0, "every front cap triangle must be CCW (+Z)");
+                0.5 * area_z
+            })
+            .sum();
+        assert!(
+            (front_cap_area - 0.76).abs() < 1e-4,
+            "front cap area {front_cap_area} must equal concave C-shape area 0.76"
+        );
+        // Verify no front cap triangle covers the concave notch center (0.75, 0.5)
+        let notch = [0.75, 0.5];
+        for f in mesh.faces.iter().take(n - 2) {
+            let a = [
+                mesh.vertices[f.vertices[0]].x,
+                mesh.vertices[f.vertices[0]].y,
+            ];
+            let b = [
+                mesh.vertices[f.vertices[1]].x,
+                mesh.vertices[f.vertices[1]].y,
+            ];
+            let c = [
+                mesh.vertices[f.vertices[2]].x,
+                mesh.vertices[f.vertices[2]].y,
+            ];
+            assert!(
+                !point_in_ccw_triangle_2d(notch, a, b, c, 1e-6),
+                "ear-clipped cap triangle must not bridge concave notch"
+            );
+        }
+
+        // Reject self-intersecting bowtie polygon with nonzero net area
+        let self_intersecting = [[0.0, 0.0], [1.0, 1.0], [1.0, 0.0], [0.0, 0.8]];
+        assert!(create_extruded_polygon(&self_intersecting, 0.2, mat).is_err());
+
+        // Sub-millimeter concave polygon (scale 0.0005) still triangulates with exact area
+        let tiny_scale = 0.0005f32;
+        let tiny_c: Vec<[f32; 2]> = c_shape
+            .iter()
+            .map(|&[x, y]| [x * tiny_scale, y * tiny_scale])
+            .collect();
+        let tiny_mesh = create_extruded_polygon(&tiny_c, 0.01, mat).unwrap();
+        let tiny_area: f32 = tiny_mesh
+            .faces
+            .iter()
+            .take(n - 2)
+            .map(|f| {
+                let a = tiny_mesh.vertices[f.vertices[0]];
+                let b = tiny_mesh.vertices[f.vertices[1]];
+                let c = tiny_mesh.vertices[f.vertices[2]];
+                0.5 * ((b.x - a.x) * (c.y - a.y) - (b.y - a.y) * (c.x - a.x))
+            })
+            .sum();
+        let expected_tiny = 0.76 * tiny_scale * tiny_scale;
+        assert!(
+            (tiny_area - expected_tiny).abs() < expected_tiny * 1e-3,
+            "tiny concave area {tiny_area} must match {expected_tiny}"
+        );
     }
 
     #[test]
@@ -2561,5 +2905,49 @@ mod tests {
         assert_eq!(moved.skin_weights[&0].joints, [5, 0, 0, 0]);
         let beveled = bevel_mesh(&painted, 0.2).unwrap();
         assert!(beveled.skin_weights.is_empty());
+    }
+
+    #[test]
+    fn weight_paint_brush_blends_smoothly_and_normalizes() {
+        let mat = PaletteIndex::new(4).unwrap();
+        let cube = create_primitive(PrimitiveKind::Cube, 1.0, mat);
+        // Seed vertex 0 with joint 1 weight 1.0
+        let seeded = set_vertex_weights(&cube, &[0], [1, 0, 0, 0], [1.0, 0.0, 0.0, 0.0]).unwrap();
+        let v0 = seeded.vertices[0];
+
+        // Paint joint 3 directly on vertex 0 with strength 0.5 -> expect 50/50 blend between joint 1 and joint 3
+        let painted = paint_vertex_weights_brush(&seeded, v0, 0.25, 3, 0.5, None)
+            .unwrap()
+            .expect("vertex 0 must be within radius");
+        let w = painted.skin_weights[&0];
+        let sum: f32 = w.weights.iter().sum();
+        assert!((sum - 1.0).abs() < 1e-5, "weights must normalize to 1.0");
+        assert!(w.joints.contains(&1) && w.joints.contains(&3));
+
+        // Hit point far outside mesh returns Ok(None)
+        let missed =
+            paint_vertex_weights_brush(&seeded, Vec3::new(10.0, 10.0, 10.0), 0.25, 3, 0.5, None)
+                .unwrap();
+        assert!(missed.is_none());
+
+        // Invalid radius/strength errors cleanly
+        assert!(paint_vertex_weights_brush(&seeded, v0, 0.0, 3, 0.5, None).is_err());
+        assert!(paint_vertex_weights_brush(&seeded, v0, 0.25, 3, 1.5, None).is_err());
+
+        // Duplicate base joints are merged and NaN vertices are skipped safely
+        let mut dup_mesh =
+            set_vertex_weights(&cube, &[0], [1, 1, 2, 0], [0.4, 0.4, 0.2, 0.0]).unwrap();
+        dup_mesh.vertices[1] = Vec3::new(f32::NAN, 0.0, 0.0);
+        let dup_painted = paint_vertex_weights_brush(&dup_mesh, v0, 0.25, 3, 0.5, None)
+            .unwrap()
+            .unwrap();
+        let dw = dup_painted.skin_weights[&0];
+        assert_eq!(dw.joints[0], 3);
+        assert_eq!(dw.joints[1], 1);
+        assert_eq!(dw.joints[2], 2);
+        assert!((dw.weights[0] - 0.5).abs() < 1e-4);
+        assert!((dw.weights[1] - 0.4).abs() < 1e-4);
+        assert!((dw.weights[2] - 0.1).abs() < 1e-4);
+        assert!(!dup_painted.skin_weights.contains_key(&1));
     }
 }

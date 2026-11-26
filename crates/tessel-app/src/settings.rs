@@ -4,8 +4,27 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 use tessel_ai::AiProviderKind;
+use thiserror::Error;
 
 const MAX_RECENT_PROJECTS: usize = 6;
+
+#[derive(Debug, Error)]
+pub enum SettingsError {
+    #[error("Failed to create config directory {path}: {source}")]
+    CreateDir {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("Failed to serialize settings: {0}")]
+    Serialize(#[from] serde_json::Error),
+    #[error("Failed to write settings file {path}: {source}")]
+    Write {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+}
 
 /// Returns the OS-native default export directory: `<home_dir>/tessel-project`
 /// (Linux: `/home/<user>/tessel-project`, macOS: `/Users/<user>/tessel-project`,
@@ -136,13 +155,17 @@ impl AppSettings {
         }
     }
 
-    pub fn save(&self, paths: &AppPaths) {
-        if fs::create_dir_all(&paths.config_dir).is_err() {
-            return;
-        }
-        if let Ok(json) = serde_json::to_string_pretty(self) {
-            let _ = fs::write(&paths.settings_file, json);
-        }
+    pub fn save(&self, paths: &AppPaths) -> Result<(), SettingsError> {
+        fs::create_dir_all(&paths.config_dir).map_err(|source| SettingsError::CreateDir {
+            path: paths.config_dir.clone(),
+            source,
+        })?;
+        let json = serde_json::to_string_pretty(self)?;
+        fs::write(&paths.settings_file, json).map_err(|source| SettingsError::Write {
+            path: paths.settings_file.clone(),
+            source,
+        })?;
+        Ok(())
     }
 
     pub fn profile_for(&self, provider: AiProviderKind) -> ProviderProfile {
@@ -279,6 +302,27 @@ mod tests {
         let rotated = rotate_mcp_token(&paths);
         assert_ne!(first, rotated);
         assert_eq!(load_or_create_mcp_token(&paths), rotated);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn save_returns_error_when_config_dir_is_an_existing_file() {
+        let dir = std::env::temp_dir().join("tessel_settings_save_err_test");
+        let _ = fs::remove_dir_all(&dir);
+        let _ = fs::create_dir_all(&dir);
+        let blocking_file = dir.join("not_a_dir");
+        fs::write(&blocking_file, b"occupied").unwrap();
+
+        let paths = AppPaths {
+            config_dir: blocking_file.clone(),
+            settings_file: blocking_file.join("settings.json"),
+            recovery_file: dir.join("autosave.tessel"),
+            log_file: dir.join("tessel.log"),
+        };
+
+        let err = AppSettings::default().save(&paths).unwrap_err();
+        assert!(matches!(err, SettingsError::CreateDir { .. }));
 
         let _ = fs::remove_dir_all(&dir);
     }

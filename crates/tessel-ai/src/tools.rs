@@ -142,14 +142,15 @@ pub fn tool_definitions() -> Vec<Value> {
         }),
         json!({
             "name": "scene_set_node_transform",
-            "description": "Set a scene node's world position [x,y,z], rotation_deg [pitch,yaw,roll], and/or scale [sx,sy,sz] (omitted fields keep their current values).",
+            "description": "Set a scene node's world position [x,y,z], rotation_deg [pitch,yaw,roll], and/or scale [sx,sy,sz] (omitted fields keep their current values). Pass dry_run=true to preview world transform, orientation axes, and bounds without mutating the scene.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "node_id": { "type": "integer", "minimum": 1 },
                     "position": { "type": "array", "items": { "type": "number" }, "minItems": 3, "maxItems": 3 },
                     "rotation_deg": { "type": "array", "items": { "type": "number" }, "minItems": 3, "maxItems": 3 },
-                    "scale": { "type": "array", "items": { "type": "number" }, "minItems": 3, "maxItems": 3 }
+                    "scale": { "type": "array", "items": { "type": "number" }, "minItems": 3, "maxItems": 3 },
+                    "dry_run": { "type": "boolean", "description": "When true, previews resulting world position, orientation vectors, and bounds without mutating the scene or undo history (default false)" }
                 }
             }
         }),
@@ -496,7 +497,7 @@ pub fn tool_definitions() -> Vec<Value> {
         }),
         json!({
             "name": "mesh_create_primitive",
-            "description": "Create a low-poly primitive mesh (cube, plane, cylinder, cone, sphere, torus, capsule) with optional world position, rotation_deg, and scale. 'size' accepts either a scalar (>= 0.005) or [sx, sy, sz] non-uniform dimensions. Local pivot is bottom-centered: y in [0, size] (torus y in [0, 0.28*size]); x,z in [-size/2, size/2] (capsule x,z in [-size/4, size/4]).",
+            "description": "Create a low-poly primitive mesh (cube, plane, cylinder, cone, sphere, torus, capsule) with optional world position, rotation_deg, scale, and vertical pivot anchor ('bottom' default, 'center', or 'top'). 'size' accepts either a scalar (>= 0.005) or [sx, sy, sz] non-uniform dimensions.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -508,8 +509,9 @@ pub fn tool_definitions() -> Vec<Value> {
                             { "type": "array", "items": { "type": "number", "minimum": 0.005 }, "minItems": 3, "maxItems": 3 }
                         ]
                     },
+                    "anchor": { "type": "string", "enum": ["bottom", "center", "top"], "description": "Local vertical pivot anchor (default 'bottom': y in [0, size_y]; 'center': y in [-size_y/2, +size_y/2]; 'top': y in [-size_y, 0])" },
                     "palette_index": { "type": "integer", "minimum": 1, "maximum": 255 },
-                    "position": { "type": "array", "items": { "type": "number" }, "minItems": 3, "maxItems": 3 },
+                    "position": { "type": "array", "items": { "type": "number" }, "minItems": 3, "maxItems": 3, "description": "World position of the selected pivot anchor [x, y, z]" },
                     "rotation_deg": { "type": "array", "items": { "type": "number" }, "minItems": 3, "maxItems": 3 },
                     "scale": { "type": "array", "items": { "type": "number" }, "minItems": 3, "maxItems": 3 }
                 },
@@ -595,6 +597,7 @@ pub fn tool_definitions() -> Vec<Value> {
                     "name": { "type": "string" },
                     "sections": {
                         "type": "array",
+                        "description": "2..=32 closed cross-section rings, each an array of 3..=64 3D points [[x,y,z], ...]. Example (2 square rings): [[[-0.2, 0.0, -0.2], [0.2, 0.0, -0.2], [0.2, 0.0, 0.2], [-0.2, 0.0, 0.2]], [[-0.1, 1.0, -0.1], [0.1, 1.0, -0.1], [0.1, 1.0, 0.1], [-0.1, 1.0, 0.1]]].",
                         "minItems": 2,
                         "maxItems": 32,
                         "items": {
@@ -1354,7 +1357,7 @@ pub fn tool_definitions() -> Vec<Value> {
                     "prefix": { "type": "string", "description": "Bone name prefix when append=true (e.g. 'P2_')" },
                     "offset": { "type": "array", "items": { "type": "number" }, "minItems": 3, "maxItems": 3, "description": "World-space root translation [x, y, z] for appended sub-skeleton" },
                     "yaw_deg": { "type": "number", "description": "Yaw rotation in degrees around +Y applied to the appended sub-skeleton's Root rest orientation (so child rotations remain character-local)" },
-                    "include_default_clips": { "type": "boolean", "description": "When append=true, automatically remap Idle & Walk channels onto the appended sub-skeleton (default true)" }
+                    "include_default_clips": { "type": "boolean", "description": "Include default Idle & Walk animation clips (default true). Pass false to start with 0 default clips (or skip remapping Idle & Walk when append=true)." }
                 }
             }
         }),
@@ -1410,13 +1413,14 @@ pub fn tool_definitions() -> Vec<Value> {
         }),
         json!({
             "name": "character_set_bone_pose",
-            "description": "Set a bone's live pose rotation_deg [pitch, yaw, roll] and/or translation [dx, dy, dz] offset from rest pose on the active character rig (captured by character_snapshot_pose_to_keyframe). Right-Handed (+Y Up, +Z Front, +X Left): positive pitch (+X) tilts/falls FORWARD, negative pitch (-X) tilts/falls BACKWARD in character-local space.",
+            "description": "Set a bone's live pose rotation_deg [pitch, yaw, roll] and/or translation [dx, dy, dz] offset from rest pose on the active character rig (captured by character_snapshot_pose_to_keyframe). Right-Handed (+Y Up, +Z Front, +X Left): positive pitch (+X) tilts/falls FORWARD, negative pitch (-X) tilts/falls BACKWARD in character-local space. Pass dry_run=true to preview resulting orientation vectors and world position without mutating the rig.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "bone_id": { "type": "integer", "minimum": 0 },
-                    "rotation_deg": { "type": "array", "items": { "type": "number" }, "minItems": 3, "maxItems": 3 },
-                    "translation": { "type": "array", "items": { "type": "number" }, "minItems": 3, "maxItems": 3, "description": "Optional local translation offset [dx, dy, dz] relative to rest pose" }
+                    "rotation_deg": { "type": "array", "items": { "type": "number" }, "minItems": 3, "maxItems": 3, "description": "Local Euler degrees [pitch_x, yaw_y, roll_z] (Right-Handed +Y Up/+Z Front/+X Left: +X pitch tilts forward, +Y yaw turns toward +X/Left)" },
+                    "translation": { "type": "array", "items": { "type": "number" }, "minItems": 3, "maxItems": 3, "description": "Optional local translation offset [dx, dy, dz] relative to rest pose" },
+                    "dry_run": { "type": "boolean", "description": "When true, returns resulting local/world orientation vectors and world position without mutating the scene or undo history (default false)" }
                 },
                 "required": ["bone_id"]
             }
@@ -1672,7 +1676,7 @@ pub fn tool_definitions() -> Vec<Value> {
         }),
         json!({
             "name": "character_list_bones",
-            "description": "List all bones of the character rig (id, name, parent, rest position). Fails when the scene has no rig.",
+            "description": "List all bones of the character rig (id, name, parent, local_rest_position, world_rest_position, and coordinate_space). Fails when the scene has no rig.",
             "inputSchema": { "type": "object", "properties": {} }
         }),
         json!({
@@ -1836,7 +1840,7 @@ pub fn tool_definitions() -> Vec<Value> {
         }),
         json!({
             "name": "project_export",
-            "description": "Export the current scene to .glb, .obj, .stl, .vox, .png, or .gif inside the allowed export directory.",
+            "description": "Export the current scene inside the allowed export directory. Format matrix: glb/obj/stl export 3D geometry (Voxel/LowPoly/Character); vox exports the active VoxelVolume; png/gif export ONLY the active PixelCanvas (active frame for png, all frames for gif — fails with EmptyCanvas in 3D-only scenes; use viewport_screenshot for 3D PNG or viewport_render_turntable_gif for 3D GIF).",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -2012,6 +2016,173 @@ pub fn tool_definitions() -> Vec<Value> {
                     "clip_index": { "type": "integer", "minimum": 0 }
                 },
                 "required": ["filename"]
+            }
+        }),
+        json!({
+            "name": "character_create_bone_grid",
+            "description": "Create an M x N multi-chain cloth bone grid (each column is a parent-child chain from pinned top row to free tip) and optionally assign its bone_mask to a mesh node.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "prefix": { "type": "string", "description": "Bone name prefix (default 'Cloth')" },
+                    "cols": { "type": "integer", "minimum": 2, "maximum": 16 },
+                    "rows": { "type": "integer", "minimum": 2, "maximum": 16 },
+                    "origin": { "type": "array", "items": { "type": "number" }, "minItems": 3, "maxItems": 3 },
+                    "width": { "type": "number", "minimum": 0.01 },
+                    "height": { "type": "number", "minimum": 0.01 },
+                    "axis_u": { "type": "array", "items": { "type": "number" }, "minItems": 3, "maxItems": 3 },
+                    "axis_v": { "type": "array", "items": { "type": "number" }, "minItems": 3, "maxItems": 3 },
+                    "parent_bone": { "type": "integer", "minimum": 0 },
+                    "bind_node": { "type": "integer", "minimum": 1 }
+                }
+            }
+        }),
+        json!({
+            "name": "character_bake_cloth_wind",
+            "description": "Deterministically bake kinematic wind/gravity ripple animation for an existing cloth bone grid (by prefix) into a glTF-exportable AnimationClip.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "bone_prefix": { "type": "string", "description": "Prefix used in character_create_bone_grid (e.g. 'Cloth')" },
+                    "clip_name": { "type": "string" },
+                    "wind_dir": { "type": "array", "items": { "type": "number" }, "minItems": 3, "maxItems": 3 },
+                    "wind_strength": { "type": "number" },
+                    "gravity": { "type": "number" },
+                    "turbulence": { "type": "number" },
+                    "phase_offset": { "type": "number" },
+                    "duration_secs": { "type": "number", "minimum": 0.1 },
+                    "fps": { "type": "number", "minimum": 1.0, "maximum": 60.0 }
+                },
+                "required": ["bone_prefix"]
+            }
+        }),
+        json!({
+            "name": "mesh_morph_set_deltas",
+            "description": "Author sparse per-vertex position_deltas and normal_deltas on a named MorphTarget (exported 1:1 to glTF targets[].POSITION & targets[].NORMAL).",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "node_id": { "type": "integer", "minimum": 1 },
+                    "name": { "type": "string" },
+                    "position_deltas": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "vertex": { "type": "integer", "minimum": 0 },
+                                "delta": { "type": "array", "items": { "type": "number" }, "minItems": 3, "maxItems": 3 }
+                            },
+                            "required": ["vertex", "delta"]
+                        }
+                    },
+                    "normal_deltas": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "vertex": { "type": "integer", "minimum": 0 },
+                                "delta": { "type": "array", "items": { "type": "number" }, "minItems": 3, "maxItems": 3 }
+                            },
+                            "required": ["vertex", "delta"]
+                        }
+                    },
+                    "replace": { "type": "boolean" }
+                },
+                "required": ["name"]
+            }
+        }),
+        json!({
+            "name": "mesh_morph_set_weight",
+            "description": "Set the default rest weight (0.0..=1.0) and live viewport weight for a named MorphTarget (exported to glTF mesh.weights[]).",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "node_id": { "type": "integer", "minimum": 1 },
+                    "name": { "type": "string" },
+                    "weight": { "type": "number", "minimum": 0.0, "maximum": 1.0 }
+                },
+                "required": ["name", "weight"]
+            }
+        }),
+        json!({
+            "name": "mesh_proxy_cage_deform",
+            "description": "Apply deterministic kinematic 3D FFD Proxy Cage deformation to a low-poly mesh with optional floor_y clamp; optionally bake as a MorphTarget instead of mutating rest vertices.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "node_id": { "type": "integer", "minimum": 1 },
+                    "divisions": { "type": "array", "items": { "type": "integer", "minimum": 2, "maximum": 6 }, "minItems": 3, "maxItems": 3 },
+                    "control_deltas": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "index": { "type": "integer", "minimum": 0 },
+                                "delta": { "type": "array", "items": { "type": "number" }, "minItems": 3, "maxItems": 3 }
+                            },
+                            "required": ["index", "delta"]
+                        }
+                    },
+                    "floor_y": { "type": "number" },
+                    "bake_as_morph": { "type": "string" }
+                },
+                "required": ["control_deltas"]
+            }
+        }),
+        json!({
+            "name": "mesh_bake_vat",
+            "description": "Bake deterministic per-frame Vertex Animation Texture (position + normal RGBA8 PNGs and JSON metadata) for a low-poly mesh across an animation clip into exports/.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "node_id": { "type": "integer", "minimum": 1 },
+                    "stem": { "type": "string", "description": "Output filename stem inside exports/ (e.g. 'cape_vat')" },
+                    "clip_index": { "type": "integer", "minimum": 0 },
+                    "fps": { "type": "number", "minimum": 1.0, "maximum": 60.0 },
+                    "max_frames": { "type": "integer", "minimum": 2, "maximum": 512 }
+                },
+                "required": ["stem"]
+            }
+        }),
+        json!({
+            "name": "mesh_create_ribbon",
+            "description": "Generate a deterministic procedural ribbon/trail strip mesh following a bone/node animation trajectory or explicit_points, with optional STEP visibility track for glTF export.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "name": { "type": "string" },
+                    "source_bone": { "type": "integer", "minimum": 0 },
+                    "source_node": { "type": "integer", "minimum": 1 },
+                    "explicit_points": {
+                        "type": "array",
+                        "items": { "type": "array", "items": { "type": "number" }, "minItems": 3, "maxItems": 3 }
+                    },
+                    "clip_index": { "type": "integer", "minimum": 0 },
+                    "start_time": { "type": "number", "minimum": 0.0 },
+                    "end_time": { "type": "number", "minimum": 0.01 },
+                    "samples": { "type": "integer", "minimum": 2, "maximum": 128 },
+                    "width_start": { "type": "number", "minimum": 0.0 },
+                    "width_end": { "type": "number", "minimum": 0.0 },
+                    "material": { "type": "integer", "minimum": 1, "maximum": 255 },
+                    "bake_visibility_track": { "type": "boolean" }
+                }
+            }
+        }),
+        json!({
+            "name": "character_stick_gizmo_pose",
+            "description": "Apply an octahedral Stick Gizmo bone pose operation (roll, pitch, yaw, twist, roll_twist) with optional snap_deg (5/15/45), mirror_lr, and axis_lock (0=X,1=Y,2=Z) via Command Bus.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "bone_id": { "type": "integer", "minimum": 0 },
+                    "mode": { "type": "string", "enum": ["roll", "pitch", "yaw", "twist", "roll_twist"] },
+                    "angle_deg": { "type": "number" },
+                    "chain_len": { "type": "integer", "minimum": 1, "maximum": 32 },
+                    "snap_deg": { "type": "number", "minimum": 0.0 },
+                    "mirror_lr": { "type": "boolean" },
+                    "axis_lock": { "type": "integer", "minimum": 0, "maximum": 2 }
+                },
+                "required": ["bone_id", "mode", "angle_deg"]
             }
         }),
     ]

@@ -292,8 +292,10 @@ fn show_character_timeline(
                 }
                 ui.separator();
 
-                if let Some(clip) = rig.animations.get_mut(rig.active_animation) {
-                    let mut dur = clip.duration_secs;
+                let active_idx = rig.active_animation;
+                if active_idx < rig.animations.len() {
+                    let mut dur = rig.animations[active_idx].duration_secs;
+                    let cur_stepped = rig.animations[active_idx].stepped_fps;
                     ui.label(
                         RichText::new("Len:")
                             .size(10.5)
@@ -308,10 +310,33 @@ fn show_character_timeline(
                         )
                         .changed()
                     {
-                        clip.duration_secs = dur;
+                        rig.animations[active_idx].duration_secs = dur;
                         rig.playback_time = rig.playback_time.min(dur);
                         rig.apply_active_animation();
                         modified = true;
+                    }
+                    ui.separator();
+                    ui.label(
+                        RichText::new("Step:")
+                            .size(10.5)
+                            .color(tokens::ON_SURFACE_VARIANT),
+                    );
+                    for (lbl, target) in
+                        [("Off", None), ("8", Some(8.0_f32)), ("12", Some(12.0_f32))]
+                    {
+                        let active = match (cur_stepped, target) {
+                            (None, None) => true,
+                            (Some(a), Some(b)) => (a - b).abs() < 0.1,
+                            _ => false,
+                        };
+                        if ui.selectable_label(active, lbl).clicked() && !active {
+                            let mut updated = rig.animations[active_idx].clone();
+                            updated.stepped_fps = target;
+                            pending_cmd = Some(Command::UpsertAnimationClip {
+                                clip: updated,
+                                activate: true,
+                            });
+                        }
                     }
                 }
 
@@ -581,5 +606,95 @@ mod tests {
             show_timeline(ctx, &mut scene, &mut history);
         });
         assert!(!out_rig.shapes.is_empty());
+    }
+
+    fn find_text_center_after_x(
+        shape: &egui::epaint::Shape,
+        target: &str,
+        min_x: f32,
+    ) -> Option<egui::Pos2> {
+        match shape {
+            egui::epaint::Shape::Text(t) if t.galley.job.text == target && t.pos.x > min_x => {
+                Some(t.pos + t.galley.size() * 0.5)
+            }
+            egui::epaint::Shape::Vec(v) => v
+                .iter()
+                .find_map(|s| find_text_center_after_x(s, target, min_x)),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn c1_click_simulation_stepped_fps_is_undoable() {
+        let mut scene = SceneState::new();
+        let mut history = HistoryStack::new();
+        history
+            .execute(&mut scene, Command::SetMode(AppMode::Character))
+            .unwrap();
+        history
+            .execute(&mut scene, Command::ApplyHumanoidRig)
+            .unwrap();
+
+        let ctx = egui::Context::default();
+        let base_input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1920.0, 720.0),
+            )),
+            ..Default::default()
+        };
+        let out = ctx.run(base_input, |c| show_timeline(c, &mut scene, &mut history));
+        let step_lbl_pos = out
+            .shapes
+            .iter()
+            .find_map(|cs| find_text_center_after_x(&cs.shape, "Step:", f32::NEG_INFINITY))
+            .unwrap();
+        let step8_pos = out
+            .shapes
+            .iter()
+            .find_map(|cs| find_text_center_after_x(&cs.shape, "8", step_lbl_pos.x))
+            .unwrap();
+
+        let press = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1920.0, 720.0),
+            )),
+            events: vec![
+                egui::Event::PointerMoved(step8_pos),
+                egui::Event::PointerButton {
+                    pos: step8_pos,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+            ..Default::default()
+        };
+        let _ = ctx.run(press, |c| show_timeline(c, &mut scene, &mut history));
+        let release = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1920.0, 720.0),
+            )),
+            events: vec![egui::Event::PointerButton {
+                pos: step8_pos,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+            ..Default::default()
+        };
+        let _ = ctx.run(release, |c| show_timeline(c, &mut scene, &mut history));
+
+        assert_eq!(
+            scene.character_rig.as_ref().unwrap().animations[0].stepped_fps,
+            Some(8.0)
+        );
+        history.undo(&mut scene).unwrap();
+        assert_eq!(
+            scene.character_rig.as_ref().unwrap().animations[0].stepped_fps,
+            None
+        );
     }
 }

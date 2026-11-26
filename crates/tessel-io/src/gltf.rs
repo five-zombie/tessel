@@ -10,6 +10,131 @@ use tessel_core::{AutoSkinSolver, Palette, PaletteIndex, SceneState};
 use crate::error::IoError;
 use crate::ExportPreset;
 
+fn is_cubic_interpolation(interp: tessel_core::KeyframeInterpolation) -> bool {
+    matches!(
+        interp,
+        tessel_core::KeyframeInterpolation::EaseIn
+            | tessel_core::KeyframeInterpolation::EaseOut
+            | tessel_core::KeyframeInterpolation::EaseInOut
+            | tessel_core::KeyframeInterpolation::CubicBezier { .. }
+    )
+}
+
+/// Normalized-parameter Hermite endpoint slopes `(out_slope, in_slope)` matching
+/// `KeyframeInterpolation::apply(t)` for glTF 2.0 `CUBICSPLINE` tangents.
+fn easing_segment_slopes(interp: tessel_core::KeyframeInterpolation) -> (f32, f32) {
+    match interp {
+        tessel_core::KeyframeInterpolation::Linear => (1.0, 1.0),
+        tessel_core::KeyframeInterpolation::EaseIn => (0.0, 2.0),
+        tessel_core::KeyframeInterpolation::EaseOut => (2.0, 0.0),
+        tessel_core::KeyframeInterpolation::EaseInOut
+        | tessel_core::KeyframeInterpolation::Step => (0.0, 0.0),
+        tessel_core::KeyframeInterpolation::CubicBezier { p1x, p1y, p2x, p2y } => {
+            let x1 = if p1x.is_finite() {
+                p1x.clamp(0.0, 1.0)
+            } else {
+                0.25
+            };
+            let y1 = if p1y.is_finite() {
+                p1y.clamp(-1.0, 2.0)
+            } else {
+                0.1
+            };
+            let x2 = if p2x.is_finite() {
+                p2x.clamp(0.0, 1.0)
+            } else {
+                0.75
+            };
+            let y2 = if p2y.is_finite() {
+                p2y.clamp(-1.0, 2.0)
+            } else {
+                0.9
+            };
+            let m0 = if x1 > 1e-4 {
+                (y1 / x1).clamp(-4.0, 4.0)
+            } else {
+                0.0
+            };
+            let m1 = if (1.0 - x2) > 1e-4 {
+                ((1.0 - y2) / (1.0 - x2)).clamp(-4.0, 4.0)
+            } else {
+                0.0
+            };
+            (m0, m1)
+        }
+    }
+}
+
+fn align_quat_hemispheres(mut quats: Vec<[f32; 4]>) -> Vec<[f32; 4]> {
+    for i in 1..quats.len() {
+        let dot = quats[i - 1][0] * quats[i][0]
+            + quats[i - 1][1] * quats[i][1]
+            + quats[i - 1][2] * quats[i][2]
+            + quats[i - 1][3] * quats[i][3];
+        if dot < 0.0 {
+            for c in &mut quats[i] {
+                *c = -*c;
+            }
+        }
+    }
+    quats
+}
+
+fn pack_cubicspline<const N: usize>(
+    times: &[f32],
+    interps: &[tessel_core::KeyframeInterpolation],
+    values: &[[f32; N]],
+) -> Vec<[f32; N]> {
+    let count = values.len();
+    let mut in_tangents = vec![[0.0f32; N]; count];
+    let mut out_tangents = vec![[0.0f32; N]; count];
+    for i in 0..count.saturating_sub(1) {
+        let dt = times[i + 1] - times[i];
+        if dt > 1e-6 {
+            let (m0, m1) = easing_segment_slopes(interps[i]);
+            let inv_dt = 1.0 / dt;
+            for c in 0..N {
+                let delta = values[i + 1][c] - values[i][c];
+                out_tangents[i][c] = m0 * delta * inv_dt;
+                in_tangents[i + 1][c] = m1 * delta * inv_dt;
+            }
+        }
+    }
+    let mut packed = Vec::with_capacity(count * 3);
+    for i in 0..count {
+        packed.push(in_tangents[i]);
+        packed.push(values[i]);
+        packed.push(out_tangents[i]);
+    }
+    packed
+}
+
+/// Expands `Step` segments inside a mixed `CUBICSPLINE` channel by inserting a hold keyframe
+/// at `t_next - 1e-4` with the preceding keyframe's value so glTF players hold flat until jump.
+fn expand_mixed_step_keyframes<T: Copy>(
+    times: &[f32],
+    interps: &[tessel_core::KeyframeInterpolation],
+    values: &[T],
+) -> (Vec<f32>, Vec<tessel_core::KeyframeInterpolation>, Vec<T>) {
+    let mut out_t = Vec::with_capacity(times.len() + 2);
+    let mut out_i = Vec::with_capacity(interps.len() + 2);
+    let mut out_v = Vec::with_capacity(values.len() + 2);
+    for idx in 0..times.len() {
+        out_t.push(times[idx]);
+        out_i.push(interps[idx]);
+        out_v.push(values[idx]);
+        if idx + 1 < times.len()
+            && interps[idx] == tessel_core::KeyframeInterpolation::Step
+            && (times[idx + 1] - times[idx]) > 2e-4
+        {
+            out_t.push(times[idx + 1] - 1e-4);
+            out_i.push(tessel_core::KeyframeInterpolation::Linear);
+            out_v.push(values[idx]);
+        }
+    }
+    (out_t, out_i, out_v)
+}
+
 fn node_world_matrices(scene: &SceneState, node_id: tessel_core::NodeId) -> (Mat4, Mat4) {
     let mat = scene.node_rest_world_matrix(node_id);
     let normal_mat = if mat.determinant().abs() > 1e-8 {
@@ -20,6 +145,11 @@ fn node_world_matrices(scene: &SceneState, node_id: tessel_core::NodeId) -> (Mat
     (mat, normal_mat)
 }
 
+/// Checks whether `node_id` has a `NodeKind::Group` ancestor within 16 parent hops.
+///
+/// Note: `group_order` exports all `Group` nodes and their `children` links regardless of depth,
+/// while `has_group_ancestor` and `SceneState::compute_node_world_matrix` cap ancestor traversal
+/// at 16 hops for cycle safety (nodes nested under >16 non-group ancestors stop walking at hop 16).
 fn has_group_ancestor(scene: &SceneState, node_id: tessel_core::NodeId) -> bool {
     let mut curr = scene.nodes.get(&node_id).and_then(|n| n.parent);
     let mut hops = 0usize;
@@ -52,6 +182,30 @@ fn collect_node_transform_animated(
                 .collect()
         })
         .unwrap_or_default()
+}
+
+/// Single source of truth for "this low-poly node gets a dedicated morphed
+/// export node". Used both when precomputing `morphed_order` (node indices for
+/// animation channels) and when emitting the dedicated primitives, so the two
+/// lists cannot drift apart (checked by the `debug_assert!` after the loop).
+fn is_morphed_export_node(
+    scene: &SceneState,
+    node_id: tessel_core::NodeId,
+    mesh: &tessel_core::LowPolyMesh,
+    vis_animated: &std::collections::BTreeSet<tessel_core::NodeId>,
+    trs_animated: &std::collections::BTreeSet<tessel_core::NodeId>,
+) -> bool {
+    let visible = scene.nodes.get(&node_id).map(|n| n.visible).unwrap_or(true);
+    (visible || vis_animated.contains(&node_id))
+        && !mesh.faces.is_empty()
+        && (!mesh.morphs.is_empty()
+            || vis_animated.contains(&node_id)
+            || trs_animated.contains(&node_id)
+            || has_group_ancestor(scene, node_id))
+        && {
+            let tri = mesh.to_triangulated_flat();
+            !tri.vertices.is_empty() && !tri.indices.is_empty()
+        }
 }
 
 /// Collects all visible 3D geometry (voxels + low-poly meshes) into flat indexed buffers
@@ -481,14 +635,7 @@ pub fn export_glb_bytes(
         .lowpoly_meshes
         .iter()
         .filter(|(id, m)| {
-            (scene.nodes.get(id).map(|n| n.visible).unwrap_or(true)
-                || vis_animated_nodes.contains(id))
-                && !m.faces.is_empty()
-                && (!m.morphs.is_empty()
-                    || vis_animated_nodes.contains(id)
-                    || node_trs_animated.contains(id)
-                    || has_group_ancestor(scene, **id))
-                && !m.to_triangulated_flat().vertices.is_empty()
+            is_morphed_export_node(scene, **id, m, &vis_animated_nodes, &node_trs_animated)
         })
         .map(|(id, _)| *id)
         .collect();
@@ -595,7 +742,23 @@ pub fn export_glb_bytes(
                 if ch.keyframes.is_empty() {
                     continue;
                 }
-                let times: Vec<f32> = ch.keyframes.iter().map(|k| k.time_secs).collect();
+                let raw_times: Vec<f32> = ch.keyframes.iter().map(|k| k.time_secs).collect();
+                let raw_interps: Vec<tessel_core::KeyframeInterpolation> =
+                    ch.keyframes.iter().map(|k| k.interpolation).collect();
+                let is_cubic = ch.keyframes.len() >= 2
+                    && raw_interps.iter().copied().any(is_cubic_interpolation);
+                let has_mixed_step =
+                    is_cubic && raw_interps.contains(&tessel_core::KeyframeInterpolation::Step);
+                let (times, interps, kf_indices): (
+                    Vec<f32>,
+                    Vec<tessel_core::KeyframeInterpolation>,
+                    Vec<usize>,
+                ) = if has_mixed_step {
+                    let idx_list: Vec<usize> = (0..ch.keyframes.len()).collect();
+                    expand_mixed_step_keyframes(&raw_times, &raw_interps, &idx_list)
+                } else {
+                    (raw_times, raw_interps, (0..ch.keyframes.len()).collect())
+                };
                 let min_t = times.iter().copied().fold(f32::INFINITY, f32::min);
                 let max_t = times.iter().copied().fold(f32::NEG_INFINITY, f32::max);
 
@@ -615,19 +778,11 @@ pub fn export_glb_bytes(
                     "max": [max_t]
                 }));
 
-                let is_cubic = ch.keyframes.len() >= 2
-                    && ch.keyframes.iter().any(|k| {
-                        matches!(
-                            k.interpolation,
-                            tessel_core::KeyframeInterpolation::CubicBezier { .. }
-                        )
-                    });
                 let interp_mode = if is_cubic {
                     "CUBICSPLINE"
-                } else if ch
-                    .keyframes
+                } else if interps
                     .iter()
-                    .all(|k| k.interpolation == tessel_core::KeyframeInterpolation::Step)
+                    .all(|&i| i == tessel_core::KeyframeInterpolation::Step)
                 {
                     "STEP"
                 } else {
@@ -638,19 +793,15 @@ pub fn export_glb_bytes(
                 let rest_r = rest
                     .map(|b| b.rest_local.rotation)
                     .unwrap_or(glam::Quat::IDENTITY);
+                let raw_rots: Vec<[f32; 4]> = kf_indices
+                    .iter()
+                    .map(|&idx| (rest_r * ch.keyframes[idx].rotation).normalize().to_array())
+                    .collect();
                 let rots: Vec<[f32; 4]> = if is_cubic {
-                    let mut packed = Vec::with_capacity(ch.keyframes.len() * 3);
-                    for k in &ch.keyframes {
-                        packed.push([0.0, 0.0, 0.0, 0.0]);
-                        packed.push((rest_r * k.rotation).normalize().to_array());
-                        packed.push([0.0, 0.0, 0.0, 0.0]);
-                    }
-                    packed
+                    let aligned = align_quat_hemispheres(raw_rots);
+                    pack_cubicspline(&times, &interps, &aligned)
                 } else {
-                    ch.keyframes
-                        .iter()
-                        .map(|k| (rest_r * k.rotation).normalize().to_array())
-                        .collect()
+                    raw_rots
                 };
                 let rot_bv = push_view(
                     &mut bin,
@@ -684,19 +835,14 @@ pub fn export_glb_bytes(
                 let rest = rig.bones.iter().find(|b| b.id == ch.bone_id);
                 let rest_t = rest.map(|b| b.rest_local.translation).unwrap_or(Vec3::ZERO);
                 if ch.keyframes.iter().any(|k| k.translation != Vec3::ZERO) {
+                    let raw_trans: Vec<[f32; 3]> = kf_indices
+                        .iter()
+                        .map(|&idx| ((rest_t + ch.keyframes[idx].translation) * scale).to_array())
+                        .collect();
                     let trans: Vec<[f32; 3]> = if is_cubic {
-                        let mut packed = Vec::with_capacity(ch.keyframes.len() * 3);
-                        for k in &ch.keyframes {
-                            packed.push([0.0, 0.0, 0.0]);
-                            packed.push(((rest_t + k.translation) * scale).to_array());
-                            packed.push([0.0, 0.0, 0.0]);
-                        }
-                        packed
+                        pack_cubicspline(&times, &interps, &raw_trans)
                     } else {
-                        ch.keyframes
-                            .iter()
-                            .map(|k| ((rest_t + k.translation) * scale).to_array())
-                            .collect()
+                        raw_trans
                     };
                     let trans_bv = push_view(
                         &mut bin,
@@ -1044,7 +1190,28 @@ pub fn export_glb_bytes(
                     .get(&nt_track.node)
                     .map(|n| n.transform)
                     .unwrap_or_default();
-                let times: Vec<f32> = nt_track.keyframes.iter().map(|k| k.time_secs).collect();
+                let raw_nt_times: Vec<f32> =
+                    nt_track.keyframes.iter().map(|k| k.time_secs).collect();
+                let raw_nt_interps: Vec<tessel_core::KeyframeInterpolation> =
+                    nt_track.keyframes.iter().map(|k| k.interpolation).collect();
+                let is_nt_cubic = nt_track.keyframes.len() >= 2
+                    && raw_nt_interps.iter().copied().any(is_cubic_interpolation);
+                let has_nt_mixed_step = is_nt_cubic
+                    && raw_nt_interps.contains(&tessel_core::KeyframeInterpolation::Step);
+                let (times, nt_interps, nt_indices): (
+                    Vec<f32>,
+                    Vec<tessel_core::KeyframeInterpolation>,
+                    Vec<usize>,
+                ) = if has_nt_mixed_step {
+                    let idx_list: Vec<usize> = (0..nt_track.keyframes.len()).collect();
+                    expand_mixed_step_keyframes(&raw_nt_times, &raw_nt_interps, &idx_list)
+                } else {
+                    (
+                        raw_nt_times,
+                        raw_nt_interps,
+                        (0..nt_track.keyframes.len()).collect(),
+                    )
+                };
                 let min_t = times.iter().copied().fold(f32::INFINITY, f32::min);
                 let max_t = times.iter().copied().fold(f32::NEG_INFINITY, f32::max);
                 let time_bv = push_view(
@@ -1062,39 +1229,28 @@ pub fn export_glb_bytes(
                     "min": [min_t],
                     "max": [max_t]
                 }));
-                let is_nt_cubic = nt_track.keyframes.len() >= 2
-                    && nt_track.keyframes.iter().any(|k| {
-                        matches!(
-                            k.interpolation,
-                            tessel_core::KeyframeInterpolation::CubicBezier { .. }
-                        )
-                    });
                 let interp_mode = if is_nt_cubic {
                     "CUBICSPLINE"
-                } else if nt_track
-                    .keyframes
+                } else if nt_interps
                     .iter()
-                    .all(|k| k.interpolation == tessel_core::KeyframeInterpolation::Step)
+                    .all(|&i| i == tessel_core::KeyframeInterpolation::Step)
                 {
                     "STEP"
                 } else {
                     "LINEAR"
                 };
 
+                let raw_trans: Vec<[f32; 3]> = nt_indices
+                    .iter()
+                    .map(|&idx| {
+                        ((base_tr.translation + nt_track.keyframes[idx].translation) * scale)
+                            .to_array()
+                    })
+                    .collect();
                 let trans_out: Vec<[f32; 3]> = if is_nt_cubic {
-                    let mut packed = Vec::with_capacity(nt_track.keyframes.len() * 3);
-                    for k in &nt_track.keyframes {
-                        packed.push([0.0, 0.0, 0.0]);
-                        packed.push(((base_tr.translation + k.translation) * scale).to_array());
-                        packed.push([0.0, 0.0, 0.0]);
-                    }
-                    packed
+                    pack_cubicspline(&times, &nt_interps, &raw_trans)
                 } else {
-                    nt_track
-                        .keyframes
-                        .iter()
-                        .map(|k| ((base_tr.translation + k.translation) * scale).to_array())
-                        .collect()
+                    raw_trans
                 };
                 let t_bv = push_view(
                     &mut bin,
@@ -1120,20 +1276,19 @@ pub fn export_glb_bytes(
                     "target": { "node": target_gltf_node, "path": "translation" }
                 }));
 
+                let raw_rots: Vec<[f32; 4]> = nt_indices
+                    .iter()
+                    .map(|&idx| {
+                        (base_tr.rotation * nt_track.keyframes[idx].rotation)
+                            .normalize()
+                            .to_array()
+                    })
+                    .collect();
                 let rot_out: Vec<[f32; 4]> = if is_nt_cubic {
-                    let mut packed = Vec::with_capacity(nt_track.keyframes.len() * 3);
-                    for k in &nt_track.keyframes {
-                        packed.push([0.0, 0.0, 0.0, 0.0]);
-                        packed.push((base_tr.rotation * k.rotation).normalize().to_array());
-                        packed.push([0.0, 0.0, 0.0, 0.0]);
-                    }
-                    packed
+                    let aligned = align_quat_hemispheres(raw_rots);
+                    pack_cubicspline(&times, &nt_interps, &aligned)
                 } else {
-                    nt_track
-                        .keyframes
-                        .iter()
-                        .map(|k| (base_tr.rotation * k.rotation).normalize().to_array())
-                        .collect()
+                    raw_rots
                 };
                 let r_bv = push_view(
                     &mut bin,
@@ -1159,20 +1314,14 @@ pub fn export_glb_bytes(
                     "target": { "node": target_gltf_node, "path": "rotation" }
                 }));
 
+                let raw_scales: Vec<[f32; 3]> = nt_indices
+                    .iter()
+                    .map(|&idx| (base_tr.scale * nt_track.keyframes[idx].scale).to_array())
+                    .collect();
                 let scale_out: Vec<[f32; 3]> = if is_nt_cubic {
-                    let mut packed = Vec::with_capacity(nt_track.keyframes.len() * 3);
-                    for k in &nt_track.keyframes {
-                        packed.push([0.0, 0.0, 0.0]);
-                        packed.push((base_tr.scale * k.scale).to_array());
-                        packed.push([0.0, 0.0, 0.0]);
-                    }
-                    packed
+                    pack_cubicspline(&times, &nt_interps, &raw_scales)
                 } else {
-                    nt_track
-                        .keyframes
-                        .iter()
-                        .map(|k| (base_tr.scale * k.scale).to_array())
-                        .collect()
+                    raw_scales
                 };
                 let s_bv = push_view(
                     &mut bin,
@@ -1284,18 +1433,27 @@ pub fn export_glb_bytes(
     }
     let mut morphed: Vec<(tessel_core::NodeId, Value, Vec<f64>)> = Vec::new();
     for (node_id, lp_mesh) in &scene.lowpoly_meshes {
-        let visible = scene.nodes.get(node_id).map(|n| n.visible).unwrap_or(true);
         let is_local_trs_node =
             node_trs_animated.contains(node_id) || has_group_ancestor(scene, *node_id);
-        let has_custom = lp_mesh.texture.is_some()
+        let is_morphed = is_morphed_export_node(
+            scene,
+            *node_id,
+            lp_mesh,
+            &vis_animated_nodes,
+            &node_trs_animated,
+        );
+        let has_custom_material = lp_mesh.texture.is_some()
             || lp_mesh.normal_map.is_some()
             || lp_mesh.ao_map.is_some()
             || !lp_mesh.vertex_colors.is_empty()
-            || lp_mesh.material != tessel_core::MeshMaterial::default()
-            || !lp_mesh.morphs.is_empty()
-            || vis_animated_nodes.contains(node_id)
-            || is_local_trs_node;
-        if !visible || lp_mesh.faces.is_empty() || !has_custom {
+            || lp_mesh.material != tessel_core::MeshMaterial::default();
+        // Same gate as `morphed_order` above: hidden nodes still export when a
+        // visibility track animates them, via `is_morphed`.
+        if !(scene.nodes.get(node_id).map(|n| n.visible).unwrap_or(true)
+            || vis_animated_nodes.contains(node_id))
+            || lp_mesh.faces.is_empty()
+            || (!has_custom_material && !is_morphed)
+        {
             continue;
         }
         let (node_mat, normal_mat) = if is_local_trs_node {
@@ -1609,8 +1767,29 @@ pub fn export_glb_bytes(
                     "bufferView": d_bv, "componentType": 5126, "count": deltas.len(),
                     "type": "VEC3"
                 }));
-                targets.push(json!({ "POSITION": d_acc }));
-                morph_weights.push(0.0);
+                let mut target_obj = json!({ "POSITION": d_acc });
+                if !morph.normal_deltas.is_empty() {
+                    let mut n_deltas = vec![[0.0f32; 3]; tri.vertices.len()];
+                    for (corner, src) in tri.source_indices.iter().enumerate() {
+                        if let Some(nd) = morph.normal_deltas.get(src) {
+                            n_deltas[corner] = nd.to_array();
+                        }
+                    }
+                    let nd_bv = push_view(
+                        &mut bin,
+                        &mut buffer_views,
+                        bytemuck::cast_slice(&n_deltas),
+                        Some(34962),
+                    );
+                    let nd_acc = accessors.len();
+                    accessors.push(json!({
+                        "bufferView": nd_bv, "componentType": 5126, "count": n_deltas.len(),
+                        "type": "VEC3"
+                    }));
+                    target_obj["NORMAL"] = json!(nd_acc);
+                }
+                targets.push(target_obj);
+                morph_weights.push(morph.default_weight.clamp(0.0, 1.0) as f64);
             }
             // Targets are siblings of "attributes", not entries: morph
             // target dictionaries map attribute -> accessor index.
@@ -2316,6 +2495,77 @@ mod tests {
     }
 
     #[test]
+    fn glb_export_hidden_visibility_animated_node_matches_morphed_order() {
+        let mut scene = SceneState::new();
+        Command::CreatePrimitiveMesh {
+            name: "HiddenFlash".into(),
+            kind: PrimitiveKind::Cube,
+            size: 1.0,
+            material: PaletteIndex::new(1).unwrap(),
+        }
+        .apply(&mut scene)
+        .unwrap();
+        let flash_id = scene.active_lowpoly_node().unwrap();
+        Command::ApplyHumanoidRig.apply(&mut scene).unwrap();
+        // Hide the node *before* export: it must still export a dedicated node
+        // because a visibility track animates it (morphed_order includes it).
+        Command::SetNodeVisibility {
+            node_id: flash_id,
+            visible: false,
+        }
+        .apply(&mut scene)
+        .unwrap();
+        Command::SetVisibilityKeyframe {
+            clip_index: 0,
+            node_id: flash_id,
+            time_secs: 0.0,
+            visible: false,
+        }
+        .apply(&mut scene)
+        .unwrap();
+        Command::SetVisibilityKeyframe {
+            clip_index: 0,
+            node_id: flash_id,
+            time_secs: 0.25,
+            visible: true,
+        }
+        .apply(&mut scene)
+        .unwrap();
+        // A second, visible morphed node keeps `morphed` non-empty so the
+        // order mismatch surfaces as the assert panic (not EmptyCanvas).
+        Command::CreatePrimitiveMesh {
+            name: "Smiler".into(),
+            kind: PrimitiveKind::Cube,
+            size: 1.0,
+            material: PaletteIndex::new(1).unwrap(),
+        }
+        .apply(&mut scene)
+        .unwrap();
+        let smiler_id = scene.active_lowpoly_node().unwrap();
+        Command::AddMorphDelta {
+            node_id: smiler_id,
+            name: "Smile".into(),
+            vertex_ids: vec![0],
+            delta: Vec3::new(0.0, 0.5, 0.0),
+        }
+        .apply(&mut scene)
+        .unwrap();
+
+        // Pre-fix this panicked on the morphed/morphed_order debug_assert!.
+        let (glb, _) = export_glb_bytes(&scene, ExportPreset::Godot4).unwrap();
+        let parsed = gltf::Gltf::from_slice(&glb).unwrap();
+        assert!(parsed.meshes().len() >= 2);
+        let idle = parsed.animations().next().expect("Idle clip must export");
+        assert!(
+            idle.channels().any(|c| {
+                c.target().property() == gltf::animation::Property::Scale
+                    && c.sampler().interpolation() == gltf::animation::Interpolation::Step
+            }),
+            "hidden visibility-animated node must keep its STEP scale channel"
+        );
+    }
+
+    #[test]
     fn glb_export_writes_npr_color0_alpha_unlit_and_cubicspline() {
         let mut scene = SceneState::new();
         Command::CreatePrimitiveMesh {
@@ -2451,5 +2701,460 @@ mod tests {
         assert!(walk
             .channels()
             .all(|c| c.sampler().interpolation() == gltf::animation::Interpolation::Step));
+    }
+
+    #[test]
+    fn gltf_easing_interpolations_export_as_cubicspline_with_tangents() {
+        let mut scene = SceneState::new();
+        Command::CreatePrimitiveMesh {
+            name: "RigMesh".into(),
+            kind: PrimitiveKind::Cube,
+            size: 0.5,
+            material: PaletteIndex::new(1).unwrap(),
+        }
+        .apply(&mut scene)
+        .unwrap();
+        Command::ApplyBipedRig.apply(&mut scene).unwrap();
+        let bone = tessel_core::BoneId(1);
+        for (clip_idx, interp) in [
+            (0usize, tessel_core::KeyframeInterpolation::EaseIn),
+            (1usize, tessel_core::KeyframeInterpolation::EaseOut),
+        ] {
+            Command::SetAnimationKeyframe {
+                clip_index: clip_idx,
+                bone_id: bone,
+                keyframe: tessel_core::Keyframe {
+                    time_secs: 0.0,
+                    translation: Vec3::ZERO,
+                    rotation: glam::Quat::IDENTITY,
+                    scale: Vec3::ONE,
+                    interpolation: interp,
+                },
+            }
+            .apply(&mut scene)
+            .unwrap();
+            Command::SetAnimationKeyframe {
+                clip_index: clip_idx,
+                bone_id: bone,
+                keyframe: tessel_core::Keyframe {
+                    time_secs: 1.0,
+                    translation: Vec3::new(0.0, 1.0, 0.0),
+                    rotation: glam::Quat::from_rotation_x(0.5),
+                    scale: Vec3::ONE,
+                    interpolation: tessel_core::KeyframeInterpolation::EaseInOut,
+                },
+            }
+            .apply(&mut scene)
+            .unwrap();
+        }
+
+        let (glb, _) = export_glb_bytes(&scene, ExportPreset::Godot4).unwrap();
+        let parsed = gltf::Gltf::from_slice(&glb).unwrap();
+        let mut cubic_count = 0usize;
+        for anim in parsed.animations() {
+            for ch in anim.channels() {
+                let sampler = ch.sampler();
+                if sampler.interpolation() == gltf::animation::Interpolation::CubicSpline {
+                    assert_eq!(sampler.output().count(), sampler.input().count() * 3);
+                    cubic_count += 1;
+                }
+            }
+        }
+        assert!(
+            cubic_count >= 4,
+            "EaseIn/EaseOut/EaseInOut channels must export as CUBICSPLINE (got {cubic_count})"
+        );
+
+        // Verify exact Hermite tangents for EaseIn (0, 2) and EaseOut (2, 0) on [0 -> 1] over dt=1.0
+        let packed_in = pack_cubicspline(
+            &[0.0, 1.0],
+            &[
+                tessel_core::KeyframeInterpolation::EaseIn,
+                tessel_core::KeyframeInterpolation::EaseIn,
+            ],
+            &[[0.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
+        );
+        assert!((packed_in[2][1] - 0.0).abs() < 1e-6); // out-tangent at k=0 is 0
+        assert!((packed_in[3][1] - 2.0).abs() < 1e-6); // in-tangent at k=1 is 2*delta/dt = 2
+
+        let packed_out = pack_cubicspline(
+            &[0.0, 1.0],
+            &[
+                tessel_core::KeyframeInterpolation::EaseOut,
+                tessel_core::KeyframeInterpolation::EaseOut,
+            ],
+            &[[0.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
+        );
+        assert!((packed_out[2][1] - 2.0).abs() < 1e-6); // out-tangent at k=0 is 2*delta/dt = 2
+        assert!((packed_out[3][1] - 0.0).abs() < 1e-6); // in-tangent at k=1 is 0
+
+        // Mixed Step + EaseInOut expands Step segment with a hold keyframe at t_next - 1e-4
+        let (exp_t, _, exp_v) = expand_mixed_step_keyframes(
+            &[0.0, 0.5, 1.0],
+            &[
+                tessel_core::KeyframeInterpolation::Step,
+                tessel_core::KeyframeInterpolation::EaseInOut,
+                tessel_core::KeyframeInterpolation::EaseInOut,
+            ],
+            &[0.0f32, 1.0, 2.0],
+        );
+        assert_eq!(exp_t.len(), 4);
+        assert!((exp_t[1] - (0.5 - 1e-4)).abs() < 1e-6);
+        assert!((exp_v[1] - 0.0).abs() < 1e-6);
+
+        // NodeTransformTrack easing also exports as CUBICSPLINE
+        let node_id = scene.active_lowpoly_node().unwrap();
+        if let Some(rig) = scene.character_rig.as_mut() {
+            rig.animations[0]
+                .node_transform_tracks
+                .push(tessel_core::NodeTransformTrack {
+                    node: node_id,
+                    keyframes: vec![
+                        tessel_core::Keyframe {
+                            time_secs: 0.0,
+                            translation: Vec3::ZERO,
+                            rotation: glam::Quat::IDENTITY,
+                            scale: Vec3::ONE,
+                            interpolation: tessel_core::KeyframeInterpolation::Step,
+                        },
+                        tessel_core::Keyframe {
+                            time_secs: 0.5,
+                            translation: Vec3::new(0.0, 1.0, 0.0),
+                            rotation: glam::Quat::IDENTITY,
+                            scale: Vec3::ONE,
+                            interpolation: tessel_core::KeyframeInterpolation::EaseInOut,
+                        },
+                        tessel_core::Keyframe {
+                            time_secs: 1.0,
+                            translation: Vec3::new(0.0, 2.0, 0.0),
+                            rotation: glam::Quat::IDENTITY,
+                            scale: Vec3::ONE,
+                            interpolation: tessel_core::KeyframeInterpolation::EaseInOut,
+                        },
+                    ],
+                });
+        }
+        let (glb2, _) = export_glb_bytes(&scene, ExportPreset::Godot4).unwrap();
+        let parsed2 = gltf::Gltf::from_slice(&glb2).unwrap();
+        let idle = parsed2.animations().next().unwrap();
+        let has_expanded_nt_cubic = idle.channels().any(|c| {
+            let s = c.sampler();
+            s.interpolation() == gltf::animation::Interpolation::CubicSpline
+                && s.input().count() == 4
+                && s.output().count() == 12
+        });
+        assert!(
+            has_expanded_nt_cubic,
+            "mixed Step+EaseInOut NodeTransformTrack must export as expanded CUBICSPLINE"
+        );
+    }
+
+    #[test]
+    fn v5_4_bone_grid_morph_normals_cage_ribbon_and_stick_gizmo_export_roundtrip() {
+        let mut scene = SceneState::new();
+        let mut history = tessel_core::HistoryStack::new();
+
+        history
+            .execute(
+                &mut scene,
+                Command::CreatePrimitiveMesh {
+                    name: "CapeMesh".to_string(),
+                    kind: PrimitiveKind::Cube,
+                    size: 1.0,
+                    material: PaletteIndex::new(1).unwrap(),
+                },
+            )
+            .unwrap();
+        let cape_id = scene.active_lowpoly_node().unwrap();
+
+        // 1. Bone Grid + Cloth Wind Bake
+        history
+            .execute(
+                &mut scene,
+                Command::CreateBoneGrid {
+                    spec: tessel_core::BoneGridSpec {
+                        prefix: "Cape".to_string(),
+                        cols: 3,
+                        rows: 3,
+                        ..Default::default()
+                    },
+                    bind_node: Some(cape_id),
+                },
+            )
+            .unwrap();
+        history
+            .execute(
+                &mut scene,
+                Command::BakeClothGridAnimation {
+                    bone_prefix: "Cape".to_string(),
+                    params: tessel_core::ClothWindParams {
+                        clip_name: "CapeWind".to_string(),
+                        duration_secs: 1.0,
+                        fps: 6.0,
+                        ..Default::default()
+                    },
+                },
+            )
+            .unwrap();
+
+        // 2. Proxy Cage baked into MorphTarget (with position + normal deltas) + default weight
+        history
+            .execute(
+                &mut scene,
+                Command::ApplyProxyCageDeform {
+                    node_id: cape_id,
+                    divisions: [2, 2, 2],
+                    control_deltas: vec![
+                        (0, Vec3::new(0.0, -0.3, 0.2)),
+                        (7, Vec3::new(0.2, 0.3, 0.0)),
+                    ],
+                    floor_y: Some(-0.5),
+                    bake_as_morph: Some("CageFlutter".to_string()),
+                },
+            )
+            .unwrap();
+        history
+            .execute(
+                &mut scene,
+                Command::SetMorphDefaultWeight {
+                    node_id: cape_id,
+                    name: "CageFlutter".to_string(),
+                    weight: 0.45,
+                },
+            )
+            .unwrap();
+
+        // 3. Procedural Ribbon with STEP visibility track
+        history
+            .execute(
+                &mut scene,
+                Command::BakeProceduralRibbon {
+                    params: tessel_core::RibbonParams {
+                        name: "SwordTrail".to_string(),
+                        source_bone: Some(tessel_core::BoneId(2)),
+                        source_node: None,
+                        explicit_points: Vec::new(),
+                        clip_index: 0,
+                        start_time: 0.1,
+                        end_time: 0.9,
+                        samples: 8,
+                        width_start: 0.15,
+                        width_end: 0.02,
+                        material: PaletteIndex::new(2).unwrap(),
+                        bake_visibility_track: true,
+                    },
+                },
+            )
+            .unwrap();
+
+        // 4. Stick Gizmo Twist + Undo/Redo
+        let prev_rot = scene.character_rig.as_ref().unwrap().bones[0]
+            .pose_local
+            .rotation;
+        history
+            .execute(
+                &mut scene,
+                Command::ApplyStickGizmoPose {
+                    params: tessel_core::StickGizmoParams {
+                        bone_id: tessel_core::BoneId(0),
+                        mode: tessel_core::StickGizmoMode::Twist,
+                        angle_deg: 45.0,
+                        chain_len: 3,
+                        snap_deg: 15.0,
+                        mirror_lr: false,
+                        axis_lock: None,
+                    },
+                },
+            )
+            .unwrap();
+        assert_ne!(
+            scene.character_rig.as_ref().unwrap().bones[0]
+                .pose_local
+                .rotation,
+            prev_rot
+        );
+        history.undo(&mut scene).unwrap();
+        assert_eq!(
+            scene.character_rig.as_ref().unwrap().bones[0]
+                .pose_local
+                .rotation,
+            prev_rot
+        );
+        history.redo(&mut scene).unwrap();
+
+        // 5. Round-trip .tessel archive & glTF 2.0 .glb validation
+        let archive = crate::encode_tessel_project(&scene).unwrap();
+        let decoded = crate::decode_tessel_project(&archive).unwrap();
+        assert_eq!(
+            decoded.lowpoly_meshes[&cape_id].morphs[0].name,
+            "CageFlutter"
+        );
+        assert!((decoded.lowpoly_meshes[&cape_id].morphs[0].default_weight - 0.45).abs() < 1e-4);
+
+        let (glb, _) = export_glb_bytes(&decoded, ExportPreset::Godot4).unwrap();
+        let parsed = gltf::Gltf::from_slice(&glb).unwrap();
+        assert!(parsed.skins().count() >= 1);
+        assert!(parsed.animations().count() >= 1);
+        let morphed_mesh = parsed
+            .meshes()
+            .find(|m| m.weights().is_some_and(|w| !w.is_empty()))
+            .expect("morphed mesh with weights must export");
+        assert!((morphed_mesh.weights().unwrap()[0] - 0.45).abs() < 1e-4);
+        let prim = morphed_mesh.primitives().next().unwrap();
+        let target = prim.morph_targets().next().unwrap();
+        assert!(target.positions().is_some());
+        assert!(target.normals().is_some());
+
+        // 6. Verify GLB re-import preserves normal_deltas and default_weight
+        let reimported = crate::import_glb_bytes(&glb, PaletteIndex::new(1).unwrap()).unwrap();
+        assert!(!reimported.morphs.is_empty());
+        assert!(!reimported.morphs[0].normal_deltas.is_empty());
+        assert!((reimported.morphs[0].default_weight - 0.45).abs() < 1e-4);
+
+        // 7. Verify SetMorphDefaultWeight undo also clears rig.morph_weights cache
+        history
+            .execute(
+                &mut scene,
+                Command::SetMorphDefaultWeight {
+                    node_id: cape_id,
+                    name: "CageFlutter".to_string(),
+                    weight: 0.9,
+                },
+            )
+            .unwrap();
+        assert!(
+            (scene.character_rig.as_ref().unwrap().morph_weights
+                [&(cape_id, "CageFlutter".to_string())]
+                - 0.9)
+                .abs()
+                < 1e-4
+        );
+        history.undo(&mut scene).unwrap();
+        assert!(
+            (scene.character_rig.as_ref().unwrap().morph_weights
+                [&(cape_id, "CageFlutter".to_string())]
+                - 0.45)
+                .abs()
+                < 1e-4
+        );
+    }
+
+    #[test]
+    fn e5_gltf_spec_invariants_and_deep_group_hierarchy_beyond_16_levels() {
+        let mut scene = SceneState::new();
+        let mut history = tessel_core::HistoryStack::default();
+
+        // Build an 18-level nested Group hierarchy (g0 -> g1 -> ... -> g17) via CreateGroupNode
+        let mut groups: Vec<tessel_core::NodeId> = Vec::with_capacity(18);
+        let mut prev_group: Option<tessel_core::NodeId> = None;
+        for depth in 0..18 {
+            history
+                .execute(
+                    &mut scene,
+                    Command::CreateGroupNode {
+                        name: format!("Group_{depth}"),
+                        transform: tessel_core::Transform::default(),
+                        parent: prev_group,
+                    },
+                )
+                .unwrap();
+            let gid = scene.selected_node.expect("group created");
+            groups.push(gid);
+            prev_group = Some(gid);
+        }
+
+        history
+            .execute(
+                &mut scene,
+                Command::CreatePrimitiveMesh {
+                    name: "DeepCube".into(),
+                    kind: tessel_core::PrimitiveKind::Cube,
+                    size: 1.0,
+                    material: PaletteIndex::DEFAULT_ACTIVE,
+                },
+            )
+            .unwrap();
+        let mesh_id = scene.selected_node.unwrap();
+
+        // SetNodeParent enforces the 16-hop cycle/depth cap (depth 18 fails closed with OutOfBounds).
+        assert!(matches!(
+            history.execute(
+                &mut scene,
+                Command::SetNodeParent {
+                    node_id: mesh_id,
+                    parent: Some(groups[17]),
+                },
+            ),
+            Err(tessel_core::CoreError::OutOfBounds)
+        ));
+
+        // Parenting within the 16-hop cap (Group_14, 15 ancestors) succeeds.
+        history
+            .execute(
+                &mut scene,
+                Command::SetNodeParent {
+                    node_id: mesh_id,
+                    parent: Some(groups[14]),
+                },
+            )
+            .unwrap();
+
+        assert!(has_group_ancestor(&scene, mesh_id));
+
+        let (glb, _) = export_glb_bytes(&scene, ExportPreset::Godot4).unwrap();
+
+        // Full gltf crate document + GLB binary buffer + accessor/node validation
+        let parsed = gltf::Gltf::from_slice(&glb).unwrap();
+        let doc = &parsed.document;
+        assert_eq!(doc.as_json().asset.version, "2.0");
+        let bin_len = parsed.blob.as_ref().map_or(0, |b| b.len());
+        for bv in doc.views() {
+            assert!(bv.offset() + bv.length() <= bin_len);
+        }
+        for acc in doc.accessors() {
+            if let Some(bv) = acc.view() {
+                assert!(acc.offset() + acc.count() * acc.size() <= bv.length());
+            }
+        }
+
+        // Verify all 18 group nodes are present and linked in parent -> child chain via GLB JSON
+        let json_len = u32::from_le_bytes(glb[12..16].try_into().unwrap()) as usize;
+        let raw_json: Value = serde_json::from_slice(&glb[20..20 + json_len]).unwrap();
+        let json_nodes = raw_json["nodes"].as_array().unwrap();
+        let group_count = json_nodes
+            .iter()
+            .filter(|n| n["name"].as_str().is_some_and(|s| s.starts_with("Group_")))
+            .count();
+        assert_eq!(group_count, 18);
+
+        let mut curr_idx = json_nodes
+            .iter()
+            .position(|n| n["name"].as_str() == Some("Group_0"))
+            .expect("Group_0 root node");
+        let mut group14_idx = None;
+        for expected_depth in 1..18 {
+            let expected_name = format!("Group_{expected_depth}");
+            let children = json_nodes[curr_idx]["children"]
+                .as_array()
+                .expect("expected nested group children");
+            curr_idx = children
+                .iter()
+                .filter_map(|v| v.as_u64().map(|u| u as usize))
+                .find(|&i| json_nodes[i]["name"].as_str() == Some(expected_name.as_str()))
+                .expect("expected nested group child");
+            if expected_depth == 14 {
+                group14_idx = Some(curr_idx);
+            }
+        }
+        let g14 = group14_idx.expect("Group_14 node index");
+        assert!(
+            json_nodes[g14]["children"]
+                .as_array()
+                .is_some_and(|cs| cs.iter().any(|v| {
+                    v.as_u64()
+                        .is_some_and(|i| json_nodes[i as usize]["mesh"].is_u64())
+                })),
+            "Group_14 should parent the exported mesh node"
+        );
     }
 }

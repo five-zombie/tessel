@@ -3,9 +3,10 @@ use std::path::Path;
 use serde_json::{json, Value};
 use tessel_core::voxel::ops as voxel_ops;
 use tessel_core::{
-    bake_mesh_maps, generate_smart_material_texture, AppMode, BakeMapKind, BakeParams, BoneId,
-    Command, FrameIndex, HistoryStack, Keyframe, LayerId, NodeId, PaletteEntry, PaletteIndex,
-    PixelCoord, PixelEdit, PrimitiveKind, Rgba8, SceneState, SmartMaterialParams, VoxelCoord,
+    apply_primitive_anchor, bake_mesh_maps, generate_smart_material_texture, AppMode, BakeMapKind,
+    BakeParams, BoneId, Command, FrameIndex, HistoryStack, Keyframe, LayerId, NodeId, PaletteEntry,
+    PaletteIndex, PixelCoord, PixelEdit, PrimitiveAnchor, PrimitiveKind, Rgba8, SceneState,
+    SmartMaterialParams, VoxelCoord,
 };
 use tessel_io::{
     export_mesh_texture_png_bytes, export_scene_to_dir, export_sprite_sheet_bytes,
@@ -17,6 +18,25 @@ use crate::error::AiError;
 
 const MAX_COORD_ABS: i32 = 256;
 const MAX_BATCH_VOXELS: usize = 50_000;
+
+/// Returns a canonical (or absolute fallback) display string for the sandboxed export directory.
+pub(crate) fn canonical_export_dir_string(allowed_export_dir: &Path) -> String {
+    std::fs::canonicalize(allowed_export_dir)
+        .or_else(|_| std::path::absolute(allowed_export_dir))
+        .unwrap_or_else(|_| allowed_export_dir.to_path_buf())
+        .display()
+        .to_string()
+}
+
+fn parse_opt_bool(args: &Value, field: &str) -> Result<bool, AiError> {
+    match args.get(field) {
+        None => Ok(false),
+        Some(Value::Bool(b)) => Ok(*b),
+        Some(_) => Err(AiError::InvalidArguments(format!(
+            "'{field}' must be a boolean"
+        ))),
+    }
+}
 
 fn check_coord(c: VoxelCoord) -> Result<(), AiError> {
     if c.x.abs() > MAX_COORD_ABS || c.y.abs() > MAX_COORD_ABS || c.z.abs() > MAX_COORD_ABS {
@@ -508,6 +528,7 @@ pub fn execute_tool_call(
         }
         "scene_inspect" | "scene_list_nodes" => Ok(json!({
             "ok": true,
+            "export_dir": canonical_export_dir_string(allowed_export_dir),
             "scene": scene_summary_json(scene),
             "palette": palette_summary_json(scene)["colors"]
         })),
@@ -960,6 +981,53 @@ pub fn execute_tool_call(
             }
             if let Some(sc) = parse_opt_vec3(args, "scale")? {
                 transform.scale = sc;
+            }
+            let dry_run = parse_opt_bool(args, "dry_run")?;
+            if dry_run {
+                let parent_mat = scene
+                    .nodes
+                    .get(&node_id)
+                    .and_then(|n| n.parent)
+                    .map(|pid| scene.node_world_matrix(pid))
+                    .unwrap_or(glam::Mat4::IDENTITY);
+                let local_mat = glam::Mat4::from_scale_rotation_translation(
+                    transform.scale,
+                    transform.rotation,
+                    transform.translation,
+                );
+                let world_mat = parent_mat * local_mat;
+                let world_pos = world_mat.transform_point3(glam::Vec3::ZERO);
+                let world_up = world_mat
+                    .transform_vector3(glam::Vec3::Y)
+                    .normalize_or_zero();
+                let world_fwd = world_mat
+                    .transform_vector3(glam::Vec3::Z)
+                    .normalize_or_zero();
+                let world_bounds = scene.lowpoly_meshes.get(&node_id).and_then(|m| {
+                    if m.vertices.is_empty() {
+                        return None;
+                    }
+                    let mut bmin = glam::Vec3::splat(f32::INFINITY);
+                    let mut bmax = glam::Vec3::splat(f32::NEG_INFINITY);
+                    for &v in &m.vertices {
+                        let wv = world_mat.transform_point3(v);
+                        bmin = bmin.min(wv);
+                        bmax = bmax.max(wv);
+                    }
+                    (bmin.is_finite() && bmax.is_finite())
+                        .then(|| json!({ "min": bmin.to_array(), "max": bmax.to_array() }))
+                });
+                return Ok(json!({
+                    "ok": true,
+                    "dry_run": true,
+                    "node_id": node_id.0,
+                    "position": transform.translation.to_array(),
+                    "scale": transform.scale.to_array(),
+                    "world_position": world_pos.to_array(),
+                    "world_up_dir": world_up.to_array(),
+                    "world_forward_dir": world_fwd.to_array(),
+                    "world_bounds": world_bounds
+                }));
             }
             history.execute(scene, Command::SetNodeTransform { node_id, transform })?;
             Ok(json!({
@@ -1919,6 +1987,24 @@ pub fn execute_tool_call(
                 None
             };
             let sc = parse_opt_vec3(args, "scale")?;
+            let anchor = match args.get("anchor") {
+                None => PrimitiveAnchor::Bottom,
+                Some(Value::String(s)) => match s.as_str() {
+                    "bottom" => PrimitiveAnchor::Bottom,
+                    "center" => PrimitiveAnchor::Center,
+                    "top" => PrimitiveAnchor::Top,
+                    other => {
+                        return Err(AiError::InvalidArguments(format!(
+                            "unknown anchor '{other}' (expected 'bottom', 'center', or 'top')"
+                        )));
+                    }
+                },
+                Some(_) => {
+                    return Err(AiError::InvalidArguments(
+                        "'anchor' must be a string ('bottom', 'center', or 'top')".into(),
+                    ));
+                }
+            };
             let min_s = tessel_core::mesh::ops::MIN_PRIMITIVE_SIZE;
             let (actual_size_json, clamped) = if let Some(v) = size_vec_scale {
                 let actual_v = glam::Vec3::new(v.x.max(min_s), v.y.max(min_s), v.z.max(min_s));
@@ -1926,9 +2012,16 @@ pub fn execute_tool_call(
                 for vert in &mut mesh.vertices {
                     *vert *= actual_v;
                 }
+                apply_primitive_anchor(&mut mesh, anchor);
                 history.execute(scene, Command::ImportLowPolyMesh { name, mesh })?;
                 let was_clamped = (actual_v - v).abs().max_element() > 1e-6;
                 (json!(actual_v.to_array()), was_clamped)
+            } else if anchor != PrimitiveAnchor::Bottom {
+                let actual_s = size.max(min_s);
+                let mut mesh = tessel_core::mesh::ops::create_primitive(kind, actual_s, material);
+                apply_primitive_anchor(&mut mesh, anchor);
+                history.execute(scene, Command::ImportLowPolyMesh { name, mesh })?;
+                (json!(actual_s), (actual_s - size).abs() > 1e-6)
             } else {
                 history.execute(
                     scene,
@@ -1971,6 +2064,7 @@ pub fn execute_tool_call(
             Ok(json!({
                 "ok": true,
                 "node_id": created_id.map(|n| n.0),
+                "anchor": anchor.as_str(),
                 "actual_size": actual_size_json,
                 "clamped": clamped,
                 "bounds": bounds
@@ -4769,12 +4863,405 @@ pub fn execute_tool_call(
             let report = tessel_core::validate_mesh_topology(mesh);
             Ok(json!({ "ok": true, "node_id": node_id.0, "report": report }))
         }
+        "character_create_bone_grid" => {
+            let mut spec = tessel_core::BoneGridSpec::default();
+            if let Some(p) = args.get("prefix").and_then(Value::as_str) {
+                spec.prefix = p.to_string();
+            }
+            if let Some(c) = args.get("cols").and_then(Value::as_u64) {
+                spec.cols = c as usize;
+            }
+            if let Some(r) = args.get("rows").and_then(Value::as_u64) {
+                spec.rows = r as usize;
+            }
+            if let Some(v) = parse_opt_vec3(args, "origin")? {
+                spec.origin = v;
+            }
+            if let Some(w) = args.get("width").and_then(Value::as_f64) {
+                spec.width = w as f32;
+            }
+            if let Some(h) = args.get("height").and_then(Value::as_f64) {
+                spec.height = h as f32;
+            }
+            if let Some(v) = parse_opt_vec3(args, "axis_u")? {
+                spec.axis_u = v;
+            }
+            if let Some(v) = parse_opt_vec3(args, "axis_v")? {
+                spec.axis_v = v;
+            }
+            if let Some(pb) = args.get("parent_bone").and_then(Value::as_u64) {
+                spec.parent_bone = Some(BoneId(pb as u32));
+            }
+            let bind_node = args.get("bind_node").and_then(Value::as_u64).map(NodeId);
+            let cols = spec.cols.clamp(2, 16);
+            let rows = spec.rows.clamp(2, 16);
+            let prefix = spec.prefix.clone();
+            history.execute(scene, Command::CreateBoneGrid { spec, bind_node })?;
+            Ok(json!({
+                "ok": true,
+                "prefix": prefix,
+                "cols": cols,
+                "rows": rows,
+                "bone_count": cols * rows
+            }))
+        }
+        "character_bake_cloth_wind" => {
+            let bone_prefix = args
+                .get("bone_prefix")
+                .and_then(Value::as_str)
+                .ok_or_else(|| AiError::InvalidArguments("missing 'bone_prefix'".into()))?
+                .to_string();
+            let mut params = tessel_core::ClothWindParams::default();
+            if let Some(cn) = args.get("clip_name").and_then(Value::as_str) {
+                params.clip_name = cn.to_string();
+            }
+            if let Some(v) = parse_opt_vec3(args, "wind_dir")? {
+                params.wind_dir = v;
+            }
+            if let Some(v) = args.get("wind_strength").and_then(Value::as_f64) {
+                params.wind_strength = v as f32;
+            }
+            if let Some(v) = args.get("gravity").and_then(Value::as_f64) {
+                params.gravity = v as f32;
+            }
+            if let Some(v) = args.get("turbulence").and_then(Value::as_f64) {
+                params.turbulence = v as f32;
+            }
+            if let Some(v) = args.get("phase_offset").and_then(Value::as_f64) {
+                params.phase_offset = v as f32;
+            }
+            if let Some(v) = args.get("duration_secs").and_then(Value::as_f64) {
+                params.duration_secs = v as f32;
+            }
+            if let Some(v) = args.get("fps").and_then(Value::as_f64) {
+                params.fps = v as f32;
+            }
+            let clip_name = params.clip_name.clone();
+            history.execute(
+                scene,
+                Command::BakeClothGridAnimation {
+                    bone_prefix,
+                    params,
+                },
+            )?;
+            Ok(json!({ "ok": true, "clip_name": clip_name }))
+        }
+        "mesh_morph_set_deltas" => {
+            let node_id = args
+                .get("node_id")
+                .and_then(Value::as_u64)
+                .map(NodeId)
+                .or_else(|| scene.active_lowpoly_node())
+                .ok_or_else(|| AiError::InvalidArguments("no low-poly mesh found".into()))?;
+            let name = args
+                .get("name")
+                .and_then(Value::as_str)
+                .ok_or_else(|| AiError::InvalidArguments("missing 'name'".into()))?
+                .to_string();
+            let replace = args
+                .get("replace")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            let parse_pairs = |key: &str| -> Result<Vec<(usize, glam::Vec3)>, AiError> {
+                let mut out = Vec::new();
+                if let Some(arr) = args.get(key).and_then(Value::as_array) {
+                    for item in arr {
+                        let vi = item
+                            .get("vertex")
+                            .and_then(Value::as_u64)
+                            .ok_or_else(|| AiError::InvalidArguments(format!("invalid {key}.vertex")))?
+                            as usize;
+                        let d = parse_opt_vec3(item, "delta")?
+                            .ok_or_else(|| AiError::InvalidArguments(format!("invalid {key}.delta")))?;
+                        out.push((vi, d));
+                    }
+                }
+                Ok(out)
+            };
+            let position_deltas = parse_pairs("position_deltas")?;
+            let normal_deltas = parse_pairs("normal_deltas")?;
+            let pos_count = position_deltas.len();
+            let nrm_count = normal_deltas.len();
+            history.execute(
+                scene,
+                Command::SetMorphTargetDeltas {
+                    node_id,
+                    name: name.clone(),
+                    position_deltas,
+                    normal_deltas,
+                    replace,
+                },
+            )?;
+            Ok(json!({
+                "ok": true,
+                "node_id": node_id.0,
+                "target": name,
+                "position_deltas": pos_count,
+                "normal_deltas": nrm_count
+            }))
+        }
+        "mesh_morph_set_weight" => {
+            let node_id = args
+                .get("node_id")
+                .and_then(Value::as_u64)
+                .map(NodeId)
+                .or_else(|| scene.active_lowpoly_node())
+                .ok_or_else(|| AiError::InvalidArguments("no low-poly mesh found".into()))?;
+            let name = args
+                .get("name")
+                .and_then(Value::as_str)
+                .ok_or_else(|| AiError::InvalidArguments("missing 'name'".into()))?
+                .to_string();
+            let weight = args
+                .get("weight")
+                .and_then(Value::as_f64)
+                .ok_or_else(|| AiError::InvalidArguments("missing 'weight'".into()))?
+                as f32;
+            history.execute(
+                scene,
+                Command::SetMorphDefaultWeight {
+                    node_id,
+                    name: name.clone(),
+                    weight,
+                },
+            )?;
+            Ok(json!({ "ok": true, "node_id": node_id.0, "target": name, "weight": weight.clamp(0.0, 1.0) }))
+        }
+        "mesh_proxy_cage_deform" => {
+            let node_id = args
+                .get("node_id")
+                .and_then(Value::as_u64)
+                .map(NodeId)
+                .or_else(|| scene.active_lowpoly_node())
+                .ok_or_else(|| AiError::InvalidArguments("no low-poly mesh found".into()))?;
+            let divisions = if let Some(arr) = args.get("divisions").and_then(Value::as_array) {
+                if arr.len() != 3 {
+                    return Err(AiError::InvalidArguments(
+                        "divisions must have 3 integers in 2..=6".into(),
+                    ));
+                }
+                let mut out = [2usize; 3];
+                for (i, item) in arr.iter().enumerate() {
+                    let v = item.as_u64().ok_or_else(|| {
+                        AiError::InvalidArguments(format!(
+                            "divisions[{i}] must be an integer in 2..=6"
+                        ))
+                    })? as usize;
+                    if !(2..=6).contains(&v) {
+                        return Err(AiError::InvalidArguments(format!(
+                            "divisions[{i}] must be in 2..=6, got {v}"
+                        )));
+                    }
+                    out[i] = v;
+                }
+                out
+            } else {
+                [2, 2, 2]
+            };
+            let arr = args
+                .get("control_deltas")
+                .and_then(Value::as_array)
+                .ok_or_else(|| AiError::InvalidArguments("missing 'control_deltas'".into()))?;
+            let mut control_deltas = Vec::with_capacity(arr.len());
+            for item in arr {
+                let idx = item
+                    .get("index")
+                    .and_then(Value::as_u64)
+                    .ok_or_else(|| AiError::InvalidArguments("missing control_deltas.index".into()))?
+                    as usize;
+                let d = parse_opt_vec3(item, "delta")?
+                    .ok_or_else(|| AiError::InvalidArguments("missing control_deltas.delta".into()))?;
+                control_deltas.push((idx, d));
+            }
+            let floor_y = args.get("floor_y").and_then(Value::as_f64).map(|v| v as f32);
+            let bake_as_morph = args
+                .get("bake_as_morph")
+                .and_then(Value::as_str)
+                .map(ToOwned::to_owned);
+            history.execute(
+                scene,
+                Command::ApplyProxyCageDeform {
+                    node_id,
+                    divisions,
+                    control_deltas,
+                    floor_y,
+                    bake_as_morph: bake_as_morph.clone(),
+                },
+            )?;
+            Ok(json!({ "ok": true, "node_id": node_id.0, "baked_morph": bake_as_morph }))
+        }
+        "mesh_bake_vat" => {
+            let node_id = args
+                .get("node_id")
+                .and_then(Value::as_u64)
+                .map(NodeId)
+                .or_else(|| scene.active_lowpoly_node())
+                .ok_or_else(|| AiError::InvalidArguments("no low-poly mesh found".into()))?;
+            let stem = args
+                .get("stem")
+                .and_then(Value::as_str)
+                .ok_or_else(|| AiError::InvalidArguments("missing 'stem'".into()))?;
+            let clip_index = args.get("clip_index").and_then(Value::as_u64).unwrap_or(0) as usize;
+            let fps = args.get("fps").and_then(Value::as_f64).unwrap_or(15.0) as f32;
+            let max_frames = args
+                .get("max_frames")
+                .and_then(Value::as_u64)
+                .unwrap_or(120) as usize;
+            let report = tessel_io::export_vat_bundle(
+                scene,
+                &tessel_core::VatBakeParams {
+                    node_id,
+                    clip_index,
+                    fps,
+                    max_frames,
+                },
+                allowed_export_dir,
+                stem,
+            )?;
+            Ok(json!({ "ok": true, "report": report }))
+        }
+        "mesh_create_ribbon" => {
+            let name = args
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or("Ribbon")
+                .to_string();
+            let source_bone = args
+                .get("source_bone")
+                .and_then(Value::as_u64)
+                .map(|b| BoneId(b as u32));
+            let source_node = args.get("source_node").and_then(Value::as_u64).map(NodeId);
+            let mut explicit_points = Vec::new();
+            if let Some(val) = args.get("explicit_points") {
+                let arr = val.as_array().ok_or_else(|| {
+                    AiError::InvalidArguments("explicit_points must be an array of [x,y,z]".into())
+                })?;
+                for (i, pt) in arr.iter().enumerate() {
+                    let a = pt.as_array().ok_or_else(|| {
+                        AiError::InvalidArguments(format!(
+                            "explicit_points[{i}] must be a 3-element array"
+                        ))
+                    })?;
+                    if a.len() != 3 {
+                        return Err(AiError::InvalidArguments(format!(
+                            "explicit_points[{i}] must have exactly 3 numbers"
+                        )));
+                    }
+                    let (Some(x), Some(y), Some(z)) =
+                        (a[0].as_f64(), a[1].as_f64(), a[2].as_f64())
+                    else {
+                        return Err(AiError::InvalidArguments(format!(
+                            "explicit_points[{i}] elements must be numbers"
+                        )));
+                    };
+                    let v = glam::Vec3::new(x as f32, y as f32, z as f32);
+                    if !v.is_finite() {
+                        return Err(AiError::InvalidArguments(format!(
+                            "explicit_points[{i}] must be finite"
+                        )));
+                    }
+                    explicit_points.push(v);
+                }
+            }
+            let clip_index = args.get("clip_index").and_then(Value::as_u64).unwrap_or(0) as usize;
+            let start_time = args.get("start_time").and_then(Value::as_f64).unwrap_or(0.0) as f32;
+            let end_time = args.get("end_time").and_then(Value::as_f64).unwrap_or(1.0) as f32;
+            let samples = args.get("samples").and_then(Value::as_u64).unwrap_or(16) as usize;
+            let width_start = args
+                .get("width_start")
+                .and_then(Value::as_f64)
+                .unwrap_or(0.16) as f32;
+            let width_end = args
+                .get("width_end")
+                .and_then(Value::as_f64)
+                .unwrap_or(0.02) as f32;
+            let mat_idx = args.get("material").and_then(Value::as_u64).unwrap_or(1) as u8;
+            let material = PaletteIndex::new(mat_idx)
+                .map_err(|_| AiError::InvalidArguments("material must be 1..=255".into()))?;
+            let bake_visibility_track = args
+                .get("bake_visibility_track")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            let params = tessel_core::RibbonParams {
+                name,
+                source_bone,
+                source_node,
+                explicit_points,
+                clip_index,
+                start_time,
+                end_time,
+                samples,
+                width_start,
+                width_end,
+                material,
+                bake_visibility_track,
+            };
+            history.execute(scene, Command::BakeProceduralRibbon { params })?;
+            let id = scene.selected_node.map(|n| n.0);
+            Ok(json!({ "ok": true, "node_id": id }))
+        }
+        "character_stick_gizmo_pose" => {
+            let bone_id = BoneId(
+                args.get("bone_id")
+                    .and_then(Value::as_u64)
+                    .ok_or_else(|| AiError::InvalidArguments("missing 'bone_id'".into()))?
+                    as u32,
+            );
+            let mode_str = args
+                .get("mode")
+                .and_then(Value::as_str)
+                .ok_or_else(|| AiError::InvalidArguments("missing 'mode'".into()))?;
+            let mode = match mode_str.to_ascii_lowercase().as_str() {
+                "roll" => tessel_core::StickGizmoMode::Roll,
+                "pitch" => tessel_core::StickGizmoMode::Pitch,
+                "yaw" => tessel_core::StickGizmoMode::Yaw,
+                "twist" => tessel_core::StickGizmoMode::Twist,
+                "roll_twist" | "rolltwist" => tessel_core::StickGizmoMode::RollTwist,
+                other => {
+                    return Err(AiError::InvalidArguments(format!(
+                        "unknown stick gizmo mode '{other}'"
+                    )))
+                }
+            };
+            let angle_deg = args
+                .get("angle_deg")
+                .and_then(Value::as_f64)
+                .ok_or_else(|| AiError::InvalidArguments("missing 'angle_deg'".into()))?
+                as f32;
+            let chain_len = args.get("chain_len").and_then(Value::as_u64).unwrap_or(3) as usize;
+            let snap_deg = args.get("snap_deg").and_then(Value::as_f64).unwrap_or(0.0) as f32;
+            let mirror_lr = args
+                .get("mirror_lr")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            let axis_lock = args.get("axis_lock").and_then(Value::as_u64).map(|v| v as u8);
+            let params = tessel_core::StickGizmoParams {
+                bone_id,
+                mode,
+                angle_deg,
+                chain_len,
+                snap_deg,
+                mirror_lr,
+                axis_lock,
+            };
+            history.execute(scene, Command::ApplyStickGizmoPose { params })?;
+            Ok(json!({ "ok": true, "bone_id": bone_id.0, "mode": mode }))
+        }
         "character_apply_biped_rig" => {
             let preset = args
                 .get("preset")
                 .and_then(Value::as_str)
                 .unwrap_or("starter");
             let append = args.get("append").and_then(Value::as_bool).unwrap_or(false);
+            let include_default_clips = match args.get("include_default_clips") {
+                None | Some(Value::Null) => true,
+                Some(Value::Bool(b)) => *b,
+                Some(_) => {
+                    return Err(AiError::InvalidArguments(
+                        "'include_default_clips' must be a boolean".into(),
+                    ));
+                }
+            };
             if append {
                 let template = match preset {
                     "starter" => tessel_core::CharacterRig::biped_template(),
@@ -4785,29 +5272,48 @@ pub fn execute_tool_call(
                         )));
                     }
                 };
-                if scene.character_rig.is_none() {
-                    history.execute(scene, Command::ApplyHumanoidRig)?;
-                }
                 let prefix = args.get("prefix").and_then(Value::as_str).unwrap_or("P2_");
                 let offset = parse_opt_vec3(args, "offset")?.unwrap_or(glam::Vec3::ZERO);
                 let yaw_deg = args.get("yaw_deg").and_then(Value::as_f64).unwrap_or(0.0) as f32;
                 if !yaw_deg.is_finite() {
                     return Err(AiError::InvalidArguments("'yaw_deg' must be finite".into()));
                 }
-                let include_default_clips = args
-                    .get("include_default_clips")
-                    .and_then(Value::as_bool)
-                    .unwrap_or(true);
                 let yaw_q = glam::Quat::from_rotation_y(yaw_deg.to_radians());
 
-                let base_id = scene
-                    .character_rig
-                    .as_ref()
-                    .and_then(|r| r.bones.iter().map(|b| b.id.0).max())
-                    .map(|m| m + 1)
-                    .unwrap_or(0);
+                let mut cmds = Vec::with_capacity(template.bones.len() + 4);
+                let base_rig_clips: Vec<String>;
+                let base_id = if let Some(rig) = scene.character_rig.as_ref() {
+                    base_rig_clips = rig.animations.iter().map(|c| c.name.clone()).collect();
+                    rig.bones
+                        .iter()
+                        .map(|b| b.id.0)
+                        .max()
+                        .map(|m| m + 1)
+                        .unwrap_or(0)
+                } else {
+                    let base_tmpl = tessel_core::CharacterRig::humanoid_template();
+                    cmds.push(Command::ApplyHumanoidRig);
+                    if !include_default_clips {
+                        for _ in 0..base_tmpl.animations.len() {
+                            cmds.push(Command::RemoveAnimationClip { clip_index: 0 });
+                        }
+                        base_rig_clips = Vec::new();
+                    } else {
+                        base_rig_clips = base_tmpl
+                            .animations
+                            .iter()
+                            .map(|c| c.name.clone())
+                            .collect();
+                    }
+                    base_tmpl
+                        .bones
+                        .iter()
+                        .map(|b| b.id.0)
+                        .max()
+                        .map(|m| m + 1)
+                        .unwrap_or(0)
+                };
                 let mut id_map = std::collections::BTreeMap::new();
-                let mut cmds = Vec::with_capacity(template.bones.len() + 1);
                 let mut bone_ids_json = serde_json::Map::new();
                 let mut appended_root: Option<BoneId> = None;
                 for (i, b) in template.bones.iter().enumerate() {
@@ -4840,20 +5346,18 @@ pub fn execute_tool_call(
                 }
                 let count = template.bones.len();
                 if include_default_clips {
-                    if let Some(rig) = scene.character_rig.as_ref() {
-                        for tmpl_clip in &template.animations {
-                            if let Some(clip_idx) =
-                                rig.animations.iter().position(|c| c.name == tmpl_clip.name)
-                            {
-                                for ch in &tmpl_clip.channels {
-                                    if let Some(&mapped_bone) = id_map.get(&ch.bone_id) {
-                                        for kf in &ch.keyframes {
-                                            cmds.push(Command::SetAnimationKeyframe {
-                                                clip_index: clip_idx,
-                                                bone_id: mapped_bone,
-                                                keyframe: *kf,
-                                            });
-                                        }
+                    for tmpl_clip in &template.animations {
+                        if let Some(clip_idx) =
+                            base_rig_clips.iter().position(|n| n == &tmpl_clip.name)
+                        {
+                            for ch in &tmpl_clip.channels {
+                                if let Some(&mapped_bone) = id_map.get(&ch.bone_id) {
+                                    for kf in &ch.keyframes {
+                                        cmds.push(Command::SetAnimationKeyframe {
+                                            clip_index: clip_idx,
+                                            bone_id: mapped_bone,
+                                            keyframe: *kf,
+                                        });
                                     }
                                 }
                             }
@@ -4869,19 +5373,41 @@ pub fn execute_tool_call(
                     "bone_ids": bone_ids_json
                 }));
             }
-            match preset {
-                "starter" => {
-                    history.execute(scene, Command::ApplyBipedRig)?;
-                    Ok(json!({ "ok": true, "preset": "starter", "bones": 7 }))
+            let (apply_cmd, bones, default_clips) = match preset {
+                "starter" => (
+                    Command::ApplyBipedRig,
+                    7usize,
+                    tessel_core::CharacterRig::biped_template().animations.len(),
+                ),
+                "humanoid" => (
+                    Command::ApplyHumanoidRig,
+                    19usize,
+                    tessel_core::CharacterRig::humanoid_template()
+                        .animations
+                        .len(),
+                ),
+                other => {
+                    return Err(AiError::InvalidArguments(format!(
+                        "unknown rig preset '{other}'; use 'starter' or 'humanoid'"
+                    )));
                 }
-                "humanoid" => {
-                    history.execute(scene, Command::ApplyHumanoidRig)?;
-                    Ok(json!({ "ok": true, "preset": "humanoid", "bones": 19 }))
+            };
+            if include_default_clips || default_clips == 0 {
+                history.execute(scene, apply_cmd)?;
+            } else {
+                let mut cmds = Vec::with_capacity(1 + default_clips);
+                cmds.push(apply_cmd);
+                for _ in 0..default_clips {
+                    cmds.push(Command::RemoveAnimationClip { clip_index: 0 });
                 }
-                other => Err(AiError::InvalidArguments(format!(
-                    "unknown rig preset '{other}'; use 'starter' or 'humanoid'"
-                ))),
+                history.execute(scene, Command::Transaction(cmds))?;
             }
+            let clips = scene
+                .character_rig
+                .as_ref()
+                .map(|r| r.animations.len())
+                .unwrap_or(0);
+            Ok(json!({ "ok": true, "preset": preset, "bones": bones, "clips": clips }))
         }
         "character_set_bone_rest_position" => {
             let bone_id = parse_bone_id(args, "bone_id")?;
@@ -5018,6 +5544,64 @@ pub fn execute_tool_call(
                     "provide 'rotation_deg' and/or 'translation'".into(),
                 ));
             }
+            let dry_run = parse_opt_bool(args, "dry_run")?;
+            let rot_delta = if has_rot {
+                Some(parse_rotation_deg(args)?)
+            } else {
+                None
+            };
+            if dry_run {
+                let rig = scene.character_rig.as_ref().ok_or_else(|| {
+                    AiError::InvalidArguments("no character rig applied".into())
+                })?;
+                let existing = rig.bone(bone_id).ok_or_else(|| {
+                    AiError::InvalidArguments(format!("bone {} not found", bone_id.0))
+                })?;
+                let before_mats = rig.world_pose_matrices();
+                let world_pos_before = before_mats
+                    .get(&bone_id)
+                    .map(|m| m.transform_point3(glam::Vec3::ZERO))
+                    .unwrap_or(glam::Vec3::ZERO);
+                let mut preview_rig = rig.clone();
+                if let Some(b) = preview_rig.bones.iter_mut().find(|b| b.id == bone_id) {
+                    if let Some(delta) = rot_delta {
+                        b.pose_local.rotation = b.rest_local.rotation * delta;
+                    }
+                    if let Some(td) = trans_delta {
+                        b.pose_local.translation = b.rest_local.translation + td;
+                    }
+                }
+                let after_mats = preview_rig.world_pose_matrices();
+                let after_mat = after_mats
+                    .get(&bone_id)
+                    .copied()
+                    .unwrap_or(glam::Mat4::IDENTITY);
+                let world_pos_after = after_mat.transform_point3(glam::Vec3::ZERO);
+                let local_rot = preview_rig
+                    .bone(bone_id)
+                    .map(|b| b.pose_local.rotation)
+                    .unwrap_or(glam::Quat::IDENTITY);
+                let local_up = (local_rot * glam::Vec3::Y).normalize_or_zero();
+                let local_fwd = (local_rot * glam::Vec3::Z).normalize_or_zero();
+                let world_up = after_mat
+                    .transform_vector3(glam::Vec3::Y)
+                    .normalize_or_zero();
+                let world_fwd = after_mat
+                    .transform_vector3(glam::Vec3::Z)
+                    .normalize_or_zero();
+                return Ok(json!({
+                    "ok": true,
+                    "dry_run": true,
+                    "bone_id": bone_id.0,
+                    "bone_name": existing.name,
+                    "world_pos_before": world_pos_before.to_array(),
+                    "world_pos_after": world_pos_after.to_array(),
+                    "local_up_dir": local_up.to_array(),
+                    "local_forward_dir": local_fwd.to_array(),
+                    "world_up_dir": world_up.to_array(),
+                    "world_forward_dir": world_fwd.to_array(),
+                }));
+            }
             let (rest_rot, rest_trans) = scene
                 .character_rig
                 .as_ref()
@@ -5025,8 +5609,7 @@ pub fn execute_tool_call(
                 .map(|b| (b.rest_local.rotation, b.rest_local.translation))
                 .unwrap_or((glam::Quat::IDENTITY, glam::Vec3::ZERO));
             let mut cmds = Vec::new();
-            if has_rot {
-                let delta = parse_rotation_deg(args)?;
+            if let Some(delta) = rot_delta {
                 cmds.push(Command::SetBoneRotation {
                     bone_id,
                     rotation: rest_rot * delta,
@@ -6214,19 +6797,32 @@ pub fn execute_tool_call(
                 .character_rig
                 .as_ref()
                 .ok_or_else(|| AiError::InvalidArguments("no character rig in scene".into()))?;
+            let world_rest = rig.world_rest_matrices();
             let bones: Vec<Value> = rig
                 .bones
                 .iter()
                 .map(|b| {
+                    let local_pos = b.rest_local.translation.to_array();
+                    let world_pos = world_rest
+                        .get(&b.id)
+                        .map(|m| m.w_axis.truncate().to_array())
+                        .unwrap_or(local_pos);
                     json!({
                         "bone_id": b.id.0,
                         "name": b.name,
                         "parent_bone_id": b.parent.map(|p| p.0),
-                        "rest_position": b.rest_local.translation.to_array(),
+                        "rest_position": local_pos,
+                        "local_rest_position": local_pos,
+                        "world_rest_position": world_pos,
                     })
                 })
                 .collect();
-            Ok(json!({ "ok": true, "bone_count": bones.len(), "bones": bones }))
+            Ok(json!({
+                "ok": true,
+                "coordinate_space": "local_rest_position is parent-relative; world_rest_position is rig world space",
+                "bone_count": bones.len(),
+                "bones": bones
+            }))
         }
         "character_inspect_weights" => {
             let rig = scene
@@ -6946,6 +7542,10 @@ mod tests {
         let sinspect =
             execute_tool_call("scene_inspect", &json!({}), &mut scene, &mut history, &dir).unwrap();
         assert_eq!(sinspect["ok"], true);
+        assert_eq!(
+            sinspect["export_dir"],
+            crate::translator::canonical_export_dir_string(&dir)
+        );
 
         let beveled = execute_tool_call(
             "mesh_bevel",
@@ -7432,6 +8032,22 @@ mod tests {
         assert_eq!(listed["bone_count"], 7);
         assert_eq!(listed["bones"][1]["name"], "Torso");
         assert_eq!(listed["bones"][1]["parent_bone_id"], 0);
+        assert!(listed["coordinate_space"].as_str().is_some());
+        let torso_local = listed["bones"][1]["local_rest_position"]
+            .as_array()
+            .unwrap();
+        let torso_world = listed["bones"][1]["world_rest_position"]
+            .as_array()
+            .unwrap();
+        assert_eq!(torso_local.len(), 3);
+        assert_eq!(torso_world.len(), 3);
+        let head_world_y = listed["bones"][2]["world_rest_position"][1]
+            .as_f64()
+            .unwrap();
+        let head_local_y = listed["bones"][2]["local_rest_position"][1]
+            .as_f64()
+            .unwrap();
+        assert!(head_world_y > head_local_y);
 
         // Inspect the Idle clip (index 0): Torso channel has 3 keys.
         let insp = execute_tool_call(
@@ -8782,7 +9398,7 @@ mod tests {
         .unwrap();
         assert_eq!(tie["ok"], true);
         assert_eq!(tie["vertices"], 10);
-        assert_eq!(tie["faces"], 7);
+        assert_eq!(tie["faces"], 11); // 3 front tris + 3 back tris + 5 side quads
 
         // 2. IK with pole_target (world point) + end_world_rotation_deg (world-space aim)
         execute_tool_call(
@@ -10885,6 +11501,346 @@ mod tests {
         )
         .unwrap();
         assert_eq!(uc["name"], "HeavySlash");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn b2_pin_primitive_bottom_anchor_bone_rotation_sign_and_png_export_mode() {
+        let dir = std::env::temp_dir().join("tessel_b2_quirk_pin_test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut scene = SceneState::new();
+        let mut history = HistoryStack::new();
+
+        // 1. Primitive bottom-anchoring: y in [0, size_y], centered in X/Z.
+        for kind in ["cube", "cylinder", "sphere", "cone", "capsule"] {
+            let res = execute_tool_call(
+                "mesh_create_primitive",
+                &json!({ "name": format!("Pin_{kind}"), "kind": kind, "size": [0.4, 1.2, 0.6] }),
+                &mut scene,
+                &mut history,
+                &dir,
+            )
+            .unwrap();
+            let nid = NodeId(res["node_id"].as_u64().unwrap());
+            let (bmin, bmax) = scene.lowpoly_meshes[&nid].bounds();
+            assert!(
+                bmin.y.abs() < 1e-4,
+                "{kind} min.y must be 0.0, got {}",
+                bmin.y
+            );
+            assert!(
+                (bmax.y - 1.2).abs() < 1e-4,
+                "{kind} max.y must be 1.2, got {}",
+                bmax.y
+            );
+            assert!((bmin.x + bmax.x).abs() < 1e-4, "{kind} X must be centered");
+            assert!((bmin.z + bmax.z).abs() < 1e-4, "{kind} Z must be centered");
+        }
+
+        // 2. Bone rotation sign: Right-Handed +Y Up, +Z Front, +X Left.
+        execute_tool_call(
+            "character_apply_biped_rig",
+            &json!({ "preset": "starter" }),
+            &mut scene,
+            &mut history,
+            &dir,
+        )
+        .unwrap();
+        execute_tool_call(
+            "character_set_bone_pose",
+            &json!({ "bone_id": 2, "rotation_deg": [45.0, 0.0, 0.0] }),
+            &mut scene,
+            &mut history,
+            &dir,
+        )
+        .unwrap();
+        let pitch_rot = scene
+            .character_rig
+            .as_ref()
+            .unwrap()
+            .bone(BoneId(2))
+            .unwrap()
+            .pose_local
+            .rotation;
+        assert!(
+            (pitch_rot * glam::Vec3::Y).z > 0.5,
+            "+X pitch must tilt +Y forward (+Z)"
+        );
+
+        execute_tool_call(
+            "character_set_bone_pose",
+            &json!({ "bone_id": 2, "rotation_deg": [0.0, 45.0, 0.0] }),
+            &mut scene,
+            &mut history,
+            &dir,
+        )
+        .unwrap();
+        let yaw_rot = scene
+            .character_rig
+            .as_ref()
+            .unwrap()
+            .bone(BoneId(2))
+            .unwrap()
+            .pose_local
+            .rotation;
+        assert!(
+            (yaw_rot * glam::Vec3::Z).x > 0.5,
+            "+Y yaw must turn +Z toward +X (Left)"
+        );
+
+        // 3. Mode-dependent PNG export: LowPoly mode rejects PNG (requires PixelCanvas), allows GLB.
+        let png_err = execute_tool_call(
+            "project_export",
+            &json!({ "filename": "should_fail.png", "format": "png" }),
+            &mut scene,
+            &mut history,
+            &dir,
+        );
+        assert!(png_err.is_err(), "PNG export in LowPoly mode must error");
+
+        execute_tool_call(
+            "pixel_create_canvas",
+            &json!({ "name": "PinSprite", "width": 8, "height": 8 }),
+            &mut scene,
+            &mut history,
+            &dir,
+        )
+        .unwrap();
+        execute_tool_call(
+            "pixel_draw",
+            &json!({ "pixels": [{ "x": 0, "y": 0, "palette_index": 4 }] }),
+            &mut scene,
+            &mut history,
+            &dir,
+        )
+        .unwrap();
+        let png_ok = execute_tool_call(
+            "project_export",
+            &json!({ "filename": "pixel_ok.png", "format": "png" }),
+            &mut scene,
+            &mut history,
+            &dir,
+        )
+        .unwrap();
+        assert!(png_ok.is_object());
+        let bytes = std::fs::read(dir.join("pixel_ok.png")).unwrap();
+        assert_eq!(&bytes[1..4], b"PNG");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn b3_explicit_primitive_anchor_and_dry_run_previews() {
+        let dir = std::env::temp_dir().join("tessel_b3_anchor_dry_run_test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut scene = SceneState::new();
+        let mut history = HistoryStack::new();
+
+        // 1. Explicit anchor='center' and 'top' on scalar and non-uniform primitives.
+        let center = execute_tool_call(
+            "mesh_create_primitive",
+            &json!({ "name": "CenteredCube", "kind": "cube", "size": 2.0, "anchor": "center" }),
+            &mut scene,
+            &mut history,
+            &dir,
+        )
+        .unwrap();
+        assert_eq!(center["anchor"], "center");
+        let cid = NodeId(center["node_id"].as_u64().unwrap());
+        let (clo, chi) = scene.lowpoly_meshes[&cid].bounds();
+        assert!((clo.y + 1.0).abs() < 1e-4 && (chi.y - 1.0).abs() < 1e-4);
+
+        let top = execute_tool_call(
+            "mesh_create_primitive",
+            &json!({ "name": "HangingCyl", "kind": "cylinder", "size": [0.4, 1.5, 0.4], "anchor": "top" }),
+            &mut scene,
+            &mut history,
+            &dir,
+        )
+        .unwrap();
+        assert_eq!(top["anchor"], "top");
+        let tid = NodeId(top["node_id"].as_u64().unwrap());
+        let (tlo, thi) = scene.lowpoly_meshes[&tid].bounds();
+        assert!((tlo.y + 1.5).abs() < 1e-4 && thi.y.abs() < 1e-4);
+
+        let bad_anchor = execute_tool_call(
+            "mesh_create_primitive",
+            &json!({ "name": "Bad", "kind": "cube", "anchor": "middle" }),
+            &mut scene,
+            &mut history,
+            &dir,
+        );
+        assert!(bad_anchor.is_err());
+        let non_str_anchor = execute_tool_call(
+            "mesh_create_primitive",
+            &json!({ "name": "BadType", "kind": "cube", "anchor": 123 }),
+            &mut scene,
+            &mut history,
+            &dir,
+        );
+        assert!(non_str_anchor.is_err());
+
+        // Non-boolean dry_run must fail closed without mutating scene
+        let rev_guard = scene.revision;
+        let bad_dry = execute_tool_call(
+            "scene_set_node_transform",
+            &json!({ "node_id": cid.0, "position": [9.0, 9.0, 9.0], "dry_run": "true" }),
+            &mut scene,
+            &mut history,
+            &dir,
+        );
+        assert!(bad_dry.is_err());
+        assert_eq!(scene.revision, rev_guard);
+
+        // 2. scene_set_node_transform dry_run previews world position/bounds without mutating state.
+        let rev_before = scene.revision;
+        let transform_before = scene.nodes[&cid].transform;
+        let tx_preview = execute_tool_call(
+            "scene_set_node_transform",
+            &json!({
+                "node_id": cid.0,
+                "position": [1.0, 2.0, 3.0],
+                "rotation_deg": [0.0, 90.0, 0.0],
+                "dry_run": true
+            }),
+            &mut scene,
+            &mut history,
+            &dir,
+        )
+        .unwrap();
+        assert_eq!(tx_preview["dry_run"], true);
+        assert_eq!(tx_preview["world_position"], json!([1.0, 2.0, 3.0]));
+        assert!(tx_preview["world_forward_dir"][0].as_f64().unwrap() > 0.99);
+        assert!(
+            (tx_preview["world_bounds"]["min"][1].as_f64().unwrap() - 1.0).abs() < 1e-4
+                && (tx_preview["world_bounds"]["max"][1].as_f64().unwrap() - 3.0).abs() < 1e-4
+        );
+        assert_eq!(scene.revision, rev_before);
+        assert_eq!(scene.nodes[&cid].transform, transform_before);
+
+        // 3. character_set_bone_pose dry_run previews bone direction without mutating rig or undo stack.
+        execute_tool_call(
+            "character_apply_biped_rig",
+            &json!({ "preset": "starter" }),
+            &mut scene,
+            &mut history,
+            &dir,
+        )
+        .unwrap();
+        let rig_rev_before = scene.revision;
+        let pose_before = scene
+            .character_rig
+            .as_ref()
+            .unwrap()
+            .bone(BoneId(2))
+            .unwrap()
+            .pose_local;
+        let bone_preview = execute_tool_call(
+            "character_set_bone_pose",
+            &json!({ "bone_id": 2, "rotation_deg": [45.0, 0.0, 0.0], "dry_run": true }),
+            &mut scene,
+            &mut history,
+            &dir,
+        )
+        .unwrap();
+        assert_eq!(bone_preview["dry_run"], true);
+        assert!(bone_preview["local_up_dir"][2].as_f64().unwrap() > 0.5);
+        assert_eq!(scene.revision, rig_rev_before);
+        assert_eq!(
+            scene
+                .character_rig
+                .as_ref()
+                .unwrap()
+                .bone(BoneId(2))
+                .unwrap()
+                .pose_local,
+            pose_before
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn character_apply_biped_rig_respects_include_default_clips_false_without_append() {
+        let mut scene = SceneState::new();
+        let mut history = HistoryStack::new();
+        let dir = std::env::temp_dir().join("tessel_test_rig_no_default_clips");
+        let _ = std::fs::create_dir_all(&dir);
+
+        // Starter preset with include_default_clips: false -> 7 bones, 0 clips
+        let res = execute_tool_call(
+            "character_apply_biped_rig",
+            &json!({ "preset": "starter", "include_default_clips": false }),
+            &mut scene,
+            &mut history,
+            &dir,
+        )
+        .unwrap();
+        assert_eq!(res["ok"], true);
+        assert_eq!(res["bones"], 7);
+        assert_eq!(res["clips"], 0);
+        assert_eq!(scene.character_rig.as_ref().unwrap().animations.len(), 0);
+
+        // Single undo restores no-rig state cleanly
+        history.undo(&mut scene).unwrap();
+        assert!(scene.character_rig.is_none());
+
+        // Humanoid preset with include_default_clips: false -> 19 bones, 0 clips
+        let res2 = execute_tool_call(
+            "character_apply_biped_rig",
+            &json!({ "preset": "humanoid", "include_default_clips": false }),
+            &mut scene,
+            &mut history,
+            &dir,
+        )
+        .unwrap();
+        assert_eq!(res2["bones"], 19);
+        assert_eq!(res2["clips"], 0);
+        assert_eq!(scene.character_rig.as_ref().unwrap().animations.len(), 0);
+
+        // Default (omitted) still includes Idle & Walk
+        let res3 = execute_tool_call(
+            "character_apply_biped_rig",
+            &json!({ "preset": "starter" }),
+            &mut scene,
+            &mut history,
+            &dir,
+        )
+        .unwrap();
+        assert_eq!(res3["clips"], 2);
+        assert_eq!(scene.character_rig.as_ref().unwrap().animations.len(), 2);
+
+        // Non-boolean include_default_clips is rejected fail-closed
+        let bad = execute_tool_call(
+            "character_apply_biped_rig",
+            &json!({ "preset": "starter", "include_default_clips": "false" }),
+            &mut scene,
+            &mut history,
+            &dir,
+        );
+        assert!(bad.is_err());
+
+        // append=true + include_default_clips=false on an empty scene is atomic and leaves 0 clips
+        let mut empty_scene = SceneState::new();
+        let mut empty_history = HistoryStack::new();
+        let res4 = execute_tool_call(
+            "character_apply_biped_rig",
+            &json!({ "preset": "starter", "append": true, "include_default_clips": false }),
+            &mut empty_scene,
+            &mut empty_history,
+            &dir,
+        )
+        .unwrap();
+        assert_eq!(res4["ok"], true);
+        assert_eq!(
+            empty_scene.character_rig.as_ref().unwrap().animations.len(),
+            0
+        );
+        empty_history.undo(&mut empty_scene).unwrap();
+        assert!(empty_scene.character_rig.is_none());
 
         let _ = std::fs::remove_dir_all(&dir);
     }

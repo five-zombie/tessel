@@ -516,6 +516,23 @@ fn show_character_rig_section(
             if icons::hud_icon_button(ui, ToolIcon::Reset, "Reset all bones to rest pose", false) {
                 let _ = history.execute(scene, Command::ResetCharacterPose);
             }
+            if icons::text_icon_button(ui, "Floor", "Clamp rig to floor (y=0)", false) {
+                if let Some(rig_ref) = &scene.character_rig {
+                    let mut clamped = rig_ref.clone();
+                    let bounds = tessel_core::SkinnedBoundsCache::from_scene(scene, rig_ref);
+                    let _ =
+                        clamped.clamp_sub_skeleton_to_floor_with_bounds("", 0.0, bounds.as_ref());
+                    if let Some(root) = clamped.bones.first() {
+                        let _ = history.execute(
+                            scene,
+                            Command::SetBoneTranslation {
+                                bone_id: root.id,
+                                translation: root.pose_local.translation,
+                            },
+                        );
+                    }
+                }
+            }
         });
     });
     ui.horizontal_wrapped(|ui| {
@@ -595,6 +612,73 @@ fn show_character_rig_section(
                 },
             );
         }
+
+        ui.add_space(6.0);
+        ui.label(
+            RichText::new("Stick Gizmo (Octahedral)")
+                .strong()
+                .size(12.0)
+                .color(tokens::ON_SURFACE),
+        );
+        ui.horizontal(|ui| {
+            ui.checkbox(&mut scene.stick_gizmo.enabled, "Octahedral");
+            ui.checkbox(&mut scene.stick_gizmo.mirror_lr, "Mirror L/R");
+        });
+        ui.horizontal_wrapped(|ui| {
+            for (mode, lbl) in [
+                (tessel_core::StickGizmoMode::Roll, "Roll"),
+                (tessel_core::StickGizmoMode::Pitch, "Pitch"),
+                (tessel_core::StickGizmoMode::Yaw, "Yaw"),
+                (tessel_core::StickGizmoMode::Twist, "Twist"),
+                (tessel_core::StickGizmoMode::RollTwist, "R+T"),
+            ] {
+                if ui
+                    .selectable_label(scene.stick_gizmo.mode == mode, lbl)
+                    .clicked()
+                {
+                    scene.stick_gizmo.mode = mode;
+                }
+            }
+        });
+        ui.horizontal_wrapped(|ui| {
+            ui.label(
+                RichText::new("Snap:")
+                    .size(11.0)
+                    .color(tokens::ON_SURFACE_VARIANT),
+            );
+            for (snap, lbl) in [(0.0f32, "Off"), (5.0, "5°"), (15.0, "15°"), (45.0, "45°")] {
+                if ui
+                    .selectable_label((scene.stick_gizmo.snap_deg - snap).abs() < 1e-3, lbl)
+                    .clicked()
+                {
+                    scene.stick_gizmo.snap_deg = snap;
+                }
+            }
+        });
+        ui.horizontal(|ui| {
+            let step = if scene.stick_gizmo.snap_deg > 0.0 {
+                scene.stick_gizmo.snap_deg
+            } else {
+                15.0
+            };
+            for (lbl, delta_deg) in [
+                (&format!("-{step:.0}°"), -step),
+                (&format!("+{step:.0}°"), step),
+            ] {
+                if ui.small_button(lbl).clicked() {
+                    let params = tessel_core::StickGizmoParams {
+                        bone_id,
+                        mode: scene.stick_gizmo.mode,
+                        angle_deg: delta_deg,
+                        chain_len: scene.stick_gizmo.twist_chain_len,
+                        snap_deg: scene.stick_gizmo.snap_deg,
+                        mirror_lr: scene.stick_gizmo.mirror_lr,
+                        axis_lock: scene.stick_gizmo.axis_lock,
+                    };
+                    let _ = history.execute(scene, Command::ApplyStickGizmoPose { params });
+                }
+            }
+        });
     }
 }
 
@@ -921,6 +1005,40 @@ fn show_transform_and_lighting_section(
                     changed |= ui.color_edit_button_rgb(&mut mat.emissive).changed();
                 });
                 changed |= ui.checkbox(&mut mat.double_sided, "Double Sided").changed();
+                ui.horizontal(|ui| {
+                    changed |= ui.checkbox(&mut mat.cast_shadow, "Cast Shadow").changed();
+                    changed |= ui.checkbox(&mut mat.receive_shadow, "Receive").changed();
+                });
+                changed |= ui
+                    .checkbox(&mut mat.unlit, "Unlit (KHR_materials_unlit)")
+                    .changed();
+                ui.horizontal(|ui| {
+                    ui.label(
+                        RichText::new("Alpha Mode")
+                            .size(11.0)
+                            .color(tokens::ON_SURFACE_VARIANT),
+                    );
+                    let is_opaque = matches!(mat.alpha_mode, tessel_core::AlphaMode::Opaque);
+                    if ui.selectable_label(is_opaque, "Opaque").clicked() && !is_opaque {
+                        mat.alpha_mode = tessel_core::AlphaMode::Opaque;
+                        changed = true;
+                    }
+                    let is_mask = matches!(mat.alpha_mode, tessel_core::AlphaMode::Mask { .. });
+                    if ui.selectable_label(is_mask, "Mask").clicked() && !is_mask {
+                        mat.alpha_mode = tessel_core::AlphaMode::Mask { cutoff: 0.5 };
+                        changed = true;
+                    }
+                    let is_blend = matches!(mat.alpha_mode, tessel_core::AlphaMode::Blend);
+                    if ui.selectable_label(is_blend, "Blend").clicked() && !is_blend {
+                        mat.alpha_mode = tessel_core::AlphaMode::Blend;
+                        changed = true;
+                    }
+                });
+                if let tessel_core::AlphaMode::Mask { ref mut cutoff } = mat.alpha_mode {
+                    changed |= ui
+                        .add(egui::Slider::new(cutoff, 0.0..=1.0).text("Cutoff"))
+                        .changed();
+                }
                 if changed {
                     let _ = history.execute(
                         scene,
@@ -928,6 +1046,83 @@ fn show_transform_and_lighting_section(
                             node_id,
                             material: mat,
                         },
+                    );
+                }
+                ui.add_space(4.0);
+                ui.horizontal_wrapped(|ui| {
+                    if icons::text_icon_button(ui, "Bake AO", "Bake CPU AO map (v4.2)", false) {
+                        if let Some(mesh) = scene.lowpoly_meshes.get(&node_id) {
+                            if let Ok(baked) = tessel_core::bake_mesh_maps(
+                                mesh,
+                                &tessel_core::BakeParams::default(),
+                            ) {
+                                let _ = history.execute(
+                                    scene,
+                                    Command::SetMeshAoMap {
+                                        node_id,
+                                        ao_map: baked.ao,
+                                    },
+                                );
+                            }
+                        }
+                    }
+                    if icons::text_icon_button(
+                        ui,
+                        "Smart Mat",
+                        "Generate procedural edge-wear/dirt texture (v4.4)",
+                        false,
+                    ) {
+                        if let Some(mesh) = scene.lowpoly_meshes.get(&node_id) {
+                            let base_rgba = scene
+                                .palette
+                                .get(scene.active_color)
+                                .map_or(tessel_core::Rgba8::rgba(180, 180, 180, 255), |e| e.color);
+                            let params = tessel_core::SmartMaterialParams::from_base(base_rgba);
+                            if let Ok(out) =
+                                tessel_core::generate_smart_material_texture(mesh, &params)
+                            {
+                                let _ = history.execute(
+                                    scene,
+                                    Command::SetMeshTexture {
+                                        node_id,
+                                        texture: Some(out.albedo),
+                                    },
+                                );
+                            }
+                        }
+                    }
+                    if icons::text_icon_button(
+                        ui,
+                        "Validate",
+                        "Check mesh topology (sliver/non-manifold, v5.2)",
+                        false,
+                    ) {
+                        if let Some(mesh) = scene.lowpoly_meshes.get(&node_id) {
+                            let report = tessel_core::validate_mesh_topology(mesh);
+                            let msg = if report.is_clean {
+                                format!("Topology OK ({} tris)", report.triangle_count)
+                            } else {
+                                format!(
+                                    "Issues: {} sliver, {} non-manifold, {} deg-norm",
+                                    report.sliver_triangles,
+                                    report.non_manifold_edges,
+                                    report.degenerate_normals
+                                )
+                            };
+                            ui.ctx().data_mut(|d| {
+                                d.insert_temp(egui::Id::new(("topo_report", node_id)), msg);
+                            });
+                        }
+                    }
+                });
+                if let Some(msg) = ui
+                    .ctx()
+                    .data(|d| d.get_temp::<String>(egui::Id::new(("topo_report", node_id))))
+                {
+                    ui.label(
+                        RichText::new(msg)
+                            .size(10.5)
+                            .color(tokens::ON_SURFACE_VARIANT),
                     );
                 }
                 if let Some(face_id) = scene.selected_face {
@@ -956,6 +1151,63 @@ fn show_transform_and_lighting_section(
                                         node_id,
                                         face_id,
                                         delta: d,
+                                    },
+                                );
+                            }
+                        }
+                    });
+                }
+                ui.add_space(6.0);
+            }
+            let morph_entries: Vec<(String, f32)> = scene
+                .lowpoly_meshes
+                .get(&node_id)
+                .map(|m| {
+                    m.morphs
+                        .iter()
+                        .map(|t| (t.name.clone(), t.default_weight))
+                        .collect()
+                })
+                .unwrap_or_default();
+            if !morph_entries.is_empty() {
+                ui.label(
+                    RichText::new("Morph Targets / Blend Shapes")
+                        .strong()
+                        .size(12.0)
+                        .color(tokens::ON_SURFACE),
+                );
+                for (m_name, cur_w) in morph_entries {
+                    let mut w = cur_w;
+                    ui.horizontal(|ui| {
+                        if ui
+                            .add(egui::Slider::new(&mut w, 0.0..=1.0).text(&m_name))
+                            .changed()
+                        {
+                            let _ = history.execute(
+                                scene,
+                                Command::SetMorphDefaultWeight {
+                                    node_id,
+                                    name: m_name.clone(),
+                                    weight: w,
+                                },
+                            );
+                        }
+                        if ui
+                            .small_button("Key")
+                            .on_hover_text("Keyframe morph weight")
+                            .clicked()
+                        {
+                            if let Some(rig) = &scene.character_rig {
+                                let clip_index = rig.active_animation;
+                                let time_secs = rig.playback_time;
+                                let _ = history.execute(
+                                    scene,
+                                    Command::SetMorphWeightKeyframe {
+                                        clip_index,
+                                        node_id,
+                                        target: m_name.clone(),
+                                        time_secs,
+                                        weight: w,
                                     },
                                 );
                             }
@@ -1277,5 +1529,273 @@ mod tests {
                 });
         });
         assert!(!out.shapes.is_empty());
+    }
+
+    #[test]
+    fn c1_gui_parity_controls_render_and_dispatch_commands() {
+        let mut scene = SceneState::new();
+        let mut history = HistoryStack::new();
+        let default_material = scene.active_color;
+        history
+            .execute(
+                &mut scene,
+                Command::CreateTerrainMesh {
+                    name: "ParityTerrain".into(),
+                    params: tessel_core::TerrainParams {
+                        width: 8.0,
+                        depth: 8.0,
+                        subdiv_x: 8,
+                        subdiv_z: 8,
+                        height_scale: 1.5,
+                        seed: 42,
+                        octaves: 3,
+                        frequency: 0.35,
+                        island_falloff: 0.3,
+                        heights: None,
+                        palette_bands: Vec::new(),
+                        default_material,
+                        smooth_shading: false,
+                    },
+                    transform: tessel_core::Transform::default(),
+                },
+            )
+            .unwrap();
+        history
+            .execute(&mut scene, Command::SetMode(AppMode::LowPoly))
+            .unwrap();
+        history
+            .execute(
+                &mut scene,
+                Command::SetShadingMode(tessel_core::ViewportShadingMode::NprSumie),
+            )
+            .unwrap();
+        assert_eq!(
+            scene.shading_mode,
+            tessel_core::ViewportShadingMode::NprSumie
+        );
+
+        let ctx = egui::Context::default();
+        let raw_input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1280.0, 720.0),
+            )),
+            ..Default::default()
+        };
+        let out = ctx.run(raw_input, |ctx| {
+            egui::SidePanel::right("test_inspector_c1")
+                .exact_width(256.0)
+                .resizable(false)
+                .show(ctx, |ui| {
+                    egui::ScrollArea::vertical().show(ui, |ui| {
+                        show_transform_and_lighting_section(ui, &mut scene, &mut history);
+                    });
+                });
+        });
+        assert!(!out.shapes.is_empty());
+    }
+
+    fn find_text_center_in_shape(shape: &egui::epaint::Shape, target: &str) -> Option<egui::Pos2> {
+        match shape {
+            egui::epaint::Shape::Text(t) if t.galley.job.text == target => {
+                Some(t.pos + t.galley.size() * 0.5)
+            }
+            egui::epaint::Shape::Vec(v) => {
+                v.iter().find_map(|s| find_text_center_in_shape(s, target))
+            }
+            _ => None,
+        }
+    }
+
+    fn find_label_center(
+        shapes: &[egui::epaint::ClippedShape],
+        target: &str,
+    ) -> Option<egui::Pos2> {
+        shapes
+            .iter()
+            .find_map(|cs| find_text_center_in_shape(&cs.shape, target))
+    }
+
+    fn click_at(ctx: &egui::Context, pos: egui::Pos2, mut draw: impl FnMut(&egui::Context)) {
+        let press = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1280.0, 720.0),
+            )),
+            events: vec![
+                egui::Event::PointerMoved(pos),
+                egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+            ..Default::default()
+        };
+        let _ = ctx.run(press, &mut draw);
+        let release = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1280.0, 720.0),
+            )),
+            events: vec![egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+            ..Default::default()
+        };
+        let _ = ctx.run(release, &mut draw);
+    }
+
+    #[test]
+    fn c1_click_simulation_bake_smart_mat_validate_and_floor() {
+        let mut scene = SceneState::new();
+        let mut history = HistoryStack::new();
+        history
+            .execute(
+                &mut scene,
+                Command::CreatePrimitiveMesh {
+                    name: "ClickCube".into(),
+                    kind: tessel_core::PrimitiveKind::Cube,
+                    size: 1.0,
+                    material: PaletteIndex::new(1).unwrap(),
+                },
+            )
+            .unwrap();
+        let node_id = scene.selected_node.unwrap();
+        history
+            .execute(&mut scene, Command::SetMode(AppMode::LowPoly))
+            .unwrap();
+
+        let ctx = egui::Context::default();
+        let base_input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1280.0, 720.0),
+            )),
+            ..Default::default()
+        };
+        let draw_inspector =
+            |ctx: &egui::Context, scene: &mut SceneState, history: &mut HistoryStack| {
+                egui::SidePanel::right("test_click_c1")
+                    .exact_width(256.0)
+                    .resizable(false)
+                    .show(ctx, |ui| {
+                        egui::ScrollArea::vertical().show(ui, |ui| {
+                            show_transform_and_lighting_section(ui, scene, history);
+                        });
+                    });
+            };
+
+        let out = ctx.run(base_input.clone(), |c| {
+            draw_inspector(c, &mut scene, &mut history);
+        });
+        let bake_pos = find_label_center(&out.shapes, "Bake AO").unwrap();
+        click_at(&ctx, bake_pos, |c| {
+            draw_inspector(c, &mut scene, &mut history)
+        });
+        assert!(scene.lowpoly_meshes[&node_id].ao_map.is_some());
+
+        let smart_pos = find_label_center(&out.shapes, "Smart Mat").unwrap();
+        click_at(&ctx, smart_pos, |c| {
+            draw_inspector(c, &mut scene, &mut history);
+        });
+        assert!(scene.lowpoly_meshes[&node_id].texture.is_some());
+
+        let val_pos = find_label_center(&out.shapes, "Validate").unwrap();
+        click_at(&ctx, val_pos, |c| {
+            draw_inspector(c, &mut scene, &mut history)
+        });
+        let msg = ctx.data(|d| d.get_temp::<String>(egui::Id::new(("topo_report", node_id))));
+        assert!(msg.unwrap().contains("Topology OK"));
+
+        // Character Floor clamp click simulation
+        history
+            .execute(&mut scene, Command::ApplyHumanoidRig)
+            .unwrap();
+        let root_id = scene.character_rig.as_ref().unwrap().bones[0].id;
+        history
+            .execute(
+                &mut scene,
+                Command::SetBoneTranslation {
+                    bone_id: root_id,
+                    translation: glam::Vec3::new(0.0, 2.0, 0.0),
+                },
+            )
+            .unwrap();
+        let draw_rig = |ctx: &egui::Context, scene: &mut SceneState, history: &mut HistoryStack| {
+            egui::SidePanel::right("test_click_floor")
+                .exact_width(256.0)
+                .resizable(false)
+                .show(ctx, |ui| {
+                    egui::ScrollArea::vertical().show(ui, |ui| {
+                        show_character_rig_section(ui, scene, history);
+                    });
+                });
+        };
+        let rig_out = ctx.run(base_input, |c| draw_rig(c, &mut scene, &mut history));
+        let floor_pos = find_label_center(&rig_out.shapes, "Floor").unwrap();
+        click_at(&ctx, floor_pos, |c| draw_rig(c, &mut scene, &mut history));
+        let root_y = scene.character_rig.as_ref().unwrap().bones[0]
+            .pose_local
+            .translation
+            .y;
+        assert!(root_y < 1.0, "Floor click must lower root y, got {root_y}");
+    }
+
+    #[test]
+    fn direct_ai_ui_state_poll_response_executes_tools_and_surfaces_errors() {
+        let dir = std::env::temp_dir().join("tessel_c2_direct_ai_ui_test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let mut scene = SceneState::new();
+        let mut history = HistoryStack::new();
+        let mut ai_state = DirectAiUiState::default();
+
+        let (tx, rx) = mpsc::channel();
+        ai_state.pending = Some(rx);
+        tx.send(Ok(DirectAiResponse {
+            reply: "Built a centered cube.".into(),
+            tool_calls: vec![tessel_ai::direct::PlannedToolCall {
+                name: "mesh_create_primitive".into(),
+                arguments: serde_json::json!({
+                    "name": "AiCube",
+                    "kind": "cube",
+                    "size": 1.0,
+                    "anchor": "center"
+                }),
+            }],
+        }))
+        .unwrap();
+
+        ai_state.poll_response(&mut scene, &mut history, &dir);
+        assert!(ai_state.pending.is_none());
+        assert_eq!(scene.lowpoly_meshes.len(), 1);
+        let ok_msg = ai_state
+            .last_result
+            .as_ref()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .as_str();
+        assert!(ok_msg.contains("[OK] mesh_create_primitive"));
+        assert!(ok_msg.contains("Built a centered cube."));
+
+        // Error path surfaces directly to last_result without panicking or losing scene state.
+        let (tx2, rx2) = mpsc::channel();
+        ai_state.pending = Some(rx2);
+        tx2.send(Err("provider status 401: <redacted>".into()))
+            .unwrap();
+        ai_state.poll_response(&mut scene, &mut history, &dir);
+        assert!(matches!(
+            &ai_state.last_result,
+            Some(Err(msg)) if msg.contains("401")
+        ));
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

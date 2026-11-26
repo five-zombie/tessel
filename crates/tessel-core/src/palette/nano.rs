@@ -7,6 +7,9 @@ use crate::error::CoreError;
 pub struct PaletteIndex(u8);
 
 impl PaletteIndex {
+    /// Default active studio palette color index (`4`).
+    pub const DEFAULT_ACTIVE: Self = Self(4);
+
     pub fn new(raw: u8) -> Result<Self, CoreError> {
         if raw == 0 {
             return Err(CoreError::InvalidPaletteIndex);

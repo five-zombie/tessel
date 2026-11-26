@@ -62,6 +62,7 @@ struct StudioState {
     confirm_new_project: bool,
     confirm_exit: bool,
     quit_confirmed: bool,
+    last_error: Option<String>,
     project_files: ProjectFileManager,
     paths: AppPaths,
     settings: AppSettings,
@@ -625,6 +626,7 @@ impl Default for StudioState {
             confirm_new_project: false,
             confirm_exit: false,
             quit_confirmed: false,
+            last_error: None,
             project_files,
             paths,
             settings,
@@ -781,7 +783,12 @@ impl GpuState {
         let main_vp = &self.viewport_renderer;
         let offscreen_vp = &mut self.offscreen_screenshot_renderer;
         studio.poll_live_mcp(
-            || main_vp.capture_png_bytes(device, queue).ok(),
+            || {
+                main_vp
+                    .capture_png_bytes(device, queue)
+                    .map_err(|err| tracing::warn!("live MCP viewport PNG capture failed: {err}"))
+                    .ok()
+            },
             |tool, scene, export_dir, args| {
                 let vp =
                     offscreen_vp.get_or_insert_with(|| ViewportRenderer::new(device, 640, 480));
@@ -845,13 +852,16 @@ impl GpuState {
                 ctx.request_repaint();
             }
 
-            handle_global_shortcuts(
+            if let Some(err) = handle_global_shortcuts(
                 ctx,
                 &mut studio.scene,
                 &mut studio.history,
                 &mut studio.camera_3d,
                 &mut studio.camera_2d,
-            );
+            ) {
+                tracing::error!("{err}");
+                studio.last_error = Some(err);
+            }
             if ctx.input(|i| i.modifiers.command && i.key_pressed(egui::Key::K)) {
                 studio.command_palette.open = !studio.command_palette.open;
             }
@@ -1065,6 +1075,33 @@ impl GpuState {
                     studio.confirm_exit = open && studio.confirm_exit;
                 }
             }
+            if let Some(err_msg) = studio.last_error.clone() {
+                if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+                    studio.last_error = None;
+                } else {
+                    let mut open = true;
+                    egui::Window::new("Operation Failed")
+                        .open(&mut open)
+                        .collapsible(false)
+                        .resizable(false)
+                        .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+                        .fixed_size(egui::vec2(400.0, 120.0))
+                        .show(ctx, |ui| {
+                            ui.label(
+                                egui::RichText::new(&err_msg)
+                                    .size(12.0)
+                                    .color(ui::theme::tokens::ERROR),
+                            );
+                            ui.add_space(12.0);
+                            if ui.button("Dismiss").clicked() {
+                                studio.last_error = None;
+                            }
+                        });
+                    if !open {
+                        studio.last_error = None;
+                    }
+                }
+            }
         });
 
         match quick_action {
@@ -1122,7 +1159,10 @@ impl GpuState {
                         studio.scene = loaded;
                         studio.history = HistoryStack::new();
                         studio.settings.record_recent_project(path);
-                        studio.settings.save(&studio.paths);
+                        if let Err(err) = studio.settings.save(&studio.paths) {
+                            tracing::error!("{err}");
+                            studio.last_error = Some(err.to_string());
+                        }
                     }
                     Err(err) => {
                         studio.quick_start.open = true;
@@ -1187,15 +1227,23 @@ impl GpuState {
             {
                 match tessel_io::import_mesh_from_path(&path, studio.scene.active_color) {
                     Ok((name, mesh)) => {
-                        let _ = studio.history.execute(
+                        if let Err(err) = studio.history.execute(
                             &mut studio.scene,
                             Command::Transaction(vec![
                                 Command::ImportLowPolyMesh { name, mesh },
                                 Command::SetMode(tessel_core::AppMode::LowPoly),
                             ]),
-                        );
+                        ) {
+                            let msg = format!("Import 3D mesh failed: {err}");
+                            tracing::error!("{msg}");
+                            studio.last_error = Some(msg);
+                        }
                     }
-                    Err(err) => tracing::error!("Import 3D mesh failed: {err}"),
+                    Err(err) => {
+                        let msg = format!("Import 3D mesh failed: {err}");
+                        tracing::error!("{msg}");
+                        studio.last_error = Some(msg);
+                    }
                 }
             }
         }
@@ -1218,6 +1266,7 @@ impl GpuState {
             let thumb = self
                 .viewport_renderer
                 .capture_png_bytes(&self.device, &self.queue)
+                .map_err(|err| tracing::warn!("project thumbnail PNG capture failed: {err}"))
                 .ok();
             match studio
                 .project_files
@@ -1225,13 +1274,20 @@ impl GpuState {
             {
                 Ok(Some(path)) => {
                     studio.settings.record_recent_project(path);
-                    studio.settings.save(&studio.paths);
+                    if let Err(err) = studio.settings.save(&studio.paths) {
+                        tracing::error!("{err}");
+                        studio.last_error = Some(err.to_string());
+                    }
                     if save_and_quit {
                         studio.quit_confirmed = true;
                     }
                 }
                 Ok(None) => {}
-                Err(err) => tracing::error!("Save project failed: {err}"),
+                Err(err) => {
+                    let msg = format!("Save project failed: {err}");
+                    tracing::error!("{msg}");
+                    studio.last_error = Some(msg);
+                }
             }
         }
         if top_actions.open_project {
@@ -1241,11 +1297,18 @@ impl GpuState {
                     studio.history = HistoryStack::new();
                     if let Some(path) = studio.project_files.current_path.clone() {
                         studio.settings.record_recent_project(path);
-                        studio.settings.save(&studio.paths);
+                        if let Err(err) = studio.settings.save(&studio.paths) {
+                            tracing::error!("{err}");
+                            studio.last_error = Some(err.to_string());
+                        }
                     }
                 }
                 Ok(None) => {}
-                Err(err) => tracing::error!("Open project failed: {err}"),
+                Err(err) => {
+                    let msg = format!("Open project failed: {err}");
+                    tracing::error!("{msg}");
+                    studio.last_error = Some(msg);
+                }
             }
         }
         if top_actions.new_project {

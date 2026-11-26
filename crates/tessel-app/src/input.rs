@@ -61,15 +61,16 @@ pub fn step_pixel_frame(scene: &mut SceneState, history: &mut HistoryStack, delt
 }
 
 /// Processes global and contextual studio shortcuts when text inputs do not hold keyboard focus.
+/// Returns a user-facing error message if a command or history operation fails.
 pub fn handle_global_shortcuts(
     ctx: &egui::Context,
     scene: &mut SceneState,
     history: &mut HistoryStack,
     camera_3d: &mut OrbitCamera,
     camera_2d: &mut PixelCamera2D,
-) {
+) -> Option<String> {
     if ctx.wants_keyboard_input() {
-        return;
+        return None;
     }
 
     let (
@@ -140,33 +141,45 @@ pub fn handle_global_shortcuts(
         )
     });
 
+    let mut last_err: Option<String> = None;
+
     if undo {
-        let _ = history.undo(scene);
+        if let Err(err) = history.undo(scene) {
+            last_err = Some(format!("Undo failed: {err}"));
+        }
     } else if redo {
-        let _ = history.redo(scene);
+        if let Err(err) = history.redo(scene) {
+            last_err = Some(format!("Redo failed: {err}"));
+        }
     }
 
     if duplicate {
         if let Some(node_id) = scene.selected_node {
-            let _ = history.execute(
+            if let Err(err) = history.execute(
                 scene,
                 Command::DuplicateNode {
                     node_id,
                     name: None,
                 },
-            );
+            ) {
+                last_err = Some(format!("Duplicate failed: {err}"));
+            }
         }
     }
 
     if delete_selected {
         if let Some(id) = scene.selected_node {
-            let _ = history.execute(scene, Command::DeleteNode(id));
+            if let Err(err) = history.execute(scene, Command::DeleteNode(id)) {
+                last_err = Some(format!("Delete failed: {err}"));
+            }
         }
     }
 
     if let Some(target_mode) = mode_switch {
         if scene.active_mode != target_mode {
-            let _ = history.execute(scene, Command::SetMode(target_mode));
+            if let Err(err) = history.execute(scene, Command::SetMode(target_mode)) {
+                last_err = Some(format!("Mode switch failed: {err}"));
+            }
         }
     }
 
@@ -199,13 +212,15 @@ pub fn handle_global_shortcuts(
                 step_pixel_frame(scene, history, 1);
             } else if rewind_home {
                 if let Some(node_id) = scene.active_pixel_node() {
-                    let _ = history.execute(
+                    if let Err(err) = history.execute(
                         scene,
                         Command::SetActivePixelFrame {
                             node_id,
                             frame: FrameIndex(0),
                         },
-                    );
+                    ) {
+                        last_err = Some(format!("Rewind frame failed: {err}"));
+                    }
                 }
             }
             if key_b {
@@ -226,6 +241,8 @@ pub fn handle_global_shortcuts(
         }
         AppMode::Voxel | AppMode::LowPoly => {}
     }
+
+    last_err
 }
 
 #[cfg(test)]

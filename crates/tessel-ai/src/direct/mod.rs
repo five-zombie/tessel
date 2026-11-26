@@ -203,6 +203,111 @@ fn validate_direct_ai_config(config: &DirectAiConfig) -> Result<(), AiError> {
 }
 
 const MAX_DIRECT_AI_RESPONSE_BYTES: u64 = 4 * 1024 * 1024;
+const MAX_PROVIDER_ERROR_CHARS: usize = 240;
+
+fn extract_provider_error_summary(raw_body: &str) -> String {
+    if let Ok(val) = serde_json::from_str::<Value>(raw_body) {
+        if let Some(msg) = val
+            .get("error")
+            .and_then(|e| {
+                e.get("message")
+                    .and_then(Value::as_str)
+                    .or_else(|| e.as_str())
+            })
+            .or_else(|| val.get("message").and_then(Value::as_str))
+        {
+            return msg.to_string();
+        }
+    }
+    raw_body.to_string()
+}
+
+fn is_token_char(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'+' | b'/' | b'=')
+}
+
+fn redact_prefixed_tokens(input: &str, prefix: &str, case_insensitive: bool) -> String {
+    let mut out = String::with_capacity(input.len());
+    let mut i = 0;
+    let bytes = input.as_bytes();
+    let plen = prefix.len();
+    while i < input.len() {
+        let at_boundary = i == 0 || (!bytes[i - 1].is_ascii_alphanumeric() && bytes[i - 1] != b'_');
+        let matched = if at_boundary && i + plen <= input.len() && input.is_char_boundary(i + plen)
+        {
+            let slice = &input[i..i + plen];
+            if case_insensitive {
+                slice.eq_ignore_ascii_case(prefix)
+            } else {
+                slice == prefix
+            }
+        } else {
+            false
+        };
+        if matched {
+            let mut end = i + plen;
+            while end < bytes.len() && is_token_char(bytes[end]) {
+                end += 1;
+            }
+            if end > i + plen {
+                if prefix.ends_with(' ') {
+                    out.push_str(&input[i..i + plen]);
+                    out.push_str("<redacted>");
+                } else {
+                    out.push_str("<redacted>");
+                }
+                i = end;
+                continue;
+            }
+        }
+        if let Some(ch) = input[i..].chars().next() {
+            out.push(ch);
+            i += ch.len_utf8();
+        } else {
+            break;
+        }
+    }
+    out
+}
+
+/// Extracts a bounded, single-line, secret-redacted summary from a non-2xx provider response body.
+pub fn sanitize_provider_error_body(raw_body: &str, api_key: &str) -> String {
+    let extracted = extract_provider_error_summary(raw_body);
+    let mut normalized = String::with_capacity(extracted.len());
+    let mut prev_space = true;
+    for ch in extracted.chars() {
+        if ch.is_whitespace() || ch.is_control() {
+            if !prev_space {
+                normalized.push(' ');
+                prev_space = true;
+            }
+        } else {
+            normalized.push(ch);
+            prev_space = false;
+        }
+    }
+    let mut sanitized = normalized.trim().to_string();
+
+    let key = api_key.trim();
+    if !key.is_empty() {
+        sanitized = sanitized.replace(key, "<redacted>");
+    }
+    sanitized = redact_prefixed_tokens(&sanitized, "bearer ", true);
+    sanitized = redact_prefixed_tokens(&sanitized, "sk-", false);
+    sanitized = redact_prefixed_tokens(&sanitized, "AIza", false);
+    sanitized = redact_prefixed_tokens(&sanitized, "tsl_", false);
+
+    if sanitized.is_empty() {
+        return "upstream provider returned an error".into();
+    }
+
+    if sanitized.chars().count() > MAX_PROVIDER_ERROR_CHARS {
+        let truncated: String = sanitized.chars().take(MAX_PROVIDER_ERROR_CHARS).collect();
+        format!("{truncated}...")
+    } else {
+        sanitized
+    }
+}
 
 /// Sends a real HTTP chat completion request with Tessel tool definitions attached.
 /// Surfaces real network/auth errors with zero mocking.
@@ -291,7 +396,7 @@ pub async fn send_prompt(
     if !status.is_success() {
         return Err(AiError::ProviderStatus {
             status: status.as_u16(),
-            message: body_text,
+            message: sanitize_provider_error_body(&body_text, &config.api_key),
         });
     }
 
@@ -378,5 +483,35 @@ mod tests {
         );
         // Ensure API key is redacted in Debug output and never placed in URL
         assert!(!format!("{gemini_default:?}").contains("gk"));
+    }
+
+    #[test]
+    fn sanitize_provider_error_body_redacts_secrets_and_bounds_length() {
+        let json_err = r#"{"error":{"message":"Incorrect API key provided: sk-proj-abc123XYZ and Bearer tok_secret_999\nstack"}}"#;
+        let out = sanitize_provider_error_body(json_err, "custom-key-42");
+        assert!(!out.contains("sk-proj-abc123XYZ"));
+        assert!(!out.contains("tok_secret_999"));
+        assert!(!out.contains('\n'));
+        assert!(out.contains("<redacted>"));
+
+        let custom_echo =
+            "disk-full on task-123: auth failed for custom-key-42, AIzaSyDummyKey123, Bearer abc+def/ghi==";
+        let out2 = sanitize_provider_error_body(custom_echo, "custom-key-42");
+        assert!(out2.contains("disk-full"));
+        assert!(out2.contains("task-123"));
+        assert!(!out2.contains("custom-key-42"));
+        assert!(!out2.contains("AIzaSyDummyKey123"));
+        assert!(!out2.contains("abc+def/ghi=="));
+        assert!(!out2.contains("ghi=="));
+
+        let huge = "é".repeat(500);
+        let out3 = sanitize_provider_error_body(&huge, "");
+        assert!(out3.ends_with("..."));
+        assert_eq!(out3.chars().count(), MAX_PROVIDER_ERROR_CHARS + 3);
+
+        assert_eq!(
+            sanitize_provider_error_body("   \n\t  ", ""),
+            "upstream provider returned an error"
+        );
     }
 }
