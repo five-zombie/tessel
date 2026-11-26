@@ -144,6 +144,9 @@ pub fn create_bone_grid(
     } else {
         glam::Mat4::IDENTITY
     };
+    if parent_world.determinant().abs() <= 1e-8 {
+        return Err(CoreError::OutOfBounds);
+    }
     let parent_world_inv = parent_world.inverse();
 
     let mut next_id = rig

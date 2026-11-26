@@ -233,7 +233,7 @@ pub fn bake_vertex_animation_texture(
 pub fn sample_vat_position(vat: &VatBakeResult, vertex_idx: usize, frame_f: f32) -> Option<Vec3> {
     let vc = vat.metadata.vertex_count;
     let fc = vat.metadata.frame_count;
-    if vertex_idx >= vc || fc == 0 {
+    if vertex_idx >= vc || fc == 0 || !frame_f.is_finite() {
         return None;
     }
     let clamped = frame_f.clamp(0.0, (fc - 1) as f32);
@@ -243,19 +243,25 @@ pub fn sample_vat_position(vat: &VatBakeResult, vertex_idx: usize, frame_f: f32)
 
     let min = Vec3::from_array(vat.metadata.pos_min);
     let max = Vec3::from_array(vat.metadata.pos_max);
+    if !min.is_finite() || !max.is_finite() {
+        return None;
+    }
     let extent = max - min;
 
-    let read = |f: usize| -> Vec3 {
-        let idx = (f * vc + vertex_idx) * 4;
-        Vec3::new(
-            vat.position_rgba[idx] as f32 / 255.0,
-            vat.position_rgba[idx + 1] as f32 / 255.0,
-            vat.position_rgba[idx + 2] as f32 / 255.0,
-        ) * extent
-            + min
+    let read = |f: usize| -> Option<Vec3> {
+        let idx = f.checked_mul(vc)?.checked_add(vertex_idx)?.checked_mul(4)?;
+        let rgba = vat.position_rgba.get(idx..idx.checked_add(3)?)?;
+        Some(
+            Vec3::new(
+                rgba[0] as f32 / 255.0,
+                rgba[1] as f32 / 255.0,
+                rgba[2] as f32 / 255.0,
+            ) * extent
+                + min,
+        )
     };
 
-    Some(read(f0).lerp(read(f1), alpha))
+    Some(read(f0)?.lerp(read(f1)?, alpha))
 }
 
 fn compute_deformed_normals(vertices: &[Vec3], faces: &[super::face::Face]) -> Vec<Vec3> {
@@ -331,5 +337,11 @@ mod tests {
         let sampled = sample_vat_position(&vat, 0, 0.0).unwrap();
         let orig = scene.lowpoly_meshes[&node_id].vertices[0];
         assert!((sampled - orig).length() < 0.02);
+
+        // Non-finite frame or truncated RGBA buffer must return None rather than panicking or NaN.
+        assert!(sample_vat_position(&vat, 0, f32::NAN).is_none());
+        let mut truncated = vat.clone();
+        truncated.position_rgba.truncate(2);
+        assert!(sample_vat_position(&truncated, 0, 0.0).is_none());
     }
 }

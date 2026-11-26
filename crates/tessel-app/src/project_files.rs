@@ -74,14 +74,36 @@ impl ProjectFileManager {
 
     pub fn load_recovery_snapshot(&mut self) -> Result<SceneState, String> {
         let loaded = load_tessel_project(&self.recovery_path).map_err(|e| e.to_string())?;
-        self.last_saved_revision = loaded.revision;
+        // A recovered session has not been explicitly saved to a user file yet.
+        self.current_path = None;
+        self.last_saved_revision = loaded.revision.wrapping_sub(1);
+        self.last_autosaved_revision = loaded.revision;
+        self.last_observed_revision = loaded.revision;
+        self.last_change_at = Instant::now();
         Ok(loaded)
+    }
+
+    /// Returns the remaining duration until the next debounced autosave should run,
+    /// or `None` if no autosave is pending.
+    pub fn next_autosave_wakeup(&self, scene_revision: u64) -> Option<Duration> {
+        if self.autosave_paused
+            || scene_revision == self.last_saved_revision
+            || scene_revision == self.last_autosaved_revision
+        {
+            return None;
+        }
+        let now = Instant::now();
+        let debounce_rem =
+            AUTOSAVE_DEBOUNCE.saturating_sub(now.duration_since(self.last_change_at));
+        let interval_rem =
+            AUTOSAVE_MIN_INTERVAL.saturating_sub(now.duration_since(self.last_autosave_at));
+        Some(debounce_rem.max(interval_rem))
     }
 
     pub fn load_from_path(&mut self, path: PathBuf) -> Result<SceneState, String> {
         let loaded = load_tessel_project(&path).map_err(|e| e.to_string())?;
         self.current_path = Some(path);
-        self.last_saved_revision = loaded.revision;
+        self.mark_baseline_revision(loaded.revision);
         Ok(loaded)
     }
 
@@ -93,7 +115,7 @@ impl ProjectFileManager {
 
     pub fn finish_open(&mut self, path: PathBuf, loaded_revision: u64) {
         self.current_path = Some(path);
-        self.last_saved_revision = loaded_revision;
+        self.mark_baseline_revision(loaded_revision);
     }
 
     /// Writes a debounced atomic recovery snapshot after edits settle (`AUTOSAVE_DEBOUNCE`)
@@ -182,6 +204,27 @@ mod tests {
         assert!(recovery_path.exists());
         // Autosave must NOT clear has_unsaved_changes() (Close Guard must remain armed!)
         assert!(mgr.has_unsaved_changes(scene.revision));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_recovery_snapshot_marks_scene_unsaved_and_clears_current_path() {
+        let dir = std::env::temp_dir().join("tessel_recovery_unsaved_test");
+        let _ = std::fs::create_dir_all(&dir);
+        let recovery_path = dir.join("autosave.tessel");
+
+        let mut scene = SceneState::new();
+        scene.mark_modified();
+        save_tessel_project_atomic(&recovery_path, &scene).unwrap();
+
+        let mut mgr = ProjectFileManager::with_recovery_path(recovery_path.clone());
+        mgr.current_path = Some(dir.join("old.tessel"));
+        let loaded = mgr.load_recovery_snapshot().unwrap();
+
+        assert!(mgr.current_path.is_none());
+        assert!(mgr.has_unsaved_changes(loaded.revision));
+        assert!(mgr.next_autosave_wakeup(loaded.revision).is_none());
 
         let _ = std::fs::remove_dir_all(&dir);
     }

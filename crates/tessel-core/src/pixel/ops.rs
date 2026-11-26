@@ -93,13 +93,23 @@ pub fn rect_outline_points(start: PixelCoord, end: PixelCoord) -> Vec<PixelCoord
     out
 }
 
+const MAX_FLOOD_FILL_DIM: u32 = 512;
+
 /// Contiguous 4-way flood fill returning `PixelEdit`s without mutating the layer directly.
 pub fn flood_fill_edits(
     layer: &PixelLayer,
     start: PixelCoord,
     replacement: Option<PaletteIndex>,
 ) -> Vec<PixelEdit> {
-    if start.x >= layer.width() || start.y >= layer.height() {
+    let w = layer.width();
+    let h = layer.height();
+    if w == 0
+        || h == 0
+        || w > MAX_FLOOD_FILL_DIM
+        || h > MAX_FLOOD_FILL_DIM
+        || start.x >= w
+        || start.y >= h
+    {
         return Vec::new();
     }
     let target = layer.get(start);
@@ -107,9 +117,10 @@ pub fn flood_fill_edits(
         return Vec::new();
     }
 
-    let w = layer.width();
-    let h = layer.height();
-    let mut visited = vec![false; (w as usize) * (h as usize)];
+    let Some(total_pixels) = (w as usize).checked_mul(h as usize) else {
+        return Vec::new();
+    };
+    let mut visited = vec![false; total_pixels];
     let mut queue = VecDeque::new();
     let mut edits = Vec::new();
 

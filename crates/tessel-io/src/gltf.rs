@@ -145,12 +145,8 @@ fn node_world_matrices(scene: &SceneState, node_id: tessel_core::NodeId) -> (Mat
     (mat, normal_mat)
 }
 
-/// Checks whether `node_id` has a `NodeKind::Group` ancestor within 16 parent hops.
-///
-/// Note: `group_order` exports all `Group` nodes and their `children` links regardless of depth,
-/// while `has_group_ancestor` and `SceneState::compute_node_world_matrix` cap ancestor traversal
-/// at 16 hops for cycle safety (nodes nested under >16 non-group ancestors stop walking at hop 16).
-fn has_group_ancestor(scene: &SceneState, node_id: tessel_core::NodeId) -> bool {
+/// Returns `true` if any `NodeKind::Group` ancestor within 16 hops is hidden (`!visible`).
+fn has_hidden_group_ancestor(scene: &SceneState, node_id: tessel_core::NodeId) -> bool {
     let mut curr = scene.nodes.get(&node_id).and_then(|n| n.parent);
     let mut hops = 0usize;
     while let Some(pid) = curr {
@@ -161,12 +157,37 @@ fn has_group_ancestor(scene: &SceneState, node_id: tessel_core::NodeId) -> bool 
         let Some(pnode) = scene.nodes.get(&pid) else {
             break;
         };
-        if pnode.kind == tessel_core::NodeKind::Group {
+        if pnode.kind == tessel_core::NodeKind::Group && !pnode.visible {
             return true;
         }
         curr = pnode.parent;
     }
     false
+}
+
+/// Checks whether `node_id` has an effectively visible `NodeKind::Group` ancestor chain within 16 hops.
+/// Returns `false` if any `Group` ancestor in the chain is hidden.
+fn has_group_ancestor(scene: &SceneState, node_id: tessel_core::NodeId) -> bool {
+    let mut curr = scene.nodes.get(&node_id).and_then(|n| n.parent);
+    let mut hops = 0usize;
+    let mut found_visible_group = false;
+    while let Some(pid) = curr {
+        if hops >= 16 {
+            break;
+        }
+        hops += 1;
+        let Some(pnode) = scene.nodes.get(&pid) else {
+            break;
+        };
+        if pnode.kind == tessel_core::NodeKind::Group {
+            if !pnode.visible {
+                return false;
+            }
+            found_visible_group = true;
+        }
+        curr = pnode.parent;
+    }
+    found_visible_group
 }
 
 fn collect_node_transform_animated(
@@ -338,8 +359,8 @@ impl CollectedMesh {
                     .flat_map(|c| {
                         c.visibility_tracks
                             .iter()
-                            .filter(|t| !t.keys.is_empty())
                             .map(|t| t.node)
+                            .chain(c.parent_switch_tracks.iter().map(|t| t.node))
                     })
                     .collect()
             })
@@ -600,7 +621,7 @@ pub fn export_glb_bytes(
         total_triangles += mesh.indices.len() / 3;
     }
 
-    let mut nodes: Vec<Value> = vec![json!({ "name": "TesselAsset", "mesh": 0 })];
+    let mut nodes: Vec<Value> = vec![json!({ "name": "TesselAsset" })];
     let mut root_nodes: Vec<usize> = vec![0];
     let mut animations: Vec<Value> = Vec::new();
     let mut skins: Vec<Value> = Vec::new();
@@ -628,7 +649,11 @@ pub fn export_glb_bytes(
     let group_order: Vec<tessel_core::NodeId> = scene
         .nodes
         .iter()
-        .filter(|(_, n)| n.visible && n.kind == tessel_core::NodeKind::Group)
+        .filter(|(id, n)| {
+            n.visible
+                && n.kind == tessel_core::NodeKind::Group
+                && !has_hidden_group_ancestor(scene, **id)
+        })
         .map(|(id, _)| *id)
         .collect();
     let morphed_order: Vec<tessel_core::NodeId> = scene
@@ -720,7 +745,6 @@ pub fn export_glb_bytes(
                     skin_json["skeleton"] = json!(skel);
                 }
                 skins.push(skin_json);
-                nodes[0]["skin"] = json!(0);
             }
         }
 
@@ -872,19 +896,14 @@ pub fn export_glb_bytes(
                 // Keyframe scale multiplies the rest scale; same skip rule.
                 let rest_s = rest.map(|b| b.rest_local.scale).unwrap_or(Vec3::ONE);
                 if ch.keyframes.iter().any(|k| k.scale != Vec3::ONE) {
+                    let raw_scales: Vec<[f32; 3]> = kf_indices
+                        .iter()
+                        .map(|&idx| (rest_s * ch.keyframes[idx].scale).to_array())
+                        .collect();
                     let scales: Vec<[f32; 3]> = if is_cubic {
-                        let mut packed = Vec::with_capacity(ch.keyframes.len() * 3);
-                        for k in &ch.keyframes {
-                            packed.push([0.0, 0.0, 0.0]);
-                            packed.push((rest_s * k.scale).to_array());
-                            packed.push([0.0, 0.0, 0.0]);
-                        }
-                        packed
+                        pack_cubicspline(&times, &interps, &raw_scales)
                     } else {
-                        ch.keyframes
-                            .iter()
-                            .map(|k| (rest_s * k.scale).to_array())
-                            .collect()
+                        raw_scales
                     };
                     let scale_bv = push_view(
                         &mut bin,
@@ -1825,11 +1844,19 @@ pub fn export_glb_bytes(
     // weights) plus dedicated identity nodes, since morph targets cannot
     // ride the merged palette mesh. Vertex data is already baked, so the
     // nodes carry no transform.
-    let mut meshes = vec![json!({
-        "name": "TesselMesh",
-        "primitives": primitives
-    })];
     let has_skin = !skins.is_empty();
+    let mut meshes: Vec<Value> = if !primitives.is_empty() {
+        nodes[0]["mesh"] = json!(0);
+        if has_skin {
+            nodes[0]["skin"] = json!(0);
+        }
+        vec![json!({
+            "name": "TesselMesh",
+            "primitives": primitives
+        })]
+    } else {
+        Vec::new()
+    };
     // Node indices must match the precomputed `morphed_order` used by the
     // morph weight channels above (same BTreeMap order, same filters).
     debug_assert!(morphed
@@ -3155,6 +3182,102 @@ mod tests {
                         .is_some_and(|i| json_nodes[i as usize]["mesh"].is_u64())
                 })),
             "Group_14 should parent the exported mesh node"
+        );
+    }
+
+    #[test]
+    fn glb_export_omits_empty_primitives_mesh_and_validates_cubicspline_step_scale() {
+        let mut scene = SceneState::new();
+        Command::CreatePrimitiveMesh {
+            name: "MorphedOnly".into(),
+            kind: tessel_core::PrimitiveKind::Cube,
+            size: 1.0,
+            material: PaletteIndex::new(1).unwrap(),
+        }
+        .apply(&mut scene)
+        .unwrap();
+        let node_id = scene.active_lowpoly_node().unwrap();
+        Command::SetMorphTargetDeltas {
+            node_id,
+            name: "Blink".into(),
+            position_deltas: vec![(0, Vec3::new(0.0, 0.1, 0.0))],
+            normal_deltas: vec![],
+            replace: true,
+        }
+        .apply(&mut scene)
+        .unwrap();
+
+        Command::AddBone {
+            name: "Root".into(),
+            parent: None,
+            position: Vec3::ZERO,
+        }
+        .apply(&mut scene)
+        .unwrap();
+        let bone_id = scene.character_rig.as_ref().unwrap().bones[0].id;
+        Command::AddAnimationClip {
+            name: "ScaleCubicStep".into(),
+            duration_secs: 1.0,
+        }
+        .apply(&mut scene)
+        .unwrap();
+        let clip_idx = scene.character_rig.as_ref().unwrap().active_animation;
+        for (t, s, interp) in [
+            (
+                0.0,
+                Vec3::ONE,
+                tessel_core::KeyframeInterpolation::CubicBezier {
+                    p1x: 0.42,
+                    p1y: 0.0,
+                    p2x: 0.58,
+                    p2y: 1.0,
+                },
+            ),
+            (
+                0.5,
+                Vec3::splat(1.5),
+                tessel_core::KeyframeInterpolation::Step,
+            ),
+            (1.0, Vec3::ONE, tessel_core::KeyframeInterpolation::Linear),
+        ] {
+            Command::SetAnimationKeyframe {
+                clip_index: clip_idx,
+                bone_id,
+                keyframe: tessel_core::Keyframe {
+                    time_secs: t,
+                    rotation: glam::Quat::IDENTITY,
+                    translation: Vec3::ZERO,
+                    scale: s,
+                    interpolation: interp,
+                },
+            }
+            .apply(&mut scene)
+            .unwrap();
+        }
+
+        let (glb, _) = export_glb_bytes(&scene, ExportPreset::default()).unwrap();
+        let parsed = gltf::Gltf::from_slice(&glb).expect("GLB must be valid glTF 2.0");
+        // Every exported mesh must have at least 1 primitive (no empty primitives: []).
+        for mesh in parsed.meshes() {
+            assert!(
+                mesh.primitives().len() >= 1,
+                "mesh {} must have >= 1 primitive",
+                mesh.index()
+            );
+        }
+        // For the CUBICSPLINE + mixed Step scale channel, output count must equal input count * 3.
+        let scale_ch = parsed
+            .animations()
+            .flat_map(|a| a.channels())
+            .find(|c| c.target().property() == gltf::animation::Property::Scale)
+            .expect("scale channel");
+        assert_eq!(
+            scale_ch.sampler().interpolation(),
+            gltf::animation::Interpolation::CubicSpline
+        );
+        assert_eq!(
+            scale_ch.sampler().output().count(),
+            scale_ch.sampler().input().count() * 3
         );
     }
 }

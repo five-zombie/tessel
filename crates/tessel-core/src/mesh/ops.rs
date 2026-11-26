@@ -1140,7 +1140,8 @@ pub fn decimate_mesh(mesh: &LowPolyMesh, target_ratio: f32) -> Result<LowPolyMes
     for face in &mesh.faces {
         let mut loop_verts: Vec<usize> = Vec::new();
         for &vi in &face.vertices {
-            let idx = cell_accum[&vert_to_cell[vi]].2;
+            let cell = vert_to_cell.get(vi).ok_or(CoreError::OutOfBounds)?;
+            let idx = cell_accum.get(cell).ok_or(CoreError::OutOfBounds)?.2;
             if !loop_verts.contains(&idx) {
                 loop_verts.push(idx);
             }
@@ -1481,13 +1482,30 @@ pub fn extrude_face(
     face_id: FaceId,
     distance: f32,
 ) -> Result<LowPolyMesh, CoreError> {
+    if !distance.is_finite() {
+        return Err(CoreError::OutOfBounds);
+    }
     let face = mesh.faces.get(face_id.0).ok_or(CoreError::OutOfBounds)?;
     if face.vertices.len() < 3 {
         return Err(CoreError::OutOfBounds);
     }
-    let p0 = mesh.vertices[face.vertices[0]];
-    let p1 = mesh.vertices[face.vertices[1]];
-    let p2 = mesh.vertices[face.vertices[2]];
+    for &vi in &face.vertices {
+        if vi >= mesh.vertices.len() {
+            return Err(CoreError::OutOfBounds);
+        }
+    }
+    let p0 = *mesh
+        .vertices
+        .get(face.vertices[0])
+        .ok_or(CoreError::OutOfBounds)?;
+    let p1 = *mesh
+        .vertices
+        .get(face.vertices[1])
+        .ok_or(CoreError::OutOfBounds)?;
+    let p2 = *mesh
+        .vertices
+        .get(face.vertices[2])
+        .ok_or(CoreError::OutOfBounds)?;
     let normal = (p1 - p0).cross(p2 - p0).normalize_or_zero();
 
     let mut next = mesh.clone();
@@ -1496,8 +1514,9 @@ pub fn extrude_face(
     let mut new_verts = Vec::with_capacity(old_verts.len());
 
     for &vi in &old_verts {
+        let base = *next.vertices.get(vi).ok_or(CoreError::OutOfBounds)?;
         let idx = next.vertices.len();
-        next.vertices.push(next.vertices[vi] + normal * distance);
+        next.vertices.push(base + normal * distance);
         new_verts.push(idx);
     }
 
@@ -1523,6 +1542,9 @@ pub fn inset_face(
     face_id: FaceId,
     factor: f32,
 ) -> Result<LowPolyMesh, CoreError> {
+    if !factor.is_finite() {
+        return Err(CoreError::OutOfBounds);
+    }
     let face = mesh.faces.get(face_id.0).ok_or(CoreError::OutOfBounds)?;
     if face.vertices.len() < 3 {
         return Err(CoreError::OutOfBounds);

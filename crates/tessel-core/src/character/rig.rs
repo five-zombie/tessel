@@ -624,7 +624,12 @@ impl CharacterRig {
             let bone_world = world_mats.get(&bid).copied().unwrap_or(Mat4::IDENTITY);
             let bone_rest = rest_mats.get(&bid).copied().unwrap_or(Mat4::IDENTITY);
             let offset = Mat4::from_rotation_translation(key.rotation, key.position);
-            bone_world * offset * bone_rest.inverse() * base_node_mat
+            let bone_rest_inv = if bone_rest.determinant().abs() > 1e-8 {
+                bone_rest.inverse()
+            } else {
+                Mat4::IDENTITY
+            };
+            bone_world * offset * bone_rest_inv * base_node_mat
         } else {
             let (base_scale, _, _) = base_node_mat.to_scale_rotation_translation();
             Mat4::from_scale_rotation_translation(base_scale, key.rotation, key.position)

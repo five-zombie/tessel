@@ -28,6 +28,10 @@ struct MaskCell {
 /// Runs deterministic Greedy Meshing across the entire `VoxelVolume` with per-vertex AO
 /// and CCW front-face winding (Right-Handed Y-Up).
 /// `unit_scale` maps 1 voxel to world meters (e.g. `0.1` or `1.0`).
+///
+/// # Limitations
+/// Volumes whose bounding-box span exceeds `513` voxels along any axis return an empty
+/// `VoxelMeshOutput` as a memory-safety cap on the 2D greedy-meshing slice mask.
 pub fn greedy_mesh_volume(volume: &VoxelVolume, unit_scale: f32) -> VoxelMeshOutput {
     let mut output = VoxelMeshOutput::default();
     let Some((min_b, max_b)) = volume.bounds() else {

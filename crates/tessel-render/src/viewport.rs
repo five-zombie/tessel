@@ -41,6 +41,7 @@ pub struct ViewportRenderer {
     overlay_pass: OverlayPass,
     pixel_pass: PixelPass,
     last_uploaded_revision: u64,
+    last_playback_time_bits: Option<u32>,
     last_hover_voxel: Option<VoxelCoord>,
     last_gizmo_axis: Option<GizmoAxis>,
     last_light_angles: (f32, f32),
@@ -69,6 +70,7 @@ impl ViewportRenderer {
             overlay_pass,
             pixel_pass,
             last_uploaded_revision: u64::MAX,
+            last_playback_time_bits: None,
             last_hover_voxel: None,
             last_gizmo_axis: None,
             last_light_angles: (f32::NAN, f32::NAN),
@@ -108,7 +110,13 @@ impl ViewportRenderer {
         hover_voxel: Option<VoxelCoord>,
         active_gizmo_axis: Option<GizmoAxis>,
     ) {
-        let scene_changed = self.last_uploaded_revision != scene.revision;
+        let playback_time_bits = scene
+            .character_rig
+            .as_ref()
+            .map(|r| r.playback_time.to_bits());
+        let scene_changed = self.last_uploaded_revision != scene.revision
+            || self.last_playback_time_bits != playback_time_bits
+            || scene.dirty_viewport;
         let hover_changed = self.last_hover_voxel != hover_voxel;
         let gizmo_changed = self.last_gizmo_axis != active_gizmo_axis;
         let light_angles = (scene.light_azimuth, scene.light_elevation);
@@ -123,6 +131,7 @@ impl ViewportRenderer {
         if !scene_changed {
             return;
         }
+        self.last_playback_time_bits = playback_time_bits;
         self.mesh_pass.upload_palette(queue, &scene.palette);
 
         if let Some(node_id) = scene.active_pixel_node() {

@@ -518,6 +518,9 @@ pub enum UndoDelta {
         voxel_volume: Option<Box<VoxelVolume>>,
         lowpoly_mesh: Option<Box<LowPolyMesh>>,
         previous_selection: Option<NodeId>,
+        previous_selected_face: Option<FaceId>,
+        orphaned_children: Vec<NodeId>,
+        previous_rig: Option<Box<CharacterRig>>,
     },
     RestoreSelection(Option<NodeId>),
     RestoreNodeTransform {
@@ -763,8 +766,47 @@ impl Command {
                 let voxel_volume = scene.voxel_volumes.remove(id);
                 let lowpoly_mesh = scene.lowpoly_meshes.remove(id);
                 let previous_selection = scene.selected_node;
+                let previous_selected_face = scene.selected_face;
                 if scene.selected_node == Some(*id) {
                     scene.selected_node = None;
+                    scene.selected_face = None;
+                }
+                let mut orphaned_children = Vec::new();
+                for (child_id, child) in scene.nodes.iter_mut() {
+                    if child.parent == Some(*id) {
+                        child.parent = None;
+                        orphaned_children.push(*child_id);
+                    }
+                }
+                let mut previous_rig = None;
+                if let Some(rig) = scene.character_rig.as_mut() {
+                    let has_refs = rig.bindings.iter().any(|b| b.node_id == *id)
+                        || rig.node_bone_masks.contains_key(id)
+                        || rig.node_visibility.contains_key(id)
+                        || rig.node_transform_overrides.contains_key(id)
+                        || rig.node_parent_overrides.contains_key(id)
+                        || rig.morph_weights.keys().any(|(nid, _)| nid == id)
+                        || rig.animations.iter().any(|c| {
+                            c.visibility_tracks.iter().any(|t| t.node == *id)
+                                || c.parent_switch_tracks.iter().any(|t| t.node == *id)
+                                || c.node_transform_tracks.iter().any(|t| t.node == *id)
+                                || c.morph_tracks.iter().any(|t| t.node == *id)
+                        });
+                    if has_refs {
+                        previous_rig = Some(Box::new(rig.clone()));
+                        rig.bindings.retain(|b| b.node_id != *id);
+                        rig.node_bone_masks.remove(id);
+                        rig.node_visibility.remove(id);
+                        rig.node_transform_overrides.remove(id);
+                        rig.node_parent_overrides.remove(id);
+                        rig.morph_weights.retain(|(nid, _), _| nid != id);
+                        for clip in &mut rig.animations {
+                            clip.visibility_tracks.retain(|t| t.node != *id);
+                            clip.parent_switch_tracks.retain(|t| t.node != *id);
+                            clip.node_transform_tracks.retain(|t| t.node != *id);
+                            clip.morph_tracks.retain(|t| t.node != *id);
+                        }
+                    }
                 }
                 UndoDelta::RestoreNode {
                     node: Box::new(node),
@@ -772,6 +814,9 @@ impl Command {
                     voxel_volume: voxel_volume.map(Box::new),
                     lowpoly_mesh: lowpoly_mesh.map(Box::new),
                     previous_selection,
+                    previous_selected_face,
+                    orphaned_children,
+                    previous_rig,
                 }
             }
             Self::SelectNode(target) => {
@@ -785,6 +830,12 @@ impl Command {
                 UndoDelta::RestoreSelection(prev)
             }
             Self::SetNodeTransform { node_id, transform } => {
+                if !transform.translation.is_finite()
+                    || !transform.rotation.is_finite()
+                    || !transform.scale.is_finite()
+                {
+                    return Err(CoreError::OutOfBounds);
+                }
                 let node = scene
                     .nodes
                     .get_mut(node_id)
@@ -897,13 +948,18 @@ impl Command {
                     return Err(CoreError::OutOfBounds);
                 }
                 let (w, h) = (canvas.width, canvas.height);
+                {
+                    let frame_check = canvas
+                        .frame(*frame)
+                        .ok_or(CoreError::PixelFrameNotFound(*frame))?;
+                    if frame_check.layers.len() >= 32 {
+                        return Err(CoreError::OutOfBounds);
+                    }
+                }
                 let new_id = canvas.allocate_layer_id();
                 let frame_ref = canvas
                     .frame_mut(*frame)
                     .ok_or(CoreError::PixelFrameNotFound(*frame))?;
-                if frame_ref.layers.len() >= 32 {
-                    return Err(CoreError::OutOfBounds);
-                }
                 let previous_active = frame_ref.active_layer;
                 frame_ref.layers.push(PixelLayer::new(new_id, name, w, h));
                 frame_ref.active_layer = frame_ref.layers.len().saturating_sub(1);
@@ -1421,6 +1477,9 @@ impl Command {
                     .ok_or(CoreError::LowPolyMeshNotFound(*target_node_id))?
                     .clone();
                 let target_world = scene.node_world_matrix(*target_node_id);
+                if target_world.determinant().abs() <= 1e-8 {
+                    return Err(CoreError::OutOfBounds);
+                }
                 let target_inv = target_world.inverse();
                 let mut owned_sources: Vec<(NodeId, LowPolyMesh, glam::Mat4)> =
                     Vec::with_capacity(source_node_ids.len());
@@ -2363,6 +2422,9 @@ impl Command {
                 UndoDelta::RestoreCharacterRig(prev)
             }
             Self::SetBoneRotation { bone_id, rotation } => {
+                if !rotation.is_finite() {
+                    return Err(CoreError::OutOfBounds);
+                }
                 let rig = scene
                     .character_rig
                     .as_mut()
@@ -2521,6 +2583,9 @@ impl Command {
                 name,
                 duration_secs,
             } => {
+                if !duration_secs.is_finite() || *duration_secs <= 0.0 {
+                    return Err(CoreError::OutOfBounds);
+                }
                 let prev_rig = scene.character_rig.clone();
                 let had_rig = scene.character_rig.is_some();
                 let rig = scene
@@ -3363,6 +3428,9 @@ impl UndoDelta {
                 voxel_volume,
                 lowpoly_mesh,
                 previous_selection,
+                previous_selected_face,
+                orphaned_children,
+                previous_rig,
             } => {
                 if let Some(canvas) = pixel_canvas {
                     scene.pixel_canvases.insert(node.id, (**canvas).clone());
@@ -3373,8 +3441,18 @@ impl UndoDelta {
                 if let Some(mesh) = lowpoly_mesh {
                     scene.lowpoly_meshes.insert(node.id, (**mesh).clone());
                 }
-                scene.nodes.insert(node.id, (**node).clone());
+                let restored_id = node.id;
+                scene.nodes.insert(restored_id, (**node).clone());
+                for child_id in orphaned_children {
+                    if let Some(child) = scene.nodes.get_mut(child_id) {
+                        child.parent = Some(restored_id);
+                    }
+                }
+                if let Some(rig) = previous_rig {
+                    scene.character_rig = Some((**rig).clone());
+                }
                 scene.selected_node = *previous_selection;
+                scene.selected_face = *previous_selected_face;
             }
             Self::RestoreSelection(prev) => {
                 scene.selected_node = *prev;

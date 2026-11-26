@@ -32,6 +32,33 @@ pub enum SceneGadgetDrag {
     Camera,
 }
 
+/// Cancels an in-progress gizmo drag and restores the node's pre-drag transform so no
+/// unrecorded mutation leaks outside the `Command` bus and `scene.revision` stays clean.
+pub fn cancel_gizmo_drag(scene: &mut SceneState, gizmo_drag: &mut Option<GizmoDragState>) {
+    if let Some(drag) = gizmo_drag.take() {
+        if let Some(node) = scene.nodes.get_mut(&drag.node_id) {
+            node.transform = drag.start_transform;
+            scene.dirty_viewport = true;
+        }
+    }
+}
+
+/// Cancels an in-progress scene gadget drag (e.g. Sun light) and restores its pre-drag state.
+pub fn cancel_scene_gadget_drag(
+    scene: &mut SceneState,
+    scene_gadget_drag: &mut Option<SceneGadgetDrag>,
+) {
+    if let Some(SceneGadgetDrag::Sun {
+        start_azimuth,
+        start_elevation,
+    }) = scene_gadget_drag.take()
+    {
+        scene.light_azimuth = start_azimuth;
+        scene.light_elevation = start_elevation;
+        scene.dirty_viewport = true;
+    }
+}
+
 /// Displays the offscreen wgpu viewport texture, routes 2D/3D viewport input,
 /// renders the floating Zoom & Camera Preset HUD, and returns `(desired_physical_size, hover_voxel, hovered_gizmo_axis)`.
 #[allow(clippy::too_many_arguments)]
@@ -75,6 +102,9 @@ pub fn show_viewport(
         );
 
         if scene.active_mode == AppMode::Pixel {
+            cancel_scene_gadget_drag(scene, scene_gadget_drag);
+            cancel_gizmo_drag(scene, gizmo_drag);
+            active_gizmo_axis = None;
             handle_pixel_viewport_input(
                 ui,
                 rect,
@@ -86,7 +116,7 @@ pub fn show_viewport(
             );
         } else {
             let gadget_consumed = if *render_preview {
-                *scene_gadget_drag = None;
+                cancel_scene_gadget_drag(scene, scene_gadget_drag);
                 false
             } else {
                 handle_scene_gadget_input(
@@ -104,7 +134,7 @@ pub fn show_viewport(
                 )
             };
             let gizmo_consumed = if *free_view || gadget_consumed {
-                *gizmo_drag = None;
+                cancel_gizmo_drag(scene, gizmo_drag);
                 active_gizmo_axis = None;
                 false
             } else {
@@ -426,9 +456,17 @@ fn handle_gizmo_drag_input(
     active_axis: &mut Option<GizmoAxis>,
 ) -> bool {
     let Some(node_id) = scene.selected_node else {
+        cancel_gizmo_drag(scene, gizmo_drag);
+        *active_axis = None;
         return false;
     };
+    if gizmo_drag.is_some_and(|d| d.node_id != node_id) {
+        cancel_gizmo_drag(scene, gizmo_drag);
+        *active_axis = None;
+    }
     let Some(node) = scene.nodes.get(&node_id) else {
+        cancel_gizmo_drag(scene, gizmo_drag);
+        *active_axis = None;
         return false;
     };
     let node_transform = node.transform;
@@ -484,6 +522,11 @@ fn handle_gizmo_drag_input(
     }
 
     if let Some(drag) = *gizmo_drag {
+        if response.ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            cancel_gizmo_drag(scene, gizmo_drag);
+            *active_axis = None;
+            return true;
+        }
         if response.dragged_by(egui::PointerButton::Primary) {
             if let Some(pos) = response.interact_pointer_pos() {
                 let (orig, dir) = pointer_ray(pos);
@@ -494,7 +537,7 @@ fn handle_gizmo_drag_input(
                     let local_delta = drag.parent_world_inv.transform_vector3(world_delta);
                     if let Some(node) = scene.nodes.get_mut(&drag.node_id) {
                         node.transform.translation = drag.start_transform.translation + local_delta;
-                        scene.mark_modified();
+                        scene.dirty_viewport = true;
                     }
                 }
             }
@@ -518,6 +561,9 @@ fn handle_gizmo_drag_input(
             *gizmo_drag = None;
             return true;
         }
+        // Drag was interrupted without a normal stop (e.g. focus loss or modal); restore state.
+        cancel_gizmo_drag(scene, gizmo_drag);
+        *active_axis = None;
     }
 
     false
@@ -1254,6 +1300,10 @@ fn handle_scene_gadget_input(
     }
 
     if let Some(drag) = *gadget_drag {
+        if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+            cancel_scene_gadget_drag(scene, gadget_drag);
+            return true;
+        }
         match drag {
             SceneGadgetDrag::Sun {
                 start_azimuth,
@@ -1265,7 +1315,7 @@ fn handle_scene_gadget_input(
                         apply_sun_drag_delta(scene.light_azimuth, scene.light_elevation, delta);
                     scene.light_azimuth = az;
                     scene.light_elevation = el;
-                    scene.mark_modified();
+                    scene.dirty_viewport = true;
                     return true;
                 }
                 if response.drag_stopped_by(egui::PointerButton::Primary) {
@@ -1285,6 +1335,7 @@ fn handle_scene_gadget_input(
                     *gadget_drag = None;
                     return true;
                 }
+                cancel_scene_gadget_drag(scene, gadget_drag);
             }
             SceneGadgetDrag::Camera => {
                 if response.dragged_by(egui::PointerButton::Primary) {
@@ -1301,6 +1352,7 @@ fn handle_scene_gadget_input(
                     *gadget_drag = None;
                     return true;
                 }
+                *gadget_drag = None;
             }
         }
     }
@@ -1537,5 +1589,50 @@ mod tests {
         .unwrap();
         assert!(rect.contains(center));
         assert!(s_ortho.y < center.y);
+    }
+
+    #[test]
+    fn cancel_gizmo_and_sun_drag_restores_initial_values() {
+        let mut scene = SceneState::new();
+        Command::CreateVoxelVolume { name: "Box".into() }
+            .apply(&mut scene)
+            .unwrap();
+        let node_id = scene.active_voxel_node().unwrap();
+        let start_tx = scene.nodes.get(&node_id).unwrap().transform;
+        let start_rev = scene.revision;
+
+        // Simulate mid-drag node mutation followed by cancel.
+        scene.nodes.get_mut(&node_id).unwrap().transform.translation =
+            glam::Vec3::new(3.0, 2.0, -1.0);
+        let mut gizmo_drag = Some(GizmoDragState {
+            node_id,
+            axis: GizmoAxis::X,
+            start_transform: start_tx,
+            start_world_pos: glam::Vec3::ZERO,
+            parent_world_inv: glam::Mat4::IDENTITY,
+            start_axis_t: 0.0,
+        });
+        cancel_gizmo_drag(&mut scene, &mut gizmo_drag);
+        assert!(gizmo_drag.is_none());
+        assert_eq!(scene.nodes.get(&node_id).unwrap().transform, start_tx);
+        assert_eq!(scene.revision, start_rev);
+        assert!(scene.dirty_viewport);
+
+        // Simulate mid-drag Sun mutation followed by cancel.
+        let orig_az = scene.light_azimuth;
+        let orig_el = scene.light_elevation;
+        scene.light_azimuth = 2.5;
+        scene.light_elevation = 0.3;
+        scene.dirty_viewport = false;
+        let mut gadget_drag = Some(SceneGadgetDrag::Sun {
+            start_azimuth: orig_az,
+            start_elevation: orig_el,
+        });
+        cancel_scene_gadget_drag(&mut scene, &mut gadget_drag);
+        assert!(gadget_drag.is_none());
+        assert!((scene.light_azimuth - orig_az).abs() < 1e-6);
+        assert!((scene.light_elevation - orig_el).abs() < 1e-6);
+        assert_eq!(scene.revision, start_rev);
+        assert!(scene.dirty_viewport);
     }
 }

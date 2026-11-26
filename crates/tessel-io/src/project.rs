@@ -70,6 +70,51 @@ pub fn encode_tessel_project_with_thumbnail(
 
 const MAX_MANIFEST_JSON_BYTES: u64 = 64 * 1024;
 const MAX_SCENE_JSON_BYTES: u64 = 64 * 1024 * 1024;
+const MAX_PIXEL_CANVAS_DIM: u32 = 512;
+const MAX_PIXEL_CANVAS_FRAMES: usize = 128;
+const MAX_PIXEL_LAYERS_PER_FRAME: usize = 32;
+
+fn validate_loaded_scene(scene: &SceneState) -> Result<(), IoError> {
+    for canvas in scene.pixel_canvases.values() {
+        if canvas.width == 0
+            || canvas.height == 0
+            || canvas.width > MAX_PIXEL_CANVAS_DIM
+            || canvas.height > MAX_PIXEL_CANVAS_DIM
+        {
+            return Err(IoError::InvalidDimensions(canvas.width, canvas.height));
+        }
+        if canvas.frames.len() > MAX_PIXEL_CANVAS_FRAMES {
+            return Err(IoError::PayloadTooLarge(format!(
+                "pixel canvas frame count {} exceeds limit {MAX_PIXEL_CANVAS_FRAMES}",
+                canvas.frames.len()
+            )));
+        }
+        let expected_pixels = (canvas.width as usize)
+            .checked_mul(canvas.height as usize)
+            .ok_or(IoError::InvalidDimensions(canvas.width, canvas.height))?;
+        for frame in &canvas.frames {
+            if frame.layers.len() > MAX_PIXEL_LAYERS_PER_FRAME {
+                return Err(IoError::PayloadTooLarge(format!(
+                    "pixel frame layer count {} exceeds limit {MAX_PIXEL_LAYERS_PER_FRAME}",
+                    frame.layers.len()
+                )));
+            }
+            for layer in &frame.layers {
+                if layer.width() == 0
+                    || layer.height() == 0
+                    || layer.width() > MAX_PIXEL_CANVAS_DIM
+                    || layer.height() > MAX_PIXEL_CANVAS_DIM
+                    || layer.width() != canvas.width
+                    || layer.height() != canvas.height
+                    || layer.pixels().len() != expected_pixels
+                {
+                    return Err(IoError::InvalidDimensions(layer.width(), layer.height()));
+                }
+            }
+        }
+    }
+    Ok(())
+}
 
 /// Decodes `.tessel` archive bytes with forward schema version checking and decompression bounds.
 pub fn decode_tessel_project(bytes: &[u8]) -> Result<SceneState, IoError> {
@@ -97,11 +142,12 @@ pub fn decode_tessel_project(bytes: &[u8]) -> Result<SceneState, IoError> {
         .take(MAX_SCENE_JSON_BYTES + 1)
         .read_to_string(&mut scene_buf)?;
     if read_bytes as u64 > MAX_SCENE_JSON_BYTES {
-        return Err(IoError::ExportPathDenied(
+        return Err(IoError::PayloadTooLarge(
             "scene.json exceeds 64 MiB decompressed limit".into(),
         ));
     }
     let scene: SceneState = serde_json::from_str(&scene_buf)?;
+    validate_loaded_scene(&scene)?;
     Ok(scene)
 }
 
@@ -302,6 +348,18 @@ mod tests {
         assert!(matches!(
             decode_tessel_project(&bad_fmt_buf.into_inner()),
             Err(IoError::InvalidFormat(_))
+        ));
+
+        // Oversized PixelCanvas (> 512) must be rejected post-deserialization.
+        let mut oversized = SceneState::new();
+        let node_id = oversized.allocate_node_id();
+        let mut bad_canvas = tessel_core::PixelCanvas::new(16, 16).unwrap();
+        bad_canvas.width = 1024;
+        oversized.pixel_canvases.insert(node_id, bad_canvas);
+        let encoded_oversized = encode_tessel_project(&oversized).unwrap();
+        assert!(matches!(
+            decode_tessel_project(&encoded_oversized),
+            Err(IoError::InvalidDimensions(1024, 16))
         ));
     }
 }

@@ -71,8 +71,20 @@ pub fn export_stl_bytes(
     Ok((out, tri_count))
 }
 
+const MAX_IMPORT_BYTES: usize = 64 * 1024 * 1024;
+const MAX_IMPORT_VERTICES: usize = 500_000;
+const MAX_IMPORT_FACES: usize = 500_000;
+const MAX_IMPORT_ACCESSOR_ITEMS: usize = 2_000_000;
+const MAX_IMPORT_MORPH_TARGETS: usize = 128;
+const MAX_OBJ_FACE_VERTICES: usize = 256;
+
 /// Imports a Wavefront `.obj` text document into a `LowPolyMesh`, preserving `vt` UVs when present.
 pub fn import_obj_str(obj_text: &str, material: PaletteIndex) -> Result<LowPolyMesh, IoError> {
+    if obj_text.len() > MAX_IMPORT_BYTES {
+        return Err(IoError::PayloadTooLarge(
+            "OBJ text exceeds 64 MiB safety limit".into(),
+        ));
+    }
     let mut vertices = Vec::new();
     let mut tex_coords: Vec<[f32; 2]> = Vec::new();
     let mut faces = Vec::new();
@@ -106,9 +118,19 @@ pub fn import_obj_str(obj_text: &str, material: PaletteIndex) -> Result<LowPolyM
                         "non-finite OBJ vertex coordinate".into(),
                     ));
                 }
+                if vertices.len() >= MAX_IMPORT_VERTICES {
+                    return Err(IoError::PayloadTooLarge(format!(
+                        "OBJ vertex count exceeds limit {MAX_IMPORT_VERTICES}"
+                    )));
+                }
                 vertices.push(v);
             }
             "vt" => {
+                if tex_coords.len() >= MAX_IMPORT_ACCESSOR_ITEMS {
+                    return Err(IoError::PayloadTooLarge(format!(
+                        "OBJ texcoord count exceeds limit {MAX_IMPORT_ACCESSOR_ITEMS}"
+                    )));
+                }
                 if let (Some(u), Some(v)) = (
                     parts.next().and_then(|s| s.parse::<f32>().ok()),
                     parts.next().and_then(|s| s.parse::<f32>().ok()),
@@ -143,6 +165,11 @@ pub fn import_obj_str(obj_text: &str, material: PaletteIndex) -> Result<LowPolyM
                             "OBJ face index out of bounds".into(),
                         ));
                     }
+                    if indices.len() >= MAX_OBJ_FACE_VERTICES {
+                        return Err(IoError::PayloadTooLarge(format!(
+                            "OBJ face vertex count exceeds limit {MAX_OBJ_FACE_VERTICES}"
+                        )));
+                    }
                     indices.push(resolved);
                     if let Some(vt_str) = segs.next().filter(|s| !s.is_empty()) {
                         if let Ok(vt_raw) = vt_str.parse::<isize>() {
@@ -160,6 +187,11 @@ pub fn import_obj_str(obj_text: &str, material: PaletteIndex) -> Result<LowPolyM
                     }
                 }
                 if indices.len() >= 3 {
+                    if faces.len() >= MAX_IMPORT_FACES {
+                        return Err(IoError::PayloadTooLarge(format!(
+                            "OBJ face count exceeds limit {MAX_IMPORT_FACES}"
+                        )));
+                    }
                     if face_uvs.len() == indices.len() {
                         faces.push(Face::with_uvs(indices, material, face_uvs));
                     } else {
@@ -196,6 +228,11 @@ pub fn import_obj_str(obj_text: &str, material: PaletteIndex) -> Result<LowPolyM
 
 /// Imports a binary glTF 2.0 (`.glb`) buffer into a `LowPolyMesh`, preserving `TEXCOORD_0` UVs.
 pub fn import_glb_bytes(bytes: &[u8], material: PaletteIndex) -> Result<LowPolyMesh, IoError> {
+    if bytes.len() > MAX_IMPORT_BYTES {
+        return Err(IoError::PayloadTooLarge(
+            "GLB buffer exceeds 64 MiB safety limit".into(),
+        ));
+    }
     let gltf = gltf::Gltf::from_slice(bytes)
         .map_err(|e| IoError::InvalidFormat(format!("invalid GLB: {e}")))?;
     let blob = gltf.blob.as_deref();
@@ -210,12 +247,54 @@ pub fn import_glb_bytes(bytes: &[u8], material: PaletteIndex) -> Result<LowPolyM
             if prim.mode() != gltf::mesh::Mode::Triangles {
                 continue;
             }
+            if let Some(pos_acc) = prim.get(&gltf::Semantic::Positions) {
+                if pos_acc.count() > MAX_IMPORT_ACCESSOR_ITEMS
+                    || vertices.len().saturating_add(pos_acc.count()) > MAX_IMPORT_VERTICES
+                {
+                    return Err(IoError::PayloadTooLarge(format!(
+                        "GLB vertex count exceeds limit {MAX_IMPORT_VERTICES}"
+                    )));
+                }
+            }
+            if let Some(idx_acc) = prim.indices() {
+                if idx_acc.count() > MAX_IMPORT_ACCESSOR_ITEMS
+                    || faces.len().saturating_add(idx_acc.count() / 3) > MAX_IMPORT_FACES
+                {
+                    return Err(IoError::PayloadTooLarge(format!(
+                        "GLB index/face count exceeds safety limit ({MAX_IMPORT_FACES} faces)"
+                    )));
+                }
+            }
+            for semantic in [
+                gltf::Semantic::Joints(0),
+                gltf::Semantic::Weights(0),
+                gltf::Semantic::TexCoords(0),
+            ] {
+                if let Some(acc) = prim.get(&semantic) {
+                    if acc.count() > MAX_IMPORT_ACCESSOR_ITEMS {
+                        return Err(IoError::PayloadTooLarge(format!(
+                            "GLB accessor count {} exceeds limit {MAX_IMPORT_ACCESSOR_ITEMS}",
+                            acc.count()
+                        )));
+                    }
+                }
+            }
+            if morphs.len().saturating_add(prim.morph_targets().len()) > MAX_IMPORT_MORPH_TARGETS {
+                return Err(IoError::PayloadTooLarge(format!(
+                    "GLB morph target count exceeds limit {MAX_IMPORT_MORPH_TARGETS}"
+                )));
+            }
             let reader = prim.reader(|_| blob);
             let Some(positions) = reader.read_positions() else {
                 continue;
             };
             let base = vertices.len();
             for p in positions {
+                if vertices.len() >= MAX_IMPORT_VERTICES {
+                    return Err(IoError::PayloadTooLarge(format!(
+                        "GLB vertex count exceeds limit {MAX_IMPORT_VERTICES}"
+                    )));
+                }
                 let v = Vec3::from_array(p);
                 if !v.is_finite() {
                     return Err(IoError::InvalidFormat(
@@ -311,6 +390,11 @@ pub fn import_glb_bytes(bytes: &[u8], material: PaletteIndex) -> Result<LowPolyM
                 None => (base..base + added).collect(),
             };
             for tri in indices.as_chunks::<3>().0 {
+                if faces.len() >= MAX_IMPORT_FACES {
+                    return Err(IoError::PayloadTooLarge(format!(
+                        "GLB face count exceeds limit {MAX_IMPORT_FACES}"
+                    )));
+                }
                 if tri[0] < vertices.len() && tri[1] < vertices.len() && tri[2] < vertices.len() {
                     let (l0, l1, l2) = (tri[0] - base, tri[1] - base, tri[2] - base);
                     if l0 < prim_uvs.len() && l1 < prim_uvs.len() && l2 < prim_uvs.len() {

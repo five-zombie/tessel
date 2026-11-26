@@ -31,4 +31,7 @@ pub enum IoError {
 
     #[error("export path denied: {0}")]
     ExportPathDenied(String),
+
+    #[error("payload exceeds safety limit: {0}")]
+    PayloadTooLarge(String),
 }

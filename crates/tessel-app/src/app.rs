@@ -1,10 +1,12 @@
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use thiserror::Error;
 use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
 use winit::event::WindowEvent;
-use winit::event_loop::{ActiveEventLoop, EventLoop};
+use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::window::{Window, WindowId};
 
 use tessel_ai::{dispatch_mcp_message_with_preview, LiveMcpServerHandle};
@@ -570,6 +572,24 @@ impl StudioState {
             }
         }
     }
+
+    /// Resets transient viewport/camera/drag/dialog states whenever a different scene is loaded.
+    fn reset_transient_view_state(&mut self) {
+        self.camera_3d.reset();
+        self.camera_3d_target = None;
+        self.showcase_camera = default_showcase_camera();
+        self.showcase_camera_target = None;
+        self.display_light_azimuth = self.scene.light_azimuth;
+        self.display_light_elevation = self.scene.light_elevation;
+        self.camera_2d.reset();
+        self.pixel_drag_start = None;
+        self.gizmo_drag = None;
+        self.scene_gadget_drag = None;
+        self.export_dialog.status_message = None;
+        self.confirm_exit = false;
+        self.confirm_new_project = false;
+        self.scene.dirty_viewport = true;
+    }
 }
 
 fn default_showcase_camera() -> OrbitCamera {
@@ -589,25 +609,35 @@ impl Default for StudioState {
         let has_recovery = project_files.has_recovery_snapshot();
 
         let mut scene = SceneState::new();
-        let _ = Command::CreatePixelCanvas {
-            name: "Sprite 32x32".into(),
-            width: 32,
-            height: 32,
+        let mut startup_error: Option<String> = None;
+        for cmd in [
+            Command::CreatePixelCanvas {
+                name: "Sprite 32x32".into(),
+                width: 32,
+                height: 32,
+            },
+            Command::CreateVoxelVolume {
+                name: "Starter Voxel".into(),
+            },
+        ] {
+            if let Err(err) = cmd.apply(&mut scene) {
+                tracing::error!("startup scene initialization failed: {err}");
+                startup_error = Some(format!("Startup scene initialization failed: {err}"));
+            }
         }
-        .apply(&mut scene);
-        let _ = Command::CreateVoxelVolume {
-            name: "Starter Voxel".into(),
-        }
-        .apply(&mut scene);
         if let Some(voxel_id) = scene.active_voxel_node() {
-            let _ = Command::FillVoxelBox {
+            if let Err(err) = (Command::FillVoxelBox {
                 node_id: voxel_id,
                 min: tessel_core::VoxelCoord::new(-2, 0, -2),
                 max: tessel_core::VoxelCoord::new(2, 4, 2),
                 color: Some(scene.active_color),
                 hollow: false,
+            })
+            .apply(&mut scene)
+            {
+                tracing::error!("startup starter voxel fill failed: {err}");
+                startup_error = Some(format!("Startup starter voxel fill failed: {err}"));
             }
-            .apply(&mut scene);
         }
         project_files.mark_baseline_revision(scene.revision);
         project_files.set_autosave_paused(has_recovery);
@@ -658,7 +688,7 @@ impl Default for StudioState {
             confirm_new_project: false,
             confirm_exit: false,
             quit_confirmed: false,
-            last_error: None,
+            last_error: startup_error,
             project_files,
             paths,
             settings,
@@ -675,6 +705,7 @@ struct GpuState {
     surface_config: wgpu::SurfaceConfiguration,
     device: wgpu::Device,
     queue: wgpu::Queue,
+    device_lost: Arc<AtomicBool>,
     software_fallback: bool,
     egui_ctx: egui::Context,
     egui_state: egui_winit::State,
@@ -735,6 +766,16 @@ impl GpuState {
             None,
         ))?;
 
+        let device_lost = Arc::new(AtomicBool::new(false));
+        let lost_flag = Arc::clone(&device_lost);
+        device.set_device_lost_callback(move |reason, message| {
+            tracing::error!("wgpu device lost ({reason:?}): {message}");
+            lost_flag.store(true, Ordering::SeqCst);
+        });
+        device.on_uncaptured_error(Box::new(|error| {
+            tracing::error!("wgpu uncaptured error: {error}");
+        }));
+
         let caps = surface.get_capabilities(&adapter);
         let surface_format = caps
             .formats
@@ -790,6 +831,7 @@ impl GpuState {
             surface_config,
             device,
             queue,
+            device_lost,
             software_fallback,
             egui_ctx,
             egui_state,
@@ -810,7 +852,10 @@ impl GpuState {
         self.surface.configure(&self.device, &self.surface_config);
     }
 
-    fn render(&mut self, studio: &mut StudioState) -> Result<(), RenderError> {
+    fn render(&mut self, studio: &mut StudioState) -> Result<RenderOutcome, RenderError> {
+        if self.device_lost.load(Ordering::SeqCst) {
+            return Err(RenderError::SurfaceTexture(wgpu::SurfaceError::Lost));
+        }
         let device = &self.device;
         let queue = &self.queue;
         let main_vp = &self.viewport_renderer;
@@ -837,10 +882,6 @@ impl GpuState {
                 }
             },
         );
-        studio
-            .project_files
-            .set_autosave_paused(studio.quick_start.open && studio.quick_start.has_recovery);
-        studio.project_files.tick_autosave(&studio.scene);
 
         let raw_input = self.egui_state.take_egui_input(&self.window);
         let mut desired_viewport = self.viewport_renderer.size();
@@ -1147,24 +1188,14 @@ impl GpuState {
                     Ok(loaded) => {
                         studio.scene = loaded;
                         studio.history = HistoryStack::new();
-                        studio.camera_3d_target = None;
-                        studio.showcase_camera_target = None;
-                        studio.display_light_azimuth = studio.scene.light_azimuth;
-                        studio.display_light_elevation = studio.scene.light_elevation;
-                        studio.camera_2d.reset();
+                        studio.reset_transient_view_state();
                         if let Some((target, yaw_deg, pitch_deg, distance)) = example.camera_pose()
                         {
                             studio.camera_3d.target = glam::Vec3::from(target);
                             studio.camera_3d.yaw = yaw_deg.to_radians();
                             studio.camera_3d.pitch = pitch_deg.to_radians();
                             studio.camera_3d.distance = distance;
-                        } else {
-                            studio.camera_3d.reset();
                         }
-                        studio.pixel_drag_start = None;
-                        studio.gizmo_drag = None;
-                        studio.scene_gadget_drag = None;
-                        studio.export_dialog.status_message = None;
                         // Keep current_path = None so Ctrl+S always prompts Save As
                         // and never overwrites the original example file.
                         studio.project_files.current_path = None;
@@ -1183,6 +1214,9 @@ impl GpuState {
                     Ok(loaded) => {
                         studio.scene = loaded;
                         studio.history = HistoryStack::new();
+                        studio.reset_transient_view_state();
+                        studio.quick_start.has_recovery =
+                            studio.project_files.has_recovery_snapshot();
                     }
                     Err(err) => {
                         studio.quick_start.open = true;
@@ -1195,6 +1229,7 @@ impl GpuState {
                     Ok(loaded) => {
                         studio.scene = loaded;
                         studio.history = HistoryStack::new();
+                        studio.reset_transient_view_state();
                         studio.settings.record_recent_project(path);
                         if let Err(err) = studio.settings.save(&studio.paths) {
                             tracing::error!("{err}");
@@ -1253,14 +1288,7 @@ impl GpuState {
                     let rev = loaded.revision;
                     studio.scene = loaded;
                     studio.history = HistoryStack::new();
-                    studio.camera_3d_target = None;
-                    studio.showcase_camera_target = None;
-                    studio.pixel_drag_start = None;
-                    studio.gizmo_drag = None;
-                    studio.scene_gadget_drag = None;
-                    studio.export_dialog.status_message = None;
-                    studio.confirm_exit = false;
-                    studio.confirm_new_project = false;
+                    studio.reset_transient_view_state();
                     studio.project_files.finish_open(path.clone(), rev);
                     studio.settings.record_recent_project(path);
                     if let Err(err) = studio.settings.save(&studio.paths) {
@@ -1285,6 +1313,8 @@ impl GpuState {
                         studio
                             .project_files
                             .finish_save(outcome.path.clone(), outcome.revision);
+                        studio.quick_start.has_recovery =
+                            studio.project_files.has_recovery_snapshot();
                     } else {
                         studio.project_files.current_path = Some(outcome.path.clone());
                     }
@@ -1313,10 +1343,6 @@ impl GpuState {
             },
             Ok(Some(None)) | Ok(None) => {}
             Err(err) => studio.last_error = Some(err.into()),
-        }
-        if studio.jobs.any_busy() {
-            self.egui_ctx
-                .request_repaint_after(std::time::Duration::from_millis(50));
         }
 
         if let ui::export_dialog::ExportAction::TurntableGif(args) = export_action {
@@ -1358,6 +1384,7 @@ impl GpuState {
         }
         if top_actions.open_welcome {
             studio.quick_start.error_message = None;
+            studio.quick_start.has_recovery = studio.project_files.has_recovery_snapshot();
             studio.quick_start.open = true;
         }
         if top_actions.open_about {
@@ -1440,17 +1467,7 @@ impl GpuState {
         if top_actions.new_project {
             studio.scene = SceneState::new();
             studio.history = HistoryStack::new();
-            studio.camera_3d.reset();
-            studio.camera_3d_target = None;
-            studio.showcase_camera = default_showcase_camera();
-            studio.showcase_camera_target = None;
-            studio.display_light_azimuth = studio.scene.light_azimuth;
-            studio.display_light_elevation = studio.scene.light_elevation;
-            studio.camera_2d.reset();
-            studio.pixel_drag_start = None;
-            studio.gizmo_drag = None;
-            studio.scene_gadget_drag = None;
-            studio.export_dialog.status_message = None;
+            studio.reset_transient_view_state();
             studio.project_files.current_path = None;
             studio
                 .project_files
@@ -1483,6 +1500,11 @@ impl GpuState {
             );
         }
 
+        studio
+            .project_files
+            .set_autosave_paused(studio.quick_start.open && studio.quick_start.has_recovery);
+        studio.project_files.tick_autosave(&studio.scene);
+
         self.viewport_renderer.sync_scene(
             &self.device,
             &self.queue,
@@ -1490,14 +1512,29 @@ impl GpuState {
             hover_voxel,
             active_gizmo_axis,
         );
+        studio.scene.dirty_viewport = false;
+
+        let egui_repaint = full_output
+            .viewport_output
+            .get(&egui::ViewportId::ROOT)
+            .map(|v| v.repaint_delay)
+            .unwrap_or(Duration::MAX);
+        let next_repaint = compute_next_repaint_delay(
+            egui_repaint,
+            studio.jobs.any_busy(),
+            studio.live_mcp.is_some(),
+            studio
+                .project_files
+                .next_autosave_wakeup(studio.scene.revision),
+        );
 
         let frame = match self.surface.get_current_texture() {
             Ok(frame) => frame,
             Err(wgpu::SurfaceError::Lost | wgpu::SurfaceError::Outdated) => {
                 self.surface.configure(&self.device, &self.surface_config);
-                return Ok(());
+                return Ok(RenderOutcome::SurfaceReconfigured);
             }
-            Err(wgpu::SurfaceError::Timeout) => return Ok(()),
+            Err(wgpu::SurfaceError::Timeout) => return Ok(RenderOutcome::Rendered(next_repaint)),
             Err(err) => return Err(RenderError::SurfaceTexture(err)),
         };
 
@@ -1511,13 +1548,14 @@ impl GpuState {
                 label: Some("tessel-frame-encoder"),
             });
 
+        let pixels_per_point = full_output.pixels_per_point;
         self.viewport_renderer.render_with_light(
             &self.queue,
             &mut encoder,
             &studio.scene,
             &studio.camera_3d,
             &studio.camera_2d,
-            self.window.scale_factor() as f32,
+            pixels_per_point,
             studio.render_preview,
             studio.display_light_azimuth,
             studio.display_light_elevation,
@@ -1525,12 +1563,12 @@ impl GpuState {
 
         let screen_descriptor = egui_wgpu::ScreenDescriptor {
             size_in_pixels: [self.surface_config.width, self.surface_config.height],
-            pixels_per_point: self.window.scale_factor() as f32,
+            pixels_per_point,
         };
 
         let paint_jobs = self
             .egui_ctx
-            .tessellate(full_output.shapes, full_output.pixels_per_point);
+            .tessellate(full_output.shapes, pixels_per_point);
 
         for (id, image_delta) in &full_output.textures_delta.set {
             self.egui_renderer
@@ -1573,8 +1611,46 @@ impl GpuState {
 
         self.queue.submit(Some(encoder.finish()));
         frame.present();
-        Ok(())
+        Ok(RenderOutcome::Rendered(next_repaint))
     }
+}
+
+enum RenderOutcome {
+    Rendered(Option<Duration>),
+    SurfaceReconfigured,
+}
+
+const JOB_POLL_INTERVAL: Duration = Duration::from_millis(50);
+const LIVE_MCP_POLL_INTERVAL: Duration = Duration::from_millis(100);
+const MAX_GPU_RECOVERY_ATTEMPTS: u32 = 2;
+const MAX_SURFACE_RECONFIG_IMMEDIATE: u32 = 3;
+const MAX_SURFACE_RECONFIG_BEFORE_RECOVERY: u32 = 5;
+const RENDER_ERROR_BACKOFF: Duration = Duration::from_millis(250);
+
+/// Computes the next idle wakeup delay combining egui repaint requests, background jobs,
+/// live MCP polling, and pending autosave timers. Returns `None` when the event loop can
+/// sleep indefinitely.
+fn compute_next_repaint_delay(
+    egui_repaint: Duration,
+    jobs_busy: bool,
+    live_mcp_active: bool,
+    autosave_wakeup: Option<Duration>,
+) -> Option<Duration> {
+    let mut best: Option<Duration> = if egui_repaint == Duration::MAX {
+        None
+    } else {
+        Some(egui_repaint)
+    };
+    if jobs_busy {
+        best = Some(best.map_or(JOB_POLL_INTERVAL, |d| d.min(JOB_POLL_INTERVAL)));
+    }
+    if live_mcp_active {
+        best = Some(best.map_or(LIVE_MCP_POLL_INTERVAL, |d| d.min(LIVE_MCP_POLL_INTERVAL)));
+    }
+    if let Some(auto) = autosave_wakeup {
+        best = Some(best.map_or(auto, |d| d.min(auto)));
+    }
+    best
 }
 
 #[derive(Default)]
@@ -1582,6 +1658,47 @@ struct TesselApp {
     gpu: Option<GpuState>,
     studio: StudioState,
     fatal_error: Option<AppError>,
+    next_repaint_at: Option<Instant>,
+    consecutive_surface_reconfigs: u32,
+    gpu_recovery_attempts: u32,
+}
+
+impl TesselApp {
+    /// Drops the old `GpuState` (releasing its `wgpu::Surface` first) and recreates it,
+    /// bounded by `MAX_GPU_RECOVERY_ATTEMPTS`. Exits the event loop if recovery fails.
+    fn attempt_gpu_recovery(&mut self, event_loop: &ActiveEventLoop, cause: RenderError) {
+        if self.gpu_recovery_attempts >= MAX_GPU_RECOVERY_ATTEMPTS {
+            self.fatal_error = Some(AppError::Render(cause));
+            event_loop.exit();
+            return;
+        }
+        let Some(window) = self.gpu.as_ref().map(|g| Arc::clone(&g.window)) else {
+            self.fatal_error = Some(AppError::Render(cause));
+            event_loop.exit();
+            return;
+        };
+        self.gpu_recovery_attempts += 1;
+        tracing::warn!(
+            "Attempting GPU device/surface recovery ({}/{})",
+            self.gpu_recovery_attempts,
+            MAX_GPU_RECOVERY_ATTEMPTS
+        );
+        // Drop old Surface & Device before creating a new Surface for the same Window.
+        self.gpu = None;
+        match GpuState::new(window) {
+            Ok(recreated) => {
+                recreated.window.request_redraw();
+                self.gpu = Some(recreated);
+                self.next_repaint_at = None;
+                self.consecutive_surface_reconfigs = 0;
+            }
+            Err(recreate_err) => {
+                tracing::error!("GPU recovery failed: {recreate_err}");
+                self.fatal_error = Some(AppError::Render(recreate_err));
+                event_loop.exit();
+            }
+        }
+    }
 }
 
 impl ApplicationHandler for TesselApp {
@@ -1648,21 +1765,90 @@ impl ApplicationHandler for TesselApp {
                     event_loop.exit();
                 }
             }
+            WindowEvent::Focused(false) => {
+                let had_drag =
+                    self.studio.gizmo_drag.is_some() || self.studio.scene_gadget_drag.is_some();
+                ui::viewport::cancel_gizmo_drag(
+                    &mut self.studio.scene,
+                    &mut self.studio.gizmo_drag,
+                );
+                ui::viewport::cancel_scene_gadget_drag(
+                    &mut self.studio.scene,
+                    &mut self.studio.scene_gadget_drag,
+                );
+                if had_drag {
+                    gpu.window.request_redraw();
+                }
+            }
             WindowEvent::Resized(size) => {
                 gpu.resize_surface(size.width, size.height);
                 gpu.window.request_redraw();
             }
             WindowEvent::RedrawRequested => {
-                if let Err(err) = gpu.render(&mut self.studio) {
-                    tracing::error!("render error: {err}");
-                }
+                let render_res = gpu.render(&mut self.studio);
                 if self.studio.quit_confirmed {
                     event_loop.exit();
                     return;
                 }
-                gpu.window.request_redraw();
+                match render_res {
+                    Ok(RenderOutcome::Rendered(repaint_after)) => {
+                        self.consecutive_surface_reconfigs = 0;
+                        self.gpu_recovery_attempts = 0;
+                        match repaint_after {
+                            Some(delay) if delay.is_zero() => {
+                                self.next_repaint_at = None;
+                                gpu.window.request_redraw();
+                            }
+                            Some(delay) => {
+                                self.next_repaint_at = Instant::now().checked_add(delay);
+                            }
+                            None => {
+                                self.next_repaint_at = None;
+                            }
+                        }
+                    }
+                    Ok(RenderOutcome::SurfaceReconfigured) => {
+                        self.consecutive_surface_reconfigs =
+                            self.consecutive_surface_reconfigs.saturating_add(1);
+                        if self.consecutive_surface_reconfigs < MAX_SURFACE_RECONFIG_IMMEDIATE {
+                            self.next_repaint_at = None;
+                            gpu.window.request_redraw();
+                        } else if self.consecutive_surface_reconfigs
+                            < MAX_SURFACE_RECONFIG_BEFORE_RECOVERY
+                        {
+                            self.next_repaint_at = Instant::now().checked_add(RENDER_ERROR_BACKOFF);
+                        } else {
+                            tracing::error!(
+                                "persistent surface reconfigure failure; recreating GPU"
+                            );
+                            self.attempt_gpu_recovery(
+                                event_loop,
+                                RenderError::SurfaceTexture(wgpu::SurfaceError::Lost),
+                            );
+                        }
+                    }
+                    Err(err) => {
+                        tracing::error!("render error: {err}");
+                        self.attempt_gpu_recovery(event_loop, err);
+                    }
+                }
             }
             _ => {}
+        }
+    }
+
+    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        if let Some(deadline) = self.next_repaint_at {
+            if Instant::now() >= deadline {
+                self.next_repaint_at = None;
+                if let Some(gpu) = self.gpu.as_ref() {
+                    gpu.window.request_redraw();
+                }
+            } else {
+                event_loop.set_control_flow(ControlFlow::WaitUntil(deadline));
+            }
+        } else {
+            event_loop.set_control_flow(ControlFlow::Wait);
         }
     }
 }
@@ -1841,5 +2027,38 @@ mod tests {
         }
         // Failed calls leave the camera untouched.
         assert!((cam.distance - 9.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn compute_next_repaint_delay_sleeps_when_idle_and_honors_earliest_wakeup() {
+        assert_eq!(
+            compute_next_repaint_delay(Duration::MAX, false, false, None),
+            None
+        );
+        assert_eq!(
+            compute_next_repaint_delay(Duration::ZERO, true, true, Some(Duration::from_secs(5))),
+            Some(Duration::ZERO)
+        );
+        assert_eq!(
+            compute_next_repaint_delay(Duration::MAX, true, true, Some(Duration::from_secs(5))),
+            Some(JOB_POLL_INTERVAL)
+        );
+        assert_eq!(
+            compute_next_repaint_delay(Duration::MAX, false, true, Some(Duration::from_secs(5))),
+            Some(LIVE_MCP_POLL_INTERVAL)
+        );
+        assert_eq!(
+            compute_next_repaint_delay(Duration::MAX, false, false, Some(Duration::from_secs(3))),
+            Some(Duration::from_secs(3))
+        );
+        assert_eq!(
+            compute_next_repaint_delay(
+                Duration::from_millis(25),
+                true,
+                true,
+                Some(Duration::from_secs(3))
+            ),
+            Some(Duration::from_millis(25))
+        );
     }
 }

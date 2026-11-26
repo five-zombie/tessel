@@ -58,7 +58,7 @@ pub fn show_timeline(ctx: &egui::Context, scene: &mut SceneState, history: &mut 
                 let dt = ctx.input(|i| i.stable_dt).min(0.05) * timescale;
                 rig.playback_time += dt;
                 rig.apply_active_animation();
-                scene.mark_modified();
+                scene.dirty_viewport = true;
                 ctx.request_repaint();
             }
         }
@@ -561,7 +561,7 @@ fn show_character_timeline(
     if let Some(cmd) = pending_cmd {
         super::exec_history(ctx, history, scene, cmd);
     } else if modified {
-        scene.mark_modified();
+        scene.dirty_viewport = true;
     }
 }
 

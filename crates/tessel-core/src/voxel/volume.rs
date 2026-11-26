@@ -181,9 +181,9 @@ impl VoxelVolume {
                 for z in 0..CHUNK_SIZE {
                     for x in 0..CHUNK_SIZE {
                         if chunk.get(x, y, z).is_some() {
-                            let gx = ox + x as i32;
-                            let gy = oy + y as i32;
-                            let gz = oz + z as i32;
+                            let gx = ox.saturating_add(x as i32);
+                            let gy = oy.saturating_add(y as i32);
+                            let gz = oz.saturating_add(z as i32);
                             min_v[0] = min_v[0].min(gx);
                             min_v[1] = min_v[1].min(gy);
                             min_v[2] = min_v[2].min(gz);
@@ -215,7 +215,11 @@ impl VoxelVolume {
                     for x in 0..CHUNK_SIZE {
                         if let Some(color) = chunk.get(x, y, z) {
                             out.push((
-                                VoxelCoord::new(ox + x as i32, oy + y as i32, oz + z as i32),
+                                VoxelCoord::new(
+                                    ox.saturating_add(x as i32),
+                                    oy.saturating_add(y as i32),
+                                    oz.saturating_add(z as i32),
+                                ),
                                 color,
                             ));
                         }

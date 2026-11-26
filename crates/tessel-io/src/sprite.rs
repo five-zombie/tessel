@@ -33,12 +33,22 @@ pub struct SpriteSheetMetadata {
     pub frames: Vec<SpriteFrameRect>,
 }
 
+const MAX_SPRITE_DIM: u32 = 512;
+const MAX_SPRITE_FRAMES: usize = 128;
+
 /// Encodes a single frame of `PixelCanvas` to PNG bytes.
 pub fn export_png_bytes(
     canvas: &PixelCanvas,
     frame_idx: usize,
     palette: &Palette,
 ) -> Result<Vec<u8>, IoError> {
+    if canvas.width == 0
+        || canvas.height == 0
+        || canvas.width > MAX_SPRITE_DIM
+        || canvas.height > MAX_SPRITE_DIM
+    {
+        return Err(IoError::InvalidDimensions(canvas.width, canvas.height));
+    }
     if frame_idx >= canvas.frames.len() {
         return Err(IoError::EmptyCanvas);
     }
@@ -55,27 +65,51 @@ pub fn export_sprite_sheet_bytes(
     canvas: &PixelCanvas,
     palette: &Palette,
 ) -> Result<(Vec<u8>, SpriteSheetMetadata), IoError> {
+    if canvas.width == 0
+        || canvas.height == 0
+        || canvas.width > MAX_SPRITE_DIM
+        || canvas.height > MAX_SPRITE_DIM
+    {
+        return Err(IoError::InvalidDimensions(canvas.width, canvas.height));
+    }
     let frame_count = canvas.frames.len();
     if frame_count == 0 {
         return Err(IoError::EmptyCanvas);
+    }
+    if frame_count > MAX_SPRITE_FRAMES {
+        return Err(IoError::PayloadTooLarge(format!(
+            "sprite sheet frame count {frame_count} exceeds limit {MAX_SPRITE_FRAMES}"
+        )));
     }
     let sheet_w = canvas
         .width
         .checked_mul(frame_count as u32)
         .ok_or(IoError::InvalidDimensions(canvas.width, canvas.height))?;
     let sheet_h = canvas.height;
-    let mut sheet = vec![0u8; (sheet_w as usize) * (sheet_h as usize) * 4];
+    let total_bytes = (sheet_w as usize)
+        .checked_mul(sheet_h as usize)
+        .and_then(|p| p.checked_mul(4))
+        .ok_or(IoError::InvalidDimensions(sheet_w, sheet_h))?;
+    let expected_frame_bytes = (canvas.width as usize)
+        .checked_mul(canvas.height as usize)
+        .and_then(|p| p.checked_mul(4))
+        .ok_or(IoError::InvalidDimensions(canvas.width, canvas.height))?;
+    let mut sheet = vec![0u8; total_bytes];
     let duration_ms = 1000u32 / u32::from(canvas.fps.max(1));
     let mut rects = Vec::with_capacity(frame_count);
 
     for f in 0..frame_count {
         let frame_rgba = canvas.composite_frame_rgba(f, palette);
+        if frame_rgba.len() < expected_frame_bytes {
+            return Err(IoError::InvalidDimensions(canvas.width, canvas.height));
+        }
         let x_offset = (f as u32) * canvas.width;
+        let row_bytes = (canvas.width as usize) * 4;
         for y in 0..canvas.height {
-            let src_start = (y as usize) * (canvas.width as usize) * 4;
-            let src_end = src_start + (canvas.width as usize) * 4;
+            let src_start = (y as usize) * row_bytes;
+            let src_end = src_start + row_bytes;
             let dst_start = ((y as usize) * (sheet_w as usize) + (x_offset as usize)) * 4;
-            let dst_end = dst_start + (canvas.width as usize) * 4;
+            let dst_end = dst_start + row_bytes;
             sheet[dst_start..dst_end].copy_from_slice(&frame_rgba[src_start..src_end]);
         }
         rects.push(SpriteFrameRect {

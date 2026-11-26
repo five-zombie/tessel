@@ -67,13 +67,22 @@ pub fn export_vox_bytes(volume: &VoxelVolume, palette: &Palette) -> Result<Vec<u
     Ok(out)
 }
 
+const MAX_VOX_FILE_BYTES: usize = 64 * 1024 * 1024;
+const MAX_VOX_VOXELS: usize = 2_000_000;
+
 /// Reads a MagicaVoxel `.vox` binary buffer into `(VoxelVolume, Palette)`.
 pub fn import_vox_bytes(bytes: &[u8]) -> Result<(VoxelVolume, Palette), IoError> {
+    if bytes.len() > MAX_VOX_FILE_BYTES {
+        return Err(IoError::PayloadTooLarge(
+            "VOX file exceeds 64 MiB safety limit".into(),
+        ));
+    }
     if bytes.len() < 20 || &bytes[0..4] != b"VOX " {
         return Err(IoError::InvalidFormat("not a valid VOX header".into()));
     }
     let mut volume = VoxelVolume::new();
     let mut palette = Palette::studio_default();
+    let mut total_voxels = 0usize;
 
     let mut offset = 8usize;
     if &bytes[offset..offset + 4] != b"MAIN" {
@@ -105,13 +114,24 @@ pub fn import_vox_bytes(bytes: &[u8]) -> Result<(VoxelVolume, Palette), IoError>
                 let raw_count = read_u32_le(content, 0)? as usize;
                 let max_count = (content.len() - 4) / 4;
                 let count = raw_count.min(max_count);
+                if total_voxels.saturating_add(count) > MAX_VOX_VOXELS {
+                    return Err(IoError::PayloadTooLarge(format!(
+                        "VOX voxel count exceeds limit {MAX_VOX_VOXELS}"
+                    )));
+                }
                 for i in 0..count {
-                    let base = 4 + i * 4;
-                    let vx = i32::from(content[base]);
-                    let vz = i32::from(content[base + 1]);
-                    let vy = i32::from(content[base + 2]);
-                    if let Ok(idx) = PaletteIndex::new(content[base + 3]) {
+                    let Some(base) = i.checked_mul(4).and_then(|o| o.checked_add(4)) else {
+                        break;
+                    };
+                    let Some(entry) = content.get(base..base + 4) else {
+                        break;
+                    };
+                    let vx = i32::from(entry[0]);
+                    let vz = i32::from(entry[1]);
+                    let vy = i32::from(entry[2]);
+                    if let Ok(idx) = PaletteIndex::new(entry[3]) {
                         volume.set(VoxelCoord::new(vx, vy, vz), Some(idx));
+                        total_voxels += 1;
                     }
                 }
             }

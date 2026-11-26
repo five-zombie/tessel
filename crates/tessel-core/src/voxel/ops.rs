@@ -154,12 +154,22 @@ pub fn raycast_voxels(
     unit_scale: f32,
     max_steps: u32,
 ) -> Option<VoxelHit> {
+    if !ray_origin_world.is_finite()
+        || !ray_dir_world.is_finite()
+        || !unit_scale.is_finite()
+        || unit_scale <= 0.0
+    {
+        return None;
+    }
     let dir = ray_dir_world.normalize_or_zero();
-    if dir.length_squared() < 1e-6 || unit_scale <= 0.0 {
+    if dir.length_squared() < 1e-6 {
         return None;
     }
 
     let origin = ray_origin_world / unit_scale;
+    if !origin.is_finite() || origin.x.abs() > 1e8 || origin.y.abs() > 1e8 || origin.z.abs() > 1e8 {
+        return None;
+    }
     let mut voxel = origin.floor().as_ivec3();
 
     let step = IVec3::new(
@@ -234,20 +244,20 @@ pub fn raycast_voxels(
 
         if t_max.x < t_max.y {
             if t_max.x < t_max.z {
-                voxel.x += step.x;
+                voxel.x = voxel.x.checked_add(step.x)?;
                 t_max.x += t_delta.x;
                 last_normal = IVec3::new(-step.x, 0, 0);
             } else {
-                voxel.z += step.z;
+                voxel.z = voxel.z.checked_add(step.z)?;
                 t_max.z += t_delta.z;
                 last_normal = IVec3::new(0, 0, -step.z);
             }
         } else if t_max.y < t_max.z {
-            voxel.y += step.y;
+            voxel.y = voxel.y.checked_add(step.y)?;
             t_max.y += t_delta.y;
             last_normal = IVec3::new(0, -step.y, 0);
         } else {
-            voxel.z += step.z;
+            voxel.z = voxel.z.checked_add(step.z)?;
             t_max.z += t_delta.z;
             last_normal = IVec3::new(0, 0, -step.z);
         }
