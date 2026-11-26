@@ -50,23 +50,25 @@ jobs:
 
           mkdir -p dist
 
-          # 1. Portable .tar.gz
+          # 1. Portable .tar.gz (desktop entry + hicolor icons included for manual install)
           mkdir -p dist/tessel-linux-x86_64
           cp target/release/tessel dist/tessel-linux-x86_64/tessel
           cp README.md LICENSE dist/tessel-linux-x86_64/
+          cp packaging/linux/tessel.desktop dist/tessel-linux-x86_64/
+          cp -r assets/icons/hicolor dist/tessel-linux-x86_64/icons
           tar -czf dist/tessel-linux-x86_64.tar.gz -C dist tessel-linux-x86_64
           rm -rf dist/tessel-linux-x86_64
 
-          # Shared desktop entry
-          cat > tessel.desktop <<'EOF'
-          [Desktop Entry]
-          Type=Application
-          Name=Tessel
-          Comment=AI-first Pixel, Voxel, Low-Poly, and Character 3D Studio
-          Exec=/usr/bin/tessel
-          Terminal=false
-          Categories=Graphics;3DGraphics;2DGraphics;
-          EOF
+          # Shared desktop entry (canonical source: packaging/linux/tessel.desktop)
+          cp packaging/linux/tessel.desktop tessel.desktop
+
+          install_hicolor_icons() {
+            dest="$1"
+            for size in 16 24 32 48 64 128 256 512; do
+              install -D -m 0644 "assets/icons/hicolor/${size}/apps/tessel.png" \
+                "${dest}/usr/share/icons/hicolor/${size}x${size}/apps/tessel.png"
+            done
+          }
 
           # 2. Debian / Ubuntu (.deb)
           PKG_DIR="pkg-deb"
@@ -76,6 +78,7 @@ jobs:
                    "${PKG_DIR}/usr/share/doc/tessel"
           install -m 0755 target/release/tessel "${PKG_DIR}/usr/bin/tessel"
           install -m 0644 tessel.desktop "${PKG_DIR}/usr/share/applications/tessel.desktop"
+          install_hicolor_icons "${PKG_DIR}"
           install -m 0644 LICENSE "${PKG_DIR}/usr/share/doc/tessel/copyright"
           install -m 0644 README.md "${PKG_DIR}/usr/share/doc/tessel/README.md"
           cat > "${PKG_DIR}/DEBIAN/control" <<EOF
@@ -117,16 +120,21 @@ jobs:
           %install
           install -D -m 0755 %{_sourcedir}/tessel %{buildroot}/usr/bin/tessel
           install -D -m 0644 %{_sourcedir}/tessel.desktop %{buildroot}/usr/share/applications/tessel.desktop
+          for size in 16 24 32 48 64 128 256 512; do
+            install -D -m 0644 %{_sourcedir}/hicolor/${size}/apps/tessel.png %{buildroot}/usr/share/icons/hicolor/${size}x${size}/apps/tessel.png
+          done
           install -D -m 0644 %{_sourcedir}/LICENSE %{buildroot}/usr/share/licenses/tessel/LICENSE
           install -D -m 0644 %{_sourcedir}/README.md %{buildroot}/usr/share/doc/tessel/README.md
 
           %files
           /usr/bin/tessel
           /usr/share/applications/tessel.desktop
+          /usr/share/icons/hicolor/*/apps/tessel.png
           /usr/share/licenses/tessel/LICENSE
           /usr/share/doc/tessel/README.md
           EOF
           cp target/release/tessel tessel.desktop LICENSE README.md "${RPM_TOP}/SOURCES/"
+          cp -r assets/icons/hicolor "${RPM_TOP}/SOURCES/"
           rpmbuild --define "_topdir ${RPM_TOP}" -bb "${RPM_TOP}/SPECS/tessel.spec"
           cp "${RPM_TOP}"/RPMS/x86_64/tessel-*.rpm dist/
           rm -rf "${RPM_TOP}" tessel.desktop
@@ -160,11 +168,15 @@ jobs:
           cp README.md LICENSE dist/tessel-macos-universal/
           tar -czf dist/tessel-macos-universal.tar.gz -C dist tessel-macos-universal
 
+          # Launcher icon (.icns built from the committed iconset)
+          iconutil -c icns packaging/macos/tessel.iconset -o dist/tessel.icns
+
           # Universal .app bundle inside .dmg
           APP_DIR="dist/dmg/Tessel.app"
           mkdir -p "${APP_DIR}/Contents/MacOS" "${APP_DIR}/Contents/Resources"
           cp dist/tessel-macos-universal/tessel "${APP_DIR}/Contents/MacOS/tessel"
           chmod +x "${APP_DIR}/Contents/MacOS/tessel"
+          cp dist/tessel.icns "${APP_DIR}/Contents/Resources/tessel.icns"
           cat > "${APP_DIR}/Contents/Info.plist" <<EOF
           <?xml version="1.0" encoding="UTF-8"?>
           <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -181,6 +193,8 @@ jobs:
             <key>CFBundleShortVersionString</key>
             <string>${RAW_VER}</string>
             <key>CFBundleExecutable</key>
+            <string>tessel</string>
+            <key>CFBundleIconFile</key>
             <string>tessel</string>
             <key>CFBundlePackageType</key>
             <string>APPL</string>

@@ -1,4 +1,5 @@
 mod app;
+mod icon;
 mod input;
 mod project_files;
 mod settings;

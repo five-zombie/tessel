@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Tessel
+Comment=AI-first Pixel, Voxel, Low-Poly, and Character 3D Studio
+Exec=/usr/bin/tessel
+Icon=tessel
+Terminal=false
+Categories=Graphics;3DGraphics;2DGraphics;
+Keywords=pixel;voxel;lowpoly;3d;glb;

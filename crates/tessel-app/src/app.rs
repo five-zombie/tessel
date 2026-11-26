@@ -1401,10 +1401,13 @@ impl ApplicationHandler for TesselApp {
             return;
         }
 
-        let attrs = Window::default_attributes()
+        let mut attrs = Window::default_attributes()
             .with_title("Tessel")
             .with_inner_size(LogicalSize::new(1280.0, 800.0))
             .with_min_inner_size(LogicalSize::new(800.0, 520.0));
+        if let Some(icon) = crate::icon::load_window_icon() {
+            attrs = attrs.with_window_icon(Some(icon));
+        }
 
         match event_loop.create_window(attrs) {
             Ok(window) => {
