@@ -486,3 +486,124 @@ fn smoke_h2_dual_kawase_bloom_glow_and_npr_bypass() {
         "unexpected wgpu validation error on H2 Dual-Kawase bloom pipeline: {validation_err:?}"
     );
 }
+
+#[test]
+fn smoke_h3_glass_refraction_split_voxel_and_4x_msaa() {
+    let Some((device, queue, _info)) = request_test_device() else {
+        eprintln!("skipping GPU smoke test: no compatible GPU or software adapter available");
+        return;
+    };
+
+    device.push_error_scope(wgpu::ErrorFilter::Validation);
+
+    let mut viewport = ViewportRenderer::new(&device, 64, 64);
+    let mut scene = SceneState::new();
+    scene.active_mode = AppMode::Voxel;
+    scene.npr_look.msaa_samples = 4;
+    scene.post_process.bloom_enabled = true;
+    scene.post_process.fog_enabled = true;
+
+    let wall_idx = PaletteIndex::new(1).unwrap();
+    let glass_idx = PaletteIndex::new(15).unwrap();
+    let mut glass_entry =
+        tessel_core::PaletteEntry::matte("CrystalGlass", tessel_core::Rgba8::rgb(170, 230, 255));
+    glass_entry.transmission = 0.9;
+    glass_entry.ior = 1.5;
+    glass_entry.roughness = 0.12;
+    scene.palette.set(glass_idx, glass_entry);
+
+    // Mixed opaque + glass voxel volume with active rig skinning.
+    let vox_id = scene.allocate_node_id();
+    scene.nodes.insert(
+        vox_id,
+        SceneNode {
+            id: vox_id,
+            name: "GlassLantern".into(),
+            kind: NodeKind::VoxelVolume,
+            visible: true,
+            parent: None,
+            transform: Transform::default(),
+        },
+    );
+    let mut vol = VoxelVolume::new();
+    vol.set(VoxelCoord::new(0, 0, 0), Some(wall_idx));
+    vol.set(VoxelCoord::new(0, 0, 1), Some(glass_idx));
+    vol.set(VoxelCoord::new(1, 0, 1), Some(glass_idx));
+    scene.voxel_volumes.insert(vox_id, vol);
+
+    // Refractive Low-Poly glass quad + AlphaMode::Blend quad at different depths.
+    for (name, z, is_glass) in [("GlassPane", 0.6_f32, true), ("MistPlane", 0.3_f32, false)] {
+        let mid = scene.allocate_node_id();
+        scene.nodes.insert(
+            mid,
+            SceneNode {
+                id: mid,
+                name: name.into(),
+                kind: NodeKind::LowPolyMesh,
+                visible: true,
+                parent: None,
+                transform: Transform::default(),
+            },
+        );
+        let mut mesh = LowPolyMesh::new();
+        mesh.vertices = vec![
+            Vec3::new(-0.4, 0.0, z),
+            Vec3::new(0.4, 0.0, z),
+            Vec3::new(0.4, 0.8, z),
+            Vec3::new(-0.4, 0.8, z),
+        ];
+        mesh.faces = vec![Face::with_uvs(
+            vec![0, 1, 2, 3],
+            wall_idx,
+            vec![[0.0, 1.0], [1.0, 1.0], [1.0, 0.0], [0.0, 0.0]],
+        )];
+        if is_glass {
+            mesh.material.transmission = 0.85;
+            mesh.material.ior = 1.48;
+            mesh.material.roughness = 0.1;
+        } else {
+            mesh.material.alpha_mode = tessel_core::AlphaMode::Blend;
+        }
+        scene.lowpoly_meshes.insert(mid, mesh);
+    }
+    scene.character_rig = Some(tessel_core::CharacterRig::biped_template());
+    scene.mark_modified();
+
+    let mut cam = OrbitCamera::new();
+    cam.distance = 2.5;
+    let cam_2d = PixelCamera2D::new();
+
+    // Render with 4x MSAA + Pass 2.5 glass refraction + Bloom + Fog, plus minimized resize.
+    viewport.sync_scene(&device, &queue, &scene, None, None);
+    let mut enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+        label: Some("tessel-smoke-h3-glass-4x"),
+    });
+    viewport.render(&queue, &mut enc, &scene, &cam, &cam_2d, 1.0, false);
+    queue.submit(Some(enc.finish()));
+    let (w, h, rgba) = viewport
+        .capture_rgba_bytes_with_timeout(&device, &queue, Duration::from_secs(5))
+        .expect("H3 4x MSAA glass readback must succeed");
+    assert_eq!((w, h), (64, 64));
+    assert!(rgba.iter().any(|&b| b != 0));
+
+    // Also test 1x sample count + minimized resize safety.
+    scene.npr_look.msaa_samples = 1;
+    scene.mark_modified();
+    assert!(viewport.resize(&device, 0, 0));
+    assert!(viewport.resize(&device, 64, 64));
+    viewport.sync_scene(&device, &queue, &scene, None, None);
+    let mut enc2 = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+        label: Some("tessel-smoke-h3-glass-1x"),
+    });
+    viewport.render(&queue, &mut enc2, &scene, &cam, &cam_2d, 1.0, true);
+    queue.submit(Some(enc2.finish()));
+    let _ = viewport
+        .capture_rgba_bytes_with_timeout(&device, &queue, Duration::from_secs(5))
+        .expect("H3 1x glass readback must succeed");
+
+    let validation_err = pollster::block_on(device.pop_error_scope());
+    assert!(
+        validation_err.is_none(),
+        "unexpected wgpu validation error on H3 glass/translucent pipeline: {validation_err:?}"
+    );
+}

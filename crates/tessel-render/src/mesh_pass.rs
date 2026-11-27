@@ -7,6 +7,7 @@ use wgpu::util::DeviceExt;
 use crate::vertex::{CameraUniform, MaterialUniform, ShadowMapUniform, StudioVertex3D};
 
 const MESH_SHADER_WGSL: &str = include_str!("../../../assets/shaders/mesh_3d.wgsl");
+const GLASS_SHADER_WGSL: &str = include_str!("../../../assets/shaders/glass_3d.wgsl");
 const SHADOW_DEPTH_SHADER_WGSL: &str = include_str!("../../../assets/shaders/shadow_depth.wgsl");
 const OUTLINE_HULL_SHADER_WGSL: &str = include_str!("../../../assets/shaders/outline_hull.wgsl");
 const SHADOW_MAP_SIZE: u32 = 2048;
@@ -50,6 +51,8 @@ pub struct CustomMeshUpload<'a> {
     pub face_sdf_map: Option<&'a MeshTexture>,
     pub hatching_ramp_map: Option<&'a MeshTexture>,
     pub material: MeshMaterial,
+    /// When `true` (translucent voxel submeshes), forces Palette Material LUT lookup and Pass 2.5 glass routing.
+    pub force_palette_lut: bool,
     pub vertices: Vec<StudioVertex3D>,
     pub indices: Vec<u32>,
 }
@@ -66,18 +69,24 @@ struct TexturedMeshDraw {
     index_buffer: wgpu::Buffer,
     index_count: u32,
     cast_shadow: bool,
+    is_glass: bool,
     alpha_blend: bool,
+    centroid: [f32; 3],
 }
 
 /// Renders shaded 3D Voxel & Low-Poly meshes using a 256x1 palette texture (or per-mesh RGBA texture)
 /// with per-mesh PBR material properties, tangent-space normal mapping, real directional shadow map,
-/// NPR / Sumi-e preview + inverted-hull outlines, transparent blending, and depth testing.
+/// NPR / Sumi-e preview + inverted-hull outlines, Pass 2.5 glass refraction + back-to-front sorting, and depth testing.
 pub struct MeshPass {
     pipeline: wgpu::RenderPipeline,
     blend_pipeline: wgpu::RenderPipeline,
+    glass_pipeline: wgpu::RenderPipeline,
     outline_pipeline: wgpu::RenderPipeline,
     shadow_depth_pipeline: wgpu::RenderPipeline,
     bgl: wgpu::BindGroupLayout,
+    glass_opaque_bgl: wgpu::BindGroupLayout,
+    glass_opaque_sampler: wgpu::Sampler,
+    glass_opaque_bg: wgpu::BindGroup,
     camera_buffer: wgpu::Buffer,
     _default_material_buffer: wgpu::Buffer,
     palette_texture: wgpu::Texture,
@@ -109,6 +118,7 @@ impl MeshPass {
         color_format: wgpu::TextureFormat,
         depth_format: wgpu::TextureFormat,
         sample_count: u32,
+        opaque_copy_view: &wgpu::TextureView,
     ) -> Self {
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("tessel-mesh-3d-shader"),
@@ -649,6 +659,92 @@ impl MeshPass {
             cache: None,
         });
 
+        let glass_opaque_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("tessel-glass-opaque-bgl"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+            ],
+        });
+        let glass_opaque_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("tessel-glass-opaque-sampler"),
+            address_mode_u: wgpu::AddressMode::ClampToEdge,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            ..Default::default()
+        });
+        let glass_opaque_bg = create_glass_opaque_bind_group(
+            device,
+            &glass_opaque_bgl,
+            opaque_copy_view,
+            &glass_opaque_sampler,
+        );
+
+        let glass_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("tessel-glass-3d-shader"),
+            source: wgpu::ShaderSource::Wgsl(GLASS_SHADER_WGSL.into()),
+        });
+        let glass_pipeline_layout =
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("tessel-glass-pipeline-layout"),
+                bind_group_layouts: &[&bgl, &shadow_sample_bgl, &glass_opaque_bgl],
+                push_constant_ranges: &[],
+            });
+        let glass_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("tessel-glass-3d-pipeline"),
+            layout: Some(&glass_pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &glass_shader,
+                entry_point: Some("vs_main"),
+                buffers: std::slice::from_ref(&shadow_vertex_layout),
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &glass_shader,
+                entry_point: Some("fs_main"),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: color_format,
+                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+            }),
+            primitive: wgpu::PrimitiveState {
+                cull_mode: None,
+                front_face: wgpu::FrontFace::Ccw,
+                ..Default::default()
+            },
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: depth_format,
+                depth_write_enabled: false,
+                depth_compare: wgpu::CompareFunction::Less,
+                stencil: wgpu::StencilState::default(),
+                bias: wgpu::DepthBiasState::default(),
+            }),
+            multisample: wgpu::MultisampleState {
+                count: sample_count,
+                mask: !0,
+                alpha_to_coverage_enabled: false,
+            },
+            multiview: None,
+            cache: None,
+        });
+
         let outline_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("tessel-outline-hull-shader"),
             source: wgpu::ShaderSource::Wgsl(OUTLINE_HULL_SHADER_WGSL.into()),
@@ -696,9 +792,13 @@ impl MeshPass {
         Self {
             pipeline,
             blend_pipeline,
+            glass_pipeline,
             outline_pipeline,
             shadow_depth_pipeline,
             bgl,
+            glass_opaque_bgl,
+            glass_opaque_sampler,
+            glass_opaque_bg,
             camera_buffer,
             _default_material_buffer: default_material_buffer,
             palette_texture,
@@ -918,12 +1018,13 @@ impl MeshPass {
                 Some([x, y, z]) => (x, y, z, 1.0),
                 None => (0.0, 0.0, 1.0, 0.0),
             };
-            let use_palette_mat_lut = item.texture.is_none()
-                && mat.metallic == 0.0
-                && (mat.roughness - 0.85).abs() < 1e-4
-                && mat.emissive == [0.0, 0.0, 0.0]
-                && mat.transmission == 0.0
-                && (mat.ior - 1.5).abs() < 1e-4;
+            let use_palette_mat_lut = item.force_palette_lut
+                || (item.texture.is_none()
+                    && mat.metallic == 0.0
+                    && (mat.roughness - 0.85).abs() < 1e-4
+                    && mat.emissive == [0.0, 0.0, 0.0]
+                    && mat.transmission == 0.0
+                    && (mat.ior - 1.5).abs() < 1e-4);
             let mat_uniform = MaterialUniform {
                 pbr: [
                     mat.metallic,
@@ -1043,6 +1144,8 @@ impl MeshPass {
                 contents: bytemuck::cast_slice(indices),
                 usage: wgpu::BufferUsages::INDEX,
             });
+            let is_glass = item.force_palette_lut || mat.transmission > 0.0;
+            let centroid = compute_vertices_centroid(vertices);
             self.textured_draws.push(TexturedMeshDraw {
                 _texture: gpu_tex,
                 _normal_texture: gpu_norm_tex,
@@ -1054,10 +1157,32 @@ impl MeshPass {
                 vertex_buffer,
                 index_buffer,
                 index_count: indices.len() as u32,
-                cast_shadow: mat.cast_shadow && mat.transmission <= 0.0,
-                alpha_blend: mat.alpha_mode == AlphaMode::Blend,
+                cast_shadow: mat.cast_shadow && !is_glass,
+                is_glass,
+                alpha_blend: !is_glass && mat.alpha_mode == AlphaMode::Blend,
+                centroid,
             });
         }
+    }
+
+    /// Rebinds `opaque_copy_view` for Pass 2.5 screen-space glass refraction after viewport resize.
+    pub fn rebind_opaque_copy(
+        &mut self,
+        device: &wgpu::Device,
+        opaque_copy_view: &wgpu::TextureView,
+    ) {
+        self.glass_opaque_bg = create_glass_opaque_bind_group(
+            device,
+            &self.glass_opaque_bgl,
+            opaque_copy_view,
+            &self.glass_opaque_sampler,
+        );
+    }
+
+    pub fn has_translucent_draws(&self) -> bool {
+        self.textured_draws
+            .iter()
+            .any(|d| d.is_glass || d.alpha_blend)
     }
 
     pub fn update_camera(&self, queue: &wgpu::Queue, uniform: &CameraUniform) {
@@ -1148,7 +1273,12 @@ impl MeshPass {
         }
     }
 
-    pub fn draw<'a>(&'a self, pass: &mut wgpu::RenderPass<'a>, shading_mode: ViewportShadingMode) {
+    /// Pass 2: Draws all opaque and alpha-mask 3D geometry plus NPR inverted-hull outlines.
+    pub fn draw_opaque<'a>(
+        &'a self,
+        pass: &mut wgpu::RenderPass<'a>,
+        shading_mode: ViewportShadingMode,
+    ) {
         // 1. Opaque & Alpha-Mask geometry pass
         pass.set_pipeline(&self.pipeline);
         pass.set_bind_group(1, &self.shadow_sample_bg, &[]);
@@ -1161,7 +1291,7 @@ impl MeshPass {
             }
         }
         for draw in &self.textured_draws {
-            if draw.alpha_blend {
+            if draw.is_glass || draw.alpha_blend {
                 continue;
             }
             pass.set_bind_group(0, &draw.bind_group, &[]);
@@ -1183,22 +1313,7 @@ impl MeshPass {
                 }
             }
             for draw in &self.textured_draws {
-                if draw.alpha_blend {
-                    continue;
-                }
-                pass.set_bind_group(0, &draw.bind_group, &[]);
-                pass.set_vertex_buffer(0, draw.vertex_buffer.slice(..));
-                pass.set_index_buffer(draw.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
-                pass.draw_indexed(0..draw.index_count, 0, 0..1);
-            }
-        }
-
-        // 3. Transparent AlphaMode::Blend pass
-        if self.textured_draws.iter().any(|d| d.alpha_blend) {
-            pass.set_pipeline(&self.blend_pipeline);
-            pass.set_bind_group(1, &self.shadow_sample_bg, &[]);
-            for draw in &self.textured_draws {
-                if !draw.alpha_blend {
+                if draw.is_glass || draw.alpha_blend {
                     continue;
                 }
                 pass.set_bind_group(0, &draw.bind_group, &[]);
@@ -1208,6 +1323,91 @@ impl MeshPass {
             }
         }
     }
+
+    /// Pass 2.5: Draws all refractive glass (voxel & low-poly) and `AlphaMode::Blend` meshes
+    /// sorted strictly back-to-front against `camera_pos`.
+    pub fn draw_translucent<'a>(
+        &'a self,
+        pass: &mut wgpu::RenderPass<'a>,
+        shading_mode: ViewportShadingMode,
+        camera_pos: glam::Vec3,
+    ) {
+        let mut items: Vec<(usize, [f32; 3])> = self
+            .textured_draws
+            .iter()
+            .enumerate()
+            .filter(|(_, d)| d.is_glass || d.alpha_blend)
+            .map(|(i, d)| (i, d.centroid))
+            .collect();
+        if items.is_empty() {
+            return;
+        }
+        let centroids: Vec<[f32; 3]> = items.iter().map(|(_, c)| *c).collect();
+        let order = sort_back_to_front_indices(&centroids, camera_pos);
+        for ord in order {
+            let (draw_idx, _) = items[ord];
+            let draw = &self.textured_draws[draw_idx];
+            if draw.is_glass && shading_mode == ViewportShadingMode::Pbr {
+                pass.set_pipeline(&self.glass_pipeline);
+                pass.set_bind_group(1, &self.shadow_sample_bg, &[]);
+                pass.set_bind_group(2, &self.glass_opaque_bg, &[]);
+            } else {
+                pass.set_pipeline(&self.blend_pipeline);
+                pass.set_bind_group(1, &self.shadow_sample_bg, &[]);
+            }
+            pass.set_bind_group(0, &draw.bind_group, &[]);
+            pass.set_vertex_buffer(0, draw.vertex_buffer.slice(..));
+            pass.set_index_buffer(draw.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+            pass.draw_indexed(0..draw.index_count, 0, 0..1);
+        }
+        items.clear();
+    }
+}
+
+fn create_glass_opaque_bind_group(
+    device: &wgpu::Device,
+    layout: &wgpu::BindGroupLayout,
+    opaque_copy_view: &wgpu::TextureView,
+    sampler: &wgpu::Sampler,
+) -> wgpu::BindGroup {
+    device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("tessel-glass-opaque-bg"),
+        layout,
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: wgpu::BindingResource::TextureView(opaque_copy_view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: wgpu::BindingResource::Sampler(sampler),
+            },
+        ],
+    })
+}
+
+fn compute_vertices_centroid(vertices: &[StudioVertex3D]) -> [f32; 3] {
+    if vertices.is_empty() {
+        return [0.0, 0.0, 0.0];
+    }
+    let mut sum = glam::Vec3::ZERO;
+    for v in vertices {
+        sum += glam::Vec3::from_array(v.position);
+    }
+    (sum / (vertices.len() as f32)).to_array()
+}
+
+pub(crate) fn sort_back_to_front_indices(
+    centroids: &[[f32; 3]],
+    camera_pos: glam::Vec3,
+) -> Vec<usize> {
+    let mut order: Vec<usize> = (0..centroids.len()).collect();
+    order.sort_by(|&a, &b| {
+        let da = glam::Vec3::from_array(centroids[a]).distance_squared(camera_pos);
+        let db = glam::Vec3::from_array(centroids[b]).distance_squared(camera_pos);
+        db.total_cmp(&da).then_with(|| a.cmp(&b))
+    });
+    order
 }
 
 fn upload_optional_rgba_texture(
@@ -1306,6 +1506,17 @@ mod tests {
         assert_eq!(f32_to_f16_bits(20.0), 0x4d00);
         assert_eq!(f32_to_f16_bits(f32::NAN), 0x0000);
         assert_eq!(f32_to_f16_bits(f32::INFINITY), 0x0000);
+    }
+
+    #[test]
+    fn sort_back_to_front_orders_farthest_centroid_first() {
+        let cam = glam::Vec3::new(0.0, 0.0, 10.0);
+        let centroids = [
+            [0.0, 0.0, 5.0],  // dist 5 (nearest)
+            [0.0, 0.0, -4.0], // dist 14 (farthest)
+            [0.0, 0.0, 1.0],  // dist 9 (middle)
+        ];
+        assert_eq!(sort_back_to_front_indices(&centroids, cam), vec![1, 2, 0]);
     }
 
     #[test]

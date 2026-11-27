@@ -48,6 +48,7 @@ pub use scene::{
     ViewportShadingMode, MAX_NODE_NAME_LEN,
 };
 pub use voxel::{
-    ChunkCoord, Symmetry3D, VoxelChunk, VoxelCoord, VoxelEdit, VoxelHit, VoxelMeshOutput,
-    VoxelTool, VoxelVertex, VoxelVolume,
+    greedy_mesh_volume, greedy_mesh_volume_split, ChunkCoord, SplitVoxelMeshOutput, Symmetry3D,
+    VoxelChunk, VoxelCoord, VoxelEdit, VoxelHit, VoxelMeshOutput, VoxelTool, VoxelVertex,
+    VoxelVolume,
 };

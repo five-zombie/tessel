@@ -3,7 +3,7 @@ use std::sync::mpsc::{Receiver, RecvTimeoutError, TryRecvError};
 use std::time::{Duration, Instant};
 
 use image::{ImageFormat, RgbaImage};
-use tessel_core::voxel::greedy_mesh_volume;
+use tessel_core::voxel::greedy_mesh_volume_split;
 use tessel_core::{AppMode, SceneState, VoxelCoord};
 
 use crate::camera::{GizmoAxis, OrbitCamera, TransformGizmoMode};
@@ -38,6 +38,8 @@ pub struct ViewportRenderer {
     color_view: wgpu::TextureView,
     hdr_color_texture: wgpu::Texture,
     hdr_color_view: wgpu::TextureView,
+    opaque_copy_texture: wgpu::Texture,
+    opaque_copy_view: wgpu::TextureView,
     msaa_hdr_color_texture: Option<wgpu::Texture>,
     msaa_hdr_color_view: Option<wgpu::TextureView>,
     depth_texture: wgpu::Texture,
@@ -71,11 +73,19 @@ impl ViewportRenderer {
         let (color_texture, color_view) = create_color_target(device, safe_size.0, safe_size.1);
         let (hdr_color_texture, hdr_color_view) =
             create_hdr_color_target(device, safe_size.0, safe_size.1);
+        let (opaque_copy_texture, opaque_copy_view) =
+            create_opaque_copy_target(device, safe_size.0, safe_size.1);
         let (depth_texture, depth_view) =
             create_depth_target(device, safe_size.0, safe_size.1, sample_count);
         let grid_pass = GridPass::new(device, HDR_VIEWPORT_FORMAT, DEPTH_FORMAT, sample_count);
         let shadow_pass = ShadowPass::new(device, HDR_VIEWPORT_FORMAT, DEPTH_FORMAT, sample_count);
-        let mesh_pass = MeshPass::new(device, HDR_VIEWPORT_FORMAT, DEPTH_FORMAT, sample_count);
+        let mesh_pass = MeshPass::new(
+            device,
+            HDR_VIEWPORT_FORMAT,
+            DEPTH_FORMAT,
+            sample_count,
+            &opaque_copy_view,
+        );
         let post_process_pass =
             PostProcessPass::new(device, VIEWPORT_FORMAT, safe_size, &hdr_color_view);
         let overlay_pass = OverlayPass::new(device, VIEWPORT_FORMAT);
@@ -87,6 +97,8 @@ impl ViewportRenderer {
             color_view,
             hdr_color_texture,
             hdr_color_view,
+            opaque_copy_texture,
+            opaque_copy_view,
             msaa_hdr_color_texture: None,
             msaa_hdr_color_view: None,
             depth_texture,
@@ -148,12 +160,18 @@ impl ViewportRenderer {
         self.depth_view = dview;
         self.grid_pass = GridPass::new(device, HDR_VIEWPORT_FORMAT, DEPTH_FORMAT, normalized);
         self.shadow_pass = ShadowPass::new(device, HDR_VIEWPORT_FORMAT, DEPTH_FORMAT, normalized);
-        self.mesh_pass = MeshPass::new(device, HDR_VIEWPORT_FORMAT, DEPTH_FORMAT, normalized);
+        self.mesh_pass = MeshPass::new(
+            device,
+            HDR_VIEWPORT_FORMAT,
+            DEPTH_FORMAT,
+            normalized,
+            &self.opaque_copy_view,
+        );
         self.last_uploaded_revision = u64::MAX;
         true
     }
 
-    /// Resizes offscreen color, HDR, MSAA, & depth targets only when physical pixel dimensions change.
+    /// Resizes offscreen color, HDR, opaque copy, MSAA, & depth targets only when physical pixel dimensions change.
     pub fn resize(&mut self, device: &wgpu::Device, width: u32, height: u32) -> bool {
         let next = (width.max(1), height.max(1));
         if next == self.size {
@@ -162,6 +180,7 @@ impl ViewportRenderer {
         self.size = next;
         let (tex, view) = create_color_target(device, next.0, next.1);
         let (hdr_tex, hdr_view) = create_hdr_color_target(device, next.0, next.1);
+        let (opaque_tex, opaque_view) = create_opaque_copy_target(device, next.0, next.1);
         let (msaa_tex, msaa_view) = if self.sample_count > 1 {
             let (t, v) = create_msaa_hdr_color_target(device, next.0, next.1, self.sample_count);
             (Some(t), Some(v))
@@ -173,10 +192,14 @@ impl ViewportRenderer {
         self.color_view = view;
         self.hdr_color_texture = hdr_tex;
         self.hdr_color_view = hdr_view;
+        self.opaque_copy_texture = opaque_tex;
+        self.opaque_copy_view = opaque_view;
         self.msaa_hdr_color_texture = msaa_tex;
         self.msaa_hdr_color_view = msaa_view;
         self.depth_texture = dtex;
         self.depth_view = dview;
+        self.mesh_pass
+            .rebind_opaque_copy(device, &self.opaque_copy_view);
         self.post_process_pass
             .resize(device, next, &self.hdr_color_view);
         true
@@ -283,6 +306,7 @@ impl ViewportRenderer {
         self.scratch_indices.clear();
         let vertices = &mut self.scratch_vertices;
         let indices = &mut self.scratch_indices;
+        let mut custom_items = Vec::new();
         for (node_id, vol) in &scene.voxel_volumes {
             let visible = is_visible(*node_id);
             if !visible || vol.is_empty() {
@@ -314,9 +338,10 @@ impl ViewportRenderer {
             } else {
                 glam::Mat4::IDENTITY
             };
-            let mesh = greedy_mesh_volume(vol, scene.unit_scale);
-            let base = vertices.len() as u32;
-            for v in mesh.vertices {
+            let rest_node_mat = scene.node_rest_world_matrix(*node_id);
+            let split = greedy_mesh_volume_split(vol, &scene.palette, scene.unit_scale);
+
+            let transform_voxel_vertex = |v: tessel_core::VoxelVertex| -> StudioVertex3D {
                 let u = (f32::from(v.palette_index.get()) + 0.5) / 256.0;
                 let mut wp = node_mat.transform_point3(glam::Vec3::from_array(v.position));
                 let mut wn = normal_mat
@@ -324,28 +349,53 @@ impl ViewportRenderer {
                     .normalize_or_zero();
                 if !skip_skin {
                     if let (Some(solver), Some(mats)) = (&skin_solver, &skin_mats) {
-                        let rest_wp = scene
-                            .node_rest_world_matrix(*node_id)
-                            .transform_point3(glam::Vec3::from_array(v.position));
+                        let rest_wp =
+                            rest_node_mat.transform_point3(glam::Vec3::from_array(v.position));
                         let w = solver.weights_for_vertex(Some(*node_id), rest_wp);
                         let (sp, sn) = solver.deform_point_normal(mats, w, wp, wn);
                         wp = sp;
                         wn = sn;
                     }
                 }
-                vertices.push(StudioVertex3D {
+                StudioVertex3D {
                     position: wp.to_array(),
                     normal: wn.to_array(),
                     palette_uv: [u, 0.5],
                     ao: v.ao,
                     tangent: [1.0, 0.0, 0.0, 1.0],
                     outline_normal: wn.to_array(),
+                }
+            };
+
+            if !split.opaque.vertices.is_empty() && !split.opaque.indices.is_empty() {
+                let base = vertices.len() as u32;
+                for v in split.opaque.vertices {
+                    vertices.push(transform_voxel_vertex(v));
+                }
+                indices.extend(split.opaque.indices.into_iter().map(|idx| idx + base));
+            }
+
+            if !split.translucent.vertices.is_empty() && !split.translucent.indices.is_empty() {
+                let t_verts: Vec<StudioVertex3D> = split
+                    .translucent
+                    .vertices
+                    .into_iter()
+                    .map(transform_voxel_vertex)
+                    .collect();
+                custom_items.push(crate::mesh_pass::CustomMeshUpload {
+                    texture: None,
+                    normal_map: None,
+                    matcap_map: None,
+                    face_sdf_map: None,
+                    hatching_ramp_map: None,
+                    material: tessel_core::MeshMaterial::default(),
+                    force_palette_lut: true,
+                    vertices: t_verts,
+                    indices: split.translucent.indices,
                 });
             }
-            indices.extend(mesh.indices.into_iter().map(|idx| idx + base));
         }
 
-        let mut custom_items = Vec::new();
         for (node_id, mesh) in &scene.lowpoly_meshes {
             let visible = is_visible(*node_id);
             if !visible || mesh.faces.is_empty() {
@@ -539,6 +589,7 @@ impl ViewportRenderer {
                     face_sdf_map: mesh.face_sdf_map.as_ref(),
                     hatching_ramp_map: mesh.hatching_ramp_map.as_ref(),
                     material: mesh.material,
+                    force_palette_lut: false,
                     vertices: t_verts,
                     indices: tri.indices,
                 });
@@ -685,14 +736,14 @@ impl ViewportRenderer {
                     scene.lookdev_preset,
                 );
 
-                // Pass 2: Main 3D HDR Pass (Rgba16Float, MSAA StoreOp::Store preserved for Pass 2.5)
+                // Pass 2: Main 3D HDR Opaque Pass (Rgba16Float, MSAA StoreOp::Store preserved for Pass 2.5)
+                let (hdr_target, resolve_target) =
+                    if let Some(msaa_view) = self.msaa_hdr_color_view.as_ref() {
+                        (msaa_view, Some(&self.hdr_color_view))
+                    } else {
+                        (&self.hdr_color_view, None)
+                    };
                 {
-                    let (hdr_target, resolve_target) =
-                        if let Some(msaa_view) = self.msaa_hdr_color_view.as_ref() {
-                            (msaa_view, Some(&self.hdr_color_view))
-                        } else {
-                            (&self.hdr_color_view, None)
-                        };
                     let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                         label: Some("tessel-3d-hdr-viewport-pass"),
                         color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -718,7 +769,58 @@ impl ViewportRenderer {
                         self.grid_pass.draw(&mut pass);
                     }
                     self.shadow_pass.draw(&mut pass);
-                    self.mesh_pass.draw(&mut pass, scene.shading_mode);
+                    self.mesh_pass.draw_opaque(&mut pass, scene.shading_mode);
+                }
+
+                // Pass 2.5: Glass Refraction & Back-to-Front Translucent Pass
+                if self.mesh_pass.has_translucent_draws() {
+                    encoder.copy_texture_to_texture(
+                        wgpu::TexelCopyTextureInfo {
+                            texture: &self.hdr_color_texture,
+                            mip_level: 0,
+                            origin: wgpu::Origin3d::ZERO,
+                            aspect: wgpu::TextureAspect::All,
+                        },
+                        wgpu::TexelCopyTextureInfo {
+                            texture: &self.opaque_copy_texture,
+                            mip_level: 0,
+                            origin: wgpu::Origin3d::ZERO,
+                            aspect: wgpu::TextureAspect::All,
+                        },
+                        wgpu::Extent3d {
+                            width: self.size.0,
+                            height: self.size.1,
+                            depth_or_array_layers: 1,
+                        },
+                    );
+                    let cam_pos = glam::Vec3::new(
+                        uniform.camera_pos[0],
+                        uniform.camera_pos[1],
+                        uniform.camera_pos[2],
+                    );
+                    let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                        label: Some("tessel-3d-glass-translucent-pass"),
+                        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                            view: hdr_target,
+                            resolve_target,
+                            ops: wgpu::Operations {
+                                load: wgpu::LoadOp::Load,
+                                store: wgpu::StoreOp::Store,
+                            },
+                        })],
+                        depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                            view: &self.depth_view,
+                            depth_ops: Some(wgpu::Operations {
+                                load: wgpu::LoadOp::Load,
+                                store: wgpu::StoreOp::Store,
+                            }),
+                            stencil_ops: None,
+                        }),
+                        occlusion_query_set: None,
+                        timestamp_writes: None,
+                    });
+                    self.mesh_pass
+                        .draw_translucent(&mut pass, scene.shading_mode, cam_pos);
                 }
 
                 // Pass 3 & 4: Dual-Kawase Bloom + Final HDR -> LDR Composite (Exposure + ACES, NPR bypass)
@@ -933,6 +1035,29 @@ fn create_hdr_color_target(
         usage: wgpu::TextureUsages::RENDER_ATTACHMENT
             | wgpu::TextureUsages::TEXTURE_BINDING
             | wgpu::TextureUsages::COPY_SRC,
+        view_formats: &[],
+    });
+    let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+    (texture, view)
+}
+
+fn create_opaque_copy_target(
+    device: &wgpu::Device,
+    width: u32,
+    height: u32,
+) -> (wgpu::Texture, wgpu::TextureView) {
+    let texture = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("tessel-viewport-opaque-copy"),
+        size: wgpu::Extent3d {
+            width: width.max(1),
+            height: height.max(1),
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: HDR_VIEWPORT_FORMAT,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
         view_formats: &[],
     });
     let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
