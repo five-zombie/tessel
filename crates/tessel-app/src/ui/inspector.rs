@@ -160,8 +160,9 @@ pub fn show_inspector(
     render_preview: &mut bool,
     interaction_tool: &mut super::viewport::ViewportInteractionTool,
     outliner_rename: &mut OutlinerRenameState,
-) {
+) -> super::RigIoRequests {
     ai_state.poll_response(scene, history, allowed_export_dir);
+    let mut rig_io = super::RigIoRequests::default();
 
     let frame = Frame::NONE
         .fill(tokens::SURFACE_LOW)
@@ -185,7 +186,7 @@ pub fn show_inspector(
                     ui.separator();
                     ui.add_space(8.0);
                 } else if scene.active_mode == AppMode::Character {
-                    show_character_rig_section(ui, scene, history);
+                    rig_io = show_character_rig_section(ui, scene, history);
                     ui.add_space(10.0);
                     ui.separator();
                     ui.add_space(8.0);
@@ -211,6 +212,7 @@ pub fn show_inspector(
                 show_direct_ai_section(ui, scene, history, ai_state, allowed_export_dir, settings);
             });
         });
+    rig_io
 }
 
 fn show_palette_section(ui: &mut egui::Ui, scene: &mut SceneState, history: &mut HistoryStack) {
@@ -485,11 +487,118 @@ fn show_pixel_layers_section(
     }
 }
 
+#[derive(Clone)]
+struct BoneRowSnapshot {
+    id: BoneId,
+    name: String,
+    rest_pos: glam::Vec3,
+    rest_rot: glam::Quat,
+    pose_rot: glam::Quat,
+}
+
+fn next_bone_name(rig: &tessel_core::CharacterRig, base: &str) -> String {
+    if !rig.bones.iter().any(|b| b.name == base) {
+        return base.to_string();
+    }
+    let mut idx = 2usize;
+    loop {
+        let candidate = format!("{base} {idx}");
+        if !rig.bones.iter().any(|b| b.name == candidate) {
+            return candidate;
+        }
+        idx = idx.saturating_add(1);
+    }
+}
+
+fn is_bone_or_descendant(
+    rig: &tessel_core::CharacterRig,
+    candidate_id: BoneId,
+    bone_id: BoneId,
+) -> bool {
+    let mut curr = Some(candidate_id);
+    let mut visited = BTreeSet::new();
+    let max_hops = rig.bones.len().saturating_add(1);
+    for _ in 0..max_hops {
+        let Some(id) = curr else {
+            return false;
+        };
+        if id == bone_id || !visited.insert(id) {
+            return true;
+        }
+        curr = rig.bone(id).and_then(|b| b.parent);
+    }
+    curr.is_some()
+}
+
+fn valid_bone_parent_candidates(
+    rig: &tessel_core::CharacterRig,
+    bone_id: BoneId,
+) -> Vec<(BoneId, String)> {
+    rig.bones
+        .iter()
+        .filter(|b| !is_bone_or_descendant(rig, b.id, bone_id))
+        .map(|b| (b.id, b.name.clone()))
+        .collect()
+}
+
+fn rename_bone_if_changed(
+    scene: &mut SceneState,
+    history: &mut HistoryStack,
+    bone_id: BoneId,
+    draft: &str,
+) -> Result<bool, String> {
+    let trimmed = draft.trim();
+    if trimmed.is_empty() {
+        return Ok(false);
+    }
+    if scene
+        .character_rig
+        .as_ref()
+        .and_then(|r| r.bone(bone_id))
+        .is_some_and(|b| b.name == trimmed)
+    {
+        return Ok(false);
+    }
+    history
+        .execute(
+            scene,
+            Command::RenameBone {
+                bone_id,
+                name: trimmed.to_string(),
+            },
+        )
+        .map(|()| true)
+        .map_err(|e| e.to_string())
+}
+
+fn rig_builder_button(
+    ui: &mut egui::Ui,
+    label: &str,
+    tooltip: &str,
+    enabled: bool,
+    danger: bool,
+) -> bool {
+    let ink = if danger && enabled {
+        tokens::ERROR
+    } else if enabled {
+        tokens::ON_SURFACE
+    } else {
+        tokens::ON_SURFACE_VARIANT
+    };
+    let btn = egui::Button::new(RichText::new(label).size(11.5).color(ink))
+        .fill(tokens::SURFACE_HIGH)
+        .corner_radius(CornerRadius::same(4));
+    ui.add_enabled(enabled, btn)
+        .on_hover_text(tooltip)
+        .clicked()
+}
+
 fn show_character_rig_section(
     ui: &mut egui::Ui,
     scene: &mut SceneState,
     history: &mut HistoryStack,
-) {
+) -> super::RigIoRequests {
+    let mut rig_io = super::RigIoRequests::default();
     ui.label(
         RichText::new("Character Rig")
             .strong()
@@ -504,24 +613,68 @@ fn show_character_rig_section(
                 .size(11.5)
                 .color(tokens::ON_SURFACE_VARIANT),
         );
-        if icons::hud_icon_button(ui, ToolIcon::BipedRig, "Apply Biped Skeleton", false) {
-            super::exec_history(ui.ctx(), history, scene, Command::ApplyBipedRig);
+        ui.add_space(4.0);
+        ui.horizontal_wrapped(|ui| {
+            if rig_builder_button(ui, "Apply Biped", "Apply Biped Skeleton", true, false) {
+                super::clear_rig_status(ui.ctx());
+                super::exec_history(ui.ctx(), history, scene, Command::ApplyBipedRig);
+            }
+            if rig_builder_button(
+                ui,
+                "New Empty Rig",
+                "Create an empty custom character rig",
+                true,
+                false,
+            ) {
+                super::clear_rig_status(ui.ctx());
+                super::exec_history(
+                    ui.ctx(),
+                    history,
+                    scene,
+                    Command::SetCharacterRig {
+                        rig: Some(tessel_core::CharacterRig::default()),
+                    },
+                );
+            }
+            if rig_builder_button(
+                ui,
+                "Import Rig",
+                "Import rig template (.tesselrig.json / .glb)",
+                true,
+                false,
+            ) {
+                rig_io.import_rig = true;
+            }
+        });
+        if let Some(status) = super::rig_status(ui.ctx()) {
+            ui.add_space(4.0);
+            ui.label(RichText::new(status).size(10.5).color(tokens::PRIMARY));
         }
-        return;
+        return rig_io;
     };
 
-    let bones: Vec<_> = rig
+    let bones: Vec<BoneRowSnapshot> = rig
         .bones
         .iter()
-        .map(|b| {
-            (
-                b.id,
-                b.name.clone(),
-                b.rest_local.rotation,
-                b.pose_local.rotation,
-            )
+        .map(|b| BoneRowSnapshot {
+            id: b.id,
+            name: b.name.clone(),
+            rest_pos: b.rest_local.translation,
+            rest_rot: b.rest_local.rotation,
+            pose_rot: b.pose_local.rotation,
         })
         .collect();
+    let next_root_name = next_bone_name(rig, "Root");
+    let next_child_name = next_bone_name(rig, "Bone");
+    let active_bone = scene
+        .selected_bone
+        .and_then(|bid| bones.iter().find(|b| b.id == bid))
+        .or_else(|| bones.first())
+        .cloned();
+    let parent_candidates = active_bone
+        .as_ref()
+        .map(|b| valid_bone_parent_candidates(rig, b.id))
+        .unwrap_or_default();
     let active_clip = rig.active_animation;
     let playback_time = rig.playback_time;
     let current_binding = scene.selected_node.and_then(|nid| {
@@ -544,6 +697,49 @@ fn show_character_rig_section(
         })
         .map(|n| (n.id, n.name.clone(), rig.should_skin_node(n.id)))
         .collect();
+
+    ui.horizontal_wrapped(|ui| {
+        if rig_builder_button(
+            ui,
+            "New Empty Rig",
+            "Replace rig with an empty custom rig",
+            true,
+            false,
+        ) {
+            super::clear_rig_status(ui.ctx());
+            super::exec_history(
+                ui.ctx(),
+                history,
+                scene,
+                Command::SetCharacterRig {
+                    rig: Some(tessel_core::CharacterRig::default()),
+                },
+            );
+        }
+        if rig_builder_button(
+            ui,
+            "Import Rig",
+            "Import rig template (.tesselrig.json / .glb)",
+            true,
+            false,
+        ) {
+            rig_io.import_rig = true;
+        }
+        if rig_builder_button(
+            ui,
+            "Export Rig",
+            "Export rig template (.tesselrig.json)",
+            true,
+            false,
+        ) {
+            rig_io.export_rig = true;
+        }
+    });
+    if let Some(status) = super::rig_status(ui.ctx()) {
+        ui.add_space(4.0);
+        ui.label(RichText::new(status).size(10.5).color(tokens::PRIMARY));
+    }
+    ui.add_space(6.0);
 
     ui.label(
         RichText::new("Rig Target Objects")
@@ -623,7 +819,7 @@ fn show_character_rig_section(
                     ui.add_space(6.0);
                 }
             }
-            if is_3d_geo && selected_skinned {
+            if is_3d_geo && selected_skinned && !bones.is_empty() {
                 ui.label(
                     RichText::new(format!("Bind '{node_name}' to Bone:"))
                         .size(11.0)
@@ -644,9 +840,9 @@ fn show_character_rig_section(
                             },
                         );
                     }
-                    for (bid, bname, _, _) in &bones {
+                    for bone in &bones {
                         if ui
-                            .selectable_label(current_binding == Some(*bid), bname)
+                            .selectable_label(current_binding == Some(bone.id), &bone.name)
                             .clicked()
                         {
                             super::exec_history(
@@ -655,7 +851,7 @@ fn show_character_rig_section(
                                 scene,
                                 Command::BindNodeToBone {
                                     node_id: selected_id,
-                                    bone_id: Some(*bid),
+                                    bone_id: Some(bone.id),
                                 },
                             );
                         }
@@ -680,10 +876,12 @@ fn show_character_rig_section(
                             },
                         );
                     }
-                    for (bid, bname, _, _) in &bones {
-                        let in_mask = current_mask.as_ref().is_some_and(|list| list.contains(bid));
-                        if ui.selectable_label(in_mask, bname).clicked() {
-                            let next_mask = toggle_bone_in_mask(current_mask.as_deref(), *bid);
+                    for bone in &bones {
+                        let in_mask = current_mask
+                            .as_ref()
+                            .is_some_and(|list| list.contains(&bone.id));
+                        if ui.selectable_label(in_mask, &bone.name).clicked() {
+                            let next_mask = toggle_bone_in_mask(current_mask.as_deref(), bone.id);
                             super::exec_history(
                                 ui.ctx(),
                                 history,
@@ -701,56 +899,328 @@ fn show_character_rig_section(
         }
     }
 
-    ui.horizontal(|ui| {
+    if !bones.is_empty() {
+        ui.horizontal(|ui| {
+            ui.label(
+                RichText::new("Pose Editor (Degrees)")
+                    .size(11.0)
+                    .color(tokens::ON_SURFACE_VARIANT),
+            );
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if icons::hud_icon_button(
+                    ui,
+                    ToolIcon::Reset,
+                    "Reset all bones to rest pose",
+                    false,
+                ) {
+                    super::exec_history(ui.ctx(), history, scene, Command::ResetCharacterPose);
+                }
+                if icons::text_icon_button(ui, "Floor", "Clamp rig to floor (y=0)", false) {
+                    if let Some(rig_ref) = &scene.character_rig {
+                        let mut clamped = rig_ref.clone();
+                        let bounds = tessel_core::SkinnedBoundsCache::from_scene(scene, rig_ref);
+                        if clamped
+                            .clamp_sub_skeleton_to_floor_with_bounds("", 0.0, bounds.as_ref())
+                            .is_none()
+                        {
+                            super::push_ui_error(ui.ctx(), "Floor clamp found no bones to adjust.");
+                        } else if let Some(root) = clamped.bones.first() {
+                            super::exec_history(
+                                ui.ctx(),
+                                history,
+                                scene,
+                                Command::SetBoneTranslation {
+                                    bone_id: root.id,
+                                    translation: root.pose_local.translation,
+                                },
+                            );
+                        }
+                    }
+                }
+            });
+        });
+        ui.horizontal_wrapped(|ui| {
+            for bone in &bones {
+                let selected = active_bone.as_ref().is_some_and(|ab| ab.id == bone.id);
+                if ui.selectable_label(selected, &bone.name).clicked() {
+                    scene.selected_bone = Some(bone.id);
+                }
+            }
+        });
+        ui.add_space(6.0);
+    }
+
+    ui.label(
+        RichText::new("Bone Builder")
+            .strong()
+            .size(11.5)
+            .color(tokens::ON_SURFACE),
+    );
+    ui.add_space(2.0);
+    ui.horizontal_wrapped(|ui| {
+        if rig_builder_button(
+            ui,
+            "+ Root Bone",
+            "Add a new root bone to the rig",
+            true,
+            false,
+        ) {
+            let prev_len = scene.character_rig.as_ref().map_or(0, |r| r.bones.len());
+            super::exec_history(
+                ui.ctx(),
+                history,
+                scene,
+                Command::AddBone {
+                    name: next_root_name,
+                    parent: None,
+                    position: glam::Vec3::new(0.0, 0.8, 0.0),
+                },
+            );
+            if scene
+                .character_rig
+                .as_ref()
+                .is_some_and(|r| r.bones.len() > prev_len)
+            {
+                scene.selected_bone = scene
+                    .character_rig
+                    .as_ref()
+                    .and_then(|r| r.bones.last().map(|b| b.id));
+            }
+        }
+        if rig_builder_button(
+            ui,
+            "+ Child Bone",
+            "Add a child bone under the selected bone",
+            active_bone.is_some(),
+            false,
+        ) {
+            if let Some(ref parent_bone) = active_bone {
+                let prev_len = scene.character_rig.as_ref().map_or(0, |r| r.bones.len());
+                super::exec_history(
+                    ui.ctx(),
+                    history,
+                    scene,
+                    Command::AddBone {
+                        name: next_child_name,
+                        parent: Some(parent_bone.id),
+                        position: glam::Vec3::new(0.0, 0.25, 0.0),
+                    },
+                );
+                if scene
+                    .character_rig
+                    .as_ref()
+                    .is_some_and(|r| r.bones.len() > prev_len)
+                {
+                    scene.selected_bone = scene
+                        .character_rig
+                        .as_ref()
+                        .and_then(|r| r.bones.last().map(|b| b.id));
+                }
+            }
+        }
+        if rig_builder_button(
+            ui,
+            "Delete",
+            "Remove the selected bone and its descendants",
+            active_bone.is_some(),
+            true,
+        ) {
+            if let Some(ref target_bone) = active_bone {
+                super::exec_history(
+                    ui.ctx(),
+                    history,
+                    scene,
+                    Command::RemoveBone {
+                        bone_id: target_bone.id,
+                    },
+                );
+                scene.selected_bone = scene
+                    .character_rig
+                    .as_ref()
+                    .and_then(|r| r.bones.first().map(|b| b.id));
+            }
+        }
+    });
+
+    if bones.is_empty() {
+        ui.add_space(4.0);
         ui.label(
-            RichText::new("Pose Editor (Degrees)")
+            RichText::new("No bones yet. Click + Root Bone to add one.")
                 .size(11.0)
                 .color(tokens::ON_SURFACE_VARIANT),
         );
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            if icons::hud_icon_button(ui, ToolIcon::Reset, "Reset all bones to rest pose", false) {
-                super::exec_history(ui.ctx(), history, scene, Command::ResetCharacterPose);
-            }
-            if icons::text_icon_button(ui, "Floor", "Clamp rig to floor (y=0)", false) {
-                if let Some(rig_ref) = &scene.character_rig {
-                    let mut clamped = rig_ref.clone();
-                    let bounds = tessel_core::SkinnedBoundsCache::from_scene(scene, rig_ref);
-                    if clamped
-                        .clamp_sub_skeleton_to_floor_with_bounds("", 0.0, bounds.as_ref())
-                        .is_none()
+    } else if let Some(ref bone) = active_bone {
+        ui.add_space(4.0);
+        let draft_id = egui::Id::new("bone_builder_rename_draft");
+        let mut draft =
+            ui.ctx()
+                .data_mut(|d| match d.get_temp::<(BoneId, String, String)>(draft_id) {
+                    Some((cached_id, seen_name, cached_draft))
+                        if cached_id == bone.id && seen_name == bone.name =>
                     {
-                        super::push_ui_error(ui.ctx(), "Floor clamp found no bones to adjust.");
-                    } else if let Some(root) = clamped.bones.first() {
+                        cached_draft
+                    }
+                    _ => bone.name.clone(),
+                });
+        ui.horizontal(|ui| {
+            ui.label(
+                RichText::new("Name")
+                    .size(11.0)
+                    .color(tokens::ON_SURFACE_VARIANT),
+            );
+            let edit = ui.add(
+                egui::TextEdit::singleline(&mut draft)
+                    .desired_width(118.0)
+                    .hint_text("Bone name"),
+            );
+            let apply_clicked = ui.small_button("Apply").clicked();
+            let enter_pressed = edit.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+            let escape_pressed = edit.has_focus() && ui.input(|i| i.key_pressed(egui::Key::Escape));
+            if escape_pressed {
+                draft = bone.name.clone();
+            } else if apply_clicked || enter_pressed || edit.lost_focus() {
+                if let Err(err) = rename_bone_if_changed(scene, history, bone.id, &draft) {
+                    super::push_ui_error(ui.ctx(), err);
+                }
+                if let Some(updated_name) = scene
+                    .character_rig
+                    .as_ref()
+                    .and_then(|r| r.bone(bone.id))
+                    .map(|b| b.name.clone())
+                {
+                    draft = updated_name;
+                }
+            }
+        });
+        let latest_name = scene
+            .character_rig
+            .as_ref()
+            .and_then(|r| r.bone(bone.id))
+            .map_or_else(|| bone.name.clone(), |b| b.name.clone());
+        ui.ctx()
+            .data_mut(|d| d.insert_temp(draft_id, (bone.id, latest_name, draft)));
+
+        let current_parent = scene
+            .character_rig
+            .as_ref()
+            .and_then(|r| r.bone(bone.id))
+            .and_then(|b| b.parent);
+        let current_parent_label = current_parent
+            .and_then(|pid| bones.iter().find(|b| b.id == pid).map(|b| b.name.as_str()))
+            .unwrap_or("None (Root)")
+            .to_string();
+        ui.horizontal(|ui| {
+            ui.label(
+                RichText::new("Parent")
+                    .size(11.0)
+                    .color(tokens::ON_SURFACE_VARIANT),
+            );
+            egui::ComboBox::from_id_salt(("bone_parent_selector", bone.id))
+                .width(ui.available_width().max(96.0))
+                .selected_text(current_parent_label)
+                .show_ui(ui, |ui| {
+                    if ui
+                        .selectable_label(current_parent.is_none(), "None (Root)")
+                        .clicked()
+                        && current_parent.is_some()
+                    {
                         super::exec_history(
                             ui.ctx(),
                             history,
                             scene,
-                            Command::SetBoneTranslation {
-                                bone_id: root.id,
-                                translation: root.pose_local.translation,
+                            Command::ReparentBone {
+                                bone_id: bone.id,
+                                parent: None,
                             },
                         );
                     }
-                }
+                    for (cand_id, cand_name) in &parent_candidates {
+                        ui.push_id(*cand_id, |ui| {
+                            if ui
+                                .selectable_label(current_parent == Some(*cand_id), cand_name)
+                                .clicked()
+                                && current_parent != Some(*cand_id)
+                            {
+                                super::exec_history(
+                                    ui.ctx(),
+                                    history,
+                                    scene,
+                                    Command::ReparentBone {
+                                        bone_id: bone.id,
+                                        parent: Some(*cand_id),
+                                    },
+                                );
+                            }
+                        });
+                    }
+                });
+        });
+
+        let mut rest_pos = scene
+            .character_rig
+            .as_ref()
+            .and_then(|r| r.bone(bone.id))
+            .map_or(bone.rest_pos, |b| b.rest_local.translation);
+        let mut rest_changed = false;
+        let mut rest_dragging = false;
+        let mut rest_drag_stopped = false;
+        ui.horizontal(|ui| {
+            ui.label(
+                RichText::new("Rest Pos")
+                    .size(11.0)
+                    .color(tokens::ON_SURFACE_VARIANT),
+            );
+            for (prefix, val) in [
+                ("X ", &mut rest_pos.x),
+                ("Y ", &mut rest_pos.y),
+                ("Z ", &mut rest_pos.z),
+            ] {
+                let resp = ui.add(
+                    egui::DragValue::new(val)
+                        .speed(0.02)
+                        .prefix(prefix)
+                        .fixed_decimals(2),
+                );
+                rest_changed |= resp.changed();
+                rest_dragging |= resp.dragged();
+                rest_drag_stopped |= resp.drag_stopped();
             }
         });
-    });
-    ui.horizontal_wrapped(|ui| {
-        for (bid, bname, _, _) in &bones {
-            let selected = scene.selected_bone == Some(*bid);
-            if ui.selectable_label(selected, bname).clicked() {
-                scene.selected_bone = Some(*bid);
-            }
+        if rest_changed || rest_drag_stopped {
+            let bone_id = bone.id;
+            super::commit_debounced_command(
+                ui.ctx(),
+                egui::Id::new(("bone_rest_pos_debounce", bone_id)),
+                history,
+                scene,
+                rest_changed,
+                rest_dragging,
+                rest_drag_stopped,
+                |s| {
+                    s.character_rig
+                        .as_ref()
+                        .and_then(|r| r.bone(bone_id))
+                        .map(|b| Command::SetBoneRestPosition {
+                            bone_id,
+                            position: b.rest_local.translation,
+                        })
+                },
+                Command::SetBoneRestPosition {
+                    bone_id,
+                    position: rest_pos,
+                },
+            );
         }
-    });
-    ui.add_space(4.0);
+    }
+    ui.add_space(6.0);
 
-    let active_bone = scene
-        .selected_bone
-        .and_then(|bid| bones.iter().find(|(id, ..)| *id == bid))
-        .or_else(|| bones.first());
+    if let Some(bone) = active_bone {
+        ui.add_space(4.0);
 
-    if let Some((bone_id, name, rest_rot, pose_rot)) = active_bone.cloned() {
+        let bone_id = bone.id;
+        let name = bone.name;
+        let rest_rot = bone.rest_rot;
+        let pose_rot = bone.pose_rot;
         let delta_rot = rest_rot.inverse() * pose_rot;
         let (rx, ry, rz) = delta_rot.to_euler(glam::EulerRot::XYZ);
         let mut rx_deg = rx.to_degrees();
@@ -906,6 +1376,8 @@ fn show_character_rig_section(
             }
         });
     }
+
+    rig_io
 }
 
 fn toggle_bone_in_mask(current: Option<&[BoneId]>, bone_id: BoneId) -> Option<Vec<BoneId>> {
@@ -3077,5 +3549,324 @@ mod tests {
             },
         );
         assert!(rename_state.collapsed_nodes.is_empty());
+    }
+
+    #[test]
+    fn next_bone_name_generates_unique_names() {
+        let mut rig = tessel_core::CharacterRig::default();
+        assert_eq!(next_bone_name(&rig, "Root"), "Root");
+        assert_eq!(next_bone_name(&rig, "Bone"), "Bone");
+
+        let add = |rig: &mut tessel_core::CharacterRig, id: u32, name: &str| {
+            rig.bones.push(tessel_core::Bone::new(
+                BoneId(id),
+                name.to_string(),
+                None,
+                tessel_core::Transform::default(),
+            ));
+        };
+        add(&mut rig, 0, "Root");
+        assert_eq!(next_bone_name(&rig, "Root"), "Root 2");
+        add(&mut rig, 1, "Root 2");
+        assert_eq!(next_bone_name(&rig, "Root"), "Root 3");
+        add(&mut rig, 2, "Bone");
+        assert_eq!(next_bone_name(&rig, "Bone"), "Bone 2");
+    }
+
+    #[test]
+    fn valid_bone_parent_candidates_excludes_self_descendants_and_cycles() {
+        let mut rig = tessel_core::CharacterRig::default();
+        rig.bones.push(tessel_core::Bone::new(
+            BoneId(0),
+            "Root",
+            None,
+            tessel_core::Transform::default(),
+        ));
+        rig.bones.push(tessel_core::Bone::new(
+            BoneId(1),
+            "Spine",
+            Some(BoneId(0)),
+            tessel_core::Transform::default(),
+        ));
+        rig.bones.push(tessel_core::Bone::new(
+            BoneId(2),
+            "Head",
+            Some(BoneId(1)),
+            tessel_core::Transform::default(),
+        ));
+        rig.bones.push(tessel_core::Bone::new(
+            BoneId(3),
+            "Arm",
+            None,
+            tessel_core::Transform::default(),
+        ));
+
+        let root_cands: Vec<BoneId> = valid_bone_parent_candidates(&rig, BoneId(0))
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect();
+        assert_eq!(root_cands, vec![BoneId(3)]);
+
+        let spine_cands: Vec<BoneId> = valid_bone_parent_candidates(&rig, BoneId(1))
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect();
+        assert_eq!(spine_cands, vec![BoneId(0), BoneId(3)]);
+
+        // Cyclic parent links must terminate cleanly without hanging.
+        let mut cyclic = tessel_core::CharacterRig::default();
+        cyclic.bones.push(tessel_core::Bone::new(
+            BoneId(10),
+            "CycleA",
+            Some(BoneId(11)),
+            tessel_core::Transform::default(),
+        ));
+        cyclic.bones.push(tessel_core::Bone::new(
+            BoneId(11),
+            "CycleB",
+            Some(BoneId(10)),
+            tessel_core::Transform::default(),
+        ));
+        cyclic.bones.push(tessel_core::Bone::new(
+            BoneId(12),
+            "Free",
+            None,
+            tessel_core::Transform::default(),
+        ));
+        let cyclic_cands: Vec<BoneId> = valid_bone_parent_candidates(&cyclic, BoneId(12))
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect();
+        assert!(cyclic_cands.is_empty());
+    }
+
+    #[test]
+    fn custom_rig_builder_full_command_and_undo_flow() {
+        let mut scene = SceneState::new();
+        let mut history = HistoryStack::new();
+
+        // 1. New Empty Rig
+        history
+            .execute(
+                &mut scene,
+                Command::SetCharacterRig {
+                    rig: Some(tessel_core::CharacterRig::default()),
+                },
+            )
+            .unwrap();
+        assert!(scene.character_rig.as_ref().unwrap().bones.is_empty());
+
+        // 2. + Root Bone
+        let root_name = next_bone_name(scene.character_rig.as_ref().unwrap(), "Root");
+        history
+            .execute(
+                &mut scene,
+                Command::AddBone {
+                    name: root_name,
+                    parent: None,
+                    position: glam::Vec3::new(0.0, 0.8, 0.0),
+                },
+            )
+            .unwrap();
+        let root_id = scene.character_rig.as_ref().unwrap().bones[0].id;
+
+        // 3. + Child Bone
+        let child_name = next_bone_name(scene.character_rig.as_ref().unwrap(), "Bone");
+        history
+            .execute(
+                &mut scene,
+                Command::AddBone {
+                    name: child_name,
+                    parent: Some(root_id),
+                    position: glam::Vec3::new(0.0, 0.25, 0.0),
+                },
+            )
+            .unwrap();
+        let child_id = scene.character_rig.as_ref().unwrap().bones[1].id;
+        assert_eq!(
+            scene
+                .character_rig
+                .as_ref()
+                .unwrap()
+                .bone(child_id)
+                .unwrap()
+                .parent,
+            Some(root_id)
+        );
+
+        // 4. RenameBone (empty/unchanged are no-ops)
+        assert!(!rename_bone_if_changed(&mut scene, &mut history, child_id, "   ").unwrap());
+        assert!(!rename_bone_if_changed(&mut scene, &mut history, child_id, "Bone").unwrap());
+        assert!(rename_bone_if_changed(&mut scene, &mut history, child_id, "Pelvis").unwrap());
+        assert_eq!(
+            scene
+                .character_rig
+                .as_ref()
+                .unwrap()
+                .bone(child_id)
+                .unwrap()
+                .name,
+            "Pelvis"
+        );
+
+        // 5. ReparentBone (to None / root, then undo back to root_id)
+        history
+            .execute(
+                &mut scene,
+                Command::ReparentBone {
+                    bone_id: child_id,
+                    parent: None,
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            scene
+                .character_rig
+                .as_ref()
+                .unwrap()
+                .bone(child_id)
+                .unwrap()
+                .parent,
+            None
+        );
+        history.undo(&mut scene).unwrap();
+        assert_eq!(
+            scene
+                .character_rig
+                .as_ref()
+                .unwrap()
+                .bone(child_id)
+                .unwrap()
+                .parent,
+            Some(root_id)
+        );
+
+        // 6. SetBoneRestPosition
+        let target_pos = glam::Vec3::new(1.0, 2.0, -0.5);
+        history
+            .execute(
+                &mut scene,
+                Command::SetBoneRestPosition {
+                    bone_id: child_id,
+                    position: target_pos,
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            scene
+                .character_rig
+                .as_ref()
+                .unwrap()
+                .bone(child_id)
+                .unwrap()
+                .rest_local
+                .translation,
+            target_pos
+        );
+
+        // 7. RemoveBone removes root + child subtree, and Undo restores both.
+        history
+            .execute(&mut scene, Command::RemoveBone { bone_id: root_id })
+            .unwrap();
+        assert!(scene.character_rig.as_ref().unwrap().bones.is_empty());
+        history.undo(&mut scene).unwrap();
+        assert_eq!(scene.character_rig.as_ref().unwrap().bones.len(), 2);
+    }
+
+    #[test]
+    fn show_character_rig_section_renders_none_empty_and_biped_cleanly() {
+        let mut scene = SceneState::new();
+        scene.active_mode = AppMode::Character;
+        let mut history = HistoryStack::new();
+
+        let ctx = egui::Context::default();
+        let base_input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1280.0, 720.0),
+            )),
+            ..Default::default()
+        };
+        let draw_rig = |ctx: &egui::Context,
+                        scene: &mut SceneState,
+                        history: &mut HistoryStack,
+                        last_req: &mut super::super::RigIoRequests| {
+            egui::SidePanel::right("test_rig_builder_g4")
+                .exact_width(256.0)
+                .resizable(false)
+                .show(ctx, |ui| {
+                    egui::ScrollArea::vertical().show(ui, |ui| {
+                        *last_req = show_character_rig_section(ui, scene, history);
+                    });
+                });
+        };
+
+        // 1. None rig: renders Apply Biped, New Empty Rig, Import Rig.
+        let mut req = super::super::RigIoRequests::default();
+        let out_none = ctx.run(base_input.clone(), |c| {
+            draw_rig(c, &mut scene, &mut history, &mut req);
+        });
+        assert!(find_label_center(&out_none.shapes, "Apply Biped").is_some());
+        let new_empty_pos = find_label_center(&out_none.shapes, "New Empty Rig").unwrap();
+        let import_pos = find_label_center(&out_none.shapes, "Import Rig").unwrap();
+
+        // Click Import Rig -> requests.import_rig == true
+        click_at(&ctx, import_pos, |c| {
+            draw_rig(c, &mut scene, &mut history, &mut req);
+        });
+        assert!(req.import_rig);
+
+        // Click New Empty Rig -> creates empty CharacterRig
+        click_at(&ctx, new_empty_pos, |c| {
+            draw_rig(c, &mut scene, &mut history, &mut req);
+        });
+        assert!(scene
+            .character_rig
+            .as_ref()
+            .is_some_and(|r| r.bones.is_empty()));
+
+        // 2. Empty rig: Bone Builder is visible; + Root Bone & + Child Bone work; Export Rig works.
+        let out_empty = ctx.run(base_input.clone(), |c| {
+            draw_rig(c, &mut scene, &mut history, &mut req);
+        });
+        assert!(find_label_center(&out_empty.shapes, "Bone Builder").is_some());
+        let add_root_pos = find_label_center(&out_empty.shapes, "+ Root Bone").unwrap();
+        let export_pos = find_label_center(&out_empty.shapes, "Export Rig").unwrap();
+
+        click_at(&ctx, export_pos, |c| {
+            draw_rig(c, &mut scene, &mut history, &mut req);
+        });
+        assert!(req.export_rig);
+
+        click_at(&ctx, add_root_pos, |c| {
+            draw_rig(c, &mut scene, &mut history, &mut req);
+        });
+        assert_eq!(scene.character_rig.as_ref().unwrap().bones.len(), 1);
+        assert!(scene.selected_bone.is_some());
+
+        let out_one = ctx.run(base_input.clone(), |c| {
+            draw_rig(c, &mut scene, &mut history, &mut req);
+        });
+        let add_child_pos = find_label_center(&out_one.shapes, "+ Child Bone").unwrap();
+        click_at(&ctx, add_child_pos, |c| {
+            draw_rig(c, &mut scene, &mut history, &mut req);
+        });
+        assert_eq!(scene.character_rig.as_ref().unwrap().bones.len(), 2);
+
+        let out_two = ctx.run(base_input.clone(), |c| {
+            draw_rig(c, &mut scene, &mut history, &mut req);
+        });
+        let del_pos = find_label_center(&out_two.shapes, "Delete").unwrap();
+        click_at(&ctx, del_pos, |c| {
+            draw_rig(c, &mut scene, &mut history, &mut req);
+        });
+        assert_eq!(scene.character_rig.as_ref().unwrap().bones.len(), 1);
+
+        // 3. Populated Biped rig renders cleanly without panic.
+        history.execute(&mut scene, Command::ApplyBipedRig).unwrap();
+        let out_biped = ctx.run(base_input, |c| {
+            draw_rig(c, &mut scene, &mut history, &mut req);
+        });
+        assert!(!out_biped.shapes.is_empty());
     }
 }

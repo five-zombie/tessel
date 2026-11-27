@@ -65,6 +65,36 @@ impl<T: Send + 'static> AsyncJobSlot<T> {
 }
 
 const UI_LAST_ERROR_ID: &str = "tessel_ui_last_error";
+const UI_RIG_STATUS_ID: &str = "tessel_ui_rig_status";
+
+/// Pending async file-dialog actions requested by character rig UI controls.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct RigIoRequests {
+    pub import_rig: bool,
+    pub export_rig: bool,
+}
+
+impl RigIoRequests {
+    pub fn merge(&mut self, other: Self) {
+        self.import_rig |= other.import_rig;
+        self.export_rig |= other.export_rig;
+    }
+}
+
+/// Records a non-error character rig lifecycle status message in egui temporary storage.
+pub fn set_rig_status(ctx: &egui::Context, msg: impl Into<String>) {
+    ctx.data_mut(|d| d.insert_temp(egui::Id::new(UI_RIG_STATUS_ID), msg.into()));
+}
+
+/// Reads the current character rig status message, if any.
+pub fn rig_status(ctx: &egui::Context) -> Option<String> {
+    ctx.data(|d| d.get_temp::<String>(egui::Id::new(UI_RIG_STATUS_ID)))
+}
+
+/// Clears any character rig status message (e.g. when switching to a brand-new rig).
+pub fn clear_rig_status(ctx: &egui::Context) {
+    ctx.data_mut(|d| d.remove_temp::<String>(egui::Id::new(UI_RIG_STATUS_ID)));
+}
 
 /// Records a UI-triggered command/history error in egui temporary storage so `app.rs`
 /// can surface it in the shared error banner.

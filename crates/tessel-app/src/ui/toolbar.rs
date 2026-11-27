@@ -78,8 +78,9 @@ pub fn show_toolbar(
     history: &mut HistoryStack,
     interaction_tool: &mut ViewportInteractionTool,
     free_view: &mut bool,
-) {
+) -> super::RigIoRequests {
     poll_texture_load_job(ctx, scene, history);
+    let mut rig_io = super::RigIoRequests::default();
     let frame = Frame::NONE
         .fill(tokens::SURFACE_LOW)
         .inner_margin(Margin::symmetric(6, 10))
@@ -521,7 +522,7 @@ pub fn show_toolbar(
                     }
                 }
                 AppMode::Character => {
-                    let rig = [
+                    let mut rig = vec![
                         IconItem {
                             icon: icons::ToolIcon::BipedRig,
                             tip: "Biped 7",
@@ -534,16 +535,36 @@ pub fn show_toolbar(
                             active: false,
                             action: ToolbarAction::ApplyHumanoidRig,
                         },
+                        IconItem {
+                            icon: icons::ToolIcon::NewProject,
+                            tip: "New Empty Rig",
+                            active: false,
+                            action: ToolbarAction::NewEmptyRig,
+                        },
+                        IconItem {
+                            icon: icons::ToolIcon::Import,
+                            tip: "Import Rig (.tesselrig.json / .glb)",
+                            active: false,
+                            action: ToolbarAction::ImportRig,
+                        },
                     ];
+                    if scene.character_rig.is_some() {
+                        rig.push(IconItem {
+                            icon: icons::ToolIcon::Export,
+                            tip: "Export Rig (.tesselrig.json)",
+                            active: false,
+                            action: ToolbarAction::ExportRig,
+                        });
+                    }
                     if let Some(action) = icons::icon_group(ui, "char_rig", "RIG", &rig) {
-                        fire_toolbar_action(
+                        rig_io.merge(fire_toolbar_action(
                             ui.ctx(),
                             action,
                             scene,
                             history,
                             interaction_tool,
                             free_view,
-                        );
+                        ));
                     }
                     if scene.character_rig.is_some() && scene.active_lowpoly_node().is_some() {
                         ui.separator();
@@ -602,6 +623,7 @@ pub fn show_toolbar(
                 }
             });
         });
+    rig_io
 }
 
 /// Executes a toolbar action. To add a button, add one [`IconItem`] line to a
@@ -614,7 +636,8 @@ fn fire_toolbar_action(
     history: &mut HistoryStack,
     interaction_tool: &mut ViewportInteractionTool,
     free_view: &mut bool,
-) {
+) -> super::RigIoRequests {
+    let mut rig_io = super::RigIoRequests::default();
     match action {
         ToolbarAction::SelectObject => {
             *interaction_tool = ViewportInteractionTool::Select;
@@ -709,10 +732,10 @@ fn fire_toolbar_action(
         }
         ToolbarAction::LoadTexture { normal } => {
             let Some(node_id) = scene.active_lowpoly_node() else {
-                return;
+                return rig_io;
             };
             let Some(node_name) = scene.nodes.get(&node_id).map(|n| n.name.clone()) else {
-                return;
+                return rig_io;
             };
             let (kind, exts) = if normal {
                 ("Normal Map (.png, .jpg)", &["png", "jpg", "jpeg"][..])
@@ -729,7 +752,7 @@ fn fire_toolbar_action(
             let mut guard = slot.lock().unwrap_or_else(|e| e.into_inner());
             if guard.is_busy() {
                 super::push_ui_error(ctx, "A texture file dialog is already open.");
-                return;
+                return rig_io;
             }
             guard.spawn(move || {
                 let path = rfd::FileDialog::new().add_filter(kind, exts).pick_file()?;
@@ -881,10 +904,29 @@ fn fire_toolbar_action(
             }
         }
         ToolbarAction::ApplyBipedRig => {
+            super::clear_rig_status(ctx);
             super::exec_history(ctx, history, scene, Command::ApplyBipedRig);
         }
         ToolbarAction::ApplyHumanoidRig => {
+            super::clear_rig_status(ctx);
             super::exec_history(ctx, history, scene, Command::ApplyHumanoidRig);
+        }
+        ToolbarAction::NewEmptyRig => {
+            super::clear_rig_status(ctx);
+            super::exec_history(
+                ctx,
+                history,
+                scene,
+                Command::SetCharacterRig {
+                    rig: Some(tessel_core::CharacterRig::default()),
+                },
+            );
+        }
+        ToolbarAction::ImportRig => {
+            rig_io.import_rig = true;
+        }
+        ToolbarAction::ExportRig => {
+            rig_io.export_rig = true;
         }
         ToolbarAction::ToggleWeightPaint => {
             scene.weight_paint_mode = !scene.weight_paint_mode;
@@ -921,4 +963,5 @@ fn fire_toolbar_action(
             scene.lowpoly_mirror_x = !scene.lowpoly_mirror_x;
         }
     }
+    rig_io
 }

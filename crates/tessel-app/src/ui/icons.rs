@@ -50,6 +50,7 @@ pub enum ToolIcon {
     Open,
     Save,
     Import,
+    Export,
     Close,
     Undo,
     Redo,
@@ -127,6 +128,7 @@ impl ToolIcon {
             Self::Open => r::FOLDER_OPEN,
             Self::Save => r::FLOPPY_DISK,
             Self::Import => r::DOWNLOAD,
+            Self::Export => r::EXPORT,
             Self::Close => r::X,
             Self::Undo => r::ARROW_U_UP_LEFT,
             Self::Redo => r::ARROW_U_UP_RIGHT,
@@ -160,7 +162,7 @@ impl ToolIcon {
 
 /// Every icon, for the headless paint smoke test below.
 #[cfg(test)]
-pub const ALL: [ToolIcon; 69] = [
+pub const ALL: [ToolIcon; 70] = [
     ToolIcon::Pencil,
     ToolIcon::Eraser,
     ToolIcon::Fill,
@@ -203,6 +205,7 @@ pub const ALL: [ToolIcon; 69] = [
     ToolIcon::Open,
     ToolIcon::Save,
     ToolIcon::Import,
+    ToolIcon::Export,
     ToolIcon::Close,
     ToolIcon::Undo,
     ToolIcon::Redo,
@@ -267,6 +270,9 @@ pub enum ToolbarAction {
     ProjectUvs,
     ApplyBipedRig,
     ApplyHumanoidRig,
+    NewEmptyRig,
+    ImportRig,
+    ExportRig,
     ToggleWeightPaint,
     ClearMeshWeights,
     TogglePixelSymX,

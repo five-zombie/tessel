@@ -251,6 +251,11 @@ type ImportMeshJobResult = Option<(
     Result<(String, tessel_core::LowPolyMesh), String>,
 )>;
 type OpenProjectJobResult = Option<(std::path::PathBuf, Result<SceneState, String>)>;
+type ImportRigJobResult = Option<(
+    std::path::PathBuf,
+    Result<tessel_core::CharacterRig, String>,
+)>;
+type ExportRigJobResult = Option<(std::path::PathBuf, Result<(), String>)>;
 
 #[derive(Default)]
 struct BackgroundJobs {
@@ -258,6 +263,8 @@ struct BackgroundJobs {
     open_project: ui::AsyncJobSlot<OpenProjectJobResult>,
     save_project: ui::AsyncJobSlot<Option<SaveJobOutcome>>,
     turntable_gif: ui::AsyncJobSlot<Result<String, String>>,
+    import_rig: ui::AsyncJobSlot<ImportRigJobResult>,
+    export_rig: ui::AsyncJobSlot<ExportRigJobResult>,
 }
 
 impl BackgroundJobs {
@@ -266,7 +273,34 @@ impl BackgroundJobs {
             || self.open_project.is_busy()
             || self.save_project.is_busy()
             || self.turntable_gif.is_busy()
+            || self.import_rig.is_busy()
+            || self.export_rig.is_busy()
     }
+}
+
+fn write_bytes_atomic(path: &std::path::Path, bytes: &[u8]) -> Result<(), String> {
+    use std::io::Write;
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+        }
+    }
+    let tmp_name = match path.file_name().and_then(|n| n.to_str()) {
+        Some(name) => format!("{name}.tmp"),
+        None => "rig.tesselrig.json.tmp".to_string(),
+    };
+    let tmp_path = path.with_file_name(tmp_name);
+    let write_res = (|| -> std::io::Result<()> {
+        let mut file = std::fs::File::create(&tmp_path)?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        std::fs::rename(&tmp_path, path)?;
+        Ok(())
+    })();
+    if write_res.is_err() {
+        let _ = std::fs::remove_file(&tmp_path);
+    }
+    write_res.map_err(|e| e.to_string())
 }
 
 /// Live-viewport camera tools for MCP agents (orbit/zoom/pan/preset/look-at).
@@ -1094,6 +1128,7 @@ impl GpuState {
         let mut save_and_quit = false;
         let mut quick_action_confirmed = false;
         let mut export_action = ui::export_dialog::ExportAction::None;
+        let mut rig_io = ui::RigIoRequests::default();
 
         let full_output = self.egui_ctx.run(raw_input, |ctx| {
             let dt = ctx.input(|i| i.unstable_dt).clamp(0.001, 0.05);
@@ -1213,14 +1248,14 @@ impl GpuState {
                 studio.project_files.has_unsaved_changes(studio.scene.revision),
             );
             ui::timeline::show_timeline(ctx, &mut studio.scene, &mut studio.history);
-            ui::toolbar::show_toolbar(
+            rig_io.merge(ui::toolbar::show_toolbar(
                 ctx,
                 &mut studio.scene,
                 &mut studio.history,
                 &mut studio.interaction_tool,
                 &mut studio.free_view,
-            );
-            ui::inspector::show_inspector(
+            ));
+            rig_io.merge(ui::inspector::show_inspector(
                 ctx,
                 &mut studio.scene,
                 &mut studio.history,
@@ -1233,7 +1268,7 @@ impl GpuState {
                 &mut studio.render_preview,
                 &mut studio.interaction_tool,
                 &mut studio.outliner_rename,
-            );
+            ));
             let (vp_size, hv, g_axis, p_ghost) = ui::viewport::show_viewport(
                 ctx,
                 self.viewport_texture_id,
@@ -1842,6 +1877,80 @@ impl GpuState {
                 ui_dirty_post_ui = true;
             }
         }
+        match studio.jobs.import_rig.poll() {
+            Ok(Some(Some((path, res)))) => {
+                match res {
+                    Ok(rig) => {
+                        let bone_count = rig.bones.len();
+                        let first_bone = rig.bones.first().map(|b| b.id);
+                        if let Err(err) = studio.history.execute(
+                            &mut studio.scene,
+                            Command::SetCharacterRig { rig: Some(rig) },
+                        ) {
+                            let msg = format!("Import rig failed: {err}");
+                            tracing::error!("{msg}");
+                            studio.last_error = Some(msg);
+                        } else {
+                            if studio.scene.selected_bone.is_none_or(|bid| {
+                                studio
+                                    .scene
+                                    .character_rig
+                                    .as_ref()
+                                    .is_none_or(|r| r.bone(bid).is_none())
+                            }) {
+                                studio.scene.selected_bone = first_bone;
+                            }
+                            let file_label =
+                                path.file_name().and_then(|n| n.to_str()).unwrap_or("rig");
+                            ui::set_rig_status(
+                                &self.egui_ctx,
+                                format!("Imported '{file_label}' ({bone_count} bones)"),
+                            );
+                            tracing::info!(
+                                "Imported character rig from {} ({bone_count} bones)",
+                                path.display()
+                            );
+                        }
+                    }
+                    Err(err) => {
+                        let msg = format!("Import rig failed: {err}");
+                        tracing::error!("{msg}");
+                        studio.last_error = Some(msg);
+                    }
+                }
+                ui_dirty_post_ui = true;
+            }
+            Ok(Some(None)) | Ok(None) => {}
+            Err(err) => {
+                studio.last_error = Some(err.into());
+                ui_dirty_post_ui = true;
+            }
+        }
+        match studio.jobs.export_rig.poll() {
+            Ok(Some(Some((path, res)))) => {
+                match res {
+                    Ok(()) => {
+                        let file_label = path
+                            .file_name()
+                            .and_then(|n| n.to_str())
+                            .unwrap_or("character.tesselrig.json");
+                        ui::set_rig_status(&self.egui_ctx, format!("Exported rig to {file_label}"));
+                        tracing::info!("Exported character rig to {}", path.display());
+                    }
+                    Err(err) => {
+                        let msg = format!("Export rig failed: {err}");
+                        tracing::error!("{msg}");
+                        studio.last_error = Some(msg);
+                    }
+                }
+                ui_dirty_post_ui = true;
+            }
+            Ok(Some(None)) | Ok(None) => {}
+            Err(err) => {
+                studio.last_error = Some(err.into());
+                ui_dirty_post_ui = true;
+            }
+        }
 
         if let ui::export_dialog::ExportAction::TurntableGif(args) = export_action {
             if studio.jobs.turntable_gif.is_busy() {
@@ -1970,6 +2079,49 @@ impl GpuState {
                 let res = tessel_io::load_tessel_project(&path).map_err(|e| e.to_string());
                 Some((path, res))
             });
+        }
+        if rig_io.import_rig {
+            if studio.jobs.import_rig.is_busy() {
+                studio.last_error = Some("A rig import dialog is already open.".into());
+                ui_dirty_post_ui = true;
+            } else {
+                studio.jobs.import_rig.spawn(|| {
+                    let path = rfd::FileDialog::new()
+                        .add_filter(
+                            "Rig Template / GLB (*.tesselrig.json, *.json, *.glb)",
+                            &["json", "glb"],
+                        )
+                        .pick_file()?;
+                    let res = tessel_io::import_rig_from_path(&path).map_err(|e| e.to_string());
+                    Some((path, res))
+                });
+            }
+        }
+        if rig_io.export_rig {
+            if studio.jobs.export_rig.is_busy() {
+                studio.last_error = Some("A rig export dialog is already open.".into());
+                ui_dirty_post_ui = true;
+            } else if let Some(rig) = studio.scene.character_rig.clone() {
+                studio.jobs.export_rig.spawn(move || {
+                    let path = rfd::FileDialog::new()
+                        .add_filter("Tessel Rig Template (*.tesselrig.json)", &["json"])
+                        .set_file_name("character.tesselrig.json")
+                        .save_file()?;
+                    let stem = path
+                        .file_stem()
+                        .and_then(|s| s.to_str())
+                        .map(|s| s.strip_suffix(".tesselrig").unwrap_or(s))
+                        .unwrap_or("character")
+                        .to_string();
+                    let res = tessel_io::export_rig_json_bytes(&rig, &stem)
+                        .map_err(|e| e.to_string())
+                        .and_then(|bytes| write_bytes_atomic(&path, &bytes));
+                    Some((path, res))
+                });
+            } else {
+                studio.last_error = Some("No character rig to export.".into());
+                ui_dirty_post_ui = true;
+            }
         }
         if let Some(kind) = studio.pending_new_project.take() {
             match create_project_scene(kind) {
