@@ -1,3 +1,4 @@
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use std::sync::{mpsc, OnceLock};
 
@@ -124,16 +125,22 @@ impl DirectAiUiState {
     }
 }
 
-/// Per-project inline rename state for the Scene Outliner (owned by `StudioState` so it clears
-/// cleanly on project switch/load and requests keyboard focus automatically on open).
+/// Per-project inline rename and tree collapse state for the Scene Outliner (owned by `StudioState`
+/// so it clears cleanly on project switch/load and requests keyboard focus automatically on open).
 #[derive(Debug, Default)]
 pub struct OutlinerRenameState {
     pub active: Option<(NodeId, String)>,
     pub request_focus: bool,
+    pub collapsed_nodes: BTreeSet<NodeId>,
 }
 
 impl OutlinerRenameState {
     pub fn clear(&mut self) {
+        self.clear_rename();
+        self.collapsed_nodes.clear();
+    }
+
+    fn clear_rename(&mut self) {
         self.active = None;
         self.request_focus = false;
     }
@@ -939,6 +946,154 @@ fn rename_node_if_changed(
         .is_ok()
 }
 
+const MAX_OUTLINER_DEPTH: usize = 16;
+const OUTLINER_INDENT_PX: f32 = 12.0;
+const MAX_OUTLINER_INDENT_PX: f32 = 72.0;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct OutlinerRow {
+    id: NodeId,
+    name: String,
+    kind: tessel_core::NodeKind,
+    visible: bool,
+    depth: usize,
+    has_children: bool,
+    collapsed: bool,
+}
+
+struct OutlinerTreeBuilder<'a> {
+    scene: &'a SceneState,
+    children_by_parent: BTreeMap<NodeId, Vec<NodeId>>,
+    collapsed: &'a BTreeSet<NodeId>,
+    visited: BTreeSet<NodeId>,
+    rows: Vec<OutlinerRow>,
+}
+
+impl OutlinerTreeBuilder<'_> {
+    fn visit(&mut self, node_id: NodeId, depth: usize, emit: bool) {
+        if !self.visited.insert(node_id) {
+            return;
+        }
+        let Some(node) = self.scene.nodes.get(&node_id) else {
+            return;
+        };
+        let children = self
+            .children_by_parent
+            .get(&node_id)
+            .cloned()
+            .unwrap_or_default();
+        let has_children = children.iter().any(|cid| !self.visited.contains(cid));
+        let collapsed = has_children && self.collapsed.contains(&node_id);
+
+        if emit {
+            self.rows.push(OutlinerRow {
+                id: node.id,
+                name: node.name.clone(),
+                kind: node.kind,
+                visible: node.visible,
+                depth,
+                has_children,
+                collapsed,
+            });
+        }
+
+        if depth >= MAX_OUTLINER_DEPTH {
+            return;
+        }
+
+        let emit_children = emit && !collapsed;
+        for child_id in children {
+            self.visit(child_id, depth + 1, emit_children);
+        }
+    }
+}
+
+fn build_outliner_tree_rows(scene: &SceneState, collapsed: &BTreeSet<NodeId>) -> Vec<OutlinerRow> {
+    let mut children_by_parent: BTreeMap<NodeId, Vec<NodeId>> = BTreeMap::new();
+    let mut roots: Vec<NodeId> = Vec::new();
+
+    for (&id, node) in &scene.nodes {
+        match node.parent {
+            Some(pid) if pid != id && scene.nodes.contains_key(&pid) => {
+                children_by_parent.entry(pid).or_default().push(id);
+            }
+            _ => roots.push(id),
+        }
+    }
+
+    let mut builder = OutlinerTreeBuilder {
+        scene,
+        children_by_parent,
+        collapsed,
+        visited: BTreeSet::new(),
+        rows: Vec::with_capacity(scene.nodes.len()),
+    };
+
+    for root_id in roots {
+        builder.visit(root_id, 0, true);
+    }
+
+    // Fallback pass: surface any remaining unvisited nodes (closed parent cycles or chains beyond
+    // MAX_OUTLINER_DEPTH) safely at root depth without dropping any node.
+    for &id in scene.nodes.keys() {
+        if !builder.visited.contains(&id) {
+            builder.visit(id, 0, true);
+        }
+    }
+
+    builder.rows
+}
+
+fn is_node_or_descendant(scene: &SceneState, candidate_id: NodeId, node_id: NodeId) -> bool {
+    let mut curr = Some(candidate_id);
+    let mut visited = BTreeSet::new();
+    for _ in 0..MAX_OUTLINER_DEPTH {
+        let Some(id) = curr else {
+            return false;
+        };
+        if id == node_id || !visited.insert(id) {
+            return true;
+        }
+        curr = scene.nodes.get(&id).and_then(|n| n.parent);
+    }
+    curr.is_some()
+}
+
+fn valid_parent_candidates(scene: &SceneState, node_id: NodeId) -> Vec<(NodeId, String)> {
+    scene
+        .nodes
+        .iter()
+        .filter(|(&cand_id, _)| !is_node_or_descendant(scene, cand_id, node_id))
+        .map(|(&cand_id, node)| (cand_id, node.name.clone()))
+        .collect()
+}
+
+fn outliner_text_button(ui: &mut egui::Ui, label: &str, tooltip: &str) -> bool {
+    let btn = egui::Button::new(
+        RichText::new(label)
+            .size(11.0)
+            .color(tokens::ON_SURFACE_VARIANT),
+    )
+    .min_size(egui::vec2(48.0, 20.0))
+    .fill(egui::Color32::TRANSPARENT)
+    .corner_radius(CornerRadius::same(3));
+    ui.add(btn).on_hover_text(tooltip).clicked()
+}
+
+fn create_outliner_group_command(scene: &SceneState) -> Command {
+    let parent = scene.selected_node.filter(|id| {
+        scene
+            .nodes
+            .get(id)
+            .is_some_and(|n| n.kind == tessel_core::NodeKind::Group)
+    });
+    Command::CreateGroupNode {
+        name: next_outliner_node_name(scene, "Group"),
+        transform: tessel_core::Transform::default(),
+        parent,
+    }
+}
+
 fn outliner_icon_button(
     ui: &mut egui::Ui,
     icon: ToolIcon,
@@ -1033,13 +1188,17 @@ fn show_outliner_section(
     history: &mut HistoryStack,
     outliner_rename: &mut OutlinerRenameState,
 ) {
+    outliner_rename
+        .collapsed_nodes
+        .retain(|id| scene.nodes.contains_key(id));
+
     // Drop stale rename state immediately if the target node was deleted externally.
     if outliner_rename
         .active
         .as_ref()
         .is_some_and(|(rid, _)| !scene.nodes.contains_key(rid))
     {
-        outliner_rename.clear();
+        outliner_rename.clear_rename();
     }
 
     let header_width = ui.available_width().max(96.0);
@@ -1051,6 +1210,10 @@ fn show_outliner_section(
             if outliner_icon_button(ui, ToolIcon::Add, add_tooltip, false, false) {
                 let add_cmd = create_outliner_node_command(scene);
                 super::exec_history(ui.ctx(), history, scene, add_cmd);
+            }
+            if outliner_text_button(ui, "+ Group", "Add Group") {
+                let group_cmd = create_outliner_group_command(scene);
+                super::exec_history(ui.ctx(), history, scene, group_cmd);
             }
             let title_width = ui.available_width().max(24.0);
             ui.allocate_ui_with_layout(
@@ -1079,12 +1242,9 @@ fn show_outliner_section(
         return;
     }
 
-    let nodes: Vec<_> = scene
-        .nodes
-        .values()
-        .map(|n| (n.id, n.name.clone(), n.kind, n.visible))
-        .collect();
-    for (id, name, kind, visible) in nodes {
+    let rows = build_outliner_tree_rows(scene, &outliner_rename.collapsed_nodes);
+    for row in rows {
+        let id = row.id;
         let selected = scene.selected_node == Some(id);
         let is_renaming = outliner_rename
             .active
@@ -1104,7 +1264,7 @@ fn show_outliner_section(
                         .as_ref()
                         .is_some_and(|(rid, _)| *rid == id)
                     {
-                        outliner_rename.clear();
+                        outliner_rename.clear_rename();
                     }
                     super::exec_history(ui.ctx(), history, scene, Command::DeleteNode(id));
                 }
@@ -1119,23 +1279,23 @@ fn show_outliner_section(
                         if let Some((prev_id, prev_draft)) = outliner_rename.active.take() {
                             rename_node_if_changed(scene, history, prev_id, &prev_draft);
                         }
-                        outliner_rename.active = Some((id, name.clone()));
+                        outliner_rename.active = Some((id, row.name.clone()));
                         outliner_rename.request_focus = true;
                     }
                 }
-                let (vis_icon, vis_tip) = if visible {
+                let (vis_icon, vis_tip) = if row.visible {
                     (ToolIcon::EyeOpen, "Hide node")
                 } else {
                     (ToolIcon::EyeClosed, "Show node")
                 };
-                if outliner_icon_button(ui, vis_icon, vis_tip, !visible, false) {
+                if outliner_icon_button(ui, vis_icon, vis_tip, !row.visible, false) {
                     super::exec_history(
                         ui.ctx(),
                         history,
                         scene,
                         Command::SetNodeVisibility {
                             node_id: id,
-                            visible: !visible,
+                            visible: !row.visible,
                         },
                     );
                 }
@@ -1147,11 +1307,39 @@ fn show_outliner_section(
                     egui::Layout::left_to_right(egui::Align::Center),
                     |ui| {
                         ui.set_max_width(text_width);
+                        let indent =
+                            (row.depth as f32 * OUTLINER_INDENT_PX).min(MAX_OUTLINER_INDENT_PX);
+                        if indent > 0.0 {
+                            ui.add_space(indent);
+                        }
+                        if row.has_children {
+                            let (glyph, tip) = if row.collapsed {
+                                ("▸", "Expand children")
+                            } else {
+                                ("▾", "Collapse children")
+                            };
+                            let toggle_btn = egui::Button::new(
+                                RichText::new(glyph)
+                                    .size(11.0)
+                                    .color(tokens::ON_SURFACE_VARIANT),
+                            )
+                            .min_size(egui::vec2(14.0, 18.0))
+                            .fill(Color32::TRANSPARENT)
+                            .corner_radius(CornerRadius::same(2));
+                            if ui.add(toggle_btn).on_hover_text(tip).clicked() {
+                                if row.collapsed {
+                                    outliner_rename.collapsed_nodes.remove(&id);
+                                } else {
+                                    outliner_rename.collapsed_nodes.insert(id);
+                                }
+                            }
+                        }
                         if is_renaming {
                             if let Some((_, ref mut draft)) = outliner_rename.active {
+                                let edit_width = ui.available_width().max(24.0);
                                 let resp = ui.add(
                                     egui::TextEdit::singleline(draft)
-                                        .desired_width(text_width)
+                                        .desired_width(edit_width)
                                         .hint_text("Node name"),
                                 );
                                 if outliner_rename.request_focus {
@@ -1162,17 +1350,17 @@ fn show_outliner_section(
                                     && ui.input(|i| i.key_pressed(egui::Key::Enter));
                                 let escape = ui.input(|i| i.key_pressed(egui::Key::Escape));
                                 if escape {
-                                    outliner_rename.clear();
+                                    outliner_rename.clear_rename();
                                 } else if enter || resp.lost_focus() {
                                     let committed = draft.clone();
                                     rename_node_if_changed(scene, history, id, &committed);
-                                    outliner_rename.clear();
+                                    outliner_rename.clear_rename();
                                 }
                             }
                         } else {
                             ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Truncate);
-                            let label_text = format!("{name} ({kind:?})");
-                            let text = if visible {
+                            let label_text = format!("{} ({:?})", row.name, row.kind);
+                            let text = if row.visible {
                                 RichText::new(&label_text)
                             } else {
                                 RichText::new(&label_text).color(tokens::ON_SURFACE_VARIANT)
@@ -1238,6 +1426,58 @@ fn show_transform_and_lighting_section(
                         );
                     }
                 });
+            });
+            let current_parent = scene.nodes.get(&node_id).and_then(|n| n.parent);
+            let current_parent_label = current_parent
+                .and_then(|pid| scene.nodes.get(&pid).map(|n| n.name.as_str()))
+                .unwrap_or("None (Root)")
+                .to_string();
+            let parent_candidates = valid_parent_candidates(scene, node_id);
+            ui.horizontal(|ui| {
+                ui.label(
+                    RichText::new("Parent")
+                        .size(11.0)
+                        .color(tokens::ON_SURFACE_VARIANT),
+                );
+                egui::ComboBox::from_id_salt(("node_parent_selector", node_id))
+                    .width(ui.available_width().max(96.0))
+                    .selected_text(current_parent_label)
+                    .show_ui(ui, |ui| {
+                        if ui
+                            .selectable_label(current_parent.is_none(), "None (Root)")
+                            .clicked()
+                            && current_parent.is_some()
+                        {
+                            super::exec_history(
+                                ui.ctx(),
+                                history,
+                                scene,
+                                Command::SetNodeParent {
+                                    node_id,
+                                    parent: None,
+                                },
+                            );
+                        }
+                        for (cand_id, cand_name) in &parent_candidates {
+                            ui.push_id(*cand_id, |ui| {
+                                if ui
+                                    .selectable_label(current_parent == Some(*cand_id), cand_name)
+                                    .clicked()
+                                    && current_parent != Some(*cand_id)
+                                {
+                                    super::exec_history(
+                                        ui.ctx(),
+                                        history,
+                                        scene,
+                                        Command::SetNodeParent {
+                                            node_id,
+                                            parent: Some(*cand_id),
+                                        },
+                                    );
+                                }
+                            });
+                        }
+                    });
             });
             if scene.active_mode != AppMode::Pixel {
                 let mut gizmo_active = super::viewport::is_transform_gizmo_enabled(
@@ -2435,5 +2675,407 @@ mod tests {
         let cmd_ch = create_outliner_node_command(&scene);
         history.execute(&mut scene, cmd_ch).unwrap();
         assert_eq!(scene.lowpoly_meshes.len(), 2);
+    }
+
+    #[test]
+    fn outliner_tree_orders_hierarchy_and_falls_back_for_orphans() {
+        let mut scene = SceneState::new();
+        let mut history = HistoryStack::new();
+
+        history
+            .execute(
+                &mut scene,
+                Command::CreateGroupNode {
+                    name: "RootGroup".into(),
+                    transform: tessel_core::Transform::default(),
+                    parent: None,
+                },
+            )
+            .unwrap();
+        let root_group_id = scene.selected_node.unwrap();
+
+        history
+            .execute(
+                &mut scene,
+                Command::CreateGroupNode {
+                    name: "SubGroup".into(),
+                    transform: tessel_core::Transform::default(),
+                    parent: Some(root_group_id),
+                },
+            )
+            .unwrap();
+        let sub_group_id = scene.selected_node.unwrap();
+
+        history
+            .execute(
+                &mut scene,
+                Command::CreatePrimitiveMesh {
+                    name: "LeafCube".into(),
+                    kind: tessel_core::PrimitiveKind::Cube,
+                    size: 1.0,
+                    material: PaletteIndex::new(1).unwrap(),
+                },
+            )
+            .unwrap();
+        let leaf_id = scene.selected_node.unwrap();
+        history
+            .execute(
+                &mut scene,
+                Command::SetNodeParent {
+                    node_id: leaf_id,
+                    parent: Some(sub_group_id),
+                },
+            )
+            .unwrap();
+
+        // Inject an orphan node pointing to a non-existent parent ID.
+        let orphan_id = scene.allocate_node_id();
+        scene.nodes.insert(
+            orphan_id,
+            tessel_core::SceneNode {
+                id: orphan_id,
+                name: "Orphan".into(),
+                kind: tessel_core::NodeKind::Group,
+                visible: true,
+                parent: Some(NodeId(999_999)),
+                transform: tessel_core::Transform::default(),
+            },
+        );
+
+        let rows = build_outliner_tree_rows(&scene, &BTreeSet::new());
+        let summary: Vec<(&str, usize, bool)> = rows
+            .iter()
+            .map(|r| (r.name.as_str(), r.depth, r.has_children))
+            .collect();
+        assert_eq!(
+            summary,
+            vec![
+                ("RootGroup", 0, true),
+                ("SubGroup", 1, true),
+                ("LeafCube", 2, false),
+                ("Orphan", 0, false),
+            ]
+        );
+    }
+
+    #[test]
+    fn outliner_tree_collapse_hides_descendants_but_keeps_siblings() {
+        let mut scene = SceneState::new();
+        let mut history = HistoryStack::new();
+
+        history
+            .execute(
+                &mut scene,
+                Command::CreateGroupNode {
+                    name: "GroupA".into(),
+                    transform: tessel_core::Transform::default(),
+                    parent: None,
+                },
+            )
+            .unwrap();
+        let group_a = scene.selected_node.unwrap();
+
+        history
+            .execute(
+                &mut scene,
+                Command::CreateGroupNode {
+                    name: "ChildA1".into(),
+                    transform: tessel_core::Transform::default(),
+                    parent: Some(group_a),
+                },
+            )
+            .unwrap();
+        let child_a1 = scene.selected_node.unwrap();
+
+        history
+            .execute(
+                &mut scene,
+                Command::CreateGroupNode {
+                    name: "GrandChildA1".into(),
+                    transform: tessel_core::Transform::default(),
+                    parent: Some(child_a1),
+                },
+            )
+            .unwrap();
+
+        history
+            .execute(
+                &mut scene,
+                Command::CreateGroupNode {
+                    name: "SiblingB".into(),
+                    transform: tessel_core::Transform::default(),
+                    parent: None,
+                },
+            )
+            .unwrap();
+
+        let mut collapsed = BTreeSet::new();
+        collapsed.insert(group_a);
+        let rows = build_outliner_tree_rows(&scene, &collapsed);
+        let names: Vec<(&str, usize, bool, bool)> = rows
+            .iter()
+            .map(|r| (r.name.as_str(), r.depth, r.has_children, r.collapsed))
+            .collect();
+        assert_eq!(
+            names,
+            vec![("GroupA", 0, true, true), ("SiblingB", 0, false, false),]
+        );
+    }
+
+    #[test]
+    fn outliner_tree_handles_cycles_with_16_hop_guard_without_dropping_nodes() {
+        let mut scene = SceneState::new();
+        let id1 = scene.allocate_node_id();
+        let id2 = scene.allocate_node_id();
+        let id3 = scene.allocate_node_id();
+        scene.nodes.insert(
+            id1,
+            tessel_core::SceneNode {
+                id: id1,
+                name: "CycleA".into(),
+                kind: tessel_core::NodeKind::Group,
+                visible: true,
+                parent: Some(id2),
+                transform: tessel_core::Transform::default(),
+            },
+        );
+        scene.nodes.insert(
+            id2,
+            tessel_core::SceneNode {
+                id: id2,
+                name: "CycleB".into(),
+                kind: tessel_core::NodeKind::Group,
+                visible: true,
+                parent: Some(id1),
+                transform: tessel_core::Transform::default(),
+            },
+        );
+        scene.nodes.insert(
+            id3,
+            tessel_core::SceneNode {
+                id: id3,
+                name: "CycleChild".into(),
+                kind: tessel_core::NodeKind::Group,
+                visible: true,
+                parent: Some(id2),
+                transform: tessel_core::Transform::default(),
+            },
+        );
+
+        let rows = build_outliner_tree_rows(&scene, &BTreeSet::new());
+        assert_eq!(rows.len(), 3);
+        let ids: BTreeSet<NodeId> = rows.iter().map(|r| r.id).collect();
+        assert_eq!(ids.len(), 3);
+        assert!(ids.contains(&id1));
+        assert!(ids.contains(&id2));
+        assert!(ids.contains(&id3));
+        assert_eq!(rows[0].depth, 0);
+
+        // Also verify a chain deeper than MAX_OUTLINER_DEPTH terminates and renders every node once.
+        let mut deep_scene = SceneState::new();
+        let mut prev: Option<NodeId> = None;
+        for idx in 0..=(MAX_OUTLINER_DEPTH + 4) {
+            let nid = deep_scene.allocate_node_id();
+            deep_scene.nodes.insert(
+                nid,
+                tessel_core::SceneNode {
+                    id: nid,
+                    name: format!("Deep{idx}"),
+                    kind: tessel_core::NodeKind::Group,
+                    visible: true,
+                    parent: prev,
+                    transform: tessel_core::Transform::default(),
+                },
+            );
+            prev = Some(nid);
+        }
+        let deep_rows = build_outliner_tree_rows(&deep_scene, &BTreeSet::new());
+        assert_eq!(deep_rows.len(), MAX_OUTLINER_DEPTH + 5);
+        assert!(deep_rows.iter().all(|r| r.depth <= MAX_OUTLINER_DEPTH));
+        let unique: BTreeSet<NodeId> = deep_rows.iter().map(|r| r.id).collect();
+        assert_eq!(unique.len(), deep_rows.len());
+    }
+
+    #[test]
+    fn valid_parent_candidates_excludes_self_and_all_descendants() {
+        let mut scene = SceneState::new();
+        let mut history = HistoryStack::new();
+
+        for name in ["Root", "Child", "GrandChild", "Other"] {
+            history
+                .execute(
+                    &mut scene,
+                    Command::CreateGroupNode {
+                        name: name.into(),
+                        transform: tessel_core::Transform::default(),
+                        parent: None,
+                    },
+                )
+                .unwrap();
+        }
+        let ids: BTreeMap<String, NodeId> = scene
+            .nodes
+            .values()
+            .map(|n| (n.name.clone(), n.id))
+            .collect();
+        let root_id = ids["Root"];
+        let child_id = ids["Child"];
+        let grandchild_id = ids["GrandChild"];
+        let other_id = ids["Other"];
+
+        history
+            .execute(
+                &mut scene,
+                Command::SetNodeParent {
+                    node_id: child_id,
+                    parent: Some(root_id),
+                },
+            )
+            .unwrap();
+        history
+            .execute(
+                &mut scene,
+                Command::SetNodeParent {
+                    node_id: grandchild_id,
+                    parent: Some(child_id),
+                },
+            )
+            .unwrap();
+
+        let root_candidates: Vec<NodeId> = valid_parent_candidates(&scene, root_id)
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect();
+        assert_eq!(root_candidates, vec![other_id]);
+
+        let child_candidates: Vec<NodeId> = valid_parent_candidates(&scene, child_id)
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect();
+        assert_eq!(child_candidates, vec![root_id, other_id]);
+    }
+
+    #[test]
+    fn outliner_create_group_and_reparent_commands_work_with_undo() {
+        let mut scene = SceneState::new();
+        let mut history = HistoryStack::new();
+
+        // No selection -> creates root Group.
+        let cmd1 = create_outliner_group_command(&scene);
+        history.execute(&mut scene, cmd1).unwrap();
+        let group1 = scene.selected_node.unwrap();
+        assert_eq!(scene.nodes[&group1].kind, tessel_core::NodeKind::Group);
+        assert_eq!(scene.nodes[&group1].parent, None);
+        assert_eq!(scene.nodes[&group1].name, "Group");
+
+        // Group selected -> nests new Group inside selected Group.
+        let cmd2 = create_outliner_group_command(&scene);
+        history.execute(&mut scene, cmd2).unwrap();
+        let group2 = scene.selected_node.unwrap();
+        assert_eq!(scene.nodes[&group2].parent, Some(group1));
+        assert_eq!(scene.nodes[&group2].name, "Group 2");
+
+        // Non-group selected -> creates root Group.
+        history
+            .execute(
+                &mut scene,
+                Command::CreatePrimitiveMesh {
+                    name: "Prop".into(),
+                    kind: tessel_core::PrimitiveKind::Cube,
+                    size: 1.0,
+                    material: PaletteIndex::new(1).unwrap(),
+                },
+            )
+            .unwrap();
+        let prop_id = scene.selected_node.unwrap();
+        let cmd3 = create_outliner_group_command(&scene);
+        history.execute(&mut scene, cmd3).unwrap();
+        let group3 = scene.selected_node.unwrap();
+        assert_eq!(scene.nodes[&group3].parent, None);
+
+        // Reparent Prop inside Group 2 and undo back to root.
+        history
+            .execute(
+                &mut scene,
+                Command::SetNodeParent {
+                    node_id: prop_id,
+                    parent: Some(group2),
+                },
+            )
+            .unwrap();
+        assert_eq!(scene.nodes[&prop_id].parent, Some(group2));
+        history.undo(&mut scene).unwrap();
+        assert_eq!(scene.nodes[&prop_id].parent, None);
+    }
+
+    #[test]
+    fn outliner_click_group_button_and_parent_selector_render_cleanly() {
+        let mut scene = SceneState::new();
+        let mut history = HistoryStack::new();
+        let mut rename_state = OutlinerRenameState::default();
+
+        let ctx = egui::Context::default();
+        let base_input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1280.0, 720.0),
+            )),
+            ..Default::default()
+        };
+        let draw_outliner = |ctx: &egui::Context,
+                             scene: &mut SceneState,
+                             history: &mut HistoryStack,
+                             rename_state: &mut OutlinerRenameState| {
+            egui::SidePanel::right("test_outliner_g2")
+                .exact_width(256.0)
+                .resizable(false)
+                .show(ctx, |ui| {
+                    egui::ScrollArea::vertical().show(ui, |ui| {
+                        show_outliner_section(ui, scene, history, rename_state);
+                        let mut show_gizmo = false;
+                        let mut gizmo_mode = tessel_render::TransformGizmoMode::Move;
+                        let mut free_view = false;
+                        let mut render_preview = false;
+                        let mut tool = crate::ui::viewport::ViewportInteractionTool::Select;
+                        show_transform_and_lighting_section(
+                            ui,
+                            scene,
+                            history,
+                            &mut show_gizmo,
+                            &mut gizmo_mode,
+                            &mut free_view,
+                            &mut render_preview,
+                            &mut tool,
+                        );
+                    });
+                });
+        };
+
+        let out = ctx.run(base_input, |c| {
+            draw_outliner(c, &mut scene, &mut history, &mut rename_state);
+        });
+        let add_group_pos = find_label_center(&out.shapes, "+ Group").unwrap();
+        click_at(&ctx, add_group_pos, |c| {
+            draw_outliner(c, &mut scene, &mut history, &mut rename_state);
+        });
+        assert_eq!(scene.nodes.len(), 1);
+        let group_id = scene.selected_node.unwrap();
+        assert_eq!(scene.nodes[&group_id].kind, tessel_core::NodeKind::Group);
+
+        // Deleted node IDs are pruned from collapsed_nodes automatically.
+        rename_state.collapsed_nodes.insert(NodeId(987_654));
+        let _ = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(1280.0, 720.0),
+                )),
+                ..Default::default()
+            },
+            |c| {
+                draw_outliner(c, &mut scene, &mut history, &mut rename_state);
+            },
+        );
+        assert!(rename_state.collapsed_nodes.is_empty());
     }
 }
