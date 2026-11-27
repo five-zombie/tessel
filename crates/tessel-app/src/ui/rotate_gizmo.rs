@@ -304,7 +304,7 @@ pub fn draw_floating_rotate_disc(
     } else {
         140
     };
-    let stroke_width = if pressed_inside { 2.0 } else { 1.4 };
+    let stroke_width = if pressed_inside { 2.0_f32 } else { 1.4_f32 };
     let ring_color =
         egui::Color32::from_rgba_unmultiplied(accent.r(), accent.g(), accent.b(), stroke_alpha);
     painter.circle_stroke(
@@ -327,7 +327,7 @@ pub fn draw_floating_rotate_disc(
             painter.line_segment(
                 [center, handle_pos],
                 Stroke::new(
-                    1.5,
+                    1.5_f32,
                     egui::Color32::from_rgba_unmultiplied(255, 255, 255, 210),
                 ),
             );
@@ -357,7 +357,7 @@ pub fn draw_floating_rotate_disc(
         painter.rect_stroke(
             pill_rect,
             CornerRadius::same(5),
-            Stroke::new(1.0, ring_color),
+            Stroke::new(1.0_f32, ring_color),
             egui::StrokeKind::Inside,
         );
         painter.galley(
@@ -417,9 +417,9 @@ pub fn show_rotate_axis_and_ruler_hud(
                             egui::Color32::from_rgba_unmultiplied(0x19, 0x1C, 0x22, 220)
                         };
                         let stroke = if selected {
-                            Stroke::new(1.3, accent)
+                            Stroke::new(1.3_f32, accent)
                         } else {
-                            Stroke::new(1.0, tokens::OUTLINE_VARIANT)
+                            Stroke::new(1.0_f32, tokens::OUTLINE_VARIANT)
                         };
                         let text_color = if selected {
                             egui::Color32::WHITE
@@ -454,7 +454,7 @@ pub fn show_rotate_axis_and_ruler_hud(
                 // Row 2: Horizontal angle ruler (174 + 16 margin + 2 stroke = 192px exact alignment).
                 Frame::NONE
                     .fill(egui::Color32::from_rgba_unmultiplied(0x19, 0x1C, 0x22, 225))
-                    .stroke(Stroke::new(1.0, tokens::OUTLINE_VARIANT))
+                    .stroke(Stroke::new(1.0_f32, tokens::OUTLINE_VARIANT))
                     .corner_radius(CornerRadius::same(6))
                     .inner_margin(Margin::symmetric(8, 5))
                     .show(ui, |ui| {
@@ -556,7 +556,7 @@ pub fn show_rotate_axis_and_ruler_hud(
                             };
                             p.line_segment(
                                 [egui::pos2(x, tick_top), egui::pos2(x, track_bottom)],
-                                Stroke::new(if is_zero { 1.4 } else { 1.0 }, col),
+                                Stroke::new(if is_zero { 1.4_f32 } else { 1.0_f32 }, col),
                             );
                         }
 
@@ -601,7 +601,7 @@ pub fn show_rotate_axis_and_ruler_hud(
                                     egui::pos2(needle_x, track_top - 1.0),
                                     egui::pos2(needle_x, track_bottom),
                                 ],
-                                Stroke::new(2.0, needle_col),
+                                Stroke::new(2.0_f32, needle_col),
                             );
                         }
                     });

@@ -1068,7 +1068,7 @@ fn draw_scale_gizmo_overlay(
             painter.rect_stroke(
                 handle_rect,
                 CornerRadius::same(2),
-                Stroke::new(1.2, egui::Color32::from_rgb(20, 23, 29)),
+                Stroke::new(1.2_f32, egui::Color32::from_rgb(20, 23, 29)),
                 egui::StrokeKind::Outside,
             );
             painter.text(
@@ -1124,7 +1124,7 @@ fn draw_scale_gizmo_overlay(
         painter.rect_stroke(
             pill_rect,
             CornerRadius::same(4),
-            Stroke::new(1.0, tokens::OUTLINE_VARIANT),
+            Stroke::new(1.0_f32, tokens::OUTLINE_VARIANT),
             egui::StrokeKind::Inside,
         );
         painter.galley(
