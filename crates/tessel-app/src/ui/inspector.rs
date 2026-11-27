@@ -7,7 +7,7 @@ use tessel_ai::direct::{tool_call_requires_confirmation, DirectAiResponse, Plann
 use tessel_ai::{AiProviderKind, DirectAiConfig};
 use tessel_core::{
     AppMode, BoneId, Command, FrameIndex, HistoryStack, Keyframe, NodeId, PaletteEntry,
-    PaletteIndex, Rgba8, SceneState,
+    PaletteIndex, PostProcessSettings, Rgba8, SceneState, ViewportShadingMode,
 };
 
 use super::icons::{self, ToolIcon};
@@ -319,7 +319,7 @@ fn show_palette_section(ui: &mut egui::Ui, scene: &mut SceneState, history: &mut
                 .color(tokens::ON_SURFACE_VARIANT),
             );
             if ui.color_edit_button_srgba(&mut srgba).changed() {
-                let mut updated = active_entry;
+                let mut updated = active_entry.clone();
                 updated.color = Rgba8::rgba(srgba.r(), srgba.g(), srgba.b(), srgba.a());
                 super::exec_history(
                     ui.ctx(),
@@ -330,6 +330,59 @@ fn show_palette_section(ui: &mut egui::Ui, scene: &mut SceneState, history: &mut
                         entry: updated,
                     },
                 );
+            }
+        });
+        ui.add_space(4.0);
+        egui::CollapsingHeader::new(
+            RichText::new("Palette Material")
+                .size(11.5)
+                .color(tokens::ON_SURFACE),
+        )
+        .id_salt("palette_material_header")
+        .default_open(false)
+        .show(ui, |ui| {
+            let active_idx = scene.active_color;
+            if let Some(mut updated) = scene.palette.get(active_idx).cloned() {
+                let mut changed = false;
+                let mut dragging = false;
+                let mut drag_stopped = false;
+                for r in [
+                    ui.add(egui::Slider::new(&mut updated.roughness, 0.05..=1.0).text("Roughness")),
+                    ui.add(egui::Slider::new(&mut updated.metallic, 0.0..=1.0).text("Metallic")),
+                    ui.add(egui::Slider::new(&mut updated.emissive, 0.0..=20.0).text("Emissive")),
+                    ui.add(
+                        egui::Slider::new(&mut updated.transmission, 0.0..=1.0)
+                            .text("Transmission"),
+                    ),
+                    ui.add(egui::Slider::new(&mut updated.ior, 1.0..=2.5).text("IOR")),
+                ] {
+                    changed |= r.changed();
+                    dragging |= r.dragged();
+                    drag_stopped |= r.drag_stopped();
+                }
+                if changed || drag_stopped {
+                    super::commit_debounced_command(
+                        ui.ctx(),
+                        egui::Id::new(("palette_material_debounce", active_idx)),
+                        history,
+                        scene,
+                        changed,
+                        dragging,
+                        drag_stopped,
+                        |s| {
+                            s.palette.get(active_idx).cloned().map(|entry| {
+                                Command::SetPaletteEntry {
+                                    index: active_idx,
+                                    entry,
+                                }
+                            })
+                        },
+                        Command::SetPaletteEntry {
+                            index: active_idx,
+                            entry: updated,
+                        },
+                    );
+                }
             }
         });
     }
@@ -2178,6 +2231,20 @@ fn show_transform_and_lighting_section(
                     );
                     changed |= ui.color_edit_button_rgb(&mut mat.emissive).changed();
                 });
+                for r in [
+                    ui.add(
+                        egui::Slider::new(&mut mat.emissive_intensity, 0.0..=20.0)
+                            .text("Emissive Intensity"),
+                    ),
+                    ui.add(
+                        egui::Slider::new(&mut mat.transmission, 0.0..=1.0).text("Transmission"),
+                    ),
+                    ui.add(egui::Slider::new(&mut mat.ior, 1.0..=2.5).text("IOR")),
+                ] {
+                    changed |= r.changed();
+                    dragging |= r.dragged();
+                    drag_stopped |= r.drag_stopped();
+                }
                 changed |= ui.checkbox(&mut mat.double_sided, "Double Sided").changed();
                 ui.horizontal(|ui| {
                     changed |= ui.checkbox(&mut mat.cast_shadow, "Cast Shadow").changed();
@@ -2463,7 +2530,99 @@ fn show_transform_and_lighting_section(
                 },
             );
         }
+        show_post_process_section(ui, scene, history);
     }
+}
+
+fn show_post_process_section(
+    ui: &mut egui::Ui,
+    scene: &mut SceneState,
+    history: &mut HistoryStack,
+) {
+    ui.add_space(6.0);
+    egui::CollapsingHeader::new(
+        RichText::new("Post-Processing & Atmosphere")
+            .strong()
+            .size(12.0)
+            .color(tokens::ON_SURFACE),
+    )
+    .id_salt("inspector_post_process")
+    .default_open(false)
+    .show(ui, |ui| {
+        ui.horizontal(|ui| {
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui
+                    .small_button("Reset")
+                    .on_hover_text("Reset post-processing & atmosphere")
+                    .clicked()
+                {
+                    super::exec_history(
+                        ui.ctx(),
+                        history,
+                        scene,
+                        Command::SetPostProcess(PostProcessSettings::default()),
+                    );
+                }
+            });
+        });
+        if scene.shading_mode != ViewportShadingMode::Pbr {
+            ui.label(
+                RichText::new("Bypassed in NPR / analysis shading modes.")
+                    .size(10.5)
+                    .color(tokens::ON_SURFACE_VARIANT),
+            );
+        }
+
+        let mut pp = scene.post_process;
+        let mut changed = false;
+        let mut dragging = false;
+        let mut drag_stopped = false;
+        let mut track = |r: egui::Response| {
+            changed |= r.changed();
+            dragging |= r.dragged();
+            drag_stopped |= r.drag_stopped();
+        };
+
+        track(ui.checkbox(&mut pp.bloom_enabled, "Bloom"));
+        if pp.bloom_enabled {
+            track(ui.add(egui::Slider::new(&mut pp.bloom_threshold, 0.0..=10.0).text("Threshold")));
+            track(ui.add(egui::Slider::new(&mut pp.bloom_intensity, 0.0..=4.0).text("Intensity")));
+        }
+
+        track(ui.add(egui::Slider::new(&mut pp.exposure, 0.05..=8.0).text("Exposure")));
+        track(ui.checkbox(&mut pp.aces_enabled, "ACES Tone Mapping"));
+
+        track(ui.checkbox(&mut pp.fog_enabled, "Atmospheric Fog"));
+        if pp.fog_enabled {
+            ui.horizontal(|ui| {
+                ui.label(
+                    RichText::new("Fog Color")
+                        .size(11.0)
+                        .color(tokens::ON_SURFACE_VARIANT),
+                );
+                track(ui.color_edit_button_rgb(&mut pp.fog_color));
+            });
+            track(ui.add(egui::Slider::new(&mut pp.fog_density, 0.0..=1.0).text("Density")));
+            track(ui.add(egui::Slider::new(&mut pp.fog_start, 0.0..=500.0).text("Start")));
+            track(ui.add(
+                egui::Slider::new(&mut pp.fog_height_falloff, 0.0..=5.0).text("Height Falloff"),
+            ));
+        }
+
+        if changed || drag_stopped {
+            super::commit_debounced_command(
+                ui.ctx(),
+                egui::Id::new("post_process_debounce"),
+                history,
+                scene,
+                changed,
+                dragging,
+                drag_stopped,
+                |s| Some(Command::SetPostProcess(s.post_process)),
+                Command::SetPostProcess(pp),
+            );
+        }
+    });
 }
 
 fn apply_provider_selection(
@@ -3868,5 +4027,251 @@ mod tests {
             draw_rig(c, &mut scene, &mut history, &mut req);
         });
         assert!(!out_biped.shapes.is_empty());
+    }
+
+    #[test]
+    fn h4b_palette_material_inspector_expands_and_updates_entry_with_undo() {
+        let mut scene = SceneState::new();
+        scene.active_mode = AppMode::Voxel;
+        let mut history = HistoryStack::new();
+        let active_idx = scene.active_color;
+        let original_entry = scene.palette.get(active_idx).cloned().unwrap();
+
+        let ctx = egui::Context::default();
+        ctx.style_mut(|s| s.animation_time = 0.0);
+        let base_input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1280.0, 1200.0),
+            )),
+            ..Default::default()
+        };
+        let draw_palette =
+            |ctx: &egui::Context, scene: &mut SceneState, history: &mut HistoryStack| {
+                egui::SidePanel::right("test_h4b_palette")
+                    .exact_width(256.0)
+                    .resizable(false)
+                    .show(ctx, |ui| {
+                        egui::ScrollArea::vertical().show(ui, |ui| {
+                            show_palette_section(ui, scene, history);
+                        });
+                    });
+            };
+
+        let out_closed = ctx.run(base_input.clone(), |c| {
+            draw_palette(c, &mut scene, &mut history);
+        });
+        let header_pos = find_label_center(&out_closed.shapes, "Palette Material").unwrap();
+        click_at(&ctx, header_pos, |c| {
+            draw_palette(c, &mut scene, &mut history)
+        });
+
+        let out_open = ctx.run(base_input, |c| {
+            draw_palette(c, &mut scene, &mut history);
+        });
+        for slider_label in ["Roughness", "Metallic", "Emissive", "Transmission", "IOR"] {
+            assert!(
+                find_label_center(&out_open.shapes, slider_label).is_some(),
+                "expected palette material slider `{slider_label}` when expanded"
+            );
+        }
+
+        let mut updated = original_entry.clone();
+        updated.roughness = 0.2;
+        updated.metallic = 0.75;
+        updated.emissive = 4.5;
+        updated.transmission = 0.8;
+        updated.ior = 1.75;
+        history
+            .execute(
+                &mut scene,
+                Command::SetPaletteEntry {
+                    index: active_idx,
+                    entry: updated.clone(),
+                },
+            )
+            .unwrap();
+        assert_eq!(scene.palette.get(active_idx), Some(&updated));
+
+        history.undo(&mut scene).unwrap();
+        assert_eq!(scene.palette.get(active_idx), Some(&original_entry));
+    }
+
+    #[test]
+    fn h4b_post_process_and_lowpoly_material_inspector_modes_and_undo() {
+        let mut scene = SceneState::new();
+        let mut history = HistoryStack::new();
+        history
+            .execute(
+                &mut scene,
+                Command::CreatePrimitiveMesh {
+                    name: "H4bCube".into(),
+                    kind: tessel_core::PrimitiveKind::Cube,
+                    size: 1.0,
+                    material: PaletteIndex::new(1).unwrap(),
+                },
+            )
+            .unwrap();
+        let node_id = scene.selected_node.unwrap();
+        history
+            .execute(&mut scene, Command::SetMode(AppMode::LowPoly))
+            .unwrap();
+
+        let ctx = egui::Context::default();
+        ctx.style_mut(|s| s.animation_time = 0.0);
+        let base_input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1280.0, 1600.0),
+            )),
+            ..Default::default()
+        };
+        let draw_inspector =
+            |ctx: &egui::Context, scene: &mut SceneState, history: &mut HistoryStack| {
+                egui::SidePanel::right("test_h4b_inspector")
+                    .exact_width(256.0)
+                    .resizable(false)
+                    .show(ctx, |ui| {
+                        egui::ScrollArea::vertical().show(ui, |ui| {
+                            let mut show_gizmo = false;
+                            let mut gizmo_mode = tessel_render::TransformGizmoMode::Move;
+                            let mut free_view = false;
+                            let mut render_preview = false;
+                            let mut tool = crate::ui::viewport::ViewportInteractionTool::Select;
+                            show_transform_and_lighting_section(
+                                ui,
+                                scene,
+                                history,
+                                &mut show_gizmo,
+                                &mut gizmo_mode,
+                                &mut free_view,
+                                &mut render_preview,
+                                &mut tool,
+                            );
+                        });
+                    });
+            };
+
+        // 1. LowPoly renders new PBR Material sliders and Post-Processing header.
+        let out_lp = ctx.run(base_input.clone(), |c| {
+            draw_inspector(c, &mut scene, &mut history);
+        });
+        for label in ["Emissive Intensity", "Transmission", "IOR"] {
+            assert!(
+                find_label_center(&out_lp.shapes, label).is_some(),
+                "expected LowPoly PBR slider `{label}`"
+            );
+        }
+        let pp_header_pos =
+            find_label_center(&out_lp.shapes, "Post-Processing & Atmosphere").unwrap();
+
+        // Verify Command::SetMeshMaterial updates & undo for the new H1/H4b fields.
+        let orig_mat = scene.lowpoly_meshes[&node_id].material;
+        let mut custom_mat = orig_mat;
+        custom_mat.emissive_intensity = 6.5;
+        custom_mat.transmission = 0.9;
+        custom_mat.ior = 1.65;
+        history
+            .execute(
+                &mut scene,
+                Command::SetMeshMaterial {
+                    node_id,
+                    material: custom_mat,
+                },
+            )
+            .unwrap();
+        assert_eq!(scene.lowpoly_meshes[&node_id].material, custom_mat);
+        history.undo(&mut scene).unwrap();
+        assert_eq!(scene.lowpoly_meshes[&node_id].material, orig_mat);
+
+        // 2. Expand "Post-Processing & Atmosphere" and toggle Bloom, Fog, ACES, Reset.
+        click_at(&ctx, pp_header_pos, |c| {
+            draw_inspector(c, &mut scene, &mut history);
+        });
+        let out_open = ctx.run(base_input.clone(), |c| {
+            draw_inspector(c, &mut scene, &mut history);
+        });
+        let bloom_pos = find_label_center(&out_open.shapes, "Bloom").unwrap();
+        assert!(find_label_center(&out_open.shapes, "Exposure").is_some());
+        assert!(find_label_center(&out_open.shapes, "ACES Tone Mapping").is_some());
+        assert!(find_label_center(&out_open.shapes, "Atmospheric Fog").is_some());
+        assert!(find_label_center(&out_open.shapes, "Reset").is_some());
+
+        click_at(&ctx, bloom_pos, |c| {
+            draw_inspector(c, &mut scene, &mut history);
+        });
+        assert!(scene.post_process.bloom_enabled);
+
+        let out_bloom = ctx.run(base_input.clone(), |c| {
+            draw_inspector(c, &mut scene, &mut history);
+        });
+        assert!(find_label_center(&out_bloom.shapes, "Threshold").is_some());
+        assert!(find_label_center(&out_bloom.shapes, "Intensity").is_some());
+
+        let fog_pos = find_label_center(&out_bloom.shapes, "Atmospheric Fog").unwrap();
+        click_at(&ctx, fog_pos, |c| {
+            draw_inspector(c, &mut scene, &mut history);
+        });
+        assert!(scene.post_process.fog_enabled);
+
+        let out_fog = ctx.run(base_input.clone(), |c| {
+            draw_inspector(c, &mut scene, &mut history);
+        });
+        for fog_label in ["Fog Color", "Density", "Start", "Height Falloff"] {
+            assert!(
+                find_label_center(&out_fog.shapes, fog_label).is_some(),
+                "expected fog control `{fog_label}`"
+            );
+        }
+
+        let aces_pos = find_label_center(&out_fog.shapes, "ACES Tone Mapping").unwrap();
+        click_at(&ctx, aces_pos, |c| {
+            draw_inspector(c, &mut scene, &mut history);
+        });
+        assert!(!scene.post_process.aces_enabled);
+
+        let out_aces = ctx.run(base_input.clone(), |c| {
+            draw_inspector(c, &mut scene, &mut history);
+        });
+        let reset_pos = find_label_center(&out_aces.shapes, "Reset").unwrap();
+        click_at(&ctx, reset_pos, |c| {
+            draw_inspector(c, &mut scene, &mut history);
+        });
+        assert_eq!(scene.post_process, PostProcessSettings::default());
+
+        // Undo Reset restores previous post-processing state.
+        history.undo(&mut scene).unwrap();
+        assert!(scene.post_process.bloom_enabled);
+        assert!(scene.post_process.fog_enabled);
+        assert!(!scene.post_process.aces_enabled);
+
+        // 3. Voxel + NprSumie renders Post-Processing section with NPR bypass hint.
+        history
+            .execute(&mut scene, Command::SetMode(AppMode::Voxel))
+            .unwrap();
+        history
+            .execute(
+                &mut scene,
+                Command::SetShadingMode(ViewportShadingMode::NprSumie),
+            )
+            .unwrap();
+        let out_voxel = ctx.run(base_input.clone(), |c| {
+            draw_inspector(c, &mut scene, &mut history);
+        });
+        assert!(find_label_center(&out_voxel.shapes, "Post-Processing & Atmosphere").is_some());
+        assert!(find_label_center(
+            &out_voxel.shapes,
+            "Bypassed in NPR / analysis shading modes."
+        )
+        .is_some());
+
+        // 4. Pixel mode hides "Post-Processing & Atmosphere".
+        history
+            .execute(&mut scene, Command::SetMode(AppMode::Pixel))
+            .unwrap();
+        let out_pixel = ctx.run(base_input, |c| {
+            draw_inspector(c, &mut scene, &mut history);
+        });
+        assert!(find_label_center(&out_pixel.shapes, "Post-Processing & Atmosphere").is_none());
     }
 }
