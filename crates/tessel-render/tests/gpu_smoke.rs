@@ -445,7 +445,9 @@ fn smoke_h2_dual_kawase_bloom_glow_and_npr_bypass() {
     scene.post_process.bloom_enabled = false;
     let rgba_off = render_frame(&mut viewport, &scene);
     let sum_off: u64 = rgba_off
-        .chunks_exact(4)
+        .as_chunks::<4>()
+        .0
+        .iter()
         .map(|p| u64::from(p[0]) + u64::from(p[1]) + u64::from(p[2]))
         .sum();
 
@@ -454,7 +456,9 @@ fn smoke_h2_dual_kawase_bloom_glow_and_npr_bypass() {
     scene.post_process.bloom_intensity = 1.25;
     let rgba_on = render_frame(&mut viewport, &scene);
     let sum_on: u64 = rgba_on
-        .chunks_exact(4)
+        .as_chunks::<4>()
+        .0
+        .iter()
         .map(|p| u64::from(p[0]) + u64::from(p[1]) + u64::from(p[2]))
         .sum();
     assert!(

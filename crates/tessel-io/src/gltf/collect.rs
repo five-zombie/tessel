@@ -151,7 +151,7 @@ impl CollectedMesh {
             self.joints.len() == self.positions.len() && self.weights.len() == self.positions.len();
         let mut groups: std::collections::BTreeMap<PaletteMaterialGroup, Self> =
             std::collections::BTreeMap::new();
-        for tri in self.indices.chunks_exact(3) {
+        for tri in self.indices.as_chunks::<3>().0 {
             let (i0, i1, i2) = (tri[0] as usize, tri[1] as usize, tri[2] as usize);
             if i0 >= self.positions.len()
                 || i1 >= self.positions.len()
