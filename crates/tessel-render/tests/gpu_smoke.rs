@@ -307,3 +307,82 @@ fn smoke_4x_msaa_and_npr_slots_pipeline_and_readback() {
         "unexpected wgpu validation error on 4x MSAA + NPR slots pipeline: {validation_err:?}"
     );
 }
+
+#[test]
+fn smoke_h1_hdr_aces_fog_palette_lut_and_minimized_resize() {
+    let Some((device, queue, _info)) = request_test_device() else {
+        eprintln!("skipping GPU smoke test: no compatible GPU or software adapter available");
+        return;
+    };
+
+    device.push_error_scope(wgpu::ErrorFilter::Validation);
+
+    let mut viewport = ViewportRenderer::new(&device, 64, 64);
+    let mut scene = SceneState::new();
+    scene.active_mode = AppMode::Voxel;
+    scene.npr_look.msaa_samples = 4;
+    scene.post_process = tessel_core::PostProcessSettings {
+        bloom_enabled: false,
+        exposure: 1.25,
+        aces_enabled: true,
+        fog_enabled: true,
+        fog_color: [0.12, 0.16, 0.24],
+        fog_density: 0.04,
+        fog_start: 2.0,
+        fog_height_falloff: 0.2,
+        ..Default::default()
+    };
+
+    // Neon emissive voxel via Palette Material LUT.
+    let neon_idx = PaletteIndex::new(9).unwrap();
+    let mut neon_entry =
+        tessel_core::PaletteEntry::matte("Neon", tessel_core::Rgba8::rgb(255, 180, 40));
+    neon_entry.emissive = 8.0;
+    scene.palette.set(neon_idx, neon_entry);
+
+    let vox_id = scene.allocate_node_id();
+    scene.nodes.insert(
+        vox_id,
+        SceneNode {
+            id: vox_id,
+            name: "NeonVoxel".into(),
+            kind: NodeKind::VoxelVolume,
+            visible: true,
+            parent: None,
+            transform: Transform::default(),
+        },
+    );
+    let mut vol = VoxelVolume::new();
+    vol.set(VoxelCoord::new(0, 0, 0), Some(neon_idx));
+    scene.voxel_volumes.insert(vox_id, vol);
+    scene.mark_modified();
+
+    // Minimized window safety (0x0 clamped to 1x1) followed by restore to 64x64.
+    assert!(viewport.resize(&device, 0, 0));
+    assert_eq!(viewport.size(), (1, 1));
+    assert!(viewport.resize(&device, 64, 64));
+    assert_eq!(viewport.size(), (64, 64));
+
+    viewport.sync_scene(&device, &queue, &scene, None, None);
+
+    let mut cam = OrbitCamera::new();
+    cam.distance = 2.0;
+    let cam_2d = PixelCamera2D::new();
+    let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+        label: Some("tessel-smoke-h1-hdr-encoder"),
+    });
+    viewport.render(&queue, &mut encoder, &scene, &cam, &cam_2d, 1.0, false);
+    queue.submit(Some(encoder.finish()));
+
+    let (w, h, rgba) = viewport
+        .capture_rgba_bytes_with_timeout(&device, &queue, Duration::from_secs(5))
+        .expect("H1 HDR+ACES+Fog readback must succeed");
+    assert_eq!((w, h), (64, 64));
+    assert!(rgba.iter().any(|&b| b != 0));
+
+    let validation_err = pollster::block_on(device.pop_error_scope());
+    assert!(
+        validation_err.is_none(),
+        "unexpected wgpu validation error on H1 HDR pipeline: {validation_err:?}"
+    );
+}

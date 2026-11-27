@@ -628,6 +628,7 @@ pub enum Command {
     SetNprLookParams {
         params: crate::scene::NprLookParams,
     },
+    SetPostProcess(crate::scene::PostProcessSettings),
     Transaction(Vec<Command>),
 }
 
@@ -845,7 +846,14 @@ pub enum UndoDelta {
     RestoreLookDevPreset(crate::scene::LookDevPreset),
     RestoreCameraBookmarks(Vec<crate::scene::CameraBookmark>),
     RestoreReferencePlanes(Vec<crate::scene::ReferenceImagePlane>),
-    RestoreNprLookParams(crate::scene::NprLookParams),
+    RestoreNprLookParams {
+        previous: crate::scene::NprLookParams,
+        previous_post_process: crate::scene::PostProcessSettings,
+    },
+    RestorePostProcess {
+        previous: crate::scene::PostProcessSettings,
+        previous_npr_bloom: f32,
+    },
     Transaction(Vec<UndoDelta>),
 }
 
@@ -898,7 +906,8 @@ impl Command {
             | Self::SetLookDevPreset { .. }
             | Self::SaveCameraBookmark { .. }
             | Self::AddReferenceImagePlane { .. }
-            | Self::SetNprLookParams { .. } => scene_cmd::apply(self, scene),
+            | Self::SetNprLookParams { .. }
+            | Self::SetPostProcess(..) => scene_cmd::apply(self, scene),
             Self::CreateVoxelVolume { .. }
             | Self::SetVoxels { .. }
             | Self::FillVoxelBox { .. }

@@ -35,12 +35,7 @@ pub struct PlacementGhost {
 }
 
 impl OverlayPass {
-    pub fn new(
-        device: &wgpu::Device,
-        color_format: wgpu::TextureFormat,
-        depth_format: wgpu::TextureFormat,
-        sample_count: u32,
-    ) -> Self {
+    pub fn new(device: &wgpu::Device, color_format: wgpu::TextureFormat) -> Self {
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("tessel-overlay-shader"),
             source: wgpu::ShaderSource::Wgsl(OVERLAY_SHADER_WGSL.into()),
@@ -127,18 +122,8 @@ impl OverlayPass {
                 topology: wgpu::PrimitiveTopology::LineList,
                 ..Default::default()
             },
-            depth_stencil: Some(wgpu::DepthStencilState {
-                format: depth_format,
-                depth_write_enabled: false,
-                depth_compare: wgpu::CompareFunction::Always,
-                stencil: wgpu::StencilState::default(),
-                bias: wgpu::DepthBiasState::default(),
-            }),
-            multisample: wgpu::MultisampleState {
-                count: sample_count,
-                mask: !0,
-                alpha_to_coverage_enabled: false,
-            },
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
             multiview: None,
             cache: None,
         });

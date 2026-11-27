@@ -635,3 +635,137 @@ fn g3_set_character_rig_rename_and_reparent_bone_with_anti_cycle_and_undo() {
         Err(CoreError::OutOfBounds)
     ));
 }
+
+#[test]
+fn h1_post_process_and_material_contracts_validate_sync_and_undo() {
+    let mut scene = SceneState::new();
+    let mut history = crate::HistoryStack::default();
+
+    // Command::SetPostProcess validates finite inputs, syncs npr_look.bloom_strength, and undoes cleanly.
+    let bad_pp = crate::PostProcessSettings {
+        exposure: f32::NAN,
+        ..Default::default()
+    };
+    assert_eq!(
+        history.execute(&mut scene, Command::SetPostProcess(bad_pp)),
+        Err(CoreError::OutOfBounds)
+    );
+
+    let custom_pp = crate::PostProcessSettings {
+        bloom_enabled: true,
+        bloom_threshold: 0.85,
+        bloom_intensity: 0.75,
+        exposure: 1.4,
+        aces_enabled: true,
+        fog_enabled: true,
+        fog_color: [0.1, 0.2, 0.3],
+        fog_density: 0.05,
+        fog_start: 4.0,
+        fog_height_falloff: 0.4,
+    };
+    history
+        .execute(&mut scene, Command::SetPostProcess(custom_pp))
+        .unwrap();
+    assert_eq!(scene.post_process, custom_pp);
+    assert!((scene.npr_look.bloom_strength - 0.75).abs() < 1e-6);
+
+    history.undo(&mut scene).unwrap();
+    assert_eq!(scene.post_process, crate::PostProcessSettings::default());
+    assert_eq!(scene.npr_look.bloom_strength, 0.0);
+
+    // Legacy SetNprLookParams stays synced with post_process bloom fields.
+    history
+        .execute(
+            &mut scene,
+            Command::SetNprLookParams {
+                params: crate::NprLookParams {
+                    hatching_strength: 0.2,
+                    bloom_strength: 1.1,
+                    msaa_samples: 4,
+                },
+            },
+        )
+        .unwrap();
+    assert!(scene.post_process.bloom_enabled);
+    assert!((scene.post_process.bloom_intensity - 1.1).abs() < 1e-6);
+    history.undo(&mut scene).unwrap();
+    assert!(!scene.post_process.bloom_enabled);
+
+    // PaletteEntry & MeshMaterial reject NaN and clamp HDR emissive / transmission / IOR.
+    let idx = PaletteIndex::new(5).unwrap();
+    let mut bad_pal = crate::PaletteEntry::matte("Bad", crate::Rgba8::rgb(255, 0, 0));
+    bad_pal.ior = f32::INFINITY;
+    assert_eq!(
+        history.execute(
+            &mut scene,
+            Command::SetPaletteEntry {
+                index: idx,
+                entry: bad_pal,
+            }
+        ),
+        Err(CoreError::OutOfBounds)
+    );
+    let mut neon_glass = crate::PaletteEntry::matte("NeonGlass", crate::Rgba8::rgb(80, 220, 255));
+    neon_glass.emissive = 25.0;
+    neon_glass.transmission = 1.5;
+    neon_glass.ior = 0.5;
+    history
+        .execute(
+            &mut scene,
+            Command::SetPaletteEntry {
+                index: idx,
+                entry: neon_glass,
+            },
+        )
+        .unwrap();
+    let saved = scene.palette.get(idx).unwrap();
+    assert_eq!(saved.emissive, 20.0);
+    assert_eq!(saved.transmission, 1.0);
+    assert_eq!(saved.ior, 1.0);
+
+    history
+        .execute(
+            &mut scene,
+            Command::CreatePrimitiveMesh {
+                name: "Gem".into(),
+                kind: crate::PrimitiveKind::Cube,
+                size: 1.0,
+                material: idx,
+            },
+        )
+        .unwrap();
+    let mesh_id = scene.selected_node.unwrap();
+    let bad_mat = crate::MeshMaterial {
+        emissive_intensity: f32::NAN,
+        ..Default::default()
+    };
+    assert_eq!(
+        history.execute(
+            &mut scene,
+            Command::SetMeshMaterial {
+                node_id: mesh_id,
+                material: bad_mat,
+            }
+        ),
+        Err(CoreError::OutOfBounds)
+    );
+    history
+        .execute(
+            &mut scene,
+            Command::SetMeshMaterial {
+                node_id: mesh_id,
+                material: crate::MeshMaterial {
+                    emissive: [0.2, 0.9, 1.0],
+                    emissive_intensity: 50.0,
+                    transmission: 0.9,
+                    ior: 2.8,
+                    ..Default::default()
+                },
+            },
+        )
+        .unwrap();
+    let mat = scene.lowpoly_meshes[&mesh_id].material;
+    assert_eq!(mat.emissive_intensity, 20.0);
+    assert!((mat.transmission - 0.9).abs() < 1e-6);
+    assert_eq!(mat.ior, 2.5);
+}

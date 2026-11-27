@@ -44,7 +44,8 @@ pub use pixel::{
 };
 pub use scene::{
     validate_node_name, AppMode, CameraBookmark, LookDevPreset, NodeId, NodeKind, NprLookParams,
-    ReferenceImagePlane, SceneNode, SceneState, Transform, ViewportShadingMode, MAX_NODE_NAME_LEN,
+    PostProcessSettings, ReferenceImagePlane, SceneNode, SceneState, Transform,
+    ViewportShadingMode, MAX_NODE_NAME_LEN,
 };
 pub use voxel::{
     ChunkCoord, Symmetry3D, VoxelChunk, VoxelCoord, VoxelEdit, VoxelHit, VoxelMeshOutput,

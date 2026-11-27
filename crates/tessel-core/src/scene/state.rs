@@ -59,6 +59,105 @@ impl Default for NprLookParams {
     }
 }
 
+fn default_pp_true() -> bool {
+    true
+}
+fn default_bloom_threshold() -> f32 {
+    1.0
+}
+fn default_bloom_intensity() -> f32 {
+    0.35
+}
+fn default_exposure() -> f32 {
+    1.0
+}
+fn default_fog_color() -> [f32; 3] {
+    [0.08, 0.10, 0.14]
+}
+fn default_fog_density() -> f32 {
+    0.02
+}
+fn default_fog_start() -> f32 {
+    8.0
+}
+fn default_fog_height_falloff() -> f32 {
+    0.25
+}
+
+/// Cinematic HDR post-processing & forward atmospheric fog settings (`H1`).
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct PostProcessSettings {
+    #[serde(default)]
+    pub bloom_enabled: bool,
+    #[serde(default = "default_bloom_threshold")]
+    pub bloom_threshold: f32,
+    #[serde(default = "default_bloom_intensity")]
+    pub bloom_intensity: f32,
+    #[serde(default = "default_exposure")]
+    pub exposure: f32,
+    #[serde(default = "default_pp_true")]
+    pub aces_enabled: bool,
+    #[serde(default)]
+    pub fog_enabled: bool,
+    #[serde(default = "default_fog_color")]
+    pub fog_color: [f32; 3],
+    #[serde(default = "default_fog_density")]
+    pub fog_density: f32,
+    #[serde(default = "default_fog_start")]
+    pub fog_start: f32,
+    #[serde(default = "default_fog_height_falloff")]
+    pub fog_height_falloff: f32,
+}
+
+impl Default for PostProcessSettings {
+    fn default() -> Self {
+        Self {
+            bloom_enabled: false,
+            bloom_threshold: default_bloom_threshold(),
+            bloom_intensity: default_bloom_intensity(),
+            exposure: default_exposure(),
+            aces_enabled: true,
+            fog_enabled: false,
+            fog_color: default_fog_color(),
+            fog_density: default_fog_density(),
+            fog_start: default_fog_start(),
+            fog_height_falloff: default_fog_height_falloff(),
+        }
+    }
+}
+
+impl PostProcessSettings {
+    /// Validates finite values and clamps all fields to safe rendering bounds.
+    pub fn validated(self) -> Result<Self, crate::error::CoreError> {
+        if !self.bloom_threshold.is_finite()
+            || !self.bloom_intensity.is_finite()
+            || !self.exposure.is_finite()
+            || self.fog_color.iter().any(|c| !c.is_finite())
+            || !self.fog_density.is_finite()
+            || !self.fog_start.is_finite()
+            || !self.fog_height_falloff.is_finite()
+        {
+            return Err(crate::error::CoreError::OutOfBounds);
+        }
+        Ok(Self {
+            bloom_enabled: self.bloom_enabled,
+            bloom_threshold: self.bloom_threshold.clamp(0.0, 10.0),
+            bloom_intensity: self.bloom_intensity.clamp(0.0, 4.0),
+            exposure: self.exposure.clamp(0.05, 8.0),
+            aces_enabled: self.aces_enabled,
+            fog_enabled: self.fog_enabled,
+            fog_color: [
+                self.fog_color[0].clamp(0.0, 1.0),
+                self.fog_color[1].clamp(0.0, 1.0),
+                self.fog_color[2].clamp(0.0, 1.0),
+            ],
+            fog_density: self.fog_density.clamp(0.0, 1.0),
+            fog_start: self.fog_start.clamp(0.0, 500.0),
+            fog_height_falloff: self.fog_height_falloff.clamp(0.0, 5.0),
+        })
+    }
+}
+
 /// Sub-Unit: Single scene graph node metadata.
 /// Viewport shading & NPR preview mode (shared by live GUI, headless screenshots, and turntables).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -152,6 +251,8 @@ pub struct SceneState {
     pub mesh_instances: BTreeMap<NodeId, Vec<Transform>>,
     #[serde(default)]
     pub npr_look: NprLookParams,
+    #[serde(default)]
+    pub post_process: PostProcessSettings,
     pub nodes: BTreeMap<NodeId, SceneNode>,
     pub pixel_canvases: BTreeMap<NodeId, PixelCanvas>,
     pub voxel_volumes: BTreeMap<NodeId, VoxelVolume>,
@@ -226,6 +327,7 @@ impl SceneState {
             collision_hulls: BTreeMap::new(),
             mesh_instances: BTreeMap::new(),
             npr_look: NprLookParams::default(),
+            post_process: PostProcessSettings::default(),
             nodes: BTreeMap::new(),
             pixel_canvases: BTreeMap::new(),
             voxel_volumes: BTreeMap::new(),

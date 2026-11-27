@@ -37,6 +37,10 @@ fn default_one() -> f32 {
     1.0
 }
 
+fn default_ior() -> f32 {
+    1.5
+}
+
 /// Identifies an optional NPR / Sumi-e texture slot on a `LowPolyMesh` (`L2`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -71,6 +75,15 @@ pub struct MeshMaterial {
     /// Optional light direction override `[x, y, z]` for Face SDF shadow evaluation (`L2`).
     #[serde(default)]
     pub face_sdf_light_override: Option<[f32; 3]>,
+    /// HDR emissive intensity multiplier (`0.0..=20.0`, default `1.0`).
+    #[serde(default = "default_one")]
+    pub emissive_intensity: f32,
+    /// Glass/dielectric transmission factor (`0.0..=1.0`, default `0.0`).
+    #[serde(default)]
+    pub transmission: f32,
+    /// Index of Refraction (`1.0..=2.5`, default `1.5`).
+    #[serde(default = "default_ior")]
+    pub ior: f32,
 }
 
 impl Default for MeshMaterial {
@@ -87,6 +100,9 @@ impl Default for MeshMaterial {
             matcap_strength: 0.0,
             hatching_scale: 1.0,
             face_sdf_light_override: None,
+            emissive_intensity: 1.0,
+            transmission: 0.0,
+            ior: default_ior(),
         }
     }
 }

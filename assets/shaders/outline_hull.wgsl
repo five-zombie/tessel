@@ -9,6 +9,9 @@ struct ShadowMapUniform {
     light_view_proj: mat4x4<f32>,
     bias_params: vec4<f32>,
     npr_params: vec4<f32>,
+    fog_color_density: vec4<f32>,
+    fog_params: vec4<f32>,
+    lookdev_tint: vec4<f32>,
 };
 
 @group(0) @binding(0)

@@ -573,8 +573,19 @@ impl UndoDelta {
             Self::RestoreReferencePlanes(prev) => {
                 scene.reference_planes = prev.clone();
             }
-            Self::RestoreNprLookParams(prev) => {
-                scene.npr_look = *prev;
+            Self::RestoreNprLookParams {
+                previous,
+                previous_post_process,
+            } => {
+                scene.npr_look = *previous;
+                scene.post_process = *previous_post_process;
+            }
+            Self::RestorePostProcess {
+                previous,
+                previous_npr_bloom,
+            } => {
+                scene.post_process = *previous;
+                scene.npr_look.bloom_strength = *previous_npr_bloom;
             }
             Self::Transaction(deltas) => {
                 for delta in deltas.iter().rev() {

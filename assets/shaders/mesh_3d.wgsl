@@ -14,6 +14,8 @@ struct MaterialUniform {
     npr_slots: vec4<f32>,
     /// [light_x, light_y, light_z, has_face_sdf_light_override]
     face_sdf_light: vec4<f32>,
+    /// [emissive_intensity, use_palette_mat_lut, transmission, ior]
+    hdr_flags: vec4<f32>,
 };
 
 struct ShadowMapUniform {
@@ -21,6 +23,12 @@ struct ShadowMapUniform {
     bias_params: vec4<f32>,
     /// [shading_mode (0=PBR, 1=NPR, 2=Silhouette, 3=Luminance), outline_width, fog_dist, paper_grain]
     npr_params: vec4<f32>,
+    /// [fog_r, fog_g, fog_b, fog_density]
+    fog_color_density: vec4<f32>,
+    /// [fog_enabled, fog_start, fog_height_falloff, 0.0]
+    fog_params: vec4<f32>,
+    /// [key_tint_r, key_tint_g, key_tint_b, ambient_scale]
+    lookdev_tint: vec4<f32>,
 };
 
 @group(0) @binding(0)
@@ -46,6 +54,9 @@ var face_sdf_tex: texture_2d<f32>;
 
 @group(0) @binding(7)
 var hatching_tex: texture_2d<f32>;
+
+@group(0) @binding(8)
+var palette_mat_tex: texture_2d<f32>;
 
 @group(1) @binding(0)
 var<uniform> shadow_map: ShadowMapUniform;
@@ -124,6 +135,15 @@ fn fs_main(in: VertexOut, @builtin(front_facing) front_facing: bool) -> @locatio
     }
     let base_color = sampled_rgba.rgb;
     let shading_mode = i32(round(shadow_map.npr_params.x));
+    let use_lut = material.hdr_flags.y > 0.5;
+    let lut0 = textureSample(palette_mat_tex, palette_sampler, vec2<f32>(in.palette_uv.x, 0.25));
+    let metallic = clamp(select(material.pbr.x, lut0.g, use_lut), 0.0, 1.0);
+    let roughness = clamp(select(material.pbr.y, lut0.r, use_lut), 0.05, 1.0);
+    let emissive_rgb = select(
+        material.emissive.rgb * max(material.hdr_flags.x, 0.0),
+        base_color * max(lut0.b, 0.0),
+        use_lut,
+    );
 
     if (shading_mode == 2) {
         // Silhouette readability check mode
@@ -131,7 +151,7 @@ fn fs_main(in: VertexOut, @builtin(front_facing) front_facing: bool) -> @locatio
     }
     if (material.emissive.w > 0.5) {
         // KHR_materials_unlit
-        return vec4<f32>(base_color + material.emissive.rgb, sampled_rgba.a);
+        return vec4<f32>(base_color + emissive_rgb, sampled_rgba.a);
     }
 
     let raw_n_len = length(in.normal);
@@ -233,15 +253,22 @@ fn fs_main(in: VertexOut, @builtin(front_facing) front_facing: bool) -> @locatio
         let hemi = mix(0.28, 0.46, n.y * 0.5 + 0.5);
         let rim = pow(1.0 - max(dot(n, view_dir), 0.0), 3.0) * 0.12;
 
-        let metallic = clamp(material.pbr.x, 0.0, 1.0);
-        let roughness = clamp(material.pbr.y, 0.05, 1.0);
         let spec_pow = mix(128.0, 4.0, roughness * roughness);
         let spec_strength = mix(0.04, 1.0, metallic) + (1.0 - roughness) * 0.45;
         let spec_color = mix(vec3<f32>(1.0), base_color, metallic);
-        let specular = spec_color * pow(max(dot(n, half_vec), 0.0), spec_pow) * spec_strength * shadow_vis;
+        let key_tint = shadow_map.lookdev_tint.rgb;
+        let amb_scale = shadow_map.lookdev_tint.w;
+        let specular = spec_color * key_tint * pow(max(dot(n, half_vec), 0.0), spec_pow) * spec_strength * shadow_vis;
 
-        let diffuse = base_color * (1.0 - metallic * 0.65) * (hemi + ndl * 0.68 * shadow_vis + fill);
-        lit = (diffuse + specular) * in.ao + vec3<f32>(rim) + material.emissive.rgb;
+        let diffuse = base_color * (1.0 - metallic * 0.65) * (vec3<f32>((hemi + fill) * amb_scale) + key_tint * (ndl * 0.68 * shadow_vis));
+        lit = (diffuse + specular) * in.ao + vec3<f32>(rim * amb_scale) + emissive_rgb;
+
+        if (shading_mode == 0 && shadow_map.fog_params.x > 0.5) {
+            let dist_over = max(cam_dist - shadow_map.fog_params.y, 0.0);
+            let height_atten = exp(-max(in.world_pos.y, 0.0) * shadow_map.fog_params.z);
+            let fog_amount = 1.0 - exp(-dist_over * shadow_map.fog_color_density.w * height_atten);
+            lit = mix(lit, shadow_map.fog_color_density.rgb, clamp(fog_amount, 0.0, 1.0));
+        }
     }
 
     if (shading_mode == 3) {

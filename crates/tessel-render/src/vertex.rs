@@ -22,7 +22,7 @@ pub struct CameraUniform {
     pub light_dir: [f32; 4],
 }
 
-/// Per-mesh PBR & NPR material uniform (64 bytes) matching `mesh_3d.wgsl`.
+/// Per-mesh PBR & NPR material uniform (80 bytes) matching `mesh_3d.wgsl`.
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Pod, Zeroable)]
 pub struct MaterialUniform {
@@ -34,6 +34,8 @@ pub struct MaterialUniform {
     pub npr_slots: [f32; 4],
     /// `[light_x, light_y, light_z, has_face_sdf_light_override]`
     pub face_sdf_light: [f32; 4],
+    /// `[emissive_intensity, use_palette_mat_lut (1.0/0.0), transmission, ior]`
+    pub hdr_flags: [f32; 4],
 }
 
 impl Default for MaterialUniform {
@@ -43,11 +45,12 @@ impl Default for MaterialUniform {
             emissive: [0.0, 0.0, 0.0, 0.0],
             npr_slots: [0.0, 0.0, 0.0, 1.0],
             face_sdf_light: [0.0, 0.0, 1.0, 0.0],
+            hdr_flags: [1.0, 1.0, 0.0, 1.5],
         }
     }
 }
 
-/// Directional shadow-map light projection, normal-offset bias, and NPR viewport shading params (96 bytes).
+/// Directional shadow-map light projection, NPR viewport shading, look-dev tint, and forward fog params (144 bytes).
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Pod, Zeroable)]
 pub struct ShadowMapUniform {
@@ -56,6 +59,12 @@ pub struct ShadowMapUniform {
     pub bias_params: [f32; 4],
     /// `[shading_mode (0=PBR,1=NPR,2=Silhouette,3=Luminance), outline_width, fog_dist, paper_grain]`
     pub npr_params: [f32; 4],
+    /// `[fog_r, fog_g, fog_b, fog_density]`
+    pub fog_color_density: [f32; 4],
+    /// `[fog_enabled (1.0/0.0), fog_start, fog_height_falloff, 0.0]`
+    pub fog_params: [f32; 4],
+    /// `[key_tint_r, key_tint_g, key_tint_b, ambient_scale]`
+    pub lookdev_tint: [f32; 4],
 }
 
 impl Default for ShadowMapUniform {
@@ -64,6 +73,9 @@ impl Default for ShadowMapUniform {
             light_view_proj: glam::Mat4::IDENTITY.to_cols_array_2d(),
             bias_params: [0.015, 0.0015, 0.55, 0.0],
             npr_params: [0.0, 0.014, 40.0, 0.06],
+            fog_color_density: [0.08, 0.10, 0.14, 0.02],
+            fog_params: [0.0, 8.0, 0.25, 0.0],
+            lookdev_tint: [1.0, 1.0, 1.0, 1.0],
         }
     }
 }

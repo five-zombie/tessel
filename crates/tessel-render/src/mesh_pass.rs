@@ -1,5 +1,6 @@
 use tessel_core::{
-    AlphaMode, MeshMaterial, MeshTexture, Palette, PaletteIndex, ViewportShadingMode,
+    AlphaMode, LookDevPreset, MeshMaterial, MeshTexture, Palette, PaletteIndex,
+    PostProcessSettings, ViewportShadingMode,
 };
 use wgpu::util::DeviceExt;
 
@@ -81,6 +82,8 @@ pub struct MeshPass {
     _default_material_buffer: wgpu::Buffer,
     palette_texture: wgpu::Texture,
     palette_view: wgpu::TextureView,
+    palette_mat_texture: wgpu::Texture,
+    palette_mat_view: wgpu::TextureView,
     _default_normal_texture: wgpu::Texture,
     default_normal_view: wgpu::TextureView,
     _default_white_texture: wgpu::Texture,
@@ -139,6 +142,25 @@ impl MeshPass {
             view_formats: &[],
         });
         let palette_view = palette_texture.create_view(&wgpu::TextureViewDescriptor::default());
+        // 256x2 Rgba16Float Palette Material LUT:
+        // Row 0 (v=0.25): [roughness, metallic, emissive_hdr, transmission]
+        // Row 1 (v=0.75): [ior, 0.0, 0.0, 0.0]
+        let palette_mat_texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("tessel-palette-mat-lut-256x2"),
+            size: wgpu::Extent3d {
+                width: 256,
+                height: 2,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba16Float,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        let palette_mat_view =
+            palette_mat_texture.create_view(&wgpu::TextureViewDescriptor::default());
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("tessel-palette-sampler"),
             mag_filter: wgpu::FilterMode::Nearest,
@@ -267,6 +289,16 @@ impl MeshPass {
                     },
                     count: None,
                 },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 8,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
             ],
         });
 
@@ -305,6 +337,10 @@ impl MeshPass {
                 wgpu::BindGroupEntry {
                     binding: 7,
                     resource: wgpu::BindingResource::TextureView(&default_white_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 8,
+                    resource: wgpu::BindingResource::TextureView(&palette_mat_view),
                 },
             ],
         });
@@ -667,6 +703,8 @@ impl MeshPass {
             _default_material_buffer: default_material_buffer,
             palette_texture,
             palette_view,
+            palette_mat_texture,
+            palette_mat_view,
             _default_normal_texture: default_normal_texture,
             default_normal_view,
             _default_white_texture: default_white_texture,
@@ -728,14 +766,29 @@ impl MeshPass {
             },
         );
         let mut rgba = vec![255u8; 256 * 4];
+        let mut lut_f16 = vec![0u16; 256 * 2 * 4];
+        // Initialize default matte material values across all 256 slots.
+        let def_rough = f32_to_f16_bits(0.85);
+        let def_ior = f32_to_f16_bits(1.5);
+        for slot in 0..256usize {
+            lut_f16[slot * 4] = def_rough;
+            lut_f16[(256 + slot) * 4] = def_ior;
+        }
         for raw in 1u8..=255 {
             if let Ok(idx) = PaletteIndex::new(raw) {
                 if let Some(entry) = palette.get(idx) {
-                    let base = usize::from(raw) * 4;
+                    let slot = usize::from(raw);
+                    let base = slot * 4;
                     rgba[base] = entry.color.r;
                     rgba[base + 1] = entry.color.g;
                     rgba[base + 2] = entry.color.b;
                     rgba[base + 3] = entry.color.a;
+                    lut_f16[base] = f32_to_f16_bits(entry.roughness.clamp(0.05, 1.0));
+                    lut_f16[base + 1] = f32_to_f16_bits(entry.metallic.clamp(0.0, 1.0));
+                    lut_f16[base + 2] = f32_to_f16_bits(entry.emissive.clamp(0.0, 20.0));
+                    lut_f16[base + 3] = f32_to_f16_bits(entry.transmission.clamp(0.0, 1.0));
+                    let row1 = (256 + slot) * 4;
+                    lut_f16[row1] = f32_to_f16_bits(entry.ior.clamp(1.0, 2.5));
                 }
             }
         }
@@ -755,6 +808,25 @@ impl MeshPass {
             wgpu::Extent3d {
                 width: 256,
                 height: 1,
+                depth_or_array_layers: 1,
+            },
+        );
+        queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &self.palette_mat_texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            bytemuck::cast_slice(&lut_f16),
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(256 * 8),
+                rows_per_image: Some(2),
+            },
+            wgpu::Extent3d {
+                width: 256,
+                height: 2,
                 depth_or_array_layers: 1,
             },
         );
@@ -846,6 +918,12 @@ impl MeshPass {
                 Some([x, y, z]) => (x, y, z, 1.0),
                 None => (0.0, 0.0, 1.0, 0.0),
             };
+            let use_palette_mat_lut = item.texture.is_none()
+                && mat.metallic == 0.0
+                && (mat.roughness - 0.85).abs() < 1e-4
+                && mat.emissive == [0.0, 0.0, 0.0]
+                && mat.transmission == 0.0
+                && (mat.ior - 1.5).abs() < 1e-4;
             let mat_uniform = MaterialUniform {
                 pbr: [
                     mat.metallic,
@@ -874,6 +952,12 @@ impl MeshPass {
                     mat.hatching_scale.clamp(0.1, 64.0),
                 ],
                 face_sdf_light: [sdf_lx, sdf_ly, sdf_lz, has_sdf_override],
+                hdr_flags: [
+                    mat.emissive_intensity.clamp(0.0, 20.0),
+                    if use_palette_mat_lut { 1.0 } else { 0.0 },
+                    mat.transmission.clamp(0.0, 1.0),
+                    mat.ior.clamp(1.0, 2.5),
+                ],
             };
             let material_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
                 label: Some("tessel-custom-material-uniform"),
@@ -943,6 +1027,10 @@ impl MeshPass {
                         binding: 7,
                         resource: wgpu::BindingResource::TextureView(hatch_view_ref),
                     },
+                    wgpu::BindGroupEntry {
+                        binding: 8,
+                        resource: wgpu::BindingResource::TextureView(&self.palette_mat_view),
+                    },
                 ],
             });
             let vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -966,7 +1054,7 @@ impl MeshPass {
                 vertex_buffer,
                 index_buffer,
                 index_count: indices.len() as u32,
-                cast_shadow: mat.cast_shadow,
+                cast_shadow: mat.cast_shadow && mat.transmission <= 0.0,
                 alpha_blend: mat.alpha_mode == AlphaMode::Blend,
             });
         }
@@ -977,7 +1065,8 @@ impl MeshPass {
     }
 
     /// Renders all shadow-casting 3D meshes into the 2048x2048 directional depth shadow map
-    /// and updates the active NPR/PBR shading mode uniform.
+    /// and updates the active NPR/PBR shading mode, forward fog, and look-dev lighting uniform.
+    #[allow(clippy::too_many_arguments)]
     pub fn render_shadow_map(
         &self,
         queue: &wgpu::Queue,
@@ -986,6 +1075,8 @@ impl MeshPass {
         min: [f32; 3],
         max: [f32; 3],
         shading_mode: ViewportShadingMode,
+        post_process: &PostProcessSettings,
+        lookdev_preset: LookDevPreset,
     ) {
         let has_geo = self.index_count > 0 || self.textured_draws.iter().any(|d| d.cast_shadow);
         let light_vp = compute_light_view_proj(light_dir, min, max);
@@ -995,10 +1086,29 @@ impl MeshPass {
             ViewportShadingMode::SilhouetteCheck => 2.0,
             ViewportShadingMode::LuminanceValueCheck => 3.0,
         };
+        let lookdev_tint = match lookdev_preset {
+            LookDevPreset::Daylight => [1.0, 1.0, 1.0, 1.0],
+            LookDevPreset::Night => [0.55, 0.70, 1.05, 0.45],
+            LookDevPreset::Indoor => [1.05, 0.96, 0.86, 0.90],
+            LookDevPreset::Sunset => [1.18, 0.78, 0.56, 0.82],
+        };
         let uniform = ShadowMapUniform {
             light_view_proj: light_vp.to_cols_array_2d(),
             bias_params: [0.015, 0.0015, 0.55, if has_geo { 1.0 } else { 0.0 }],
             npr_params: [mode_id, 0.014, 40.0, 0.06],
+            fog_color_density: [
+                post_process.fog_color[0].clamp(0.0, 1.0),
+                post_process.fog_color[1].clamp(0.0, 1.0),
+                post_process.fog_color[2].clamp(0.0, 1.0),
+                post_process.fog_density.clamp(0.0, 1.0),
+            ],
+            fog_params: [
+                if post_process.fog_enabled { 1.0 } else { 0.0 },
+                post_process.fog_start.clamp(0.0, 500.0),
+                post_process.fog_height_falloff.clamp(0.0, 5.0),
+                0.0,
+            ],
+            lookdev_tint,
         };
         queue.write_buffer(&self.shadow_uniform_buffer, 0, bytemuck::bytes_of(&uniform));
 
@@ -1153,9 +1263,50 @@ fn upload_optional_rgba_texture(
     (Some(t), Some(v))
 }
 
+pub(crate) fn f32_to_f16_bits(val: f32) -> u16 {
+    if !val.is_finite() {
+        return 0;
+    }
+    let clamped = val.clamp(-65504.0, 65504.0);
+    let bits = clamped.to_bits();
+    let sign = ((bits >> 16) & 0x8000) as u16;
+    let exp = ((bits >> 23) & 0xff) as i32;
+    let mant = bits & 0x007f_ffff;
+    if exp == 0 {
+        return sign;
+    }
+    let new_exp = exp - 127 + 15;
+    if new_exp >= 31 {
+        return sign | 0x7bff;
+    }
+    if new_exp <= 0 {
+        if new_exp < -10 {
+            return sign;
+        }
+        let m = (mant | 0x0080_0000) >> (1 - new_exp + 13);
+        return sign | (m as u16);
+    }
+    let rounded = (mant + 0x0000_1000) >> 13;
+    if rounded >= 0x0400 {
+        let e = (new_exp + 1).min(30) as u16;
+        return sign | (e << 10);
+    }
+    sign | ((new_exp as u16) << 10) | (rounded as u16)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn f32_to_f16_bits_encodes_material_values_accurately() {
+        assert_eq!(f32_to_f16_bits(0.0), 0x0000);
+        assert_eq!(f32_to_f16_bits(1.0), 0x3c00);
+        assert_eq!(f32_to_f16_bits(1.5), 0x3e00);
+        assert_eq!(f32_to_f16_bits(20.0), 0x4d00);
+        assert_eq!(f32_to_f16_bits(f32::NAN), 0x0000);
+        assert_eq!(f32_to_f16_bits(f32::INFINITY), 0x0000);
+    }
 
     #[test]
     fn compute_light_view_proj_frames_scene_bounds_in_clip_space() {

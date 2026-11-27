@@ -584,6 +584,9 @@ pub(super) fn apply(cmd: &Command, scene: &mut SceneState) -> Result<UndoDelta, 
                 || material
                     .face_sdf_light_override
                     .is_some_and(|d| d.iter().any(|c| !c.is_finite()))
+                || !material.emissive_intensity.is_finite()
+                || !material.transmission.is_finite()
+                || !material.ior.is_finite()
             {
                 return Err(CoreError::OutOfBounds);
             }
@@ -613,6 +616,9 @@ pub(super) fn apply(cmd: &Command, scene: &mut SceneState) -> Result<UndoDelta, 
                 matcap_strength: material.matcap_strength.clamp(0.0, 1.0),
                 hatching_scale: material.hatching_scale.clamp(0.1, 64.0),
                 face_sdf_light_override: material.face_sdf_light_override,
+                emissive_intensity: material.emissive_intensity.clamp(0.0, 20.0),
+                transmission: material.transmission.clamp(0.0, 1.0),
+                ior: material.ior.clamp(1.0, 2.5),
             };
             let mesh = scene
                 .lowpoly_meshes

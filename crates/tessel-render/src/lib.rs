@@ -4,6 +4,7 @@ pub mod grid_pass;
 pub mod mesh_pass;
 pub mod overlay_pass;
 pub mod pixel_pass;
+pub mod post_process_pass;
 pub mod shadow_pass;
 pub mod vertex;
 pub mod viewport;

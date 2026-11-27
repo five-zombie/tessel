@@ -12,6 +12,7 @@ use crate::grid_pass::GridPass;
 use crate::mesh_pass::MeshPass;
 use crate::overlay_pass::{OverlayPass, PlacementGhost};
 use crate::pixel_pass::{PixelCamera2D, PixelPass};
+use crate::post_process_pass::PostProcessPass;
 use crate::shadow_pass::{ShadowPass, ShadowUniform};
 use crate::vertex::StudioVertex3D;
 
@@ -24,23 +25,27 @@ const VIEWPORT_CLEAR_COLOR: wgpu::Color = wgpu::Color {
 };
 
 pub const VIEWPORT_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8UnormSrgb;
+pub const HDR_VIEWPORT_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
 pub const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
 /// Default upper bound for synchronous GPU-to-CPU viewport readback before timing out.
 pub const DEFAULT_READBACK_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Owns the offscreen viewport render target and orchestrates 2D/3D viewport passes.
+/// Owns the offscreen viewport render targets and orchestrates 2D/3D HDR + post-process passes.
 pub struct ViewportRenderer {
     size: (u32, u32),
     sample_count: u32,
     color_texture: wgpu::Texture,
     color_view: wgpu::TextureView,
-    msaa_color_texture: Option<wgpu::Texture>,
-    msaa_color_view: Option<wgpu::TextureView>,
+    hdr_color_texture: wgpu::Texture,
+    hdr_color_view: wgpu::TextureView,
+    msaa_hdr_color_texture: Option<wgpu::Texture>,
+    msaa_hdr_color_view: Option<wgpu::TextureView>,
     depth_texture: wgpu::Texture,
     depth_view: wgpu::TextureView,
     grid_pass: GridPass,
     shadow_pass: ShadowPass,
     mesh_pass: MeshPass,
+    post_process_pass: PostProcessPass,
     overlay_pass: OverlayPass,
     pixel_pass: PixelPass,
     last_uploaded_revision: u64,
@@ -64,25 +69,31 @@ impl ViewportRenderer {
         let safe_size = (width.max(1), height.max(1));
         let sample_count = 1u32;
         let (color_texture, color_view) = create_color_target(device, safe_size.0, safe_size.1);
+        let (hdr_color_texture, hdr_color_view) =
+            create_hdr_color_target(device, safe_size.0, safe_size.1);
         let (depth_texture, depth_view) =
             create_depth_target(device, safe_size.0, safe_size.1, sample_count);
-        let grid_pass = GridPass::new(device, VIEWPORT_FORMAT, DEPTH_FORMAT, sample_count);
-        let shadow_pass = ShadowPass::new(device, VIEWPORT_FORMAT, DEPTH_FORMAT, sample_count);
-        let mesh_pass = MeshPass::new(device, VIEWPORT_FORMAT, DEPTH_FORMAT, sample_count);
-        let overlay_pass = OverlayPass::new(device, VIEWPORT_FORMAT, DEPTH_FORMAT, sample_count);
+        let grid_pass = GridPass::new(device, HDR_VIEWPORT_FORMAT, DEPTH_FORMAT, sample_count);
+        let shadow_pass = ShadowPass::new(device, HDR_VIEWPORT_FORMAT, DEPTH_FORMAT, sample_count);
+        let mesh_pass = MeshPass::new(device, HDR_VIEWPORT_FORMAT, DEPTH_FORMAT, sample_count);
+        let post_process_pass = PostProcessPass::new(device, VIEWPORT_FORMAT, &hdr_color_view);
+        let overlay_pass = OverlayPass::new(device, VIEWPORT_FORMAT);
         let pixel_pass = PixelPass::new(device, VIEWPORT_FORMAT);
         Self {
             size: safe_size,
             sample_count,
             color_texture,
             color_view,
-            msaa_color_texture: None,
-            msaa_color_view: None,
+            hdr_color_texture,
+            hdr_color_view,
+            msaa_hdr_color_texture: None,
+            msaa_hdr_color_view: None,
             depth_texture,
             depth_view,
             grid_pass,
             shadow_pass,
             mesh_pass,
+            post_process_pass,
             overlay_pass,
             pixel_pass,
             last_uploaded_revision: u64::MAX,
@@ -124,25 +135,24 @@ impl ViewportRenderer {
         self.sample_count = normalized;
         let (w, h) = self.size;
         let (msaa_tex, msaa_view) = if normalized > 1 {
-            let (t, v) = create_msaa_color_target(device, w, h, normalized);
+            let (t, v) = create_msaa_hdr_color_target(device, w, h, normalized);
             (Some(t), Some(v))
         } else {
             (None, None)
         };
         let (dtex, dview) = create_depth_target(device, w, h, normalized);
-        self.msaa_color_texture = msaa_tex;
-        self.msaa_color_view = msaa_view;
+        self.msaa_hdr_color_texture = msaa_tex;
+        self.msaa_hdr_color_view = msaa_view;
         self.depth_texture = dtex;
         self.depth_view = dview;
-        self.grid_pass = GridPass::new(device, VIEWPORT_FORMAT, DEPTH_FORMAT, normalized);
-        self.shadow_pass = ShadowPass::new(device, VIEWPORT_FORMAT, DEPTH_FORMAT, normalized);
-        self.mesh_pass = MeshPass::new(device, VIEWPORT_FORMAT, DEPTH_FORMAT, normalized);
-        self.overlay_pass = OverlayPass::new(device, VIEWPORT_FORMAT, DEPTH_FORMAT, normalized);
+        self.grid_pass = GridPass::new(device, HDR_VIEWPORT_FORMAT, DEPTH_FORMAT, normalized);
+        self.shadow_pass = ShadowPass::new(device, HDR_VIEWPORT_FORMAT, DEPTH_FORMAT, normalized);
+        self.mesh_pass = MeshPass::new(device, HDR_VIEWPORT_FORMAT, DEPTH_FORMAT, normalized);
         self.last_uploaded_revision = u64::MAX;
         true
     }
 
-    /// Resizes offscreen color & depth targets only when physical pixel dimensions change.
+    /// Resizes offscreen color, HDR, MSAA, & depth targets only when physical pixel dimensions change.
     pub fn resize(&mut self, device: &wgpu::Device, width: u32, height: u32) -> bool {
         let next = (width.max(1), height.max(1));
         if next == self.size {
@@ -150,8 +160,9 @@ impl ViewportRenderer {
         }
         self.size = next;
         let (tex, view) = create_color_target(device, next.0, next.1);
+        let (hdr_tex, hdr_view) = create_hdr_color_target(device, next.0, next.1);
         let (msaa_tex, msaa_view) = if self.sample_count > 1 {
-            let (t, v) = create_msaa_color_target(device, next.0, next.1, self.sample_count);
+            let (t, v) = create_msaa_hdr_color_target(device, next.0, next.1, self.sample_count);
             (Some(t), Some(v))
         } else {
             (None, None)
@@ -159,10 +170,14 @@ impl ViewportRenderer {
         let (dtex, dview) = create_depth_target(device, next.0, next.1, self.sample_count);
         self.color_texture = tex;
         self.color_view = view;
-        self.msaa_color_texture = msaa_tex;
-        self.msaa_color_view = msaa_view;
+        self.hdr_color_texture = hdr_tex;
+        self.hdr_color_view = hdr_view;
+        self.msaa_hdr_color_texture = msaa_tex;
+        self.msaa_hdr_color_view = msaa_view;
         self.depth_texture = dtex;
         self.depth_view = dview;
+        self.post_process_pass
+            .rebind_hdr(device, &self.hdr_color_view);
         true
     }
 
@@ -665,42 +680,72 @@ impl ViewportRenderer {
                     self.scene_bounds.0,
                     self.scene_bounds.1,
                     scene.shading_mode,
+                    &scene.post_process,
+                    scene.lookdev_preset,
                 );
 
-                let (color_view_target, resolve_target, store_op) =
-                    if let Some(msaa_view) = self.msaa_color_view.as_ref() {
-                        (msaa_view, Some(&self.color_view), wgpu::StoreOp::Discard)
-                    } else {
-                        (&self.color_view, None, wgpu::StoreOp::Store)
-                    };
-                let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                    label: Some("tessel-3d-viewport-pass"),
-                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                        view: color_view_target,
-                        resolve_target,
-                        ops: wgpu::Operations {
-                            load: wgpu::LoadOp::Clear(VIEWPORT_CLEAR_COLOR),
-                            store: store_op,
-                        },
-                    })],
-                    depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
-                        view: &self.depth_view,
-                        depth_ops: Some(wgpu::Operations {
-                            load: wgpu::LoadOp::Clear(1.0),
-                            store: wgpu::StoreOp::Store,
+                // Pass 2: Main 3D HDR Pass (Rgba16Float, MSAA StoreOp::Store preserved for Pass 2.5)
+                {
+                    let (hdr_target, resolve_target) =
+                        if let Some(msaa_view) = self.msaa_hdr_color_view.as_ref() {
+                            (msaa_view, Some(&self.hdr_color_view))
+                        } else {
+                            (&self.hdr_color_view, None)
+                        };
+                    let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                        label: Some("tessel-3d-hdr-viewport-pass"),
+                        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                            view: hdr_target,
+                            resolve_target,
+                            ops: wgpu::Operations {
+                                load: wgpu::LoadOp::Clear(VIEWPORT_CLEAR_COLOR),
+                                store: wgpu::StoreOp::Store,
+                            },
+                        })],
+                        depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                            view: &self.depth_view,
+                            depth_ops: Some(wgpu::Operations {
+                                load: wgpu::LoadOp::Clear(1.0),
+                                store: wgpu::StoreOp::Store,
+                            }),
+                            stencil_ops: None,
                         }),
-                        stencil_ops: None,
-                    }),
-                    occlusion_query_set: None,
-                    timestamp_writes: None,
-                });
-                if !render_preview {
-                    self.grid_pass.draw(&mut pass);
+                        occlusion_query_set: None,
+                        timestamp_writes: None,
+                    });
+                    if !render_preview {
+                        self.grid_pass.draw(&mut pass);
+                    }
+                    self.shadow_pass.draw(&mut pass);
+                    self.mesh_pass.draw(&mut pass, scene.shading_mode);
                 }
-                self.shadow_pass.draw(&mut pass);
-                self.mesh_pass.draw(&mut pass, scene.shading_mode);
+
+                // Pass 4: Final HDR -> LDR Composite (Exposure + ACES Filmic, NPR bypass)
+                self.post_process_pass.update_params(
+                    queue,
+                    &scene.post_process,
+                    scene.shading_mode,
+                );
+                self.post_process_pass
+                    .draw_composite(encoder, &self.color_view);
+
+                // Pass 5: Crisp UI & Overlay Pass directly over post-ACES LDR color_view
                 if !render_preview {
-                    self.overlay_pass.draw(&mut pass);
+                    let mut overlay = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                        label: Some("tessel-3d-overlay-ldr-pass"),
+                        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                            view: &self.color_view,
+                            resolve_target: None,
+                            ops: wgpu::Operations {
+                                load: wgpu::LoadOp::Load,
+                                store: wgpu::StoreOp::Store,
+                            },
+                        })],
+                        depth_stencil_attachment: None,
+                        occlusion_query_set: None,
+                        timestamp_writes: None,
+                    });
+                    self.overlay_pass.draw(&mut overlay);
                 }
             }
         }
@@ -868,23 +913,48 @@ fn create_color_target(
     (texture, view)
 }
 
-fn create_msaa_color_target(
+fn create_hdr_color_target(
+    device: &wgpu::Device,
+    width: u32,
+    height: u32,
+) -> (wgpu::Texture, wgpu::TextureView) {
+    let texture = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("tessel-viewport-hdr-color"),
+        size: wgpu::Extent3d {
+            width: width.max(1),
+            height: height.max(1),
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: HDR_VIEWPORT_FORMAT,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+            | wgpu::TextureUsages::TEXTURE_BINDING
+            | wgpu::TextureUsages::COPY_SRC,
+        view_formats: &[],
+    });
+    let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+    (texture, view)
+}
+
+fn create_msaa_hdr_color_target(
     device: &wgpu::Device,
     width: u32,
     height: u32,
     sample_count: u32,
 ) -> (wgpu::Texture, wgpu::TextureView) {
     let texture = device.create_texture(&wgpu::TextureDescriptor {
-        label: Some("tessel-viewport-msaa-color"),
+        label: Some("tessel-viewport-msaa-hdr-color"),
         size: wgpu::Extent3d {
-            width,
-            height,
+            width: width.max(1),
+            height: height.max(1),
             depth_or_array_layers: 1,
         },
         mip_level_count: 1,
         sample_count,
         dimension: wgpu::TextureDimension::D2,
-        format: VIEWPORT_FORMAT,
+        format: HDR_VIEWPORT_FORMAT,
         usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
         view_formats: &[],
     });

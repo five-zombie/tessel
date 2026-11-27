@@ -190,7 +190,24 @@ pub(super) fn apply(cmd: &Command, scene: &mut SceneState) -> Result<UndoDelta, 
             UndoDelta::RestoreShadingMode(prev)
         }
         Command::SetPaletteEntry { index, entry } => {
-            let previous = scene.palette.set(*index, entry.clone());
+            if !entry.roughness.is_finite()
+                || !entry.metallic.is_finite()
+                || !entry.emissive.is_finite()
+                || !entry.transmission.is_finite()
+                || !entry.ior.is_finite()
+            {
+                return Err(CoreError::OutOfBounds);
+            }
+            let sanitized = PaletteEntry {
+                name: entry.name.clone(),
+                color: entry.color,
+                roughness: entry.roughness.clamp(0.05, 1.0),
+                metallic: entry.metallic.clamp(0.0, 1.0),
+                emissive: entry.emissive.clamp(0.0, 20.0),
+                transmission: entry.transmission.clamp(0.0, 1.0),
+                ior: entry.ior.clamp(1.0, 2.5),
+            };
+            let previous = scene.palette.set(*index, sanitized);
             UndoDelta::RestorePaletteEntry {
                 index: *index,
                 previous,
@@ -442,8 +459,33 @@ pub(super) fn apply(cmd: &Command, scene: &mut SceneState) -> Result<UndoDelta, 
                 return Err(CoreError::OutOfBounds);
             }
             let prev = scene.npr_look;
+            let prev_pp = scene.post_process;
             scene.npr_look = *params;
-            UndoDelta::RestoreNprLookParams(prev)
+            if params.bloom_strength > 0.0 {
+                scene.post_process.bloom_enabled = true;
+                scene.post_process.bloom_intensity = params.bloom_strength;
+            } else if prev.bloom_strength > 0.0 {
+                scene.post_process.bloom_enabled = false;
+            }
+            UndoDelta::RestoreNprLookParams {
+                previous: prev,
+                previous_post_process: prev_pp,
+            }
+        }
+        Command::SetPostProcess(settings) => {
+            let validated = settings.validated()?;
+            let previous = scene.post_process;
+            let previous_npr_bloom = scene.npr_look.bloom_strength;
+            scene.post_process = validated;
+            scene.npr_look.bloom_strength = if validated.bloom_enabled {
+                validated.bloom_intensity.clamp(0.0, 2.0)
+            } else {
+                0.0
+            };
+            UndoDelta::RestorePostProcess {
+                previous,
+                previous_npr_bloom,
+            }
         }
         _ => return Err(CoreError::OutOfBounds),
     };

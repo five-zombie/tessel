@@ -7,7 +7,114 @@ use tessel_core::{AutoSkinSolver, SceneState};
 use crate::error::IoError;
 use crate::ExportPreset;
 
-use super::collect::CollectedMesh;
+use super::collect::{CollectedMesh, PaletteMaterialGroup};
+
+#[derive(Default)]
+struct GltfExtensionFlags {
+    unlit: bool,
+    emissive_strength: bool,
+    transmission: bool,
+    ior: bool,
+}
+
+impl GltfExtensionFlags {
+    fn to_extensions_used(&self) -> Vec<&'static str> {
+        let mut out = Vec::new();
+        if self.unlit {
+            out.push("KHR_materials_unlit");
+        }
+        if self.emissive_strength {
+            out.push("KHR_materials_emissive_strength");
+        }
+        if self.transmission {
+            out.push("KHR_materials_transmission");
+        }
+        if self.ior {
+            out.push("KHR_materials_ior");
+        }
+        out
+    }
+}
+
+fn build_material_extensions(
+    unlit: bool,
+    has_emissive: bool,
+    emissive_intensity: f32,
+    transmission: f32,
+    ior: f32,
+    flags: &mut GltfExtensionFlags,
+) -> serde_json::Map<String, Value> {
+    let mut exts = serde_json::Map::new();
+    if unlit {
+        flags.unlit = true;
+        exts.insert("KHR_materials_unlit".into(), json!({}));
+    }
+    if has_emissive && (emissive_intensity - 1.0).abs() > 1e-4 {
+        flags.emissive_strength = true;
+        exts.insert(
+            "KHR_materials_emissive_strength".into(),
+            json!({ "emissiveStrength": emissive_intensity }),
+        );
+    }
+    if transmission > 0.0 {
+        flags.transmission = true;
+        exts.insert(
+            "KHR_materials_transmission".into(),
+            json!({ "transmissionFactor": transmission }),
+        );
+    }
+    if transmission > 0.0 || (ior - 1.5).abs() > 1e-4 {
+        flags.ior = true;
+        exts.insert("KHR_materials_ior".into(), json!({ "ior": ior }));
+    }
+    exts
+}
+
+fn build_palette_group_material_json(
+    name: String,
+    tex_idx: usize,
+    group: PaletteMaterialGroup,
+    flags: &mut GltfExtensionFlags,
+) -> Value {
+    let mut mat_json = json!({
+        "name": name,
+        "pbrMetallicRoughness": {
+            "baseColorTexture": { "index": tex_idx },
+            "metallicFactor": group.metallic(),
+            "roughnessFactor": group.roughness()
+        }
+    });
+    let emissive_strength = group.emissive();
+    let has_emissive = emissive_strength > 0.0;
+    let ext_emissive_strength = if has_emissive {
+        let base_rgb = group.emissive_rgb();
+        if emissive_strength <= 1.0 {
+            mat_json["emissiveFactor"] = json!([
+                base_rgb[0] * emissive_strength,
+                base_rgb[1] * emissive_strength,
+                base_rgb[2] * emissive_strength
+            ]);
+            1.0
+        } else {
+            mat_json["emissiveFactor"] = json!(base_rgb);
+            emissive_strength
+        }
+    } else {
+        1.0
+    };
+    let exts = build_material_extensions(
+        false,
+        has_emissive,
+        ext_emissive_strength,
+        group.transmission(),
+        group.ior(),
+        flags,
+    );
+    if !exts.is_empty() {
+        mat_json["extensions"] = Value::Object(exts);
+    }
+    mat_json
+}
 use super::helpers::{
     align_quat_hemispheres, build_palette_png, collect_node_transform_animated,
     collect_visibility_animated_nodes, encode_rgba_png, expand_mixed_step_keyframes,
@@ -58,15 +165,6 @@ pub fn export_glb_bytes(
         !static_mesh.positions.is_empty() && !static_mesh.indices.is_empty();
     let palette_png = build_palette_png(&scene.palette)?;
 
-    let mut min_pos = [f32::INFINITY; 3];
-    let mut max_pos = [f32::NEG_INFINITY; 3];
-    for p in &mesh.positions {
-        for axis in 0..3 {
-            min_pos[axis] = min_pos[axis].min(p[axis]);
-            max_pos[axis] = max_pos[axis].max(p[axis]);
-        }
-    }
-
     let mut bin = Vec::new();
     let mut buffer_views: Vec<Value> = Vec::new();
     let mut accessors: Vec<Value> = Vec::new();
@@ -97,224 +195,282 @@ pub fn export_glb_bytes(
     let mut static_primitives: Vec<Value> = Vec::new();
     let mut palette_tex_index: Option<usize> = None;
     let mut palette_mat_index: Option<usize> = None;
+    let mut palette_group_materials: BTreeMap<PaletteMaterialGroup, usize> = BTreeMap::new();
+    let mut ext_flags = GltfExtensionFlags::default();
     let mut total_triangles = 0usize;
 
-    if has_palette_prim {
-        let pos_bv = push_view(
-            &mut bin,
-            &mut buffer_views,
-            bytemuck::cast_slice(&mesh.positions),
-            Some(34962),
-        );
-        let norm_bv = push_view(
-            &mut bin,
-            &mut buffer_views,
-            bytemuck::cast_slice(&mesh.normals),
-            Some(34962),
-        );
-        let uv_bv = push_view(
-            &mut bin,
-            &mut buffer_views,
-            bytemuck::cast_slice(&mesh.uvs),
-            Some(34962),
-        );
-        let idx_bv = push_view(
-            &mut bin,
-            &mut buffer_views,
-            bytemuck::cast_slice(&mesh.indices),
-            Some(34963),
-        );
-        let img_bv = push_view(&mut bin, &mut buffer_views, &palette_png, None);
-
-        accessors.push(json!({
-            "bufferView": pos_bv,
-            "componentType": 5126,
-            "count": mesh.positions.len(),
-            "type": "VEC3",
-            "min": min_pos,
-            "max": max_pos
-        }));
-        accessors.push(json!({
-            "bufferView": norm_bv,
-            "componentType": 5126,
-            "count": mesh.normals.len(),
-            "type": "VEC3"
-        }));
-        accessors.push(json!({
-            "bufferView": uv_bv,
-            "componentType": 5126,
-            "count": mesh.uvs.len(),
-            "type": "VEC2"
-        }));
-        accessors.push(json!({
-            "bufferView": idx_bv,
-            "componentType": 5125,
-            "count": mesh.indices.len(),
-            "type": "SCALAR"
-        }));
-
+    let ensure_palette_tex = |palette_tex_index: &mut Option<usize>,
+                              bin: &mut Vec<u8>,
+                              buffer_views: &mut Vec<Value>,
+                              images: &mut Vec<Value>,
+                              textures: &mut Vec<Value>|
+     -> usize {
+        if let Some(existing) = *palette_tex_index {
+            return existing;
+        }
+        let img_bv = push_view(bin, buffer_views, &palette_png, None);
+        let img_idx = images.len();
         images.push(json!({
             "bufferView": img_bv,
             "mimeType": "image/png"
         }));
+        let tex_idx = textures.len();
         textures.push(json!({
             "sampler": 0,
-            "source": 0
+            "source": img_idx
         }));
-        materials.push(json!({
-            "name": "TesselPaletteMaterial",
-            "pbrMetallicRoughness": {
-                "baseColorTexture": { "index": 0 },
-                "metallicFactor": 0.0,
-                "roughnessFactor": 0.85
-            }
-        }));
-        palette_tex_index = Some(0);
-        palette_mat_index = Some(0);
-        let mut prim_attrs = json!({
-            "POSITION": 0,
-            "NORMAL": 1,
-            "TEXCOORD_0": 2
-        });
-        if skin_solver.is_some() && mesh.joints.len() == mesh.positions.len() {
-            let j_bv = push_view(
-                &mut bin,
-                &mut buffer_views,
-                bytemuck::cast_slice(&mesh.joints),
-                Some(34962),
-            );
-            let w_bv = push_view(
-                &mut bin,
-                &mut buffer_views,
-                bytemuck::cast_slice(&mesh.weights),
-                Some(34962),
-            );
-            let j_acc = accessors.len();
-            accessors.push(json!({
-                "bufferView": j_bv,
-                "componentType": 5123,
-                "count": mesh.joints.len(),
-                "type": "VEC4"
-            }));
-            let w_acc = accessors.len();
-            accessors.push(json!({
-                "bufferView": w_bv,
-                "componentType": 5126,
-                "count": mesh.weights.len(),
-                "type": "VEC4"
-            }));
-            prim_attrs["JOINTS_0"] = json!(j_acc);
-            prim_attrs["WEIGHTS_0"] = json!(w_acc);
-        }
-        primitives.push(json!({
-            "attributes": prim_attrs,
-            "indices": 3,
-            "material": 0
-        }));
-        total_triangles += mesh.indices.len() / 3;
-    }
+        *palette_tex_index = Some(tex_idx);
+        tex_idx
+    };
 
-    if has_static_palette_prim {
-        let mut s_min = [f32::INFINITY; 3];
-        let mut s_max = [f32::NEG_INFINITY; 3];
-        for p in &static_mesh.positions {
-            for axis in 0..3 {
-                s_min[axis] = s_min[axis].min(p[axis]);
-                s_max[axis] = s_max[axis].max(p[axis]);
+    if has_palette_prim {
+        let groups = mesh.split_by_palette_material(&scene.palette);
+        for (group, sub) in groups {
+            if sub.positions.is_empty() || sub.indices.is_empty() {
+                continue;
             }
-        }
-        let pos_bv = push_view(
-            &mut bin,
-            &mut buffer_views,
-            bytemuck::cast_slice(&static_mesh.positions),
-            Some(34962),
-        );
-        let norm_bv = push_view(
-            &mut bin,
-            &mut buffer_views,
-            bytemuck::cast_slice(&static_mesh.normals),
-            Some(34962),
-        );
-        let uv_bv = push_view(
-            &mut bin,
-            &mut buffer_views,
-            bytemuck::cast_slice(&static_mesh.uvs),
-            Some(34962),
-        );
-        let idx_bv = push_view(
-            &mut bin,
-            &mut buffer_views,
-            bytemuck::cast_slice(&static_mesh.indices),
-            Some(34963),
-        );
-        let p_acc = accessors.len();
-        accessors.push(json!({
-            "bufferView": pos_bv,
-            "componentType": 5126,
-            "count": static_mesh.positions.len(),
-            "type": "VEC3",
-            "min": s_min,
-            "max": s_max
-        }));
-        let n_acc = accessors.len();
-        accessors.push(json!({
-            "bufferView": norm_bv,
-            "componentType": 5126,
-            "count": static_mesh.normals.len(),
-            "type": "VEC3"
-        }));
-        let u_acc = accessors.len();
-        accessors.push(json!({
-            "bufferView": uv_bv,
-            "componentType": 5126,
-            "count": static_mesh.uvs.len(),
-            "type": "VEC2"
-        }));
-        let i_acc = accessors.len();
-        accessors.push(json!({
-            "bufferView": idx_bv,
-            "componentType": 5125,
-            "count": static_mesh.indices.len(),
-            "type": "SCALAR"
-        }));
-        let mat_idx = match palette_mat_index {
-            Some(existing) => existing,
-            None => {
-                let img_bv = push_view(&mut bin, &mut buffer_views, &palette_png, None);
-                let img_idx = images.len();
-                images.push(json!({
-                    "bufferView": img_bv,
-                    "mimeType": "image/png"
-                }));
-                let tex_idx = textures.len();
-                textures.push(json!({
-                    "sampler": 0,
-                    "source": img_idx
-                }));
+            let mut g_min = [f32::INFINITY; 3];
+            let mut g_max = [f32::NEG_INFINITY; 3];
+            for p in &sub.positions {
+                for axis in 0..3 {
+                    g_min[axis] = g_min[axis].min(p[axis]);
+                    g_max[axis] = g_max[axis].max(p[axis]);
+                }
+            }
+            let pos_bv = push_view(
+                &mut bin,
+                &mut buffer_views,
+                bytemuck::cast_slice(&sub.positions),
+                Some(34962),
+            );
+            let norm_bv = push_view(
+                &mut bin,
+                &mut buffer_views,
+                bytemuck::cast_slice(&sub.normals),
+                Some(34962),
+            );
+            let uv_bv = push_view(
+                &mut bin,
+                &mut buffer_views,
+                bytemuck::cast_slice(&sub.uvs),
+                Some(34962),
+            );
+            let idx_bv = push_view(
+                &mut bin,
+                &mut buffer_views,
+                bytemuck::cast_slice(&sub.indices),
+                Some(34963),
+            );
+            let tex_idx = ensure_palette_tex(
+                &mut palette_tex_index,
+                &mut bin,
+                &mut buffer_views,
+                &mut images,
+                &mut textures,
+            );
+            let mat_idx = if let Some(&existing) = palette_group_materials.get(&group) {
+                existing
+            } else {
                 let m_idx = materials.len();
-                materials.push(json!({
-                    "name": "TesselPaletteMaterial",
-                    "pbrMetallicRoughness": {
-                        "baseColorTexture": { "index": tex_idx },
-                        "metallicFactor": 0.0,
-                        "roughnessFactor": 0.85
-                    }
-                }));
-                palette_tex_index = Some(tex_idx);
-                palette_mat_index = Some(m_idx);
+                let mat_name = if group.is_default {
+                    "TesselPaletteMaterial".to_string()
+                } else {
+                    format!("TesselPaletteMaterial_{m_idx}")
+                };
+                materials.push(build_palette_group_material_json(
+                    mat_name,
+                    tex_idx,
+                    group,
+                    &mut ext_flags,
+                ));
+                palette_group_materials.insert(group, m_idx);
+                if group.is_default {
+                    palette_mat_index = Some(m_idx);
+                }
                 m_idx
-            }
-        };
-        static_primitives.push(json!({
-            "attributes": {
+            };
+
+            let p_acc = accessors.len();
+            accessors.push(json!({
+                "bufferView": pos_bv,
+                "componentType": 5126,
+                "count": sub.positions.len(),
+                "type": "VEC3",
+                "min": g_min,
+                "max": g_max
+            }));
+            let n_acc = accessors.len();
+            accessors.push(json!({
+                "bufferView": norm_bv,
+                "componentType": 5126,
+                "count": sub.normals.len(),
+                "type": "VEC3"
+            }));
+            let u_acc = accessors.len();
+            accessors.push(json!({
+                "bufferView": uv_bv,
+                "componentType": 5126,
+                "count": sub.uvs.len(),
+                "type": "VEC2"
+            }));
+            let i_acc = accessors.len();
+            accessors.push(json!({
+                "bufferView": idx_bv,
+                "componentType": 5125,
+                "count": sub.indices.len(),
+                "type": "SCALAR"
+            }));
+            let mut prim_attrs = json!({
                 "POSITION": p_acc,
                 "NORMAL": n_acc,
                 "TEXCOORD_0": u_acc
-            },
-            "indices": i_acc,
-            "material": mat_idx
-        }));
-        total_triangles += static_mesh.indices.len() / 3;
+            });
+            if skin_solver.is_some() && sub.joints.len() == sub.positions.len() {
+                let j_bv = push_view(
+                    &mut bin,
+                    &mut buffer_views,
+                    bytemuck::cast_slice(&sub.joints),
+                    Some(34962),
+                );
+                let w_bv = push_view(
+                    &mut bin,
+                    &mut buffer_views,
+                    bytemuck::cast_slice(&sub.weights),
+                    Some(34962),
+                );
+                let j_acc = accessors.len();
+                accessors.push(json!({
+                    "bufferView": j_bv,
+                    "componentType": 5123,
+                    "count": sub.joints.len(),
+                    "type": "VEC4"
+                }));
+                let w_acc = accessors.len();
+                accessors.push(json!({
+                    "bufferView": w_bv,
+                    "componentType": 5126,
+                    "count": sub.weights.len(),
+                    "type": "VEC4"
+                }));
+                prim_attrs["JOINTS_0"] = json!(j_acc);
+                prim_attrs["WEIGHTS_0"] = json!(w_acc);
+            }
+            primitives.push(json!({
+                "attributes": prim_attrs,
+                "indices": i_acc,
+                "material": mat_idx
+            }));
+            total_triangles += sub.indices.len() / 3;
+        }
+    }
+
+    if has_static_palette_prim {
+        let groups = static_mesh.split_by_palette_material(&scene.palette);
+        for (group, sub) in groups {
+            if sub.positions.is_empty() || sub.indices.is_empty() {
+                continue;
+            }
+            let mut s_min = [f32::INFINITY; 3];
+            let mut s_max = [f32::NEG_INFINITY; 3];
+            for p in &sub.positions {
+                for axis in 0..3 {
+                    s_min[axis] = s_min[axis].min(p[axis]);
+                    s_max[axis] = s_max[axis].max(p[axis]);
+                }
+            }
+            let pos_bv = push_view(
+                &mut bin,
+                &mut buffer_views,
+                bytemuck::cast_slice(&sub.positions),
+                Some(34962),
+            );
+            let norm_bv = push_view(
+                &mut bin,
+                &mut buffer_views,
+                bytemuck::cast_slice(&sub.normals),
+                Some(34962),
+            );
+            let uv_bv = push_view(
+                &mut bin,
+                &mut buffer_views,
+                bytemuck::cast_slice(&sub.uvs),
+                Some(34962),
+            );
+            let idx_bv = push_view(
+                &mut bin,
+                &mut buffer_views,
+                bytemuck::cast_slice(&sub.indices),
+                Some(34963),
+            );
+            let p_acc = accessors.len();
+            accessors.push(json!({
+                "bufferView": pos_bv,
+                "componentType": 5126,
+                "count": sub.positions.len(),
+                "type": "VEC3",
+                "min": s_min,
+                "max": s_max
+            }));
+            let n_acc = accessors.len();
+            accessors.push(json!({
+                "bufferView": norm_bv,
+                "componentType": 5126,
+                "count": sub.normals.len(),
+                "type": "VEC3"
+            }));
+            let u_acc = accessors.len();
+            accessors.push(json!({
+                "bufferView": uv_bv,
+                "componentType": 5126,
+                "count": sub.uvs.len(),
+                "type": "VEC2"
+            }));
+            let i_acc = accessors.len();
+            accessors.push(json!({
+                "bufferView": idx_bv,
+                "componentType": 5125,
+                "count": sub.indices.len(),
+                "type": "SCALAR"
+            }));
+            let tex_idx = ensure_palette_tex(
+                &mut palette_tex_index,
+                &mut bin,
+                &mut buffer_views,
+                &mut images,
+                &mut textures,
+            );
+            let mat_idx = if let Some(&existing) = palette_group_materials.get(&group) {
+                existing
+            } else {
+                let m_idx = materials.len();
+                let mat_name = if group.is_default {
+                    "TesselPaletteMaterial".to_string()
+                } else {
+                    format!("TesselPaletteMaterial_{m_idx}")
+                };
+                materials.push(build_palette_group_material_json(
+                    mat_name,
+                    tex_idx,
+                    group,
+                    &mut ext_flags,
+                ));
+                palette_group_materials.insert(group, m_idx);
+                if group.is_default {
+                    palette_mat_index = Some(m_idx);
+                }
+                m_idx
+            };
+            static_primitives.push(json!({
+                "attributes": {
+                    "POSITION": p_acc,
+                    "NORMAL": n_acc,
+                    "TEXCOORD_0": u_acc
+                },
+                "indices": i_acc,
+                "material": mat_idx
+            }));
+            total_triangles += sub.indices.len() / 3;
+        }
     }
 
     let mut nodes: Vec<Value> = vec![json!({ "name": "TesselAsset" })];
@@ -1067,8 +1223,8 @@ pub fn export_glb_bytes(
     // Export any Low-Poly meshes with custom RGBA texture, PBR material, or
     // morph targets as dedicated primitives (morphs need per-mesh targets,
     // which the merged palette mesh cannot carry).
-    let mut any_unlit = false;
     // Deduplicate identical PBR materials across nodes so multi-part assets avoid redundant draw calls.
+    #[allow(clippy::type_complexity)]
     type MaterialKey = (
         usize,
         Option<usize>,
@@ -1076,6 +1232,9 @@ pub fn export_glb_bytes(
         u32,
         u32,
         [u32; 3],
+        u32,
+        u32,
+        u32,
         bool,
         (u8, u32),
         bool,
@@ -1090,6 +1249,9 @@ pub fn export_glb_bytes(
                 0.0_f32.to_bits(),
                 0.85_f32.to_bits(),
                 [0.0_f32.to_bits(); 3],
+                1.0_f32.to_bits(),
+                0.0_f32.to_bits(),
+                1.5_f32.to_bits(),
                 false,
                 (0, 0),
                 false,
@@ -1286,6 +1448,9 @@ pub fn export_glb_bytes(
                 lp_mesh.material.emissive[1].to_bits(),
                 lp_mesh.material.emissive[2].to_bits(),
             ],
+            lp_mesh.material.emissive_intensity.to_bits(),
+            lp_mesh.material.transmission.to_bits(),
+            lp_mesh.material.ior.to_bits(),
             lp_mesh.material.double_sided,
             alpha_key,
             lp_mesh.material.unlit,
@@ -1313,7 +1478,8 @@ pub fn export_glb_bytes(
                     "roughnessFactor": lp_mesh.material.roughness
                 }
             });
-            if lp_mesh.material.emissive.iter().any(|&c| c > 0.0) {
+            let has_emissive = lp_mesh.material.emissive.iter().any(|&c| c > 0.0);
+            if has_emissive {
                 mat_json["emissiveFactor"] = json!(lp_mesh.material.emissive);
             }
             if lp_mesh.material.double_sided {
@@ -1329,9 +1495,16 @@ pub fn export_glb_bytes(
                     mat_json["alphaMode"] = json!("BLEND");
                 }
             }
-            if lp_mesh.material.unlit {
-                any_unlit = true;
-                mat_json["extensions"] = json!({ "KHR_materials_unlit": {} });
+            let exts = build_material_extensions(
+                lp_mesh.material.unlit,
+                has_emissive,
+                lp_mesh.material.emissive_intensity,
+                lp_mesh.material.transmission,
+                lp_mesh.material.ior,
+                &mut ext_flags,
+            );
+            if !exts.is_empty() {
+                mat_json["extensions"] = Value::Object(exts);
             }
             if let Some(n_tex_idx) = norm_tex_idx {
                 mat_json["normalTexture"] = json!({ "index": n_tex_idx });
@@ -1693,8 +1866,9 @@ pub fn export_glb_bytes(
     if !animations.is_empty() {
         gltf_json["animations"] = Value::Array(animations);
     }
-    if any_unlit {
-        gltf_json["extensionsUsed"] = json!(["KHR_materials_unlit"]);
+    let extensions_used = ext_flags.to_extensions_used();
+    if !extensions_used.is_empty() {
+        gltf_json["extensionsUsed"] = json!(extensions_used);
     }
     if !skins.is_empty() {
         gltf_json["skins"] = Value::Array(skins);

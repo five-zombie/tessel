@@ -1501,3 +1501,149 @@ fn g1_glb_export_separates_unrigged_nodes_from_skinned_nodes() {
     assert!(legacy_rig.unrigged_nodes.is_empty());
     assert!(legacy_rig.should_skin_node(terrain_id));
 }
+
+#[test]
+fn h1_glb_export_writes_hdr_emissive_transmission_and_ior_extensions() {
+    // Legacy PaletteEntry & MeshMaterial JSON without H1 fields deserialize with safe defaults.
+    let legacy_pal_json = r#"{"name":"Clay","color":{"r":200,"g":150,"b":100,"a":255},"roughness":0.8,"metallic":0.0,"emissive":0.0}"#;
+    let legacy_pal: tessel_core::PaletteEntry = serde_json::from_str(legacy_pal_json).unwrap();
+    assert_eq!(legacy_pal.transmission, 0.0);
+    assert!((legacy_pal.ior - 1.5).abs() < 1e-6);
+
+    let legacy_mat_json = r#"{"metallic":0.2,"roughness":0.6,"emissive":[0.5,0.0,0.0]}"#;
+    let legacy_mat: tessel_core::MeshMaterial = serde_json::from_str(legacy_mat_json).unwrap();
+    assert!((legacy_mat.emissive_intensity - 1.0).abs() < 1e-6);
+    assert_eq!(legacy_mat.transmission, 0.0);
+    assert!((legacy_mat.ior - 1.5).abs() < 1e-6);
+
+    let mut scene = SceneState::new();
+    let neon_idx = PaletteIndex::new(10).unwrap();
+    let glass_idx = PaletteIndex::new(11).unwrap();
+    let matte_idx = PaletteIndex::new(1).unwrap();
+
+    // Configure glowing neon voxel palette slot & glass voxel palette slot.
+    let mut neon = tessel_core::PaletteEntry::matte("NeonCyan", Rgba8::rgb(40, 220, 255));
+    neon.emissive = 6.0;
+    Command::SetPaletteEntry {
+        index: neon_idx,
+        entry: neon,
+    }
+    .apply(&mut scene)
+    .unwrap();
+
+    let mut glass = tessel_core::PaletteEntry::matte("Crystal", Rgba8::rgb(180, 235, 255));
+    glass.transmission = 0.85;
+    glass.ior = 1.45;
+    Command::SetPaletteEntry {
+        index: glass_idx,
+        entry: glass,
+    }
+    .apply(&mut scene)
+    .unwrap();
+
+    Command::CreateVoxelVolume {
+        name: "MixedVoxels".into(),
+    }
+    .apply(&mut scene)
+    .unwrap();
+    let vox_id = scene.selected_node.unwrap();
+    Command::SetVoxels {
+        node_id: vox_id,
+        edits: vec![
+            tessel_core::VoxelEdit {
+                coord: VoxelCoord::new(0, 0, 0),
+                color: Some(matte_idx),
+            },
+            tessel_core::VoxelEdit {
+                coord: VoxelCoord::new(2, 0, 0),
+                color: Some(neon_idx),
+            },
+            tessel_core::VoxelEdit {
+                coord: VoxelCoord::new(4, 0, 0),
+                color: Some(glass_idx),
+            },
+        ],
+    }
+    .apply(&mut scene)
+    .unwrap();
+
+    // Add two Low-Poly meshes with identical base PBR but different emissive_intensity so
+    // MaterialKey deduplication must keep them as distinct materials.
+    for (name, intensity) in [("LampLow", 2.0_f32), ("LampHigh", 8.5_f32)] {
+        Command::CreatePrimitiveMesh {
+            name: name.into(),
+            kind: PrimitiveKind::Cube,
+            size: 0.5,
+            material: matte_idx,
+        }
+        .apply(&mut scene)
+        .unwrap();
+        let nid = scene.selected_node.unwrap();
+        Command::SetMeshMaterial {
+            node_id: nid,
+            material: tessel_core::MeshMaterial {
+                emissive: [1.0, 0.5, 0.1],
+                emissive_intensity: intensity,
+                transmission: 0.25,
+                ior: 1.6,
+                ..Default::default()
+            },
+        }
+        .apply(&mut scene)
+        .unwrap();
+    }
+
+    let (glb, _) = export_glb_bytes(&scene, ExportPreset::Godot4).unwrap();
+    // Validate GLB container and schema with gltf parser, and inspect raw JSON chunk for KHR extensions.
+    let _parsed = gltf::Gltf::from_slice(&glb).unwrap();
+    let json_len = u32::from_le_bytes([glb[12], glb[13], glb[14], glb[15]]) as usize;
+    let json_val: serde_json::Value = serde_json::from_slice(&glb[20..20 + json_len]).unwrap();
+
+    // Verify conditional extensionsUsed contains all three H1 extensions (and NOT unlit).
+    let ext_used = json_val["extensionsUsed"]
+        .as_array()
+        .expect("extensionsUsed must be present");
+    let ext_names: Vec<&str> = ext_used.iter().filter_map(|v| v.as_str()).collect();
+    assert!(ext_names.contains(&"KHR_materials_emissive_strength"));
+    assert!(ext_names.contains(&"KHR_materials_transmission"));
+    assert!(ext_names.contains(&"KHR_materials_ior"));
+    assert!(!ext_names.contains(&"KHR_materials_unlit"));
+
+    // 3 voxel palette material groups (matte, neon, glass) + 2 distinct LowPoly materials = 5 materials.
+    let mats = json_val["materials"].as_array().unwrap();
+    assert_eq!(
+        mats.len(),
+        5,
+        "expected 3 palette groups + 2 distinct lowpoly materials, got {mats:?}"
+    );
+
+    // Verify emissiveStrength values (6.0 for neon voxel, 2.0 & 8.5 for lowpoly lamps).
+    let strengths: Vec<f64> = mats
+        .iter()
+        .filter_map(|m| {
+            m.get("extensions")?
+                .get("KHR_materials_emissive_strength")?
+                .get("emissiveStrength")?
+                .as_f64()
+        })
+        .collect();
+    assert!(strengths.iter().any(|&s| (s - 6.0).abs() < 1e-3));
+    assert!(strengths.iter().any(|&s| (s - 2.0).abs() < 1e-3));
+    assert!(strengths.iter().any(|&s| (s - 8.5).abs() < 1e-3));
+
+    // Verify transmission & IOR extensions are populated.
+    assert!(mats.iter().any(|m| {
+        m.get("extensions")
+            .and_then(|e| e.get("KHR_materials_transmission"))
+            .and_then(|t| t.get("transmissionFactor"))
+            .and_then(|v| v.as_f64())
+            .is_some_and(|tf| (tf - 0.85).abs() < 1e-3)
+    }));
+    assert!(mats.iter().any(|m| {
+        m.get("extensions")
+            .and_then(|e| e.get("KHR_materials_ior"))
+            .and_then(|t| t.get("ior"))
+            .and_then(|v| v.as_f64())
+            .is_some_and(|ior| (ior - 1.45).abs() < 1e-3)
+    }));
+}
