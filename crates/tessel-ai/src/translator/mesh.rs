@@ -3025,6 +3025,39 @@ pub(super) fn execute(
             if let Some(unlit) = args.get("unlit").and_then(Value::as_bool) {
                 mat.unlit = unlit;
             }
+            if let Some(val) = args.get("emissive_intensity").filter(|v| !v.is_null()) {
+                let ei = val.as_f64().ok_or_else(|| {
+                    AiError::InvalidArguments("'emissive_intensity' must be a finite number".into())
+                })? as f32;
+                if !ei.is_finite() || !(0.0..=20.0).contains(&ei) {
+                    return Err(AiError::InvalidArguments(
+                        "'emissive_intensity' must be a finite number in 0.0..=20.0".into(),
+                    ));
+                }
+                mat.emissive_intensity = ei;
+            }
+            if let Some(val) = args.get("transmission").filter(|v| !v.is_null()) {
+                let tr = val.as_f64().ok_or_else(|| {
+                    AiError::InvalidArguments("'transmission' must be a finite number".into())
+                })? as f32;
+                if !tr.is_finite() || !(0.0..=1.0).contains(&tr) {
+                    return Err(AiError::InvalidArguments(
+                        "'transmission' must be a finite number in 0.0..=1.0".into(),
+                    ));
+                }
+                mat.transmission = tr;
+            }
+            if let Some(val) = args.get("ior").filter(|v| !v.is_null()) {
+                let ior = val.as_f64().ok_or_else(|| {
+                    AiError::InvalidArguments("'ior' must be a finite number".into())
+                })? as f32;
+                if !ior.is_finite() || !(1.0..=2.5).contains(&ior) {
+                    return Err(AiError::InvalidArguments(
+                        "'ior' must be a finite number in 1.0..=2.5".into(),
+                    ));
+                }
+                mat.ior = ior;
+            }
             history.execute(
                 scene,
                 Command::SetMeshMaterial {
@@ -3038,6 +3071,9 @@ pub(super) fn execute(
                 "metallic": mat.metallic,
                 "roughness": mat.roughness,
                 "emissive": mat.emissive,
+                "emissive_intensity": mat.emissive_intensity,
+                "transmission": mat.transmission,
+                "ior": mat.ior,
                 "double_sided": mat.double_sided,
                 "cast_shadow": mat.cast_shadow,
                 "receive_shadow": mat.receive_shadow,

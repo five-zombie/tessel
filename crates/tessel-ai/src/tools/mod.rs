@@ -34,7 +34,7 @@ mod tests {
     #[test]
     fn tool_definitions_has_160_unique_tools() {
         let defs = tool_definitions();
-        assert_eq!(defs.len(), 167);
+        assert_eq!(defs.len(), 168);
         let names: HashSet<&str> = defs
             .iter()
             .filter_map(|d| d.get("name").and_then(|v| v.as_str()))
@@ -462,6 +462,243 @@ mod tests {
         .expect("import glb rig");
         assert_eq!(imp_glb["ok"], json!(true));
         assert_eq!(imp_glb["bone_count"], json!(7));
+
+        let _ = std::fs::remove_dir_all(&export_dir);
+    }
+
+    #[test]
+    fn h4a_mcp_hdr_post_process_materials_validation_and_headless_parity() {
+        let mut scene = SceneState::new();
+        let mut history = HistoryStack::new();
+        let export_dir = std::env::temp_dir().join("tessel_h4a_hdr_mcp_test");
+        let _ = std::fs::remove_dir_all(&export_dir);
+        std::fs::create_dir_all(&export_dir).unwrap();
+
+        // 1. palette_set_color supports emissive (0..=20), transmission (0..=1), ior (1..=2.5)
+        // and rejects out-of-range values strictly.
+        for bad in [
+            json!({"palette_index": 20, "hex": "#66DDFF", "emissive": 25.0}),
+            json!({"palette_index": 20, "hex": "#66DDFF", "transmission": 1.2}),
+            json!({"palette_index": 20, "hex": "#66DDFF", "ior": 0.8}),
+            json!({"palette_index": 20, "hex": "#66DDFF", "ior": 3.0}),
+            json!({"palette_index": 20, "hex": "#66DDFF", "transmission": "glass"}),
+        ] {
+            assert!(
+                matches!(
+                    execute_tool_call(
+                        "palette_set_color",
+                        &bad,
+                        &mut scene,
+                        &mut history,
+                        &export_dir
+                    ),
+                    Err(AiError::InvalidArguments(_))
+                ),
+                "expected InvalidArguments for {bad}"
+            );
+        }
+
+        let pal_res = execute_tool_call(
+            "palette_set_color",
+            &json!({
+                "palette_index": 20,
+                "name": "CrystalNeon",
+                "hex": "#66DDFF",
+                "roughness": 0.15,
+                "metallic": 0.1,
+                "emissive": 8.0,
+                "transmission": 0.85,
+                "ior": 1.48
+            }),
+            &mut scene,
+            &mut history,
+            &export_dir,
+        )
+        .expect("palette_set_color with H4a params");
+        assert_eq!(pal_res["ok"], json!(true));
+        assert!((pal_res["transmission"].as_f64().unwrap() - 0.85).abs() < 1e-4);
+        assert!((pal_res["ior"].as_f64().unwrap() - 1.48).abs() < 1e-4);
+
+        let pal_summary = crate::translator::palette_summary_json(&scene);
+        let slot20 = pal_summary["colors"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["index"] == json!(20))
+            .expect("palette slot 20 in summary");
+        assert!((slot20["transmission"].as_f64().unwrap() - 0.85).abs() < 1e-4);
+        assert!((slot20["ior"].as_f64().unwrap() - 1.48).abs() < 1e-4);
+        assert!((slot20["emissive"].as_f64().unwrap() - 8.0).abs() < 1e-4);
+
+        // 2. mesh_set_material supports emissive_intensity, transmission, ior with strict bounds.
+        let created = execute_tool_call(
+            "mesh_create_primitive",
+            &json!({"name": "Prism", "kind": "cube", "size": 1.0}),
+            &mut scene,
+            &mut history,
+            &export_dir,
+        )
+        .expect("create cube");
+        let mesh_id = created["node_id"].as_u64().unwrap();
+
+        for bad in [
+            json!({"node_id": mesh_id, "emissive_intensity": -0.5}),
+            json!({"node_id": mesh_id, "emissive_intensity": 25.0}),
+            json!({"node_id": mesh_id, "transmission": -0.1}),
+            json!({"node_id": mesh_id, "ior": 0.9}),
+            json!({"node_id": mesh_id, "ior": 2.9}),
+        ] {
+            assert!(
+                matches!(
+                    execute_tool_call(
+                        "mesh_set_material",
+                        &bad,
+                        &mut scene,
+                        &mut history,
+                        &export_dir
+                    ),
+                    Err(AiError::InvalidArguments(_))
+                ),
+                "expected InvalidArguments for {bad}"
+            );
+        }
+
+        let mat_res = execute_tool_call(
+            "mesh_set_material",
+            &json!({
+                "node_id": mesh_id,
+                "emissive": [0.2, 0.8, 1.0],
+                "emissive_intensity": 6.5,
+                "transmission": 0.8,
+                "ior": 1.52
+            }),
+            &mut scene,
+            &mut history,
+            &export_dir,
+        )
+        .expect("mesh_set_material with H4a params");
+        assert!((mat_res["emissive_intensity"].as_f64().unwrap() - 6.5).abs() < 1e-4);
+        assert!((mat_res["transmission"].as_f64().unwrap() - 0.8).abs() < 1e-4);
+        assert!((mat_res["ior"].as_f64().unwrap() - 1.52).abs() < 1e-4);
+
+        // 3. scene_set_post_process validates ranges, exposes status in scene_summary_json, and undoes.
+        for bad in [
+            json!({"exposure": 0.0}),
+            json!({"exposure": 10.0}),
+            json!({"bloom_intensity": -1.0}),
+            json!({"fog_color": [1.5, 0.0, 0.0]}),
+            json!({"fog_density": 2.0}),
+            json!({"bloom_enabled": "yes"}),
+        ] {
+            assert!(
+                matches!(
+                    execute_tool_call(
+                        "scene_set_post_process",
+                        &bad,
+                        &mut scene,
+                        &mut history,
+                        &export_dir
+                    ),
+                    Err(AiError::InvalidArguments(_))
+                ),
+                "expected InvalidArguments for {bad}"
+            );
+        }
+
+        let pp_res = execute_tool_call(
+            "scene_set_post_process",
+            &json!({
+                "bloom_enabled": true,
+                "bloom_threshold": 0.9,
+                "bloom_intensity": 0.8,
+                "exposure": 1.2,
+                "aces_enabled": true,
+                "fog_enabled": true,
+                "fog_color": [0.1, 0.15, 0.2],
+                "fog_density": 0.03,
+                "fog_start": 3.0,
+                "fog_height_falloff": 0.3
+            }),
+            &mut scene,
+            &mut history,
+            &export_dir,
+        )
+        .expect("scene_set_post_process");
+        assert_eq!(pp_res["ok"], json!(true));
+        let summary = crate::translator::scene_summary_json(&scene);
+        assert_eq!(summary["post_process"]["bloom_enabled"], json!(true));
+        assert_eq!(summary["post_process"]["fog_enabled"], json!(true));
+        assert!((summary["post_process"]["exposure"].as_f64().unwrap() - 1.2).abs() < 1e-4);
+
+        history.undo(&mut scene).expect("undo post_process");
+        assert!(!scene.post_process.bloom_enabled);
+        assert!(!scene.post_process.fog_enabled);
+
+        // 4. Headless PNG / GIF parity check across PBR HDR, NprSumie bypass, and Pixel bypass.
+        if let Ok(mut renderer) = crate::headless::HeadlessRenderer::new(64, 64) {
+            let cam = crate::headless::screenshot_camera(&json!({"distance": 2.5})).unwrap();
+
+            // PBR HDR with Bloom + Glass + Fog produces a valid PNG.
+            scene.active_mode = tessel_core::AppMode::LowPoly;
+            scene.shading_mode = tessel_core::ViewportShadingMode::Pbr;
+            scene.post_process.bloom_enabled = true;
+            scene.post_process.fog_enabled = true;
+            let pbr_png = renderer
+                .render_png(&scene, &cam, 64, 64, true)
+                .expect("headless HDR PBR PNG");
+            assert!(pbr_png.starts_with(b"\x89PNG\r\n\x1a\n"));
+
+            // Turntable GIF (2 frames) succeeds over the HDR pipeline.
+            let gif_args = crate::headless::parse_turntable_args(
+                &export_dir,
+                &json!({
+                    "filename": "hdr_turntable.gif",
+                    "frames": 4,
+                    "width": 64,
+                    "height": 64
+                }),
+            )
+            .expect("parse turntable args");
+            let gif_res = renderer
+                .render_turntable_gif(&scene, &gif_args)
+                .expect("headless HDR turntable GIF");
+            assert_eq!(gif_res["frames"], json!(4));
+            assert!(export_dir.join("hdr_turntable.gif").exists());
+
+            // NPR Sumi-e mode bypasses Bloom & Exposure bit-identically.
+            scene.shading_mode = tessel_core::ViewportShadingMode::NprSumie;
+            scene.post_process.bloom_enabled = false;
+            scene.post_process.exposure = 1.0;
+            let npr_a = renderer.render_png(&scene, &cam, 64, 64, true).unwrap();
+            scene.post_process.bloom_enabled = true;
+            scene.post_process.exposure = 3.0;
+            let npr_b = renderer.render_png(&scene, &cam, 64, 64, true).unwrap();
+            assert_eq!(
+                npr_a, npr_b,
+                "headless NPR Sumi-e must bypass HDR post-process"
+            );
+
+            // Pixel 2D mode bypasses 3D/HDR post-process bit-identically.
+            execute_tool_call(
+                "pixel_create_canvas",
+                &json!({"name": "Sprite", "width": 16, "height": 16}),
+                &mut scene,
+                &mut history,
+                &export_dir,
+            )
+            .expect("create pixel canvas");
+            scene.active_mode = tessel_core::AppMode::Pixel;
+            scene.post_process.bloom_enabled = false;
+            scene.post_process.exposure = 1.0;
+            let px_a = renderer.render_png(&scene, &cam, 64, 64, true).unwrap();
+            scene.post_process.bloom_enabled = true;
+            scene.post_process.exposure = 4.0;
+            let px_b = renderer.render_png(&scene, &cam, 64, 64, true).unwrap();
+            assert_eq!(
+                px_a, px_b,
+                "headless Pixel mode must bypass HDR post-process"
+            );
+        }
 
         let _ = std::fs::remove_dir_all(&export_dir);
     }

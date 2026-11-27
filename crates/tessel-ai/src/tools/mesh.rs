@@ -726,7 +726,7 @@ pub(super) fn mesh_tools() -> Vec<Value> {
         }),
         json!({
             "name": "mesh_set_material",
-            "description": "Set PBR material properties (metallic 0..1, roughness 0.05..1, emissive [r,g,b] 0..1, double_sided, cast_shadow, receive_shadow) on a Low-Poly mesh.",
+            "description": "Set PBR & optical material properties (metallic 0..1, roughness 0.05..1, emissive [r,g,b] 0..1, emissive_intensity 0..20, transmission 0..1, ior 1..2.5, double_sided, cast_shadow, receive_shadow) on a Low-Poly mesh.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -734,6 +734,9 @@ pub(super) fn mesh_tools() -> Vec<Value> {
                     "metallic": { "type": "number", "minimum": 0.0, "maximum": 1.0 },
                     "roughness": { "type": "number", "minimum": 0.05, "maximum": 1.0 },
                     "emissive": { "type": "array", "items": { "type": "number" }, "minItems": 3, "maxItems": 3 },
+                    "emissive_intensity": { "type": "number", "minimum": 0.0, "maximum": 20.0, "description": "HDR emissive strength multiplier (0.0..=20.0, default 1.0; exports KHR_materials_emissive_strength)" },
+                    "transmission": { "type": "number", "minimum": 0.0, "maximum": 1.0, "description": "Glass/dielectric transmission factor (0.0..=1.0, default 0.0; exports KHR_materials_transmission)" },
+                    "ior": { "type": "number", "minimum": 1.0, "maximum": 2.5, "description": "Index of Refraction (1.0..=2.5, default 1.5; exports KHR_materials_ior)" },
                     "double_sided": { "type": "boolean", "description": "Disable back-face culling on export (glTF doubleSided: true; ideal for thin grass blades, foliage, cloth)" },
                     "cast_shadow": { "type": "boolean", "description": "Whether this mesh casts shadows into the directional shadow map (default true)" },
                     "receive_shadow": { "type": "boolean", "description": "Whether this mesh receives shadows from the directional shadow map (default true)" },

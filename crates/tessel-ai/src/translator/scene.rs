@@ -123,19 +123,56 @@ pub(super) fn execute(
                     entry.metallic = mf.clamp(0.0, 1.0);
                 }
             }
-            if let Some(e) = args.get("emissive").and_then(Value::as_f64) {
-                let ef = e as f32;
-                if ef.is_finite() {
-                    entry.emissive = ef.clamp(0.0, 10.0);
+            if let Some(val) = args.get("emissive").filter(|v| !v.is_null()) {
+                let ef = val.as_f64().ok_or_else(|| {
+                    AiError::InvalidArguments("'emissive' must be a finite number".into())
+                })? as f32;
+                if !ef.is_finite() || !(0.0..=20.0).contains(&ef) {
+                    return Err(AiError::InvalidArguments(
+                        "'emissive' must be a finite number in 0.0..=20.0".into(),
+                    ));
                 }
+                entry.emissive = ef;
             }
+            if let Some(val) = args.get("transmission").filter(|v| !v.is_null()) {
+                let tf = val.as_f64().ok_or_else(|| {
+                    AiError::InvalidArguments("'transmission' must be a finite number".into())
+                })? as f32;
+                if !tf.is_finite() || !(0.0..=1.0).contains(&tf) {
+                    return Err(AiError::InvalidArguments(
+                        "'transmission' must be a finite number in 0.0..=1.0".into(),
+                    ));
+                }
+                entry.transmission = tf;
+            }
+            if let Some(val) = args.get("ior").filter(|v| !v.is_null()) {
+                let ior = val.as_f64().ok_or_else(|| {
+                    AiError::InvalidArguments("'ior' must be a finite number".into())
+                })? as f32;
+                if !ior.is_finite() || !(1.0..=2.5).contains(&ior) {
+                    return Err(AiError::InvalidArguments(
+                        "'ior' must be a finite number in 1.0..=2.5".into(),
+                    ));
+                }
+                entry.ior = ior;
+            }
+            let out_rough = entry.roughness;
+            let out_metal = entry.metallic;
+            let out_emissive = entry.emissive;
+            let out_trans = entry.transmission;
+            let out_ior = entry.ior;
             history.execute(scene, Command::SetPaletteEntry { index, entry })?;
             Ok(json!({
                 "ok": true,
                 "palette_index": index.get(),
                 "name": name,
                 "alpha": color.a,
-                "hex": format!("#{:02X}{:02X}{:02X}", color.r, color.g, color.b)
+                "hex": format!("#{:02X}{:02X}{:02X}", color.r, color.g, color.b),
+                "roughness": out_rough,
+                "metallic": out_metal,
+                "emissive": out_emissive,
+                "transmission": out_trans,
+                "ior": out_ior
             }))
         }
         "scene_select_node" => {
@@ -910,6 +947,91 @@ pub(super) fn execute(
             Ok(
                 json!({ "ok": true, "lookdev_preset": scene.lookdev_preset, "bookmarks": scene.camera_bookmarks.len() }),
             )
+        }
+        "scene_set_post_process" => {
+            let mut settings = scene.post_process;
+            let read_bool = |key: &str| -> Result<Option<bool>, AiError> {
+                match args.get(key) {
+                    None | Some(Value::Null) => Ok(None),
+                    Some(Value::Bool(b)) => Ok(Some(*b)),
+                    Some(_) => Err(AiError::InvalidArguments(format!(
+                        "'{key}' must be a boolean"
+                    ))),
+                }
+            };
+            let read_bounded = |key: &str, min: f32, max: f32| -> Result<Option<f32>, AiError> {
+                match args.get(key) {
+                    None | Some(Value::Null) => Ok(None),
+                    Some(v) => {
+                        let n = v.as_f64().ok_or_else(|| {
+                            AiError::InvalidArguments(format!("'{key}' must be a finite number"))
+                        })? as f32;
+                        if !n.is_finite() || !(min..=max).contains(&n) {
+                            return Err(AiError::InvalidArguments(format!(
+                                "'{key}' must be a finite number in {min}..={max}"
+                            )));
+                        }
+                        Ok(Some(n))
+                    }
+                }
+            };
+            if let Some(v) = read_bool("bloom_enabled")? {
+                settings.bloom_enabled = v;
+            }
+            if let Some(v) = read_bounded("bloom_threshold", 0.0, 10.0)? {
+                settings.bloom_threshold = v;
+            }
+            if let Some(v) = read_bounded("bloom_intensity", 0.0, 4.0)? {
+                settings.bloom_intensity = v;
+            }
+            if let Some(v) = read_bounded("exposure", 0.05, 8.0)? {
+                settings.exposure = v;
+            }
+            if let Some(v) = read_bool("aces_enabled")? {
+                settings.aces_enabled = v;
+            }
+            if let Some(v) = read_bool("fog_enabled")? {
+                settings.fog_enabled = v;
+            }
+            if let Some(val) = args.get("fog_color").filter(|v| !v.is_null()) {
+                let arr = val.as_array().ok_or_else(|| {
+                    AiError::InvalidArguments("'fog_color' must be [r, g, b] in 0.0..=1.0".into())
+                })?;
+                if arr.len() != 3 {
+                    return Err(AiError::InvalidArguments(
+                        "'fog_color' must have 3 numbers [r, g, b]".into(),
+                    ));
+                }
+                let mut col = [0.0f32; 3];
+                for (i, item) in arr.iter().enumerate() {
+                    let c = item.as_f64().ok_or_else(|| {
+                        AiError::InvalidArguments(
+                            "'fog_color' entries must be finite numbers".into(),
+                        )
+                    })? as f32;
+                    if !c.is_finite() || !(0.0..=1.0).contains(&c) {
+                        return Err(AiError::InvalidArguments(
+                            "'fog_color' entries must be in 0.0..=1.0".into(),
+                        ));
+                    }
+                    col[i] = c;
+                }
+                settings.fog_color = col;
+            }
+            if let Some(v) = read_bounded("fog_density", 0.0, 1.0)? {
+                settings.fog_density = v;
+            }
+            if let Some(v) = read_bounded("fog_start", 0.0, 500.0)? {
+                settings.fog_start = v;
+            }
+            if let Some(v) = read_bounded("fog_height_falloff", 0.0, 5.0)? {
+                settings.fog_height_falloff = v;
+            }
+            history.execute(scene, Command::SetPostProcess(settings))?;
+            Ok(json!({
+                "ok": true,
+                "post_process": scene.post_process
+            }))
         }
         other => Err(AiError::UnknownTool(other.to_string())),
     }

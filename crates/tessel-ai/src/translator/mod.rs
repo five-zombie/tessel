@@ -142,6 +142,7 @@ pub fn scene_summary_json(scene: &SceneState) -> Value {
         "selected_node": scene.selected_node.map(|n| n.0),
         "light_azimuth_deg": scene.light_azimuth.to_degrees(),
         "light_elevation_deg": scene.light_elevation.to_degrees(),
+        "post_process": scene.post_process,
         "has_character_rig": scene.character_rig.is_some(),
         "animations": animations,
         "nodes": nodes
@@ -156,7 +157,12 @@ pub fn palette_summary_json(scene: &SceneState) -> Value {
             json!({
                 "index": idx.get(),
                 "name": e.name,
-                "hex": format!("#{:02X}{:02X}{:02X}", e.color.r, e.color.g, e.color.b)
+                "hex": format!("#{:02X}{:02X}{:02X}", e.color.r, e.color.g, e.color.b),
+                "roughness": e.roughness,
+                "metallic": e.metallic,
+                "emissive": e.emissive,
+                "transmission": e.transmission,
+                "ior": e.ior
             })
         })
         .collect();

@@ -20,7 +20,7 @@ pub(super) fn scene_tools() -> Vec<Value> {
         }),
         json!({
             "name": "palette_set_color",
-            "description": "Add or update a color in the 255-slot palette (1..=255) using rgb [r,g,b] or hex '#RRGGBB'/'#RRGGBBAA', with optional alpha, roughness, metallic, and emissive.",
+            "description": "Add or update a color in the 255-slot palette (1..=255) using rgb [r,g,b] or hex '#RRGGBB'/'#RRGGBBAA', with optional alpha, roughness, metallic, HDR emissive (0..20), glass transmission (0..1), and IOR (1.0..2.5).",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -31,7 +31,9 @@ pub(super) fn scene_tools() -> Vec<Value> {
                     "alpha": { "type": "integer", "minimum": 0, "maximum": 255 },
                     "roughness": { "type": "number", "minimum": 0.05, "maximum": 1.0 },
                     "metallic": { "type": "number", "minimum": 0.0, "maximum": 1.0 },
-                    "emissive": { "type": "number", "minimum": 0.0, "maximum": 10.0 }
+                    "emissive": { "type": "number", "minimum": 0.0, "maximum": 20.0 },
+                    "transmission": { "type": "number", "minimum": 0.0, "maximum": 1.0, "description": "Glass/dielectric transmission factor (0.0..=1.0, default 0.0)" },
+                    "ior": { "type": "number", "minimum": 1.0, "maximum": 2.5, "description": "Index of Refraction (1.0..=2.5, default 1.5)" }
                 },
                 "required": ["palette_index"]
             }
@@ -256,6 +258,25 @@ pub(super) fn scene_tools() -> Vec<Value> {
                     "hatching_strength": { "type": "number", "minimum": 0.0, "maximum": 1.0 },
                     "bloom_strength": { "type": "number", "minimum": 0.0, "maximum": 2.0 },
                     "msaa_samples": { "type": "integer", "enum": [1, 4] }
+                }
+            }
+        }),
+        json!({
+            "name": "scene_set_post_process",
+            "description": "Configure Cinematic HDR post-processing (Dual-Kawase Bloom, Exposure, ACES Filmic tone mapping) and Forward Distance/Height Atmospheric Fog (undoable). Automatically bypassed in Pixel and NPR Sumi-e modes.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "bloom_enabled": { "type": "boolean" },
+                    "bloom_threshold": { "type": "number", "minimum": 0.0, "maximum": 10.0 },
+                    "bloom_intensity": { "type": "number", "minimum": 0.0, "maximum": 4.0 },
+                    "exposure": { "type": "number", "minimum": 0.05, "maximum": 8.0 },
+                    "aces_enabled": { "type": "boolean" },
+                    "fog_enabled": { "type": "boolean" },
+                    "fog_color": { "type": "array", "items": { "type": "number", "minimum": 0.0, "maximum": 1.0 }, "minItems": 3, "maxItems": 3 },
+                    "fog_density": { "type": "number", "minimum": 0.0, "maximum": 1.0 },
+                    "fog_start": { "type": "number", "minimum": 0.0, "maximum": 500.0 },
+                    "fog_height_falloff": { "type": "number", "minimum": 0.0, "maximum": 5.0 }
                 }
             }
         }),
