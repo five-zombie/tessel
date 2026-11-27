@@ -124,6 +124,22 @@ impl DirectAiUiState {
     }
 }
 
+/// Per-project inline rename state for the Scene Outliner (owned by `StudioState` so it clears
+/// cleanly on project switch/load and requests keyboard focus automatically on open).
+#[derive(Debug, Default)]
+pub struct OutlinerRenameState {
+    pub active: Option<(NodeId, String)>,
+    pub request_focus: bool,
+}
+
+impl OutlinerRenameState {
+    pub fn clear(&mut self) {
+        self.active = None;
+        self.request_focus = false;
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 pub fn show_inspector(
     ctx: &egui::Context,
     scene: &mut SceneState,
@@ -131,6 +147,12 @@ pub fn show_inspector(
     ai_state: &mut DirectAiUiState,
     allowed_export_dir: &Path,
     settings: &crate::settings::AppSettings,
+    show_viewport_gizmo: &mut bool,
+    gizmo_mode: &mut tessel_render::TransformGizmoMode,
+    free_view: &mut bool,
+    render_preview: &mut bool,
+    interaction_tool: &mut super::viewport::ViewportInteractionTool,
+    outliner_rename: &mut OutlinerRenameState,
 ) {
     ai_state.poll_response(scene, history, allowed_export_dir);
 
@@ -162,11 +184,20 @@ pub fn show_inspector(
                     ui.add_space(8.0);
                 }
 
-                show_outliner_section(ui, scene, history);
+                show_outliner_section(ui, scene, history, outliner_rename);
                 ui.add_space(10.0);
                 ui.separator();
                 ui.add_space(8.0);
-                show_transform_and_lighting_section(ui, scene, history);
+                show_transform_and_lighting_section(
+                    ui,
+                    scene,
+                    history,
+                    show_viewport_gizmo,
+                    gizmo_mode,
+                    free_view,
+                    render_preview,
+                    interaction_tool,
+                );
                 ui.add_space(10.0);
                 ui.separator();
                 ui.add_space(8.0);
@@ -495,33 +526,105 @@ fn show_character_rig_section(
     let current_mask = scene
         .selected_node
         .and_then(|nid| rig.node_bone_masks.get(&nid).cloned());
+    let rig_targets: Vec<(NodeId, String, bool)> = scene
+        .nodes
+        .values()
+        .filter(|n| {
+            matches!(
+                n.kind,
+                tessel_core::NodeKind::VoxelVolume | tessel_core::NodeKind::LowPolyMesh
+            )
+        })
+        .map(|n| (n.id, n.name.clone(), rig.should_skin_node(n.id)))
+        .collect();
 
-    if let Some(selected_id) = scene.selected_node {
-        if let Some(node) = scene.nodes.get(&selected_id) {
-            let node_name = node.name.clone();
-            ui.label(
-                RichText::new(format!("Bind '{node_name}' to Bone:"))
-                    .size(11.0)
-                    .color(tokens::ON_SURFACE_VARIANT),
-            );
-            ui.horizontal_wrapped(|ui| {
+    ui.label(
+        RichText::new("Rig Target Objects")
+            .strong()
+            .size(11.5)
+            .color(tokens::ON_SURFACE),
+    );
+    if rig_targets.is_empty() {
+        ui.label(
+            RichText::new("No 3D objects in scene.")
+                .size(11.0)
+                .color(tokens::ON_SURFACE_VARIANT),
+        );
+    } else {
+        for (target_id, target_name, mut is_skinned) in rig_targets {
+            ui.push_id(target_id, |ui| {
                 if ui
-                    .selectable_label(current_binding.is_none(), "None")
-                    .clicked()
+                    .checkbox(&mut is_skinned, &target_name)
+                    .on_hover_text("Include this object in character rig skinning deformation")
+                    .changed()
                 {
                     super::exec_history(
                         ui.ctx(),
                         history,
                         scene,
-                        Command::BindNodeToBone {
-                            node_id: selected_id,
-                            bone_id: None,
+                        Command::SetNodeRigSkinned {
+                            node_id: target_id,
+                            skinned: is_skinned,
                         },
                     );
                 }
-                for (bid, bname, _, _) in &bones {
+            });
+        }
+    }
+    ui.add_space(6.0);
+
+    let selected_skinned = scene.selected_node.is_some_and(|nid| {
+        scene
+            .character_rig
+            .as_ref()
+            .is_some_and(|r| r.should_skin_node(nid))
+    });
+
+    if let Some(selected_id) = scene.selected_node {
+        if let Some((node_name, is_3d_geo)) = scene.nodes.get(&selected_id).map(|node| {
+            (
+                node.name.clone(),
+                matches!(
+                    node.kind,
+                    tessel_core::NodeKind::VoxelVolume | tessel_core::NodeKind::LowPolyMesh
+                ),
+            )
+        }) {
+            if is_3d_geo {
+                let mut skinned_toggle = selected_skinned;
+                if ui
+                    .checkbox(&mut skinned_toggle, "Skinned by Rig")
+                    .on_hover_text("Toggle whether the selected object is deformed by this rig")
+                    .changed()
+                {
+                    super::exec_history(
+                        ui.ctx(),
+                        history,
+                        scene,
+                        Command::SetNodeRigSkinned {
+                            node_id: selected_id,
+                            skinned: skinned_toggle,
+                        },
+                    );
+                }
+                if !selected_skinned {
+                    ui.label(
+                        RichText::new("Excluded from rig deformation.")
+                            .size(10.5)
+                            .color(tokens::ON_SURFACE_VARIANT),
+                    );
+                    ui.add_space(6.0);
+                }
+            }
+            if is_3d_geo && selected_skinned {
+                ui.label(
+                    RichText::new(format!("Bind '{node_name}' to Bone:"))
+                        .size(11.0)
+                        .color(tokens::ON_SURFACE_VARIANT),
+                );
+                ui.horizontal_wrapped(|ui| {
                     if ui
-                        .selectable_label(current_binding == Some(*bid), bname)
+                        .selectable_label(current_binding.is_none(), "None")
                         .clicked()
                     {
                         super::exec_history(
@@ -530,48 +633,64 @@ fn show_character_rig_section(
                             scene,
                             Command::BindNodeToBone {
                                 node_id: selected_id,
-                                bone_id: Some(*bid),
+                                bone_id: None,
                             },
                         );
                     }
-                }
-            });
-            ui.add_space(6.0);
+                    for (bid, bname, _, _) in &bones {
+                        if ui
+                            .selectable_label(current_binding == Some(*bid), bname)
+                            .clicked()
+                        {
+                            super::exec_history(
+                                ui.ctx(),
+                                history,
+                                scene,
+                                Command::BindNodeToBone {
+                                    node_id: selected_id,
+                                    bone_id: Some(*bid),
+                                },
+                            );
+                        }
+                    }
+                });
+                ui.add_space(6.0);
 
-            ui.label(
-                RichText::new(format!("Bone Mask ('{node_name}'):"))
-                    .size(11.0)
-                    .color(tokens::ON_SURFACE_VARIANT),
-            );
-            ui.horizontal_wrapped(|ui| {
-                if ui.selectable_label(current_mask.is_none(), "All").clicked() {
-                    super::exec_history(
-                        ui.ctx(),
-                        history,
-                        scene,
-                        Command::SetNodeBoneMask {
-                            node_id: selected_id,
-                            bone_ids: None,
-                        },
-                    );
-                }
-                for (bid, bname, _, _) in &bones {
-                    let in_mask = current_mask.as_ref().is_some_and(|list| list.contains(bid));
-                    if ui.selectable_label(in_mask, bname).clicked() {
-                        let next_mask = toggle_bone_in_mask(current_mask.as_deref(), *bid);
+                ui.label(
+                    RichText::new(format!("Bone Mask ('{node_name}'):"))
+                        .size(11.0)
+                        .color(tokens::ON_SURFACE_VARIANT),
+                );
+                ui.horizontal_wrapped(|ui| {
+                    if ui.selectable_label(current_mask.is_none(), "All").clicked() {
                         super::exec_history(
                             ui.ctx(),
                             history,
                             scene,
                             Command::SetNodeBoneMask {
                                 node_id: selected_id,
-                                bone_ids: next_mask,
+                                bone_ids: None,
                             },
                         );
                     }
-                }
-            });
-            ui.add_space(6.0);
+                    for (bid, bname, _, _) in &bones {
+                        let in_mask = current_mask.as_ref().is_some_and(|list| list.contains(bid));
+                        if ui.selectable_label(in_mask, bname).clicked() {
+                            let next_mask = toggle_bone_in_mask(current_mask.as_deref(), *bid);
+                            super::exec_history(
+                                ui.ctx(),
+                                history,
+                                scene,
+                                Command::SetNodeBoneMask {
+                                    node_id: selected_id,
+                                    bone_ids: next_mask,
+                                },
+                            );
+                        }
+                    }
+                });
+                ui.add_space(6.0);
+            }
         }
     }
 
@@ -820,16 +939,138 @@ fn rename_node_if_changed(
         .is_ok()
 }
 
-fn show_outliner_section(ui: &mut egui::Ui, scene: &mut SceneState, history: &mut HistoryStack) {
-    ui.label(
-        RichText::new("Scene Outliner")
-            .strong()
-            .size(13.0)
-            .color(tokens::ON_SURFACE),
+fn outliner_icon_button(
+    ui: &mut egui::Ui,
+    icon: ToolIcon,
+    tooltip: &str,
+    active: bool,
+    danger: bool,
+) -> bool {
+    let ink = if danger {
+        tokens::ERROR
+    } else if active {
+        tokens::PRIMARY
+    } else {
+        tokens::ON_SURFACE_VARIANT
+    };
+    let fill = if active {
+        tokens::SURFACE_HIGHEST
+    } else {
+        egui::Color32::TRANSPARENT
+    };
+    let btn = egui::Button::new(RichText::new(icon.glyph()).size(13.0).color(ink))
+        .min_size(egui::vec2(22.0, 20.0))
+        .fill(fill)
+        .corner_radius(CornerRadius::same(3));
+    ui.add(btn).on_hover_text(tooltip).clicked()
+}
+
+fn next_outliner_node_name(scene: &SceneState, base: &str) -> String {
+    if !scene.nodes.values().any(|n| n.name == base) {
+        return base.to_string();
+    }
+    let mut idx = 2usize;
+    loop {
+        let candidate = format!("{base} {idx}");
+        if !scene.nodes.values().any(|n| n.name == candidate) {
+            return candidate;
+        }
+        idx = idx.saturating_add(1);
+    }
+}
+
+fn outliner_add_tooltip(scene: &SceneState) -> &'static str {
+    match scene.active_mode {
+        AppMode::Pixel => "Add Pixel Canvas",
+        AppMode::Voxel => "Add Voxel Volume",
+        AppMode::LowPoly => "Add Low-Poly Mesh",
+        AppMode::Character => {
+            if !scene.voxel_volumes.is_empty() && scene.lowpoly_meshes.is_empty() {
+                "Add Voxel Volume"
+            } else {
+                "Add Low-Poly Mesh"
+            }
+        }
+    }
+}
+
+fn create_outliner_node_command(scene: &SceneState) -> Command {
+    match scene.active_mode {
+        AppMode::Pixel => Command::CreatePixelCanvas {
+            name: next_outliner_node_name(scene, "Sprite 32x32"),
+            width: 32,
+            height: 32,
+        },
+        AppMode::Voxel => Command::CreateVoxelVolume {
+            name: next_outliner_node_name(scene, "Voxel Volume"),
+        },
+        AppMode::LowPoly => Command::CreatePrimitiveMesh {
+            name: next_outliner_node_name(scene, "Mesh"),
+            kind: tessel_core::PrimitiveKind::Cube,
+            size: 0.8,
+            material: scene.active_color,
+        },
+        AppMode::Character => {
+            if !scene.voxel_volumes.is_empty() && scene.lowpoly_meshes.is_empty() {
+                Command::CreateVoxelVolume {
+                    name: next_outliner_node_name(scene, "Voxel Volume"),
+                }
+            } else {
+                Command::CreatePrimitiveMesh {
+                    name: next_outliner_node_name(scene, "Mesh"),
+                    kind: tessel_core::PrimitiveKind::Cube,
+                    size: 0.8,
+                    material: scene.active_color,
+                }
+            }
+        }
+    }
+}
+
+fn show_outliner_section(
+    ui: &mut egui::Ui,
+    scene: &mut SceneState,
+    history: &mut HistoryStack,
+    outliner_rename: &mut OutlinerRenameState,
+) {
+    // Drop stale rename state immediately if the target node was deleted externally.
+    if outliner_rename
+        .active
+        .as_ref()
+        .is_some_and(|(rid, _)| !scene.nodes.contains_key(rid))
+    {
+        outliner_rename.clear();
+    }
+
+    let header_width = ui.available_width().max(96.0);
+    let add_tooltip = outliner_add_tooltip(scene);
+    ui.allocate_ui_with_layout(
+        egui::vec2(header_width, 22.0),
+        egui::Layout::right_to_left(egui::Align::Center),
+        |ui| {
+            if outliner_icon_button(ui, ToolIcon::Add, add_tooltip, false, false) {
+                let add_cmd = create_outliner_node_command(scene);
+                super::exec_history(ui.ctx(), history, scene, add_cmd);
+            }
+            let title_width = ui.available_width().max(24.0);
+            ui.allocate_ui_with_layout(
+                egui::vec2(title_width, 22.0),
+                egui::Layout::left_to_right(egui::Align::Center),
+                |ui| {
+                    ui.label(
+                        RichText::new("Scene Outliner")
+                            .strong()
+                            .size(13.0)
+                            .color(tokens::ON_SURFACE),
+                    );
+                },
+            );
+        },
     );
     ui.add_space(4.0);
 
     if scene.nodes.is_empty() {
+        outliner_rename.clear();
         ui.label(
             RichText::new("Scene is empty.")
                 .size(11.5)
@@ -838,11 +1079,6 @@ fn show_outliner_section(ui: &mut egui::Ui, scene: &mut SceneState, history: &mu
         return;
     }
 
-    let rename_state_id = egui::Id::new("tessel_outliner_rename");
-    let mut renaming: Option<(NodeId, String)> = ui
-        .ctx()
-        .data_mut(|d| d.get_temp::<(NodeId, String)>(rename_state_id));
-
     let nodes: Vec<_> = scene
         .nodes
         .values()
@@ -850,64 +1086,41 @@ fn show_outliner_section(ui: &mut egui::Ui, scene: &mut SceneState, history: &mu
         .collect();
     for (id, name, kind, visible) in nodes {
         let selected = scene.selected_node == Some(id);
-        let is_renaming = renaming.as_ref().is_some_and(|(rid, _)| *rid == id);
-        ui.horizontal(|ui| {
-            if is_renaming {
-                if let Some((_, ref mut draft)) = renaming {
-                    let resp = ui.add(
-                        egui::TextEdit::singleline(draft)
-                            .desired_width(140.0)
-                            .hint_text("Node name"),
-                    );
-                    let enter = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-                    let escape = ui.input(|i| i.key_pressed(egui::Key::Escape));
-                    if escape {
-                        renaming = None;
-                    } else if enter || resp.lost_focus() {
-                        let committed = draft.clone();
-                        rename_node_if_changed(scene, history, id, &committed);
-                        renaming = None;
-                    }
-                }
-            } else {
-                let label_text = format!("{name} ({kind:?})");
-                let text = if visible {
-                    RichText::new(label_text)
-                } else {
-                    RichText::new(label_text).color(tokens::ON_SURFACE_VARIANT)
-                };
-                if ui.selectable_label(selected, text).clicked() && !selected {
-                    super::exec_history(ui.ctx(), history, scene, Command::SelectNode(Some(id)));
-                }
-            }
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if icons::hud_icon_button_full(
-                    ui,
-                    ToolIcon::Close,
-                    "Delete node",
-                    false,
-                    true,
-                    true,
-                ) {
-                    if renaming.as_ref().is_some_and(|(rid, _)| *rid == id) {
-                        renaming = None;
+        let is_renaming = outliner_rename
+            .active
+            .as_ref()
+            .is_some_and(|(rid, _)| *rid == id);
+        let row_width = ui.available_width().max(96.0);
+        ui.allocate_ui_with_layout(
+            egui::vec2(row_width, 24.0),
+            egui::Layout::right_to_left(egui::Align::Center),
+            |ui| {
+                ui.spacing_mut().item_spacing.x = 2.0;
+                // Allocate compact right-aligned action buttons first inside a fixed 24px row
+                // so long node names never overlap icons and vertical padding stays tight.
+                if outliner_icon_button(ui, ToolIcon::Close, "Delete node", false, true) {
+                    if outliner_rename
+                        .active
+                        .as_ref()
+                        .is_some_and(|(rid, _)| *rid == id)
+                    {
+                        outliner_rename.clear();
                     }
                     super::exec_history(ui.ctx(), history, scene, Command::DeleteNode(id));
                 }
-                if icons::hud_icon_button_full(
-                    ui,
-                    ToolIcon::Pencil,
-                    "Rename node",
-                    is_renaming,
-                    true,
-                    true,
-                ) {
+                if outliner_icon_button(ui, ToolIcon::Pencil, "Rename node", is_renaming, false) {
                     if is_renaming {
-                        if let Some((_, draft)) = renaming.take() {
-                            rename_node_if_changed(scene, history, id, &draft);
+                        if let Some((prev_id, draft)) = outliner_rename.active.take() {
+                            rename_node_if_changed(scene, history, prev_id, &draft);
                         }
+                        outliner_rename.request_focus = false;
                     } else {
-                        renaming = Some((id, name.clone()));
+                        // Commit any in-progress rename on another row before switching.
+                        if let Some((prev_id, prev_draft)) = outliner_rename.active.take() {
+                            rename_node_if_changed(scene, history, prev_id, &prev_draft);
+                        }
+                        outliner_rename.active = Some((id, name.clone()));
+                        outliner_rename.request_focus = true;
                     }
                 }
                 let (vis_icon, vis_tip) = if visible {
@@ -915,7 +1128,7 @@ fn show_outliner_section(ui: &mut egui::Ui, scene: &mut SceneState, history: &mu
                 } else {
                     (ToolIcon::EyeClosed, "Show node")
                 };
-                if icons::hud_icon_button_full(ui, vis_icon, vis_tip, !visible, true, true) {
+                if outliner_icon_button(ui, vis_icon, vis_tip, !visible, false) {
                     super::exec_history(
                         ui.ctx(),
                         history,
@@ -926,23 +1139,73 @@ fn show_outliner_section(ui: &mut egui::Ui, scene: &mut SceneState, history: &mu
                         },
                     );
                 }
-            });
-        });
-    }
 
-    ui.ctx().data_mut(|d| {
-        if let Some(state) = renaming {
-            d.insert_temp(rename_state_id, state);
-        } else {
-            d.remove::<(NodeId, String)>(rename_state_id);
-        }
-    });
+                ui.add_space(4.0);
+                let text_width = ui.available_width().max(24.0);
+                ui.allocate_ui_with_layout(
+                    egui::vec2(text_width, 22.0),
+                    egui::Layout::left_to_right(egui::Align::Center),
+                    |ui| {
+                        ui.set_max_width(text_width);
+                        if is_renaming {
+                            if let Some((_, ref mut draft)) = outliner_rename.active {
+                                let resp = ui.add(
+                                    egui::TextEdit::singleline(draft)
+                                        .desired_width(text_width)
+                                        .hint_text("Node name"),
+                                );
+                                if outliner_rename.request_focus {
+                                    resp.request_focus();
+                                    outliner_rename.request_focus = false;
+                                }
+                                let enter = resp.lost_focus()
+                                    && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                                let escape = ui.input(|i| i.key_pressed(egui::Key::Escape));
+                                if escape {
+                                    outliner_rename.clear();
+                                } else if enter || resp.lost_focus() {
+                                    let committed = draft.clone();
+                                    rename_node_if_changed(scene, history, id, &committed);
+                                    outliner_rename.clear();
+                                }
+                            }
+                        } else {
+                            ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Truncate);
+                            let label_text = format!("{name} ({kind:?})");
+                            let text = if visible {
+                                RichText::new(&label_text)
+                            } else {
+                                RichText::new(&label_text).color(tokens::ON_SURFACE_VARIANT)
+                            };
+                            let resp = ui
+                                .selectable_label(selected, text)
+                                .on_hover_text(&label_text);
+                            if resp.clicked() && !selected {
+                                super::exec_history(
+                                    ui.ctx(),
+                                    history,
+                                    scene,
+                                    Command::SelectNode(Some(id)),
+                                );
+                            }
+                        }
+                    },
+                );
+            },
+        );
+    }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn show_transform_and_lighting_section(
     ui: &mut egui::Ui,
     scene: &mut SceneState,
     history: &mut HistoryStack,
+    show_viewport_gizmo: &mut bool,
+    gizmo_mode: &mut tessel_render::TransformGizmoMode,
+    free_view: &mut bool,
+    render_preview: &mut bool,
+    interaction_tool: &mut super::viewport::ViewportInteractionTool,
 ) {
     if let Some(node_id) = scene.selected_node {
         if let Some((node_name, mut tx)) = scene
@@ -976,6 +1239,82 @@ fn show_transform_and_lighting_section(
                     }
                 });
             });
+            if scene.active_mode != AppMode::Pixel {
+                let mut gizmo_active = super::viewport::is_transform_gizmo_enabled(
+                    scene,
+                    *interaction_tool,
+                    *free_view,
+                    *render_preview,
+                    *show_viewport_gizmo,
+                );
+                if ui
+                    .checkbox(&mut gizmo_active, "Viewport Gizmo")
+                    .on_hover_text(
+                        "Show interactive Move / Rotate / Scale gizmo in the 3D viewport",
+                    )
+                    .changed()
+                {
+                    if gizmo_active {
+                        super::viewport::activate_transform_gizmo(
+                            scene,
+                            show_viewport_gizmo,
+                            free_view,
+                            render_preview,
+                            interaction_tool,
+                        );
+                    } else {
+                        *show_viewport_gizmo = false;
+                    }
+                }
+                if gizmo_active {
+                    ui.horizontal(|ui| {
+                        for (mode, label) in [
+                            (tessel_render::TransformGizmoMode::Move, "Move"),
+                            (tessel_render::TransformGizmoMode::Rotate, "Rotate"),
+                            (tessel_render::TransformGizmoMode::Scale, "Scale"),
+                        ] {
+                            if ui.radio_value(gizmo_mode, mode, label).clicked() {
+                                super::viewport::activate_transform_gizmo(
+                                    scene,
+                                    show_viewport_gizmo,
+                                    free_view,
+                                    render_preview,
+                                    interaction_tool,
+                                );
+                            }
+                        }
+                    });
+                }
+                if scene.active_mode != AppMode::Character
+                    && scene.nodes.get(&node_id).is_some_and(|n| {
+                        matches!(
+                            n.kind,
+                            tessel_core::NodeKind::VoxelVolume | tessel_core::NodeKind::LowPolyMesh
+                        )
+                    })
+                {
+                    if let Some(mut skinned) = scene
+                        .character_rig
+                        .as_ref()
+                        .map(|r| r.should_skin_node(node_id))
+                    {
+                        if ui
+                            .checkbox(&mut skinned, "Skinned by Rig")
+                            .on_hover_text(
+                                "Toggle whether this object is deformed by the active character rig",
+                            )
+                            .changed()
+                        {
+                            super::exec_history(
+                                ui.ctx(),
+                                history,
+                                scene,
+                                Command::SetNodeRigSkinned { node_id, skinned },
+                            );
+                        }
+                    }
+                }
+            }
 
             let mut changed = false;
             let mut dragging = false;
@@ -1735,7 +2074,8 @@ mod tests {
                 .show(ctx, |ui| {
                     egui::ScrollArea::vertical().show(ui, |ui| {
                         show_character_rig_section(ui, &mut scene, &mut history);
-                        show_outliner_section(ui, &mut scene, &mut history);
+                        let mut rename_state = OutlinerRenameState::default();
+                        show_outliner_section(ui, &mut scene, &mut history, &mut rename_state);
                     });
                 });
         });
@@ -1799,7 +2139,21 @@ mod tests {
                 .resizable(false)
                 .show(ctx, |ui| {
                     egui::ScrollArea::vertical().show(ui, |ui| {
-                        show_transform_and_lighting_section(ui, &mut scene, &mut history);
+                        let mut show_gizmo = true;
+                        let mut gizmo_mode = tessel_render::TransformGizmoMode::Move;
+                        let mut free_view = false;
+                        let mut render_preview = false;
+                        let mut tool = crate::ui::viewport::ViewportInteractionTool::Select;
+                        show_transform_and_lighting_section(
+                            ui,
+                            &mut scene,
+                            &mut history,
+                            &mut show_gizmo,
+                            &mut gizmo_mode,
+                            &mut free_view,
+                            &mut render_preview,
+                            &mut tool,
+                        );
                     });
                 });
         });
@@ -1896,7 +2250,21 @@ mod tests {
                     .resizable(false)
                     .show(ctx, |ui| {
                         egui::ScrollArea::vertical().show(ui, |ui| {
-                            show_transform_and_lighting_section(ui, scene, history);
+                            let mut show_gizmo = true;
+                            let mut gizmo_mode = tessel_render::TransformGizmoMode::Move;
+                            let mut free_view = false;
+                            let mut render_preview = false;
+                            let mut tool = crate::ui::viewport::ViewportInteractionTool::Select;
+                            show_transform_and_lighting_section(
+                                ui,
+                                scene,
+                                history,
+                                &mut show_gizmo,
+                                &mut gizmo_mode,
+                                &mut free_view,
+                                &mut render_preview,
+                                &mut tool,
+                            );
                         });
                     });
             };
@@ -2029,5 +2397,43 @@ mod tests {
         assert_eq!(ai_state.config.provider, target_provider);
         assert_eq!(ai_state.config.model, "custom-model-v2");
         assert_eq!(ai_state.config.base_url, "http://127.0.0.1:9999/v1");
+    }
+
+    #[test]
+    fn outliner_add_button_creates_unique_mode_appropriate_nodes() {
+        let mut scene = SceneState::new();
+        let mut history = HistoryStack::new();
+
+        // Voxel mode: adds unique VoxelVolume nodes.
+        scene.active_mode = AppMode::Voxel;
+        let cmd1 = create_outliner_node_command(&scene);
+        history.execute(&mut scene, cmd1).unwrap();
+        let cmd2 = create_outliner_node_command(&scene);
+        history.execute(&mut scene, cmd2).unwrap();
+        assert_eq!(scene.voxel_volumes.len(), 2);
+        let names: Vec<&str> = scene.nodes.values().map(|n| n.name.as_str()).collect();
+        assert!(names.contains(&"Voxel Volume"));
+        assert!(names.contains(&"Voxel Volume 2"));
+
+        // Character mode on a Voxel project adds a VoxelVolume.
+        scene.active_mode = AppMode::Character;
+        let cmd_ch_vox = create_outliner_node_command(&scene);
+        history.execute(&mut scene, cmd_ch_vox).unwrap();
+        assert_eq!(scene.voxel_volumes.len(), 3);
+
+        // Pixel mode: adds PixelCanvas.
+        scene.active_mode = AppMode::Pixel;
+        let cmd_px = create_outliner_node_command(&scene);
+        history.execute(&mut scene, cmd_px).unwrap();
+        assert_eq!(scene.pixel_canvases.len(), 1);
+
+        // LowPoly & Character modes (with LowPoly meshes): add LowPolyMesh.
+        scene.active_mode = AppMode::LowPoly;
+        let cmd_lp = create_outliner_node_command(&scene);
+        history.execute(&mut scene, cmd_lp).unwrap();
+        scene.active_mode = AppMode::Character;
+        let cmd_ch = create_outliner_node_command(&scene);
+        history.execute(&mut scene, cmd_ch).unwrap();
+        assert_eq!(scene.lowpoly_meshes.len(), 2);
     }
 }

@@ -82,7 +82,7 @@ pub(super) fn apply(cmd: &Command, scene: &mut SceneState) -> Result<UndoDelta, 
                 None,
                 Transform::default(),
             )?;
-            scene.lowpoly_meshes.insert(id, mesh.clone());
+            scene.lowpoly_meshes.insert(id, (**mesh).clone());
             UndoDelta::RemoveNode {
                 id,
                 previous_selection,
@@ -579,6 +579,11 @@ pub(super) fn apply(cmd: &Command, scene: &mut SceneState) -> Result<UndoDelta, 
             if !material.metallic.is_finite()
                 || !material.roughness.is_finite()
                 || material.emissive.iter().any(|c| !c.is_finite())
+                || !material.matcap_strength.is_finite()
+                || !material.hatching_scale.is_finite()
+                || material
+                    .face_sdf_light_override
+                    .is_some_and(|d| d.iter().any(|c| !c.is_finite()))
             {
                 return Err(CoreError::OutOfBounds);
             }
@@ -605,6 +610,9 @@ pub(super) fn apply(cmd: &Command, scene: &mut SceneState) -> Result<UndoDelta, 
                     other => other,
                 },
                 unlit: material.unlit,
+                matcap_strength: material.matcap_strength.clamp(0.0, 1.0),
+                hatching_scale: material.hatching_scale.clamp(0.1, 64.0),
+                face_sdf_light_override: material.face_sdf_light_override,
             };
             let mesh = scene
                 .lowpoly_meshes
@@ -922,6 +930,124 @@ pub(super) fn apply(cmd: &Command, scene: &mut SceneState) -> Result<UndoDelta, 
             let previous = mesh.normal_map.clone();
             mesh.normal_map = normal_map.clone();
             UndoDelta::RestoreMeshNormalMap {
+                node_id: *node_id,
+                previous,
+            }
+        }
+        Command::SetMeshNprSlot {
+            node_id,
+            slot,
+            texture,
+        } => {
+            if let Some(tex) = texture {
+                let expected = (tex.width as usize)
+                    .checked_mul(tex.height as usize)
+                    .and_then(|px| px.checked_mul(4));
+                if tex.width == 0
+                    || tex.height == 0
+                    || tex.width > 1024
+                    || tex.height > 1024
+                    || expected != Some(tex.rgba.len())
+                {
+                    return Err(CoreError::OutOfBounds);
+                }
+            }
+            let mesh = scene
+                .lowpoly_meshes
+                .get_mut(node_id)
+                .ok_or(CoreError::LowPolyMeshNotFound(*node_id))?;
+            let target_field = match slot {
+                crate::mesh::NprTextureSlot::MatCap => &mut mesh.matcap_map,
+                crate::mesh::NprTextureSlot::FaceSdf => &mut mesh.face_sdf_map,
+                crate::mesh::NprTextureSlot::HatchingRamp => &mut mesh.hatching_ramp_map,
+            };
+            let previous = target_field.clone();
+            *target_field = texture.clone();
+            UndoDelta::RestoreMeshNprSlot {
+                node_id: *node_id,
+                slot: *slot,
+                previous,
+            }
+        }
+        Command::SetMeshUvSeams {
+            node_id,
+            edges,
+            replace,
+            unwrap,
+        } => {
+            let mesh = scene
+                .lowpoly_meshes
+                .get_mut(node_id)
+                .ok_or(CoreError::LowPolyMeshNotFound(*node_id))?;
+            let v_count = mesh.vertices.len();
+            for &(a, b) in edges {
+                if a >= v_count || b >= v_count || a == b {
+                    return Err(CoreError::OutOfBounds);
+                }
+            }
+            let previous = mesh.clone();
+            if *replace {
+                mesh.uv_seams.clear();
+            }
+            for &(a, b) in edges {
+                let c = crate::mesh::canonical_edge(a, b);
+                if !mesh.uv_seams.contains(&c) {
+                    mesh.uv_seams.push(c);
+                }
+            }
+            mesh.uv_seams.sort_unstable();
+            mesh.uv_seams.dedup();
+            if *unwrap {
+                let _ = crate::mesh::unwrap_with_uv_seams(mesh, 0.01);
+            }
+            UndoDelta::RestoreLowPolyMesh {
+                node_id: *node_id,
+                previous_mesh: previous,
+            }
+        }
+        Command::NormalizeMeshTexelDensity {
+            node_id,
+            texture_size,
+            target_px_per_unit,
+            padding_uv,
+        } => {
+            if !padding_uv.is_finite()
+                || target_px_per_unit.is_some_and(|t| !t.is_finite() || t <= 0.0)
+            {
+                return Err(CoreError::OutOfBounds);
+            }
+            let mesh = scene
+                .lowpoly_meshes
+                .get_mut(node_id)
+                .ok_or(CoreError::LowPolyMeshNotFound(*node_id))?;
+            let previous = mesh.clone();
+            let _ = crate::mesh::normalize_texel_density(
+                mesh,
+                *texture_size,
+                *target_px_per_unit,
+                *padding_uv,
+            );
+            UndoDelta::RestoreLowPolyMesh {
+                node_id: *node_id,
+                previous_mesh: previous,
+            }
+        }
+        Command::SculptMeshStroke { node_id, params } => {
+            if !params.radius.is_finite()
+                || params.radius <= 0.0
+                || !params.strength.is_finite()
+                || !params.center.iter().all(|c| c.is_finite())
+                || !params.normal.iter().all(|c| c.is_finite())
+                || !params.drag_delta.iter().all(|c| c.is_finite())
+            {
+                return Err(CoreError::OutOfBounds);
+            }
+            let mesh = scene
+                .lowpoly_meshes
+                .get_mut(node_id)
+                .ok_or(CoreError::LowPolyMeshNotFound(*node_id))?;
+            let previous = crate::mesh::apply_sculpt_stroke(mesh, *params);
+            UndoDelta::RestoreMeshVertexPositions {
                 node_id: *node_id,
                 previous,
             }

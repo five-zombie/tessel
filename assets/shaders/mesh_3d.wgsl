@@ -10,6 +10,10 @@ struct MaterialUniform {
     pbr: vec4<f32>,
     /// [emissive_r, emissive_g, emissive_b, unlit_flag]
     emissive: vec4<f32>,
+    /// [matcap_strength, has_face_sdf, has_hatching, hatching_scale]
+    npr_slots: vec4<f32>,
+    /// [light_x, light_y, light_z, has_face_sdf_light_override]
+    face_sdf_light: vec4<f32>,
 };
 
 struct ShadowMapUniform {
@@ -33,6 +37,15 @@ var<uniform> material: MaterialUniform;
 
 @group(0) @binding(4)
 var normal_tex: texture_2d<f32>;
+
+@group(0) @binding(5)
+var matcap_tex: texture_2d<f32>;
+
+@group(0) @binding(6)
+var face_sdf_tex: texture_2d<f32>;
+
+@group(0) @binding(7)
+var hatching_tex: texture_2d<f32>;
 
 @group(1) @binding(0)
 var<uniform> shadow_map: ShadowMapUniform;
@@ -155,9 +168,25 @@ fn fs_main(in: VertexOut, @builtin(front_facing) front_facing: bool) -> @locatio
 
     var lit: vec3<f32>;
     if (shading_mode == 1) {
-        // NPR / Sumi-e Ink-Wash Preview: stepped 3-band ink ramp, dark Fresnel ink rim,
+        // NPR / Sumi-e Ink-Wash Preview: stepped 3-band ink ramp, optional Face SDF shadow map,
+        // optional multi-level hatching ramp, optional MatCap, dark Fresnel ink rim,
         // stylized stepped specular, object-space washi paper grain, and atmospheric depth ink-fade.
-        let lit_tone = ndl * shadow_vis;
+        var lit_tone = ndl * shadow_vis;
+        if (material.npr_slots.y > 0.5) {
+            // Face SDF Shadow Map with optional light-direction override (anime / sumi-e face lighting)
+            let override_len = length(material.face_sdf_light.xyz);
+            let sdf_light = select(
+                key_dir,
+                material.face_sdf_light.xyz / max(override_len, 1e-5),
+                material.face_sdf_light.w > 0.5 && override_len > 1e-5,
+            );
+            let l_xz = normalize(vec2<f32>(sdf_light.x, sdf_light.z) + vec2<f32>(1e-5, 0.0));
+            let flip_u = clamp(select(in.palette_uv.x, 1.0 - in.palette_uv.x, l_xz.x < 0.0), 0.0, 1.0);
+            let sdf_sample = textureSample(face_sdf_tex, palette_sampler, vec2<f32>(flip_u, clamp(in.palette_uv.y, 0.0, 1.0))).r;
+            let sdf_threshold = clamp(1.0 - (l_xz.y * 0.5 + 0.5), 0.0, 1.0);
+            let sdf_lit = select(0.15, 1.0, sdf_sample >= sdf_threshold);
+            lit_tone = sdf_lit * shadow_vis;
+        }
         let band = select(select(0.32, 0.68, lit_tone > 0.22), 1.0, lit_tone > 0.58);
         let dark_fresnel = pow(1.0 - max(dot(n, view_dir), 0.0), 2.8) * 0.45;
         let spec_step = select(0.0, 0.22, pow(max(dot(n, half_vec), 0.0), 32.0) * shadow_vis > 0.45);
@@ -165,6 +194,36 @@ fn fs_main(in: VertexOut, @builtin(front_facing) front_facing: bool) -> @locatio
         let ink_tint = vec3<f32>(0.08, 0.075, 0.09);
         let paper_tint = vec3<f32>(0.93, 0.90, 0.84);
         var sumi = base_color * band * in.ao + vec3<f32>(spec_step + grain) + material.emissive.rgb;
+
+        if (material.npr_slots.z > 0.5) {
+            // Multi-level hatching ramp: R=light hatch, G=mid hatch, B=dense shadow hatch
+            let hatch_uv = fract(in.palette_uv * max(material.npr_slots.w, 0.1));
+            let hatch_rgb = textureSample(hatching_tex, palette_sampler, hatch_uv).rgb;
+            let shade_density = clamp(1.0 - lit_tone, 0.0, 1.0);
+            let hatch_mask = select(
+                select(hatch_rgb.r, hatch_rgb.g, shade_density > 0.35),
+                hatch_rgb.b,
+                shade_density > 0.70,
+            );
+            sumi = mix(sumi, sumi * hatch_mask, shade_density * 0.65);
+        }
+
+        if (material.npr_slots.x > 0.001) {
+            // Custom MatCap spherical environment lookup in view-aligned basis
+            let cam_up = vec3<f32>(0.0, 1.0, 0.0);
+            let cam_right_raw = cross(cam_up, view_dir);
+            let cam_right = select(
+                vec3<f32>(1.0, 0.0, 0.0),
+                normalize(cam_right_raw),
+                length(cam_right_raw) > 1e-4,
+            );
+            let cam_true_up = normalize(cross(view_dir, cam_right));
+            let mc_u = clamp(dot(n, cam_right) * 0.5 + 0.5, 0.0, 1.0);
+            let mc_v = clamp(0.5 - dot(n, cam_true_up) * 0.5, 0.0, 1.0);
+            let matcap_col = textureSample(matcap_tex, palette_sampler, vec2<f32>(mc_u, mc_v)).rgb;
+            sumi = mix(sumi, sumi * matcap_col * 1.4, clamp(material.npr_slots.x, 0.0, 1.0));
+        }
+
         sumi = mix(sumi, ink_tint, dark_fresnel);
         let fog_dist = max(shadow_map.npr_params.z, 1.0);
         let fog_factor = clamp((cam_dist - fog_dist * 0.35) / fog_dist, 0.0, 0.55);

@@ -26,8 +26,36 @@ pub fn export_glb_bytes(
         .character_rig
         .as_ref()
         .and_then(|rig| AutoSkinSolver::from_rig(rig, scale));
-    let mesh = CollectedMesh::from_scene_untextured(scene, preset, skin_solver.as_ref());
+    let node_is_skinned = |node_id: tessel_core::NodeId| -> bool {
+        skin_solver
+            .as_ref()
+            .is_some_and(|s| s.node_has_skin_influence(node_id))
+            && scene
+                .character_rig
+                .as_ref()
+                .is_some_and(|rig| rig.should_skin_node(node_id))
+    };
+    let (mesh, static_mesh) = if skin_solver.is_some() {
+        (
+            CollectedMesh::from_scene_untextured_filtered(
+                scene,
+                preset,
+                skin_solver.as_ref(),
+                &node_is_skinned,
+            ),
+            CollectedMesh::from_scene_untextured_filtered(scene, preset, None, |nid| {
+                !node_is_skinned(nid)
+            }),
+        )
+    } else {
+        (
+            CollectedMesh::from_scene_untextured(scene, preset, None),
+            CollectedMesh::empty(),
+        )
+    };
     let has_palette_prim = !mesh.positions.is_empty() && !mesh.indices.is_empty();
+    let has_static_palette_prim =
+        !static_mesh.positions.is_empty() && !static_mesh.indices.is_empty();
     let palette_png = build_palette_png(&scene.palette)?;
 
     let mut min_pos = [f32::INFINITY; 3];
@@ -66,6 +94,9 @@ pub fn export_glb_bytes(
     let mut textures: Vec<Value> = Vec::new();
     let mut materials: Vec<Value> = Vec::new();
     let mut primitives: Vec<Value> = Vec::new();
+    let mut static_primitives: Vec<Value> = Vec::new();
+    let mut palette_tex_index: Option<usize> = None;
+    let mut palette_mat_index: Option<usize> = None;
     let mut total_triangles = 0usize;
 
     if has_palette_prim {
@@ -138,6 +169,8 @@ pub fn export_glb_bytes(
                 "roughnessFactor": 0.85
             }
         }));
+        palette_tex_index = Some(0);
+        palette_mat_index = Some(0);
         let mut prim_attrs = json!({
             "POSITION": 0,
             "NORMAL": 1,
@@ -179,6 +212,109 @@ pub fn export_glb_bytes(
             "material": 0
         }));
         total_triangles += mesh.indices.len() / 3;
+    }
+
+    if has_static_palette_prim {
+        let mut s_min = [f32::INFINITY; 3];
+        let mut s_max = [f32::NEG_INFINITY; 3];
+        for p in &static_mesh.positions {
+            for axis in 0..3 {
+                s_min[axis] = s_min[axis].min(p[axis]);
+                s_max[axis] = s_max[axis].max(p[axis]);
+            }
+        }
+        let pos_bv = push_view(
+            &mut bin,
+            &mut buffer_views,
+            bytemuck::cast_slice(&static_mesh.positions),
+            Some(34962),
+        );
+        let norm_bv = push_view(
+            &mut bin,
+            &mut buffer_views,
+            bytemuck::cast_slice(&static_mesh.normals),
+            Some(34962),
+        );
+        let uv_bv = push_view(
+            &mut bin,
+            &mut buffer_views,
+            bytemuck::cast_slice(&static_mesh.uvs),
+            Some(34962),
+        );
+        let idx_bv = push_view(
+            &mut bin,
+            &mut buffer_views,
+            bytemuck::cast_slice(&static_mesh.indices),
+            Some(34963),
+        );
+        let p_acc = accessors.len();
+        accessors.push(json!({
+            "bufferView": pos_bv,
+            "componentType": 5126,
+            "count": static_mesh.positions.len(),
+            "type": "VEC3",
+            "min": s_min,
+            "max": s_max
+        }));
+        let n_acc = accessors.len();
+        accessors.push(json!({
+            "bufferView": norm_bv,
+            "componentType": 5126,
+            "count": static_mesh.normals.len(),
+            "type": "VEC3"
+        }));
+        let u_acc = accessors.len();
+        accessors.push(json!({
+            "bufferView": uv_bv,
+            "componentType": 5126,
+            "count": static_mesh.uvs.len(),
+            "type": "VEC2"
+        }));
+        let i_acc = accessors.len();
+        accessors.push(json!({
+            "bufferView": idx_bv,
+            "componentType": 5125,
+            "count": static_mesh.indices.len(),
+            "type": "SCALAR"
+        }));
+        let mat_idx = match palette_mat_index {
+            Some(existing) => existing,
+            None => {
+                let img_bv = push_view(&mut bin, &mut buffer_views, &palette_png, None);
+                let img_idx = images.len();
+                images.push(json!({
+                    "bufferView": img_bv,
+                    "mimeType": "image/png"
+                }));
+                let tex_idx = textures.len();
+                textures.push(json!({
+                    "sampler": 0,
+                    "source": img_idx
+                }));
+                let m_idx = materials.len();
+                materials.push(json!({
+                    "name": "TesselPaletteMaterial",
+                    "pbrMetallicRoughness": {
+                        "baseColorTexture": { "index": tex_idx },
+                        "metallicFactor": 0.0,
+                        "roughnessFactor": 0.85
+                    }
+                }));
+                palette_tex_index = Some(tex_idx);
+                palette_mat_index = Some(m_idx);
+                m_idx
+            }
+        };
+        static_primitives.push(json!({
+            "attributes": {
+                "POSITION": p_acc,
+                "NORMAL": n_acc,
+                "TEXCOORD_0": u_acc
+            },
+            "indices": i_acc,
+            "material": mat_idx
+        }));
+        total_triangles += static_mesh.indices.len() / 3;
     }
 
     let mut nodes: Vec<Value> = vec![json!({ "name": "TesselAsset" })];
@@ -227,8 +363,8 @@ pub fn export_glb_bytes(
         scene_node_to_gltf.insert(mid, morph_base_node + mi);
     }
 
+    let mut bone_to_node: BTreeMap<tessel_core::BoneId, usize> = BTreeMap::new();
     if let Some(rig) = &scene.character_rig {
-        let mut bone_to_node: BTreeMap<tessel_core::BoneId, usize> = BTreeMap::new();
         for bone in &rig.bones {
             let node_idx = nodes.len();
             bone_to_node.insert(bone.id, node_idx);
@@ -257,40 +393,6 @@ pub fn export_glb_bytes(
                     }
                 }
                 None => root_nodes.push(child_idx),
-            }
-        }
-
-        if let Some(solver) = &skin_solver {
-            let joint_nodes: Vec<usize> = rig
-                .bones
-                .iter()
-                .filter_map(|b| bone_to_node.get(&b.id).copied())
-                .collect();
-            let ibm = solver.inverse_bind_matrices();
-            if !joint_nodes.is_empty() && joint_nodes.len() == ibm.len() {
-                let ibm_bv =
-                    push_view(&mut bin, &mut buffer_views, bytemuck::cast_slice(ibm), None);
-                let ibm_acc = accessors.len();
-                accessors.push(json!({
-                    "bufferView": ibm_bv,
-                    "componentType": 5126,
-                    "count": ibm.len(),
-                    "type": "MAT4"
-                }));
-                let mut skin_json = json!({
-                    "name": "TesselCharacterSkin",
-                    "inverseBindMatrices": ibm_acc,
-                    "joints": joint_nodes
-                });
-                if let Some(skel) = rig
-                    .bones
-                    .iter()
-                    .find(|b| b.parent.is_none())
-                    .and_then(|b| bone_to_node.get(&b.id).copied())
-                {
-                    skin_json["skeleton"] = json!(skel);
-                }
-                skins.push(skin_json);
             }
         }
 
@@ -965,7 +1067,6 @@ pub fn export_glb_bytes(
     // Export any Low-Poly meshes with custom RGBA texture, PBR material, or
     // morph targets as dedicated primitives (morphs need per-mesh targets,
     // which the merged palette mesh cannot carry).
-    let mut palette_tex_index: Option<usize> = if has_palette_prim { Some(0) } else { None };
     let mut any_unlit = false;
     // Deduplicate identical PBR materials across nodes so multi-part assets avoid redundant draw calls.
     type MaterialKey = (
@@ -980,10 +1081,10 @@ pub fn export_glb_bytes(
         bool,
     );
     let mut material_cache: BTreeMap<MaterialKey, usize> = BTreeMap::new();
-    if has_palette_prim {
+    if let (Some(ptex), Some(pmat)) = (palette_tex_index, palette_mat_index) {
         material_cache.insert(
             (
-                0,
+                ptex,
                 None,
                 None,
                 0.0_f32.to_bits(),
@@ -993,7 +1094,7 @@ pub fn export_glb_bytes(
                 (0, 0),
                 false,
             ),
-            0,
+            pmat,
         );
     }
     let mut morphed: Vec<(tessel_core::NodeId, Value, Vec<f64>)> = Vec::new();
@@ -1189,7 +1290,18 @@ pub fn export_glb_bytes(
             alpha_key,
             lp_mesh.material.unlit,
         );
-        let mat_idx = if let Some(&existing) = material_cache.get(&mat_key) {
+        let has_npr_extras = lp_mesh.matcap_map.is_some()
+            || lp_mesh.face_sdf_map.is_some()
+            || lp_mesh.hatching_ramp_map.is_some()
+            || lp_mesh.material.matcap_strength > 0.0
+            || lp_mesh.material.face_sdf_light_override.is_some()
+            || (lp_mesh.material.hatching_scale - 1.0).abs() > 1e-4;
+        let cached_idx = if !has_npr_extras {
+            material_cache.get(&mat_key).copied()
+        } else {
+            None
+        };
+        let mat_idx = if let Some(existing) = cached_idx {
             existing
         } else {
             let idx = materials.len();
@@ -1231,8 +1343,36 @@ pub fn export_glb_bytes(
                     json!({ "index": a_tex_idx })
                 };
             }
+            if has_npr_extras {
+                let mut extras = serde_json::Map::new();
+                extras.insert(
+                    "tessel_has_matcap".into(),
+                    json!(lp_mesh.matcap_map.is_some()),
+                );
+                extras.insert(
+                    "tessel_has_face_sdf".into(),
+                    json!(lp_mesh.face_sdf_map.is_some()),
+                );
+                extras.insert(
+                    "tessel_has_hatching_ramp".into(),
+                    json!(lp_mesh.hatching_ramp_map.is_some()),
+                );
+                extras.insert(
+                    "tessel_matcap_strength".into(),
+                    json!(lp_mesh.material.matcap_strength),
+                );
+                extras.insert(
+                    "tessel_hatching_scale".into(),
+                    json!(lp_mesh.material.hatching_scale),
+                );
+                if let Some(dir) = lp_mesh.material.face_sdf_light_override {
+                    extras.insert("tessel_face_sdf_light_override".into(), json!(dir));
+                }
+                mat_json["extras"] = serde_json::Value::Object(extras);
+            } else {
+                material_cache.insert(mat_key, idx);
+            }
             materials.push(mat_json);
-            material_cache.insert(mat_key, idx);
             idx
         };
         let mut custom_attrs = json!({
@@ -1266,50 +1406,53 @@ pub fn export_glb_bytes(
             }));
             custom_attrs["COLOR_0"] = json!(c_acc);
         }
-        if let Some(solver) = &skin_solver {
-            let mut t_joints = Vec::with_capacity(t_pos.len());
-            let mut t_weights = Vec::with_capacity(t_pos.len());
-            for (corner, &p) in t_pos.iter().enumerate() {
-                // Manual weight-paint overrides win over the auto solver.
-                let sw = tri
-                    .source_indices
-                    .get(corner)
-                    .and_then(|src| lp_mesh.skin_weights.get(src))
-                    .copied()
-                    .unwrap_or_else(|| {
-                        solver.weights_for_vertex(Some(*node_id), Vec3::from_array(p))
-                    });
-                t_joints.push(sw.joints);
-                t_weights.push(sw.weights);
+        let is_skinned_node = node_is_skinned(*node_id) && !is_local_trs_node;
+        if is_skinned_node {
+            if let Some(solver) = &skin_solver {
+                let mut t_joints = Vec::with_capacity(t_pos.len());
+                let mut t_weights = Vec::with_capacity(t_pos.len());
+                for (corner, &p) in t_pos.iter().enumerate() {
+                    // Manual weight-paint overrides win over the auto solver.
+                    let sw = tri
+                        .source_indices
+                        .get(corner)
+                        .and_then(|src| lp_mesh.skin_weights.get(src))
+                        .copied()
+                        .unwrap_or_else(|| {
+                            solver.weights_for_vertex(Some(*node_id), Vec3::from_array(p))
+                        });
+                    t_joints.push(sw.joints);
+                    t_weights.push(sw.weights);
+                }
+                let j_bv = push_view(
+                    &mut bin,
+                    &mut buffer_views,
+                    bytemuck::cast_slice(&t_joints),
+                    Some(34962),
+                );
+                let w_bv = push_view(
+                    &mut bin,
+                    &mut buffer_views,
+                    bytemuck::cast_slice(&t_weights),
+                    Some(34962),
+                );
+                let j_acc = accessors.len();
+                accessors.push(json!({
+                    "bufferView": j_bv,
+                    "componentType": 5123,
+                    "count": t_joints.len(),
+                    "type": "VEC4"
+                }));
+                let w_acc = accessors.len();
+                accessors.push(json!({
+                    "bufferView": w_bv,
+                    "componentType": 5126,
+                    "count": t_weights.len(),
+                    "type": "VEC4"
+                }));
+                custom_attrs["JOINTS_0"] = json!(j_acc);
+                custom_attrs["WEIGHTS_0"] = json!(w_acc);
             }
-            let j_bv = push_view(
-                &mut bin,
-                &mut buffer_views,
-                bytemuck::cast_slice(&t_joints),
-                Some(34962),
-            );
-            let w_bv = push_view(
-                &mut bin,
-                &mut buffer_views,
-                bytemuck::cast_slice(&t_weights),
-                Some(34962),
-            );
-            let j_acc = accessors.len();
-            accessors.push(json!({
-                "bufferView": j_bv,
-                "componentType": 5123,
-                "count": t_joints.len(),
-                "type": "VEC4"
-            }));
-            let w_acc = accessors.len();
-            accessors.push(json!({
-                "bufferView": w_bv,
-                "componentType": 5126,
-                "count": t_weights.len(),
-                "type": "VEC4"
-            }));
-            custom_attrs["JOINTS_0"] = json!(j_acc);
-            custom_attrs["WEIGHTS_0"] = json!(w_acc);
         }
         if !lp_mesh.morphs.is_empty() {
             let mut targets = Vec::with_capacity(lp_mesh.morphs.len());
@@ -1373,17 +1516,67 @@ pub fn export_glb_bytes(
             });
             morphed.push((*node_id, prim_json, Vec::new()));
         } else {
-            primitives.push(json!({
+            let prim_val = json!({
                 "attributes": custom_attrs,
                 "indices": i_acc,
                 "material": mat_idx
-            }));
+            });
+            if is_skinned_node || skin_solver.is_none() {
+                primitives.push(prim_val);
+            } else {
+                static_primitives.push(prim_val);
+            }
         }
         total_triangles += tri.indices.len() / 3;
     }
 
-    if primitives.is_empty() && morphed.is_empty() {
+    if primitives.is_empty() && static_primitives.is_empty() && morphed.is_empty() {
         return Err(IoError::EmptyCanvas);
+    }
+
+    // Only emit glTF `skins` and its IBM accessor/bufferView when at least one exported
+    // node actually references skinning, avoiding orphaned `UNUSED_OBJECT` skins on
+    // all-unrigged exports.
+    let any_skinned_export = (!primitives.is_empty() && skin_solver.is_some())
+        || morphed.iter().any(|(mnode, _, _)| {
+            let is_local_trs_node =
+                node_trs_animated.contains(mnode) || has_group_ancestor(scene, *mnode);
+            node_is_skinned(*mnode) && !is_local_trs_node
+        });
+    if any_skinned_export {
+        if let (Some(rig), Some(solver)) = (&scene.character_rig, &skin_solver) {
+            let joint_nodes: Vec<usize> = rig
+                .bones
+                .iter()
+                .filter_map(|b| bone_to_node.get(&b.id).copied())
+                .collect();
+            let ibm = solver.inverse_bind_matrices();
+            if !joint_nodes.is_empty() && joint_nodes.len() == ibm.len() {
+                let ibm_bv =
+                    push_view(&mut bin, &mut buffer_views, bytemuck::cast_slice(ibm), None);
+                let ibm_acc = accessors.len();
+                accessors.push(json!({
+                    "bufferView": ibm_bv,
+                    "componentType": 5126,
+                    "count": ibm.len(),
+                    "type": "MAT4"
+                }));
+                let mut skin_json = json!({
+                    "name": "TesselCharacterSkin",
+                    "inverseBindMatrices": ibm_acc,
+                    "joints": joint_nodes
+                });
+                if let Some(skel) = rig
+                    .bones
+                    .iter()
+                    .find(|b| b.parent.is_none())
+                    .and_then(|b| bone_to_node.get(&b.id).copied())
+                {
+                    skin_json["skeleton"] = json!(skel);
+                }
+                skins.push(skin_json);
+            }
+        }
     }
 
     // Morphed meshes get dedicated mesh objects (with exact default
@@ -1391,6 +1584,7 @@ pub fn export_glb_bytes(
     // ride the merged palette mesh. Vertex data is already baked, so the
     // nodes carry no transform.
     let has_skin = !skins.is_empty();
+    let mut static_mesh_assigned_to_root = false;
     let mut meshes: Vec<Value> = if !primitives.is_empty() {
         nodes[0]["mesh"] = json!(0);
         if has_skin {
@@ -1399,6 +1593,13 @@ pub fn export_glb_bytes(
         vec![json!({
             "name": "TesselMesh",
             "primitives": primitives
+        })]
+    } else if !static_primitives.is_empty() {
+        nodes[0]["mesh"] = json!(0);
+        static_mesh_assigned_to_root = true;
+        vec![json!({
+            "name": "TesselMesh",
+            "primitives": static_primitives
         })]
     } else {
         Vec::new()
@@ -1438,7 +1639,7 @@ pub fn export_glb_bytes(
                 mnode_json["scale"] = json!(snode.transform.scale.to_array());
             }
         }
-        if has_skin && !is_local_trs_node {
+        if has_skin && node_is_skinned(mnode) && !is_local_trs_node {
             mnode_json["skin"] = json!(0);
         }
         nodes.push(mnode_json);
@@ -1450,6 +1651,20 @@ pub fn export_glb_bytes(
         if !parent_is_group {
             root_nodes.push(node_idx);
         }
+    }
+
+    if !static_primitives.is_empty() && !static_mesh_assigned_to_root {
+        let static_mesh_idx = meshes.len();
+        meshes.push(json!({
+            "name": "TesselStaticMesh",
+            "primitives": static_primitives
+        }));
+        let static_node_idx = nodes.len();
+        nodes.push(json!({
+            "name": "TesselStaticAsset",
+            "mesh": static_mesh_idx
+        }));
+        root_nodes.push(static_node_idx);
     }
 
     let mut gltf_json = json!({

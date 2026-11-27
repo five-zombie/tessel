@@ -608,6 +608,26 @@ pub(super) fn execute(
                 "masked_bones": count
             }))
         }
+        "character_set_node_skinned" => {
+            let raw_id = args
+                .get("node_id")
+                .and_then(Value::as_u64)
+                .ok_or_else(|| AiError::InvalidArguments("missing 'node_id'".into()))?;
+            if raw_id == 0 {
+                return Err(AiError::InvalidArguments("'node_id' must be >= 1".into()));
+            }
+            let node_id = NodeId(raw_id);
+            let skinned = args
+                .get("skinned")
+                .and_then(Value::as_bool)
+                .ok_or_else(|| AiError::InvalidArguments("missing boolean 'skinned'".into()))?;
+            history.execute(scene, Command::SetNodeRigSkinned { node_id, skinned })?;
+            Ok(json!({
+                "ok": true,
+                "node_id": node_id.0,
+                "skinned": skinned
+            }))
+        }
         "character_set_bone_pose" => {
             let raw_id = args
                 .get("bone_id")
@@ -1894,6 +1914,7 @@ pub(super) fn execute(
                         "bone_id": b.id.0,
                         "name": b.name,
                         "parent_bone_id": b.parent.map(|p| p.0),
+                        "deform": b.deform,
                         "rest_position": local_pos,
                         "local_rest_position": local_pos,
                         "world_rest_position": world_pos,
@@ -1912,9 +1933,30 @@ pub(super) fn execute(
                 .character_rig
                 .as_ref()
                 .ok_or_else(|| AiError::InvalidArguments("no character rig in scene".into()))?;
-            let solver = tessel_core::AutoSkinSolver::from_rig(rig, 1.0)
-                .ok_or_else(|| AiError::InvalidArguments("character rig has no bones".into()))?;
-            let node_id = args.get("node_id").and_then(Value::as_u64).map(NodeId);
+            if rig.bones.is_empty() {
+                return Err(AiError::InvalidArguments(
+                    "character rig has no bones".into(),
+                ));
+            }
+            let solver = tessel_core::AutoSkinSolver::from_rig(rig, 1.0);
+            let node_id = match args.get("node_id") {
+                None | Some(Value::Null) => None,
+                Some(v) => {
+                    let raw = v.as_u64().filter(|&n| n >= 1).ok_or_else(|| {
+                        AiError::InvalidArguments(
+                            "'node_id' must be a positive integer >= 1".into(),
+                        )
+                    })?;
+                    let nid = NodeId(raw);
+                    if !scene.nodes.contains_key(&nid) {
+                        return Err(AiError::InvalidArguments(format!(
+                            "node {} not found",
+                            nid.0
+                        )));
+                    }
+                    Some(nid)
+                }
+            };
             let sample_point = if let Some(pt) = parse_opt_vec3(args, "point")? {
                 pt
             } else if let Some(nid) = node_id {
@@ -1922,6 +1964,16 @@ pub(super) fn execute(
                 if let Some(m) = scene.lowpoly_meshes.get(&nid) {
                     let (lo, hi) = m.bounds();
                     mat.transform_point3((lo + hi) * 0.5)
+                } else if let Some(vol) = scene.voxel_volumes.get(&nid).filter(|v| !v.is_empty()) {
+                    let mut lo = glam::IVec3::splat(i32::MAX);
+                    let mut hi = glam::IVec3::splat(i32::MIN);
+                    for (c, _) in vol.iter_voxels() {
+                        lo = lo.min(glam::IVec3::new(c.x, c.y, c.z));
+                        hi = hi.max(glam::IVec3::new(c.x, c.y, c.z));
+                    }
+                    let center =
+                        (lo.as_vec3() + (hi + glam::IVec3::ONE).as_vec3()) * 0.5 * scene.unit_scale;
+                    mat.transform_point3(center)
                 } else {
                     mat.transform_point3(glam::Vec3::ZERO)
                 }
@@ -1930,34 +1982,47 @@ pub(super) fn execute(
                     "provide 'point' [x,y,z] and/or 'node_id'".into(),
                 ));
             };
-            let rigid_bone = node_id.and_then(|nid| {
-                rig.bindings
-                    .iter()
-                    .find(|b| b.node_id == nid)
-                    .map(|b| b.bone_id.0)
-            });
+            let skinned = node_id.is_none_or(|nid| rig.should_skin_node(nid))
+                && solver
+                    .as_ref()
+                    .is_some_and(|s| node_id.is_none_or(|nid| s.node_has_skin_influence(nid)));
+            let rigid_bone = if skinned {
+                node_id.and_then(|nid| {
+                    rig.bindings
+                        .iter()
+                        .find(|b| b.node_id == nid)
+                        .map(|b| b.bone_id.0)
+                })
+            } else {
+                None
+            };
             let manual_weight_vertices = node_id
                 .and_then(|nid| scene.lowpoly_meshes.get(&nid))
                 .map_or(0, |m| m.skin_weights.len());
-            let w = solver.weights_for_vertex(node_id, sample_point);
             let mut influences = Vec::new();
-            for k in 0..4 {
-                if w.weights[k] > 0.0 {
-                    let bone_name = rig
-                        .bones
-                        .get(usize::from(w.joints[k]))
-                        .map(|b| b.name.as_str())
-                        .unwrap_or("unknown");
-                    influences.push(json!({
-                        "joint_index": w.joints[k],
-                        "bone_name": bone_name,
-                        "weight": w.weights[k]
-                    }));
+            if skinned {
+                if let Some(solver) = solver.as_ref() {
+                    let w = solver.weights_for_vertex(node_id, sample_point);
+                    for k in 0..4 {
+                        if w.weights[k] > 0.0 {
+                            let bone_name = rig
+                                .bones
+                                .get(usize::from(w.joints[k]))
+                                .map(|b| b.name.as_str())
+                                .unwrap_or("unknown");
+                            influences.push(json!({
+                                "joint_index": w.joints[k],
+                                "bone_name": bone_name,
+                                "weight": w.weights[k]
+                            }));
+                        }
+                    }
                 }
             }
             Ok(json!({
                 "ok": true,
                 "node_id": node_id.map(|n| n.0),
+                "skinned": skinned,
                 "sample_point": sample_point.to_array(),
                 "rigid_bone_id": rigid_bone,
                 "manual_weight_vertices": manual_weight_vertices,
@@ -2469,6 +2534,153 @@ pub(super) fn execute(
                 },
             )?;
             Ok(json!({ "ok": true, "roll_deg": roll_deg }))
+        }
+        "character_export_rig" => {
+            use std::io::Write;
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static RIG_EXPORT_NONCE: AtomicU64 = AtomicU64::new(0);
+
+            let filename = args
+                .get("filename")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .ok_or_else(|| AiError::InvalidArguments("missing non-empty 'filename'".into()))?;
+            let rig = scene
+                .character_rig
+                .as_ref()
+                .ok_or_else(|| AiError::InvalidArguments("no character rig in scene".into()))?;
+            std::fs::create_dir_all(allowed_export_dir).map_err(tessel_io::IoError::from)?;
+            let canon_allowed =
+                std::fs::canonicalize(allowed_export_dir).map_err(tessel_io::IoError::from)?;
+            let target = resolve_safe_export_path(allowed_export_dir, filename)?;
+            if target.is_dir()
+                || target == allowed_export_dir
+                || target == canon_allowed
+                || !matches!(
+                    target.components().next_back(),
+                    Some(std::path::Component::Normal(_))
+                )
+            {
+                return Err(AiError::InvalidArguments(
+                    "'filename' must be a file path inside the export directory".into(),
+                ));
+            }
+            let has_json_ext = target
+                .extension()
+                .and_then(|e| e.to_str())
+                .is_some_and(|e| e.eq_ignore_ascii_case("json"));
+            if !has_json_ext {
+                return Err(AiError::InvalidArguments(
+                    "'filename' must end with '.tesselrig.json' or '.json'".into(),
+                ));
+            }
+            let fallback_name = target
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("TesselRig")
+                .trim_end_matches(".tesselrig");
+            let template_name = match args.get("name") {
+                None | Some(Value::Null) => fallback_name,
+                Some(Value::String(s)) => {
+                    let t = s.trim();
+                    if t.is_empty() {
+                        fallback_name
+                    } else {
+                        t
+                    }
+                }
+                Some(_) => {
+                    return Err(AiError::InvalidArguments("'name' must be a string".into()));
+                }
+            };
+            let bytes = tessel_io::export_rig_json_bytes(rig, template_name)?;
+            let Some(parent) = target.parent() else {
+                return Err(AiError::InvalidArguments(
+                    "'filename' must have a valid parent directory".into(),
+                ));
+            };
+            std::fs::create_dir_all(parent).map_err(tessel_io::IoError::from)?;
+            let canon_parent = std::fs::canonicalize(parent).map_err(tessel_io::IoError::from)?;
+            if !canon_parent.starts_with(&canon_allowed) {
+                return Err(tessel_io::IoError::ExportPathDenied(
+                    "resolved export directory escapes allowed export directory".into(),
+                )
+                .into());
+            }
+            let Some(file_name) = target.file_name().and_then(|s| s.to_str()) else {
+                return Err(AiError::InvalidArguments(
+                    "'filename' must contain a valid UTF-8 file name".into(),
+                ));
+            };
+            let final_target = canon_parent.join(file_name);
+            if final_target.is_dir() {
+                return Err(AiError::InvalidArguments(
+                    "'filename' points to a directory, expected a file path".into(),
+                ));
+            }
+            let nonce = RIG_EXPORT_NONCE.fetch_add(1, Ordering::Relaxed);
+            let tmp_name = format!(".{file_name}.tmp.{}.{nonce}", std::process::id());
+            let tmp_path = canon_parent.join(tmp_name);
+            {
+                let mut file = std::fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(&tmp_path)
+                    .map_err(tessel_io::IoError::from)?;
+                if let Err(err) = file.write_all(&bytes).and_then(|_| file.sync_all()) {
+                    let _ = std::fs::remove_file(&tmp_path);
+                    return Err(tessel_io::IoError::from(err).into());
+                }
+            }
+            if let Err(err) = std::fs::rename(&tmp_path, &final_target) {
+                let _ = std::fs::remove_file(&tmp_path);
+                return Err(tessel_io::IoError::from(err).into());
+            }
+            Ok(json!({
+                "ok": true,
+                "output_path": final_target.display().to_string(),
+                "file_size_bytes": bytes.len(),
+                "bone_count": rig.bones.len(),
+                "animation_count": rig.animations.len()
+            }))
+        }
+        "character_import_rig" => {
+            let filename = args
+                .get("filename")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .ok_or_else(|| AiError::InvalidArguments("missing non-empty 'filename'".into()))?;
+            let preserve_unrigged = parse_opt_bool_default(args, "preserve_unrigged", true)?;
+            let target = resolve_safe_export_path(allowed_export_dir, filename)?;
+            let mut imported = tessel_io::import_rig_from_path(&target)?;
+            if preserve_unrigged {
+                if let Some(existing) = scene.character_rig.as_ref() {
+                    imported.unrigged_nodes = existing
+                        .unrigged_nodes
+                        .iter()
+                        .copied()
+                        .filter(|nid| scene.nodes.contains_key(nid))
+                        .collect();
+                }
+            }
+            let bone_count = imported.bones.len();
+            let animation_count = imported.animations.len();
+            let bone_names: Vec<String> = imported.bones.iter().map(|b| b.name.clone()).collect();
+            history.execute(
+                scene,
+                Command::SetCharacterRig {
+                    rig: Some(imported),
+                },
+            )?;
+            Ok(json!({
+                "ok": true,
+                "path": target.display().to_string(),
+                "bone_count": bone_count,
+                "animation_count": animation_count,
+                "bones": bone_names
+            }))
         }
         other => Err(AiError::UnknownTool(other.to_string())),
     }

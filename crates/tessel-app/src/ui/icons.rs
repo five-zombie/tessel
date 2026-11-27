@@ -64,6 +64,7 @@ pub enum ToolIcon {
     Keyframe,
     Copy,
     RotateButton,
+    ScaleButton,
     Settings,
     Send,
     EyeOpen,
@@ -75,6 +76,7 @@ pub enum ToolIcon {
     Select,
     Sun,
     SceneCamera,
+    CameraGizmo,
 }
 
 impl ToolIcon {
@@ -139,6 +141,7 @@ impl ToolIcon {
             Self::Keyframe => r::DIAMOND,
             Self::Copy => r::COPY,
             Self::RotateButton => r::ARROW_CLOCKWISE,
+            Self::ScaleButton => r::ARROWS_OUT_SIMPLE,
             Self::Settings => r::GEAR,
             Self::Send => r::PAPER_PLANE_RIGHT,
             Self::EyeOpen => r::EYE,
@@ -150,13 +153,14 @@ impl ToolIcon {
             Self::Select => r::CURSOR,
             Self::Sun => r::SUN,
             Self::SceneCamera => r::VIDEO_CAMERA,
+            Self::CameraGizmo => r::APERTURE,
         }
     }
 }
 
 /// Every icon, for the headless paint smoke test below.
 #[cfg(test)]
-pub const ALL: [ToolIcon; 67] = [
+pub const ALL: [ToolIcon; 69] = [
     ToolIcon::Pencil,
     ToolIcon::Eraser,
     ToolIcon::Fill,
@@ -213,6 +217,7 @@ pub const ALL: [ToolIcon; 67] = [
     ToolIcon::Keyframe,
     ToolIcon::Copy,
     ToolIcon::RotateButton,
+    ToolIcon::ScaleButton,
     ToolIcon::Settings,
     ToolIcon::Send,
     ToolIcon::EyeOpen,
@@ -224,6 +229,7 @@ pub const ALL: [ToolIcon; 67] = [
     ToolIcon::Select,
     ToolIcon::Sun,
     ToolIcon::SceneCamera,
+    ToolIcon::CameraGizmo,
 ];
 
 /// One clickable toolbar cell. To add a button, push one of these into a
@@ -239,6 +245,7 @@ pub struct IconItem {
 /// and toggles are handled by [`fire_toolbar_action`] in `toolbar.rs`.
 #[derive(Debug, Clone, Copy)]
 pub enum ToolbarAction {
+    SelectObject,
     PixelTool(tessel_core::PixelTool),
     VoxelTool(tessel_core::VoxelTool),
     Primitive(tessel_core::PrimitiveKind),

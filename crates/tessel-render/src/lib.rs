@@ -8,8 +8,12 @@ pub mod shadow_pass;
 pub mod vertex;
 pub mod viewport;
 
-pub use camera::{closest_point_on_axis, pick_move_gizmo, CameraPreset, GizmoAxis, OrbitCamera};
+pub use camera::{
+    closest_point_on_axis, pick_move_gizmo, CameraPreset, GizmoAxis, OrbitCamera,
+    TransformGizmoMode,
+};
 pub use error::RenderError;
+pub use overlay_pass::{PlacementGhost, GIZMO_AXIS_LEN};
 pub use pixel_pass::PixelCamera2D;
 pub use vertex::{CameraUniform, StudioVertex3D};
 pub use viewport::ViewportRenderer;

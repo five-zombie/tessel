@@ -973,5 +973,80 @@ pub(super) fn mesh_tools() -> Vec<Value> {
                 }
             }
         }),
+        json!({
+            "name": "mesh_set_npr_slot",
+            "description": "Attach or clear an NPR texture slot (matcap, face_sdf, hatching_ramp) on a LowPolyMesh and optionally tune matcap_strength, hatching_scale, or face_sdf_light_override (Phase L2).",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "node_id": { "type": "integer", "minimum": 1 },
+                    "slot": { "type": "string", "enum": ["matcap", "face_sdf", "hatching_ramp"] },
+                    "filename": { "type": "string", "description": "Image filename inside exports/ (.png/.jpg/.tga/.tiff/.exr)" },
+                    "clear": { "type": "boolean" },
+                    "matcap_strength": { "type": "number", "minimum": 0.0, "maximum": 1.0 },
+                    "hatching_scale": { "type": "number", "minimum": 0.1, "maximum": 64.0 },
+                    "face_sdf_light_override": {
+                        "type": "array",
+                        "items": { "type": "number" },
+                        "minItems": 3,
+                        "maxItems": 3
+                    }
+                },
+                "required": ["slot"]
+            }
+        }),
+        json!({
+            "name": "mesh_set_uv_seams",
+            "description": "Mark or replace manual UV seam edges ([v0, v1]) on a LowPolyMesh and optionally unwrap UV islands along those seams (Phase M1).",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "node_id": { "type": "integer", "minimum": 1 },
+                    "edges": {
+                        "type": "array",
+                        "items": {
+                            "type": "array",
+                            "items": { "type": "integer", "minimum": 0 },
+                            "minItems": 2,
+                            "maxItems": 2
+                        }
+                    },
+                    "replace": { "type": "boolean" },
+                    "unwrap": { "type": "boolean" }
+                },
+                "required": ["edges"]
+            }
+        }),
+        json!({
+            "name": "mesh_normalize_texel_density",
+            "description": "Equalize UV island scales across a LowPolyMesh for uniform texel density and repack cleanly into [0, 1] (Phase M1).",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "node_id": { "type": "integer", "minimum": 1 },
+                    "texture_size": { "type": "integer", "minimum": 16, "maximum": 4096 },
+                    "target_px_per_unit": { "type": "number", "minimum": 0.1 },
+                    "padding_uv": { "type": "number", "minimum": 0.0, "maximum": 0.05 }
+                }
+            }
+        }),
+        json!({
+            "name": "mesh_sculpt_stroke",
+            "description": "Apply a deterministic organic sculpting brush stroke (smooth, inflate, grab, crease) with falloff radius, strength, and optional mirror_x symmetry (Phase M2).",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "node_id": { "type": "integer", "minimum": 1 },
+                    "brush": { "type": "string", "enum": ["smooth", "inflate", "grab", "crease"] },
+                    "center": { "type": "array", "items": { "type": "number" }, "minItems": 3, "maxItems": 3 },
+                    "normal": { "type": "array", "items": { "type": "number" }, "minItems": 3, "maxItems": 3 },
+                    "drag_delta": { "type": "array", "items": { "type": "number" }, "minItems": 3, "maxItems": 3 },
+                    "radius": { "type": "number", "minimum": 0.001, "maximum": 50.0 },
+                    "strength": { "type": "number", "minimum": -1.0, "maximum": 1.0 },
+                    "mirror_x": { "type": "boolean" }
+                },
+                "required": ["brush", "center", "radius"]
+            }
+        }),
     ]
 }

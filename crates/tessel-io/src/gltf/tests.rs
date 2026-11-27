@@ -1321,3 +1321,183 @@ fn glb_export_omits_empty_primitives_mesh_and_validates_cubicspline_step_scale()
         scale_ch.sampler().input().count() * 3
     );
 }
+
+#[test]
+fn gltf_export_is_byte_deterministic_across_repeated_runs() {
+    let build_scene = || {
+        let mut scene = SceneState::new();
+        let mut history = tessel_core::HistoryStack::new();
+        history
+            .execute(
+                &mut scene,
+                Command::CreateGroupNode {
+                    name: "RootGroup".into(),
+                    transform: tessel_core::Transform::default(),
+                    parent: None,
+                },
+            )
+            .unwrap();
+        let group_id = scene.selected_node.unwrap();
+
+        history
+            .execute(
+                &mut scene,
+                Command::CreatePrimitiveMesh {
+                    name: "HeroBody".into(),
+                    kind: PrimitiveKind::Cube,
+                    size: 1.0,
+                    material: PaletteIndex::new(1).unwrap(),
+                },
+            )
+            .unwrap();
+        let mesh_id = scene.active_lowpoly_node().unwrap();
+        history
+            .execute(
+                &mut scene,
+                Command::SetNodeParent {
+                    node_id: mesh_id,
+                    parent: Some(group_id),
+                },
+            )
+            .unwrap();
+        history
+            .execute(
+                &mut scene,
+                Command::SetMeshVertexColors {
+                    node_id: mesh_id,
+                    updates: vec![(0, [1.0, 0.25, 0.5, 1.0]), (1, [0.5, 0.75, 1.0, 1.0])],
+                },
+            )
+            .unwrap();
+        history
+            .execute(
+                &mut scene,
+                Command::SetMorphTargetDeltas {
+                    node_id: mesh_id,
+                    name: "Smile".into(),
+                    position_deltas: vec![(0, Vec3::new(0.0, 0.05, 0.0))],
+                    normal_deltas: vec![],
+                    replace: true,
+                },
+            )
+            .unwrap();
+        history.execute(&mut scene, Command::ApplyBipedRig).unwrap();
+        scene
+    };
+
+    let scene_a = build_scene();
+    let scene_b = build_scene();
+
+    let (glb_a1, tris_a1) = export_glb_bytes(&scene_a, ExportPreset::Godot4).unwrap();
+    let (glb_a2, tris_a2) = export_glb_bytes(&scene_a, ExportPreset::Godot4).unwrap();
+    let (glb_b1, tris_b1) = export_glb_bytes(&scene_b, ExportPreset::Godot4).unwrap();
+
+    assert_eq!(tris_a1, tris_a2);
+    assert_eq!(tris_a1, tris_b1);
+    assert_eq!(
+        glb_a1, glb_a2,
+        "repeated GLB export on same scene must be byte-identical"
+    );
+    assert_eq!(
+        glb_a1, glb_b1,
+        "GLB export on equivalent scenes must be byte-identical"
+    );
+}
+
+#[test]
+fn g1_glb_export_separates_unrigged_nodes_from_skinned_nodes() {
+    let mut scene = SceneState::new();
+    Command::CreatePrimitiveMesh {
+        name: "Hero".into(),
+        kind: PrimitiveKind::Cube,
+        size: 1.0,
+        material: PaletteIndex::new(1).unwrap(),
+    }
+    .apply(&mut scene)
+    .unwrap();
+    let hero_id = scene.selected_node.unwrap();
+
+    Command::CreatePrimitiveMesh {
+        name: "StaticTerrain".into(),
+        kind: PrimitiveKind::Cube,
+        size: 2.0,
+        material: PaletteIndex::new(2).unwrap(),
+    }
+    .apply(&mut scene)
+    .unwrap();
+    let terrain_id = scene.selected_node.unwrap();
+
+    Command::ApplyBipedRig.apply(&mut scene).unwrap();
+    Command::SetNodeRigSkinned {
+        node_id: terrain_id,
+        skinned: false,
+    }
+    .apply(&mut scene)
+    .unwrap();
+
+    // Mixed scene: Hero (skinned) + StaticTerrain (unrigged)
+    let (glb, tris) = export_glb_bytes(&scene, ExportPreset::Godot4).unwrap();
+    assert_eq!(tris, 24);
+    let parsed = gltf::Gltf::from_slice(&glb).unwrap();
+    let skinned_nodes: Vec<_> = parsed
+        .nodes()
+        .filter(|n| n.mesh().is_some() && n.skin().is_some())
+        .collect();
+    let static_nodes: Vec<_> = parsed
+        .nodes()
+        .filter(|n| n.mesh().is_some() && n.skin().is_none())
+        .collect();
+    assert_eq!(skinned_nodes.len(), 1, "Hero must be exported as skinned");
+    assert_eq!(
+        static_nodes.len(),
+        1,
+        "StaticTerrain must be exported as a separate unskinned node"
+    );
+    let skinned_prim = skinned_nodes[0]
+        .mesh()
+        .unwrap()
+        .primitives()
+        .next()
+        .unwrap();
+    assert!(skinned_prim.get(&gltf::Semantic::Joints(0)).is_some());
+    assert!(skinned_prim.get(&gltf::Semantic::Weights(0)).is_some());
+
+    let static_prim = static_nodes[0].mesh().unwrap().primitives().next().unwrap();
+    assert!(static_prim.get(&gltf::Semantic::Joints(0)).is_none());
+    assert!(static_prim.get(&gltf::Semantic::Weights(0)).is_none());
+
+    // All-unrigged scene: neither node should carry skin or JOINTS_0/WEIGHTS_0
+    Command::SetNodeRigSkinned {
+        node_id: hero_id,
+        skinned: false,
+    }
+    .apply(&mut scene)
+    .unwrap();
+    let (glb_all_static, tris_static) = export_glb_bytes(&scene, ExportPreset::Godot4).unwrap();
+    assert_eq!(tris_static, 24);
+    let parsed_static = gltf::Gltf::from_slice(&glb_all_static).unwrap();
+    assert_eq!(
+        parsed_static.skins().count(),
+        0,
+        "all-unrigged export must not emit orphaned glTF skins"
+    );
+    for node in parsed_static.nodes() {
+        assert!(
+            node.skin().is_none(),
+            "no node should carry skin when all scene objects are unrigged"
+        );
+        if let Some(mesh) = node.mesh() {
+            for prim in mesh.primitives() {
+                assert!(prim.get(&gltf::Semantic::Joints(0)).is_none());
+                assert!(prim.get(&gltf::Semantic::Weights(0)).is_none());
+            }
+        }
+    }
+
+    // Backward-compatibility: legacy rig JSON without `unrigged_nodes` deserializes cleanly.
+    let mut rig_json = serde_json::to_value(scene.character_rig.as_ref().unwrap()).unwrap();
+    rig_json.as_object_mut().unwrap().remove("unrigged_nodes");
+    let legacy_rig: tessel_core::CharacterRig = serde_json::from_value(rig_json).unwrap();
+    assert!(legacy_rig.unrigged_nodes.is_empty());
+    assert!(legacy_rig.should_skin_node(terrain_id));
+}

@@ -2,6 +2,7 @@ pub mod error;
 pub mod gltf;
 pub mod mesh_io;
 pub mod project;
+pub mod rig_io;
 pub mod sprite;
 pub mod vat;
 pub mod vox;
@@ -15,13 +16,17 @@ use tessel_core::SceneState;
 pub use error::IoError;
 pub use gltf::export_glb_bytes;
 pub use mesh_io::{
-    export_obj_string, export_stl_bytes, import_glb_bytes, import_mesh_from_path,
-    import_mesh_texture_from_path, import_obj_str,
+    export_obj_string, export_stl_bytes, import_glb_bytes, import_glb_rig_bytes,
+    import_mesh_from_path, import_mesh_texture_from_path, import_obj_str,
 };
 pub use project::{
     decode_tessel_project, encode_tessel_project, encode_tessel_project_with_thumbnail,
     load_tessel_project, save_tessel_project_atomic, save_tessel_project_with_thumbnail,
     CURRENT_SCHEMA_VERSION,
+};
+pub use rig_io::{
+    export_rig_json_bytes, import_rig_from_path, import_rig_json_bytes, RigTemplateFile,
+    RIG_TEMPLATE_SCHEMA_VERSION,
 };
 pub use sprite::{
     export_gif_bytes, export_mesh_texture_png_bytes, export_png_bytes, export_sprite_sheet_bytes,

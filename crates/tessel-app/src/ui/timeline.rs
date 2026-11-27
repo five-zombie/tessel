@@ -139,10 +139,15 @@ fn show_pixel_timeline(ctx: &egui::Context, scene: &mut SceneState, history: &mu
 
                 let mut onion = onion_skin;
                 if ui.checkbox(&mut onion, "Onion Skin").changed() {
-                    if let Some(canvas) = scene.pixel_canvases.get_mut(&node_id) {
-                        canvas.onion_skin = onion;
-                        scene.mark_modified();
-                    }
+                    super::exec_history(
+                        ctx,
+                        history,
+                        scene,
+                        Command::SetPixelOnionSkin {
+                            node_id,
+                            enabled: onion,
+                        },
+                    );
                 }
             });
         });

@@ -22,14 +22,18 @@ pub struct CameraUniform {
     pub light_dir: [f32; 4],
 }
 
-/// Per-mesh PBR material uniform (32 bytes) matching `mesh_3d.wgsl`.
+/// Per-mesh PBR & NPR material uniform (64 bytes) matching `mesh_3d.wgsl`.
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Pod, Zeroable)]
 pub struct MaterialUniform {
-    /// `[metallic, roughness, receive_shadow (1.0/0.0), 0.0]`
+    /// `[metallic, roughness, receive_shadow (1.0/0.0), alpha_cutoff]`
     pub pbr: [f32; 4],
-    /// `[emissive_r, emissive_g, emissive_b, 0.0]`
+    /// `[emissive_r, emissive_g, emissive_b, unlit_flag]`
     pub emissive: [f32; 4],
+    /// `[matcap_strength, has_face_sdf, has_hatching, hatching_scale]`
+    pub npr_slots: [f32; 4],
+    /// `[light_x, light_y, light_z, has_face_sdf_light_override]`
+    pub face_sdf_light: [f32; 4],
 }
 
 impl Default for MaterialUniform {
@@ -37,6 +41,8 @@ impl Default for MaterialUniform {
         Self {
             pbr: [0.0, 0.85, 1.0, 0.0],
             emissive: [0.0, 0.0, 0.0, 0.0],
+            npr_slots: [0.0, 0.0, 0.0, 1.0],
+            face_sdf_light: [0.0, 0.0, 1.0, 0.0],
         }
     }
 }

@@ -68,6 +68,7 @@ pub fn handle_global_shortcuts(
     history: &mut HistoryStack,
     camera_3d: &mut OrbitCamera,
     camera_2d: &mut PixelCamera2D,
+    requested_mode: &mut Option<AppMode>,
 ) -> Option<String> {
     if ctx.wants_keyboard_input() {
         return None;
@@ -177,9 +178,7 @@ pub fn handle_global_shortcuts(
 
     if let Some(target_mode) = mode_switch {
         if scene.active_mode != target_mode {
-            if let Err(err) = history.execute(scene, Command::SetMode(target_mode)) {
-                last_err = Some(format!("Mode switch failed: {err}"));
-            }
+            *requested_mode = Some(target_mode);
         }
     }
 
@@ -224,19 +223,19 @@ pub fn handle_global_shortcuts(
                 }
             }
             if key_b {
-                scene.pixel_tool = PixelTool::Pencil;
+                scene.set_pixel_tool(PixelTool::Pencil);
             } else if key_e {
-                scene.pixel_tool = PixelTool::Eraser;
+                scene.set_pixel_tool(PixelTool::Eraser);
             } else if key_g {
-                scene.pixel_tool = PixelTool::Fill;
+                scene.set_pixel_tool(PixelTool::Fill);
             } else if key_i {
-                scene.pixel_tool = PixelTool::Eyedropper;
+                scene.set_pixel_tool(PixelTool::Eyedropper);
             }
             if key_x {
-                scene.pixel_symmetry.x = !scene.pixel_symmetry.x;
+                scene.toggle_pixel_symmetry_x();
             }
             if key_y {
-                scene.pixel_symmetry.y = !scene.pixel_symmetry.y;
+                scene.toggle_pixel_symmetry_y();
             }
         }
         AppMode::Voxel | AppMode::LowPoly => {}

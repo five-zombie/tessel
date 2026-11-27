@@ -5,12 +5,13 @@ mod project_files;
 mod settings;
 mod ui;
 
-use std::fs::{self, OpenOptions};
+use std::fs;
 use std::io::{Read, Write};
 use std::path::PathBuf;
-use std::sync::Mutex;
 
 use settings::AppPaths;
+use tracing_appender::non_blocking::WorkerGuard;
+use tracing_appender::rolling::Rotation;
 use tracing_subscriber::EnvFilter;
 
 fn main() {
@@ -33,7 +34,7 @@ fn main() {
     }
 
     let paths = AppPaths::resolve();
-    init_logging(&paths);
+    let _log_guard = init_logging(&paths);
     install_panic_hook(&paths);
 
     if let Err(err) = app::run() {
@@ -176,27 +177,44 @@ fn run_batch_cli(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
-fn init_logging(paths: &AppPaths) {
-    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
-    if let Some(parent) = paths.log_file.parent() {
-        let _ = fs::create_dir_all(parent);
-    }
-    if let Ok(file) = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&paths.log_file)
+fn init_logging(paths: &AppPaths) -> Option<WorkerGuard> {
+    let filter = EnvFilter::try_from_env("TESSEL_LOG")
+        .or_else(|_| EnvFilter::try_from_default_env())
+        .unwrap_or_else(|_| EnvFilter::new("info"));
+    let log_dir = paths
+        .log_file
+        .parent()
+        .map(PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir);
+    let _ = fs::create_dir_all(&log_dir);
+    let file_prefix = paths
+        .log_file
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("tessel.log");
+    match tracing_appender::rolling::Builder::new()
+        .rotation(Rotation::DAILY)
+        .filename_prefix(file_prefix)
+        .max_log_files(5)
+        .build(&log_dir)
     {
-        let _ = tracing_subscriber::fmt()
-            .with_env_filter(filter)
-            .with_target(false)
-            .with_ansi(false)
-            .with_writer(Mutex::new(file))
-            .try_init();
-    } else {
-        let _ = tracing_subscriber::fmt()
-            .with_env_filter(filter)
-            .with_target(false)
-            .try_init();
+        Ok(file_appender) => {
+            let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
+            let _ = tracing_subscriber::fmt()
+                .with_env_filter(filter)
+                .with_target(false)
+                .with_ansi(false)
+                .with_writer(non_blocking)
+                .try_init();
+            Some(guard)
+        }
+        Err(_) => {
+            let _ = tracing_subscriber::fmt()
+                .with_env_filter(filter)
+                .with_target(false)
+                .try_init();
+            None
+        }
     }
 }
 
@@ -208,10 +226,25 @@ fn install_panic_hook(paths: &AppPaths) {
         .map(PathBuf::from)
         .unwrap_or_else(std::env::temp_dir);
     std::panic::set_hook(Box::new(move |info| {
-        tracing::error!("fatal panic: {info}");
+        let safe_info = tessel_ai::redact_sensitive_text(&info.to_string());
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs());
+        let report = format!(
+            "Tessel crash report\nversion: {}\nos: {}/{}\ntimestamp_utc: {}\npanic: {}\n",
+            env!("CARGO_PKG_VERSION"),
+            std::env::consts::OS,
+            std::env::consts::ARCH,
+            ts,
+            safe_info
+        );
+        tracing::error!("fatal panic: {safe_info}");
         let _ = fs::create_dir_all(&log_dir);
+        if let Ok(mut f) = fs::File::create(log_dir.join(format!("crash-{ts}.log"))) {
+            let _ = f.write_all(report.as_bytes());
+        }
         if let Ok(mut f) = fs::File::create(log_dir.join("crash-latest.log")) {
-            let _ = writeln!(f, "Tessel crash report: {info}");
+            let _ = f.write_all(report.as_bytes());
         }
         default_hook(info);
     }));

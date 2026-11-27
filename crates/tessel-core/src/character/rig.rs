@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use glam::{Mat4, Quat, Vec3};
 use serde::{Deserialize, Serialize};
@@ -368,6 +368,10 @@ pub struct CharacterRig {
     /// Optional dedicated root-motion bone ID (`v5.6`).
     #[serde(default)]
     pub root_motion_bone: Option<BoneId>,
+    /// Scene nodes explicitly excluded from rig skinning deformation (`G1`).
+    /// Empty by default so legacy `.tessel` files retain full auto-skinning behavior.
+    #[serde(default)]
+    pub unrigged_nodes: BTreeSet<NodeId>,
 }
 
 impl CharacterRig {
@@ -481,6 +485,321 @@ impl CharacterRig {
 
     pub fn bone_mut(&mut self, id: BoneId) -> Option<&mut Bone> {
         self.bones.iter_mut().find(|b| b.id == id)
+    }
+
+    /// Single source of truth for whether `node_id` participates in rig skinning deformation.
+    pub fn should_skin_node(&self, node_id: NodeId) -> bool {
+        !self.unrigged_nodes.contains(&node_id)
+    }
+
+    /// Validates bone ID uniqueness, valid names, finite strictly-positive transforms, valid parent
+    /// references, and acyclicity, then stably reorders `self.bones` in topological
+    /// parent-before-child order so single-pass forward kinematics always resolve parents first.
+    pub fn validate_and_sort_bones(&mut self) -> Result<(), crate::CoreError> {
+        const MAX_RIG_BONES: usize = 1024;
+        if self.bones.len() > MAX_RIG_BONES {
+            return Err(crate::CoreError::OutOfBounds);
+        }
+        let mut id_to_idx: BTreeMap<BoneId, usize> = BTreeMap::new();
+        for (idx, b) in self.bones.iter_mut().enumerate() {
+            b.name = crate::scene::validate_node_name(&b.name)?;
+            if id_to_idx.insert(b.id, idx).is_some() {
+                return Err(crate::CoreError::OutOfBounds);
+            }
+            let valid_tr = |t: &Transform| {
+                t.translation.is_finite()
+                    && t.rotation.is_finite()
+                    && t.rotation.length_squared() > 1e-8
+                    && t.scale.is_finite()
+                    && t.scale.x > 1e-6
+                    && t.scale.y > 1e-6
+                    && t.scale.z > 1e-6
+            };
+            if !valid_tr(&b.rest_local) || !valid_tr(&b.pose_local) {
+                return Err(crate::CoreError::OutOfBounds);
+            }
+            b.rest_local.rotation = b.rest_local.rotation.normalize();
+            b.pose_local.rotation = b.pose_local.rotation.normalize();
+        }
+        for b in &self.bones {
+            let mut curr = b.parent;
+            let mut hops = 0usize;
+            while let Some(pid) = curr {
+                if pid == b.id || hops >= self.bones.len() {
+                    return Err(crate::CoreError::OutOfBounds);
+                }
+                let Some(&p_idx) = id_to_idx.get(&pid) else {
+                    return Err(crate::CoreError::OutOfBounds);
+                };
+                curr = self.bones[p_idx].parent;
+                hops += 1;
+            }
+        }
+        let n = self.bones.len();
+        let mut placed = vec![false; n];
+        let mut order = Vec::with_capacity(n);
+        while order.len() < n {
+            let mut progressed = false;
+            for idx in 0..n {
+                if placed[idx] {
+                    continue;
+                }
+                let parent_ready = match self.bones[idx].parent {
+                    None => true,
+                    Some(pid) => id_to_idx.get(&pid).is_some_and(|&p_idx| placed[p_idx]),
+                };
+                if parent_ready {
+                    placed[idx] = true;
+                    order.push(idx);
+                    progressed = true;
+                }
+            }
+            if !progressed {
+                return Err(crate::CoreError::OutOfBounds);
+            }
+        }
+        let old = std::mem::take(&mut self.bones);
+        let mut slots: Vec<Option<Bone>> = old.into_iter().map(Some).collect();
+        self.bones = order
+            .into_iter()
+            .filter_map(|idx| slots[idx].take())
+            .collect();
+        if self.animations.is_empty() {
+            self.active_animation = 0;
+        } else {
+            self.active_animation = self.active_animation.min(self.animations.len() - 1);
+        }
+        if !self.playback_time.is_finite() || self.playback_time < 0.0 {
+            self.playback_time = 0.0;
+        }
+        Ok(())
+    }
+
+    /// Full rig-wide invariant validation and sanitization (bones, metadata, constraints,
+    /// sockets, bone groups, pose library, animations, keyframes, and clip layers).
+    /// Shared single source of truth for `Command::SetCharacterRig` and `tessel-io::rig_io`.
+    pub fn validate_and_sanitize(&mut self) -> Result<(), crate::CoreError> {
+        const MAX_RIG_CLIPS: usize = 256;
+        const MAX_KEYFRAMES_PER_CHANNEL: usize = 16_384;
+
+        self.validate_and_sort_bones()?;
+        if self.animations.len() > MAX_RIG_CLIPS {
+            return Err(crate::CoreError::OutOfBounds);
+        }
+
+        let valid_tr = |t: &mut Transform| -> Result<(), crate::CoreError> {
+            if !t.translation.is_finite()
+                || !t.rotation.is_finite()
+                || t.rotation.length_squared() <= 1e-8
+                || !t.scale.is_finite()
+                || t.scale.x <= 1e-6
+                || t.scale.y <= 1e-6
+                || t.scale.z <= 1e-6
+            {
+                return Err(crate::CoreError::OutOfBounds);
+            }
+            t.rotation = t.rotation.normalize();
+            Ok(())
+        };
+
+        for bone in &self.bones {
+            if let Some((min_d, max_d)) = bone.rotation_limits_deg {
+                for axis in 0..3 {
+                    if !min_d[axis].is_finite()
+                        || !max_d[axis].is_finite()
+                        || min_d[axis] > max_d[axis]
+                    {
+                        return Err(crate::CoreError::OutOfBounds);
+                    }
+                }
+            }
+            if !bone.spring_stiffness.is_finite() || !(0.0..=200.0).contains(&bone.spring_stiffness)
+            {
+                return Err(crate::CoreError::OutOfBounds);
+            }
+            if !bone.spring_damping.is_finite() || !(0.01..=50.0).contains(&bone.spring_damping) {
+                return Err(crate::CoreError::OutOfBounds);
+            }
+            if bone.lod_level > 8 {
+                return Err(crate::CoreError::OutOfBounds);
+            }
+            if let Some(col) = &bone.physics_collider {
+                let valid = match col {
+                    super::constraints::BoneColliderMeta::Capsule { radius, height } => {
+                        radius.is_finite() && *radius > 0.0 && height.is_finite() && *height > 0.0
+                    }
+                    super::constraints::BoneColliderMeta::Box { half_extents } => {
+                        half_extents.iter().all(|v| v.is_finite() && *v > 0.0)
+                    }
+                };
+                if !valid {
+                    return Err(crate::CoreError::OutOfBounds);
+                }
+            }
+        }
+
+        let valid_bones: BTreeSet<BoneId> = self.bones.iter().map(|b| b.id).collect();
+
+        if let Some(root_motion) = self.root_motion_bone {
+            if !valid_bones.contains(&root_motion) {
+                return Err(crate::CoreError::OutOfBounds);
+            }
+        }
+        for b in &self.bindings {
+            if !valid_bones.contains(&b.bone_id) {
+                return Err(crate::CoreError::OutOfBounds);
+            }
+        }
+        for mask in self.node_bone_masks.values() {
+            if !mask.iter().all(|bid| valid_bones.contains(bid)) {
+                return Err(crate::CoreError::OutOfBounds);
+            }
+        }
+        for (&bid, pole) in &self.chain_poles {
+            if !valid_bones.contains(&bid) || !pole.is_finite() {
+                return Err(crate::CoreError::OutOfBounds);
+            }
+        }
+        for constraint in &mut self.constraints {
+            let valid = match constraint {
+                super::constraints::BoneConstraint::IkFkBlend {
+                    name,
+                    root,
+                    mid,
+                    end,
+                    target,
+                    pole,
+                    weight,
+                } => {
+                    *name = crate::scene::validate_node_name(name)?;
+                    valid_bones.contains(root)
+                        && valid_bones.contains(mid)
+                        && valid_bones.contains(end)
+                        && target.is_finite()
+                        && pole.is_none_or(|p| p.is_finite())
+                        && weight.is_finite()
+                        && (0.0..=1.0).contains(weight)
+                }
+                super::constraints::BoneConstraint::LookAt {
+                    name,
+                    bone_id,
+                    target,
+                    up,
+                    influence,
+                } => {
+                    *name = crate::scene::validate_node_name(name)?;
+                    valid_bones.contains(bone_id)
+                        && target.is_finite()
+                        && up.is_finite()
+                        && up.length_squared() > 1e-8
+                        && influence.is_finite()
+                        && (0.0..=1.0).contains(influence)
+                }
+                super::constraints::BoneConstraint::CopyTransform {
+                    name,
+                    bone_id,
+                    source_bone_id,
+                    influence,
+                } => {
+                    *name = crate::scene::validate_node_name(name)?;
+                    valid_bones.contains(bone_id)
+                        && valid_bones.contains(source_bone_id)
+                        && influence.is_finite()
+                        && (0.0..=1.0).contains(influence)
+                }
+            };
+            if !valid {
+                return Err(crate::CoreError::OutOfBounds);
+            }
+        }
+        for socket in &mut self.sockets {
+            socket.name = crate::scene::validate_node_name(&socket.name)?;
+            if !valid_bones.contains(&socket.bone_id) {
+                return Err(crate::CoreError::OutOfBounds);
+            }
+            valid_tr(&mut socket.local_offset)?;
+        }
+        for (key, group) in &mut self.bone_groups {
+            let _ = crate::scene::validate_node_name(key)?;
+            group.name = crate::scene::validate_node_name(&group.name)?;
+            if !group.bone_ids.iter().all(|bid| valid_bones.contains(bid)) {
+                return Err(crate::CoreError::OutOfBounds);
+            }
+        }
+        for (pose_name, entries) in &mut self.pose_library {
+            let _ = crate::scene::validate_node_name(pose_name)?;
+            for (&bid, tr) in entries.iter_mut() {
+                if !valid_bones.contains(&bid) {
+                    return Err(crate::CoreError::OutOfBounds);
+                }
+                valid_tr(tr)?;
+            }
+        }
+        for clip in &mut self.animations {
+            clip.name = crate::scene::validate_node_name(&clip.name)?;
+            if !clip.duration_secs.is_finite() || !(0.05..=600.0).contains(&clip.duration_secs) {
+                return Err(crate::CoreError::OutOfBounds);
+            }
+            if let Some(fps) = clip.stepped_fps {
+                if !fps.is_finite() || !(1.0..=60.0).contains(&fps) {
+                    return Err(crate::CoreError::OutOfBounds);
+                }
+            }
+            let mut seen_channels = BTreeSet::new();
+            for ch in &mut clip.channels {
+                if !valid_bones.contains(&ch.bone_id) || !seen_channels.insert(ch.bone_id) {
+                    return Err(crate::CoreError::OutOfBounds);
+                }
+                if ch.keyframes.len() > MAX_KEYFRAMES_PER_CHANNEL {
+                    return Err(crate::CoreError::OutOfBounds);
+                }
+                for kf in &mut ch.keyframes {
+                    if !kf.time_secs.is_finite()
+                        || kf.time_secs < 0.0
+                        || kf.time_secs > 600.0
+                        || !kf.translation.is_finite()
+                        || !kf.rotation.is_finite()
+                        || kf.rotation.length_squared() <= 1e-8
+                        || !kf.scale.is_finite()
+                        || kf.scale.x <= 1e-6
+                        || kf.scale.y <= 1e-6
+                        || kf.scale.z <= 1e-6
+                    {
+                        return Err(crate::CoreError::OutOfBounds);
+                    }
+                    if let super::nano::KeyframeInterpolation::CubicBezier { p1x, p1y, p2x, p2y } =
+                        kf.interpolation
+                    {
+                        if !p1x.is_finite()
+                            || !p1y.is_finite()
+                            || !p2x.is_finite()
+                            || !p2y.is_finite()
+                            || !(0.0..=1.0).contains(&p1x)
+                            || !(0.0..=1.0).contains(&p2x)
+                            || !(-1.0..=2.0).contains(&p1y)
+                            || !(-1.0..=2.0).contains(&p2y)
+                        {
+                            return Err(crate::CoreError::OutOfBounds);
+                        }
+                    }
+                    kf.rotation = kf.rotation.normalize();
+                }
+                ch.keyframes
+                    .sort_by(|a, b| a.time_secs.total_cmp(&b.time_secs));
+            }
+            for ev in &mut clip.events {
+                ev.name = crate::scene::validate_node_name(&ev.name)?;
+                if !ev.time_secs.is_finite() || ev.time_secs < 0.0 || ev.time_secs > 600.0 {
+                    return Err(crate::CoreError::OutOfBounds);
+                }
+            }
+        }
+        for layer in &self.clip_layers {
+            if layer.clip_index >= self.animations.len() || !layer.time_offset.is_finite() {
+                return Err(crate::CoreError::OutOfBounds);
+            }
+        }
+        Ok(())
     }
 
     /// Computes world-space rest transform matrices for every bone in hierarchy order.

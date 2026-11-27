@@ -216,3 +216,94 @@ fn smoke_nonfiltering_sampler_pixel_2d_pipeline_and_readback() {
         "unexpected wgpu validation error on Pixel 2D NonFiltering sampler pipeline: {validation_err:?}"
     );
 }
+
+#[test]
+fn smoke_4x_msaa_and_npr_slots_pipeline_and_readback() {
+    let Some((device, queue, _info)) = request_test_device() else {
+        eprintln!(
+            "skipping 4x MSAA + NPR slots GPU smoke test: no compatible GPU or software adapter available"
+        );
+        return;
+    };
+
+    device.push_error_scope(wgpu::ErrorFilter::Validation);
+
+    let mut viewport = ViewportRenderer::new(&device, 64, 64);
+    assert_eq!(viewport.sample_count(), 1);
+
+    let mut scene = SceneState::new();
+    scene.active_mode = AppMode::LowPoly;
+    scene.shading_mode = ViewportShadingMode::NprSumie;
+    scene.npr_look.msaa_samples = 4;
+
+    let mesh_id = scene.allocate_node_id();
+    scene.nodes.insert(
+        mesh_id,
+        SceneNode {
+            id: mesh_id,
+            name: "NprHead".into(),
+            kind: NodeKind::LowPolyMesh,
+            visible: true,
+            parent: None,
+            transform: Transform::default(),
+        },
+    );
+    let mut mesh = tessel_core::mesh::ops::create_primitive(
+        tessel_core::PrimitiveKind::Cube,
+        1.0,
+        PaletteIndex::new(2).unwrap(),
+    );
+    mesh.texture = Some(MeshTexture::solid(
+        4,
+        4,
+        tessel_core::Rgba8::rgba(240, 220, 200, 255),
+    ));
+    mesh.matcap_map = Some(MeshTexture::solid(
+        4,
+        4,
+        tessel_core::Rgba8::rgba(210, 210, 230, 255),
+    ));
+    mesh.face_sdf_map = Some(MeshTexture::solid(
+        4,
+        4,
+        tessel_core::Rgba8::rgba(180, 180, 180, 255),
+    ));
+    mesh.hatching_ramp_map = Some(MeshTexture::solid(
+        4,
+        4,
+        tessel_core::Rgba8::rgba(200, 140, 80, 255),
+    ));
+    mesh.material.matcap_strength = 0.5;
+    mesh.material.hatching_scale = 4.0;
+    mesh.material.face_sdf_light_override = Some([0.6, 0.3, 0.7]);
+    scene.lowpoly_meshes.insert(mesh_id, mesh);
+    scene.mark_modified();
+
+    viewport.sync_scene(&device, &queue, &scene, None, None);
+    assert_eq!(viewport.sample_count(), 4);
+
+    let mut cam = OrbitCamera::new();
+    cam.distance = 3.5;
+    let cam_2d = PixelCamera2D::new();
+    let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+        label: Some("tessel-smoke-4x-msaa-encoder"),
+    });
+    viewport.render(&queue, &mut encoder, &scene, &cam, &cam_2d, 1.0, false);
+    queue.submit(Some(encoder.finish()));
+
+    let (w, h, rgba) = viewport
+        .capture_rgba_bytes_with_timeout(&device, &queue, Duration::from_secs(5))
+        .expect("4x MSAA resolved RGBA readback must succeed");
+    assert_eq!((w, h), (64, 64));
+    assert_eq!(rgba.len(), 64 * 64 * 4);
+    assert!(
+        rgba.iter().any(|&b| b != 0),
+        "4x MSAA resolved frame should not be all zeros"
+    );
+
+    let validation_err = pollster::block_on(device.pop_error_scope());
+    assert!(
+        validation_err.is_none(),
+        "unexpected wgpu validation error on 4x MSAA + NPR slots pipeline: {validation_err:?}"
+    );
+}

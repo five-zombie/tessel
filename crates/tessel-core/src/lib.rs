@@ -23,17 +23,19 @@ pub use character::{
 pub use command::{Command, HistoryStack, UndoDelta};
 pub use error::CoreError;
 pub use mesh::{
-    apply_primitive_anchor, bake_mesh_maps, bake_vertex_animation_texture, box_atlas_uv,
-    build_ribbon_visibility_track, cleanup_mesh, composite_paint_layers,
-    compute_smooth_outline_normals, dilate_rgba_texture, evaluate_modifier_stack,
-    extract_rgba_silhouette_and_palette, generate_ribbon_mesh, generate_smart_material_texture,
-    pack_orm_texture, paint_mesh_spot_3d, preflight_check_scene, sample_trajectory_points,
-    sample_vat_position, validate_mesh_topology, AlphaMode, BakeMapKind, BakeParams, BakedMaps,
-    CollisionHull, Face, FaceId, ImageSilhouettePalette, LowPolyMesh, MeshBvh, MeshMaterial,
-    MeshModifier, MeshPaintLayer, MeshTexture, MorphTarget, PaintSpot3DParams, PreflightIssue,
+    apply_primitive_anchor, apply_sculpt_stroke, bake_mesh_maps, bake_vertex_animation_texture,
+    box_atlas_uv, build_ribbon_visibility_track, canonical_edge, cleanup_mesh,
+    composite_paint_layers, compute_smooth_outline_normals, dilate_rgba_texture,
+    evaluate_modifier_stack, extract_rgba_silhouette_and_palette, generate_ribbon_mesh,
+    generate_smart_material_texture, normalize_texel_density, pack_orm_texture, paint_mesh_spot_3d,
+    preflight_check_scene, sample_trajectory_points, sample_vat_position, unwrap_with_uv_seams,
+    validate_mesh_topology, AlphaMode, BakeMapKind, BakeParams, BakedMaps, CollisionHull, Face,
+    FaceId, ImageSilhouettePalette, LowPolyMesh, MeshBvh, MeshMaterial, MeshModifier,
+    MeshPaintLayer, MeshTexture, MorphTarget, NprTextureSlot, PaintSpot3DParams, PreflightIssue,
     PreflightReport, PreflightSeverity, PrimitiveAnchor, PrimitiveKind, ProxyCage, RibbonParams,
-    SmartMaterialOutput, SmartMaterialParams, TerrainParams, TopologyReport, TriVertex,
-    TriangulatedMesh, VatBakeParams, VatBakeResult, VatMetadata, VertexId, DEFAULT_MESH_TEX_SIZE,
+    SculptBrushKind, SculptStrokeParams, SmartMaterialOutput, SmartMaterialParams, TerrainParams,
+    TexelDensityReport, TopologyReport, TriVertex, TriangulatedMesh, VatBakeParams, VatBakeResult,
+    VatMetadata, VertexId, DEFAULT_MESH_TEX_SIZE,
 };
 pub use palette::{Palette, PaletteEntry, PaletteIndex, Rgba8};
 pub use pixel::{

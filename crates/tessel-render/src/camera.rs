@@ -238,6 +238,15 @@ pub fn pick_move_gizmo(
     best.map(|(a, _)| a)
 }
 
+/// Active 3D transform gizmo mode for the selected scene node.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TransformGizmoMode {
+    #[default]
+    Move,
+    Rotate,
+    Scale,
+}
+
 impl Default for OrbitCamera {
     fn default() -> Self {
         Self::new()

@@ -53,14 +53,150 @@ pub(super) fn apply(cmd: &Command, scene: &mut SceneState) -> Result<UndoDelta, 
             }
         }
         Command::ApplyBipedRig => {
-            let prev = scene.character_rig.replace(CharacterRig::biped_template());
+            let mut next = CharacterRig::biped_template();
+            if let Some(existing) = scene.character_rig.as_ref() {
+                next.unrigged_nodes = existing.unrigged_nodes.clone();
+            }
+            let prev = scene.character_rig.replace(next);
             UndoDelta::RestoreCharacterRig(prev)
         }
         Command::ApplyHumanoidRig => {
-            let prev = scene
-                .character_rig
-                .replace(CharacterRig::humanoid_template());
+            let mut next = CharacterRig::humanoid_template();
+            if let Some(existing) = scene.character_rig.as_ref() {
+                next.unrigged_nodes = existing.unrigged_nodes.clone();
+            }
+            let prev = scene.character_rig.replace(next);
             UndoDelta::RestoreCharacterRig(prev)
+        }
+        Command::SetCharacterRig { rig } => {
+            let next = match rig {
+                Some(r) => {
+                    let mut validated = r.clone();
+                    validated.validate_and_sanitize()?;
+                    for b in &validated.bindings {
+                        if !scene.nodes.contains_key(&b.node_id) {
+                            return Err(CoreError::NodeNotFound(b.node_id));
+                        }
+                    }
+                    for &nid in validated.node_bone_masks.keys() {
+                        if !scene.nodes.contains_key(&nid) {
+                            return Err(CoreError::NodeNotFound(nid));
+                        }
+                    }
+                    for &nid in &validated.unrigged_nodes {
+                        if !scene.nodes.contains_key(&nid) {
+                            return Err(CoreError::NodeNotFound(nid));
+                        }
+                    }
+                    Some(validated)
+                }
+                None => None,
+            };
+            let prev = std::mem::replace(&mut scene.character_rig, next);
+            if let Some(sel_bone) = scene.selected_bone {
+                let still_exists = scene
+                    .character_rig
+                    .as_ref()
+                    .is_some_and(|r| r.bone(sel_bone).is_some());
+                if !still_exists {
+                    scene.selected_bone = None;
+                }
+            }
+            UndoDelta::RestoreCharacterRig(prev)
+        }
+        Command::RenameBone { bone_id, name } => {
+            let validated = crate::scene::validate_node_name(name)?;
+            let rig = scene
+                .character_rig
+                .as_mut()
+                .ok_or(CoreError::CharacterRigNotFound)?;
+            let bone = rig.bone_mut(*bone_id).ok_or(CoreError::OutOfBounds)?;
+            let previous = std::mem::replace(&mut bone.name, validated);
+            UndoDelta::RestoreBoneName {
+                bone_id: *bone_id,
+                previous,
+            }
+        }
+        Command::ReparentBone { bone_id, parent } => {
+            let previous = scene.character_rig.clone();
+            let rig = scene
+                .character_rig
+                .as_mut()
+                .ok_or(CoreError::CharacterRigNotFound)?;
+            if rig.bone(*bone_id).is_none() {
+                return Err(CoreError::OutOfBounds);
+            }
+            if let Some(pid) = *parent {
+                if pid == *bone_id || rig.bone(pid).is_none() {
+                    return Err(CoreError::OutOfBounds);
+                }
+                // Anti-cycle check: walk ancestors of `pid` and reject if `bone_id` is reached.
+                let mut curr = Some(pid);
+                let mut hops = 0usize;
+                let max_hops = rig.bones.len();
+                while let Some(anc) = curr {
+                    if anc == *bone_id || hops >= max_hops {
+                        return Err(CoreError::OutOfBounds);
+                    }
+                    curr = rig.bone(anc).and_then(|b| b.parent);
+                    hops += 1;
+                }
+            }
+            let old_order: Vec<BoneId> = rig.bones.iter().map(|b| b.id).collect();
+            if let Some(bone) = rig.bone_mut(*bone_id) {
+                bone.parent = *parent;
+            }
+            if let Err(err) = rig.validate_and_sort_bones() {
+                scene.character_rig = previous;
+                return Err(err);
+            }
+            let new_order: Vec<BoneId> = rig.bones.iter().map(|b| b.id).collect();
+            if new_order != old_order {
+                let mut new_idx_by_bone: std::collections::BTreeMap<BoneId, u16> =
+                    std::collections::BTreeMap::new();
+                for (idx, &bid) in new_order.iter().enumerate() {
+                    if let Ok(j) = u16::try_from(idx) {
+                        new_idx_by_bone.insert(bid, j);
+                    }
+                }
+                let mut old_to_new: std::collections::BTreeMap<u16, u16> =
+                    std::collections::BTreeMap::new();
+                for (old_idx, &bid) in old_order.iter().enumerate() {
+                    if let (Ok(oj), Some(&nj)) = (u16::try_from(old_idx), new_idx_by_bone.get(&bid))
+                    {
+                        old_to_new.insert(oj, nj);
+                    }
+                }
+                let mut deltas = vec![UndoDelta::RestoreCharacterRig(previous)];
+                for (&nid, mesh) in &mut scene.lowpoly_meshes {
+                    if mesh.skin_weights.is_empty() {
+                        continue;
+                    }
+                    deltas.push(UndoDelta::RestoreLowPolyMesh {
+                        node_id: nid,
+                        previous_mesh: mesh.clone(),
+                    });
+                    for sw in mesh.skin_weights.values_mut() {
+                        for k in 0..4 {
+                            if sw.weights[k] > 0.0 {
+                                if let Some(&mapped) = old_to_new.get(&sw.joints[k]) {
+                                    sw.joints[k] = mapped;
+                                }
+                            }
+                        }
+                    }
+                }
+                if deltas.len() > 1 {
+                    UndoDelta::Transaction(deltas)
+                } else {
+                    deltas
+                        .into_iter()
+                        .next()
+                        .unwrap_or(UndoDelta::RestoreCharacterRig(None))
+                }
+            } else {
+                UndoDelta::RestoreCharacterRig(previous)
+            }
         }
         Command::AddBone {
             name,
@@ -255,6 +391,29 @@ pub(super) fn apply(cmd: &Command, scene: &mut SceneState) -> Result<UndoDelta, 
                 }
             }
             UndoDelta::RestoreCharacterRig(prev)
+        }
+        Command::SetNodeRigSkinned { node_id, skinned } => {
+            let node = scene
+                .nodes
+                .get(node_id)
+                .ok_or(CoreError::NodeNotFound(*node_id))?;
+            if !matches!(node.kind, NodeKind::VoxelVolume | NodeKind::LowPolyMesh) {
+                return Err(CoreError::OutOfBounds);
+            }
+            let rig = scene
+                .character_rig
+                .as_mut()
+                .ok_or(CoreError::CharacterRigNotFound)?;
+            let previous_unrigged = rig.unrigged_nodes.contains(node_id);
+            if *skinned {
+                rig.unrigged_nodes.remove(node_id);
+            } else {
+                rig.unrigged_nodes.insert(*node_id);
+            }
+            UndoDelta::RestoreNodeRigSkinned {
+                node_id: *node_id,
+                previous_unrigged,
+            }
         }
         Command::AddAnimationClip {
             name,

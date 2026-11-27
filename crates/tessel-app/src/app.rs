@@ -51,7 +51,13 @@ struct StudioState {
     camera_2d: PixelCamera2D,
     pixel_drag_start: Option<PixelCoord>,
     gizmo_drag: Option<ui::viewport::GizmoDragState>,
+    gizmo_mode: tessel_render::TransformGizmoMode,
+    rotate_axis_mode: ui::viewport::RotateAxisMode,
+    show_transform_gizmo: bool,
+    outliner_rename: ui::inspector::OutlinerRenameState,
     scene_gadget_drag: Option<ui::viewport::SceneGadgetDrag>,
+    gadget_visibility: ui::viewport::ViewportGadgetVisibility,
+    interaction_tool: ui::viewport::ViewportInteractionTool,
     free_view: bool,
     render_preview: bool,
     export_dialog: ui::export_dialog::ExportDialogState,
@@ -62,6 +68,12 @@ struct StudioState {
     quick_start: ui::quick_start::QuickStartState,
     about_open: bool,
     confirm_new_project: bool,
+    new_project_kind: NewProjectKind,
+    character_origin: NewProjectKind,
+    pending_new_project: Option<NewProjectKind>,
+    pending_mode_switch: Option<PendingModeSwitch>,
+    pending_quick_start_confirm: Option<ui::quick_start::QuickStartAction>,
+    scene_generation: u64,
     confirm_exit: bool,
     quit_confirmed: bool,
     last_error: Option<String>,
@@ -73,11 +85,165 @@ struct StudioState {
     jobs: BackgroundJobs,
 }
 
-struct SaveJobOutcome {
-    path: std::path::PathBuf,
-    revision: u64,
-    save_and_quit: bool,
-    result: Result<(), String>,
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum NewProjectKind {
+    Pixel,
+    #[default]
+    Voxel,
+    LowPoly,
+}
+
+impl NewProjectKind {
+    const ALL: [Self; 3] = [Self::Pixel, Self::Voxel, Self::LowPoly];
+
+    fn from_app_mode(mode: tessel_core::AppMode) -> Option<Self> {
+        match mode {
+            tessel_core::AppMode::Pixel => Some(Self::Pixel),
+            tessel_core::AppMode::Voxel => Some(Self::Voxel),
+            tessel_core::AppMode::LowPoly => Some(Self::LowPoly),
+            tessel_core::AppMode::Character => None,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Pixel => "Pixel",
+            Self::Voxel => "Voxel",
+            Self::LowPoly => "Low-Poly",
+        }
+    }
+}
+
+fn create_project_scene(kind: NewProjectKind) -> Result<(SceneState, HistoryStack), String> {
+    let mut scene = SceneState::new();
+    let mut history = HistoryStack::new();
+    let cmd = match kind {
+        NewProjectKind::Pixel => Command::Transaction(vec![
+            Command::CreatePixelCanvas {
+                name: "Sprite 32x32".into(),
+                width: 32,
+                height: 32,
+            },
+            Command::SetMode(tessel_core::AppMode::Pixel),
+        ]),
+        NewProjectKind::Voxel => Command::Transaction(vec![
+            Command::CreateVoxelVolume {
+                name: "Voxel Volume".into(),
+            },
+            Command::SetMode(tessel_core::AppMode::Voxel),
+        ]),
+        NewProjectKind::LowPoly => Command::SetMode(tessel_core::AppMode::LowPoly),
+    };
+    history
+        .execute(&mut scene, cmd)
+        .map_err(|e| format!("Failed to initialize {} project: {e}", kind.label()))?;
+    Ok((scene, HistoryStack::new()))
+}
+
+fn create_character_project_scene() -> Result<(SceneState, HistoryStack), String> {
+    let mut scene = SceneState::new();
+    let mut history = HistoryStack::new();
+    history
+        .execute(
+            &mut scene,
+            Command::Transaction(vec![
+                Command::ApplyBipedRig,
+                Command::SetMode(tessel_core::AppMode::Character),
+            ]),
+        )
+        .map_err(|e| format!("Failed to initialize Character project: {e}"))?;
+    Ok((scene, HistoryStack::new()))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PendingModeSwitch {
+    target_kind: NewProjectKind,
+}
+
+fn is_canvas_mode(mode: tessel_core::AppMode) -> bool {
+    NewProjectKind::from_app_mode(mode).is_some()
+}
+
+fn infer_canvas_origin(scene: &SceneState) -> NewProjectKind {
+    if let Some(kind) = NewProjectKind::from_app_mode(scene.active_mode) {
+        return kind;
+    }
+    if !scene.lowpoly_meshes.is_empty() {
+        NewProjectKind::LowPoly
+    } else if scene.active_voxel_node().is_some() {
+        NewProjectKind::Voxel
+    } else if scene.active_pixel_node().is_some() {
+        NewProjectKind::Pixel
+    } else {
+        NewProjectKind::LowPoly
+    }
+}
+
+fn should_confirm_discard(
+    scene: &SceneState,
+    has_unsaved_changes: bool,
+    has_saved_file: bool,
+) -> bool {
+    scene.has_authored_content() || has_unsaved_changes || has_saved_file
+}
+
+/// Routes mode switches:
+/// - Switching between `Pixel`, `Voxel`, and `LowPoly` always starts a brand-new empty project
+///   (prompting first if the current scene has authored content, unsaved changes, or an open file;
+///   users who want to bring objects across modes use the dedicated Convert tools).
+/// - Entering `Character` records `character_origin` from the current canvas mode and stays
+///   in-project via `Command::SetMode(Character)`.
+/// - Leaving `Character` back to its recorded `character_origin` (e.g. `Voxel -> Character -> Voxel`
+///   or `LowPoly -> Character -> LowPoly`, even on an empty Low-Poly scene) stays in-project;
+///   leaving `Character` to any OTHER canvas mode starts a new project.
+#[allow(clippy::too_many_arguments)]
+fn request_mode_switch(
+    scene: &mut SceneState,
+    history: &mut HistoryStack,
+    character_origin: &mut NewProjectKind,
+    pending: &mut Option<PendingModeSwitch>,
+    pending_new_project: &mut Option<NewProjectKind>,
+    has_unsaved_changes: bool,
+    has_saved_file: bool,
+    target_mode: tessel_core::AppMode,
+) -> Result<(), String> {
+    if scene.active_mode == target_mode {
+        *pending = None;
+        return Ok(());
+    }
+    if let Some(current_kind) = NewProjectKind::from_app_mode(scene.active_mode) {
+        *character_origin = current_kind;
+    }
+    if let Some(target_kind) = NewProjectKind::from_app_mode(target_mode) {
+        let must_start_new_project =
+            is_canvas_mode(scene.active_mode) || target_kind != *character_origin;
+        if must_start_new_project {
+            if should_confirm_discard(scene, has_unsaved_changes, has_saved_file) {
+                *pending = Some(PendingModeSwitch { target_kind });
+            } else {
+                *pending = None;
+                *pending_new_project = Some(target_kind);
+            }
+            return Ok(());
+        }
+    }
+    *pending = None;
+    history
+        .execute(scene, Command::SetMode(target_mode))
+        .map_err(|e| format!("Mode switch failed: {e}"))
+}
+
+enum SaveJobOutcome {
+    Saved {
+        path: std::path::PathBuf,
+        revision: u64,
+        generation: u64,
+        save_and_quit: bool,
+        result: Result<(), String>,
+    },
+    Cancelled {
+        save_and_quit: bool,
+    },
 }
 
 type ImportMeshJobResult = Option<(
@@ -573,6 +739,25 @@ impl StudioState {
         }
     }
 
+    /// Single authoritative scene replacement boundary: increments `scene_generation` to invalidate
+    /// in-flight async save jobs, resets transient viewport/UI state, syncs `new_project_kind`,
+    /// and optionally clears any stale autosave recovery snapshot.
+    fn replace_scene(&mut self, scene: SceneState, history: HistoryStack, clear_recovery: bool) {
+        self.scene = scene;
+        self.history = history;
+        self.scene_generation = self.scene_generation.wrapping_add(1);
+        self.reset_transient_view_state();
+        let origin = infer_canvas_origin(&self.scene);
+        self.character_origin = origin;
+        if let Some(kind) = NewProjectKind::from_app_mode(self.scene.active_mode) {
+            self.new_project_kind = kind;
+        }
+        if clear_recovery {
+            self.project_files.clear_recovery_snapshot();
+            self.quick_start.has_recovery = self.project_files.has_recovery_snapshot();
+        }
+    }
+
     /// Resets transient viewport/camera/drag/dialog states whenever a different scene is loaded.
     fn reset_transient_view_state(&mut self) {
         self.camera_3d.reset();
@@ -584,10 +769,19 @@ impl StudioState {
         self.camera_2d.reset();
         self.pixel_drag_start = None;
         self.gizmo_drag = None;
+        self.gizmo_mode = tessel_render::TransformGizmoMode::Move;
+        self.rotate_axis_mode = ui::viewport::RotateAxisMode::Free;
+        self.show_transform_gizmo = true;
+        self.outliner_rename.clear();
         self.scene_gadget_drag = None;
+        self.interaction_tool = ui::viewport::ViewportInteractionTool::Select;
+        self.render_preview = false;
         self.export_dialog.status_message = None;
         self.confirm_exit = false;
         self.confirm_new_project = false;
+        self.pending_new_project = None;
+        self.pending_mode_switch = None;
+        self.pending_quick_start_confirm = None;
         self.scene.dirty_viewport = true;
     }
 }
@@ -610,20 +804,13 @@ impl Default for StudioState {
 
         let mut scene = SceneState::new();
         let mut startup_error: Option<String> = None;
-        for cmd in [
-            Command::CreatePixelCanvas {
-                name: "Sprite 32x32".into(),
-                width: 32,
-                height: 32,
-            },
-            Command::CreateVoxelVolume {
-                name: "Starter Voxel".into(),
-            },
-        ] {
-            if let Err(err) = cmd.apply(&mut scene) {
-                tracing::error!("startup scene initialization failed: {err}");
-                startup_error = Some(format!("Startup scene initialization failed: {err}"));
-            }
+        if let Err(err) = (Command::CreateVoxelVolume {
+            name: "Starter Voxel".into(),
+        })
+        .apply(&mut scene)
+        {
+            tracing::error!("startup scene initialization failed: {err}");
+            startup_error = Some(format!("Startup scene initialization failed: {err}"));
         }
         if let Some(voxel_id) = scene.active_voxel_node() {
             if let Err(err) = (Command::FillVoxelBox {
@@ -670,7 +857,13 @@ impl Default for StudioState {
             camera_2d: PixelCamera2D::new(),
             pixel_drag_start: None,
             gizmo_drag: None,
+            gizmo_mode: tessel_render::TransformGizmoMode::Move,
+            rotate_axis_mode: ui::viewport::RotateAxisMode::Free,
+            show_transform_gizmo: true,
+            outliner_rename: ui::inspector::OutlinerRenameState::default(),
             scene_gadget_drag: None,
+            gadget_visibility: ui::viewport::ViewportGadgetVisibility::default(),
+            interaction_tool: ui::viewport::ViewportInteractionTool::default(),
             free_view: true,
             render_preview: false,
             export_dialog,
@@ -686,6 +879,12 @@ impl Default for StudioState {
             },
             about_open: false,
             confirm_new_project: false,
+            new_project_kind: NewProjectKind::default(),
+            character_origin: NewProjectKind::default(),
+            pending_new_project: None,
+            pending_mode_switch: None,
+            pending_quick_start_confirm: None,
+            scene_generation: 0,
             confirm_exit: false,
             quit_confirmed: false,
             last_error: startup_error,
@@ -887,11 +1086,13 @@ impl GpuState {
         let mut desired_viewport = self.viewport_renderer.size();
         let mut hover_voxel = None;
         let mut active_gizmo_axis = None;
+        let mut placement_ghost = None;
         let mut quick_action = ui::quick_start::QuickStartAction::None;
         let mut top_actions = ui::top_bar::TopBarActions::default();
         let mut toggle_mcp_server = false;
         let mut rotate_mcp = false;
         let mut save_and_quit = false;
+        let mut quick_action_confirmed = false;
         let mut export_action = ui::export_dialog::ExportAction::None;
 
         let full_output = self.egui_ctx.run(raw_input, |ctx| {
@@ -926,24 +1127,48 @@ impl GpuState {
                 ctx.request_repaint();
             }
 
-            if let Some(err) = handle_global_shortcuts(
-                ctx,
-                &mut studio.scene,
-                &mut studio.history,
-                &mut studio.camera_3d,
-                &mut studio.camera_2d,
-            ) {
-                tracing::error!("{err}");
-                studio.last_error = Some(err);
+            let mut requested_mode: Option<tessel_core::AppMode> = None;
+            let modal_blocking_shortcuts = studio.confirm_new_project
+                || studio.confirm_exit
+                || studio.pending_mode_switch.is_some()
+                || studio.pending_quick_start_confirm.is_some()
+                || studio.quick_start.open
+                || studio.last_error.is_some();
+            if !modal_blocking_shortcuts
+                && studio.gizmo_drag.is_none()
+                && studio.scene_gadget_drag.is_none()
+            {
+                if let Some(err) = handle_global_shortcuts(
+                    ctx,
+                    &mut studio.scene,
+                    &mut studio.history,
+                    &mut studio.camera_3d,
+                    &mut studio.camera_2d,
+                    &mut requested_mode,
+                ) {
+                    tracing::error!("{err}");
+                    studio.last_error = Some(err);
+                }
             }
-            if ctx.input(|i| i.modifiers.command && i.key_pressed(egui::Key::K)) {
+            if ctx.input(|i| i.modifiers.command && i.key_pressed(egui::Key::K))
+                && !modal_blocking_shortcuts
+                && studio.gizmo_drag.is_none()
+                && studio.scene_gadget_drag.is_none()
+            {
                 studio.command_palette.open = !studio.command_palette.open;
             }
-            if !ctx.wants_keyboard_input() {
+            if !ctx.wants_keyboard_input()
+                && !modal_blocking_shortcuts
+                && studio.gizmo_drag.is_none()
+                && studio.scene_gadget_drag.is_none()
+            {
                 if ctx.input(|i| i.modifiers.command && i.key_pressed(egui::Key::E)) {
                     studio.export_dialog.open = true;
                 }
-                if ctx.input(|i| i.modifiers.command && i.key_pressed(egui::Key::S)) {
+                if ctx.input(|i| i.modifiers.command && i.modifiers.shift && i.key_pressed(egui::Key::S))
+                {
+                    top_actions.save_as_project = true;
+                } else if ctx.input(|i| i.modifiers.command && i.key_pressed(egui::Key::S)) {
                     top_actions.save_project = true;
                 }
                 if ctx.input(|i| i.modifiers.command && i.key_pressed(egui::Key::O)) {
@@ -967,12 +1192,16 @@ impl GpuState {
             );
             top_actions.open_mcp |= bar.open_mcp;
             top_actions.save_project |= bar.save_project;
+            top_actions.save_as_project |= bar.save_as_project;
             top_actions.open_project |= bar.open_project;
             top_actions.new_project |= bar.new_project;
             top_actions.import_mesh |= bar.import_mesh;
             top_actions.open_settings |= bar.open_settings;
             top_actions.open_welcome |= bar.open_welcome;
             top_actions.open_about |= bar.open_about;
+            if let Some(mode) = bar.request_mode_switch {
+                requested_mode = Some(mode);
+            }
 
             ui::status_bar::show_status_bar(
                 ctx,
@@ -984,7 +1213,13 @@ impl GpuState {
                 studio.project_files.has_unsaved_changes(studio.scene.revision),
             );
             ui::timeline::show_timeline(ctx, &mut studio.scene, &mut studio.history);
-            ui::toolbar::show_toolbar(ctx, &mut studio.scene, &mut studio.history);
+            ui::toolbar::show_toolbar(
+                ctx,
+                &mut studio.scene,
+                &mut studio.history,
+                &mut studio.interaction_tool,
+                &mut studio.free_view,
+            );
             ui::inspector::show_inspector(
                 ctx,
                 &mut studio.scene,
@@ -992,8 +1227,14 @@ impl GpuState {
                 &mut studio.ai_state,
                 &studio.export_dialog.output_dir,
                 &studio.settings,
+                &mut studio.show_transform_gizmo,
+                &mut studio.gizmo_mode,
+                &mut studio.free_view,
+                &mut studio.render_preview,
+                &mut studio.interaction_tool,
+                &mut studio.outliner_rename,
             );
-            let (vp_size, hv, g_axis) = ui::viewport::show_viewport(
+            let (vp_size, hv, g_axis, p_ghost) = ui::viewport::show_viewport(
                 ctx,
                 self.viewport_texture_id,
                 &mut studio.scene,
@@ -1006,13 +1247,19 @@ impl GpuState {
                 &mut studio.camera_2d,
                 &mut studio.pixel_drag_start,
                 &mut studio.gizmo_drag,
+                &mut studio.gizmo_mode,
+                &mut studio.rotate_axis_mode,
+                &mut studio.show_transform_gizmo,
                 &mut studio.scene_gadget_drag,
+                &mut studio.gadget_visibility,
+                &mut studio.interaction_tool,
                 &mut studio.free_view,
                 &mut studio.render_preview,
             );
             desired_viewport = vp_size;
             hover_voxel = hv;
             active_gizmo_axis = g_axis;
+            placement_ghost = p_ghost;
             export_action = ui::export_dialog::show_export_dialog(
                 ctx,
                 &studio.scene,
@@ -1057,8 +1304,90 @@ impl GpuState {
                     export_open: &mut studio.export_dialog.open,
                     import_mesh: &mut top_actions.import_mesh,
                     new_project: &mut top_actions.new_project,
+                    requested_mode: &mut requested_mode,
                 },
             );
+            if let Some(current_kind) = NewProjectKind::from_app_mode(studio.scene.active_mode) {
+                studio.character_origin = current_kind;
+            }
+            if let Some(target_mode) = requested_mode {
+                let has_unsaved = studio
+                    .project_files
+                    .has_unsaved_changes(studio.scene.revision);
+                let has_saved_file = studio.project_files.current_path.is_some();
+                if let Err(err) = request_mode_switch(
+                    &mut studio.scene,
+                    &mut studio.history,
+                    &mut studio.character_origin,
+                    &mut studio.pending_mode_switch,
+                    &mut studio.pending_new_project,
+                    has_unsaved,
+                    has_saved_file,
+                    target_mode,
+                ) {
+                    tracing::error!("{err}");
+                    studio.last_error = Some(err);
+                }
+            }
+            if let Some(pending) = studio.pending_mode_switch.take() {
+                if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+                    // Dismiss without changing mode.
+                } else {
+                    let mut open = true;
+                    let mut keep_open = true;
+                    let target_kind = pending.target_kind;
+                    let mode_label = target_kind.label();
+                    let has_unsaved = studio
+                        .project_files
+                        .has_unsaved_changes(studio.scene.revision);
+                    egui::Window::new(format!("Switch to {mode_label} (New Project)"))
+                        .open(&mut open)
+                        .collapsible(false)
+                        .resizable(false)
+                        .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+                        .fixed_size(egui::vec2(420.0, 165.0))
+                        .show(ctx, |ui| {
+                            ui.label(
+                                egui::RichText::new(format!(
+                                    "Switching to {mode_label} starts a new empty project and discards the current scene. To bring existing objects into another mode, use the Convert tool instead."
+                                ))
+                                .size(12.0)
+                                .color(ui::theme::tokens::ON_SURFACE),
+                            );
+                            if has_unsaved {
+                                ui.add_space(8.0);
+                                ui.label(
+                                    egui::RichText::new(
+                                        "Unsaved changes in the current scene will be lost.",
+                                    )
+                                    .size(11.5)
+                                    .color(ui::theme::tokens::ERROR),
+                                );
+                            }
+                            ui.add_space(12.0);
+                            ui.horizontal(|ui| {
+                                let create_btn = egui::Button::new(
+                                    egui::RichText::new(format!("New {mode_label} Project"))
+                                        .strong()
+                                        .color(ui::theme::tokens::ON_PRIMARY),
+                                )
+                                .fill(ui::theme::tokens::PRIMARY_CONTAINER)
+                                .corner_radius(egui::CornerRadius::same(4));
+                                if ui.add(create_btn).clicked() {
+                                    studio.new_project_kind = target_kind;
+                                    studio.pending_new_project = Some(target_kind);
+                                    keep_open = false;
+                                }
+                                if ui.button("Cancel").clicked() {
+                                    keep_open = false;
+                                }
+                            });
+                        });
+                    if open && keep_open {
+                        studio.pending_mode_switch = Some(pending);
+                    }
+                }
+            }
             if let Some(ui_err) = ui::take_ui_error(ctx) {
                 studio.last_error = Some(ui_err);
             }
@@ -1071,31 +1400,52 @@ impl GpuState {
                     studio.confirm_new_project = false;
                 } else {
                     let mut open = studio.confirm_new_project;
+                    let has_unsaved = studio
+                        .project_files
+                        .has_unsaved_changes(studio.scene.revision);
                     egui::Window::new("New Project")
                         .open(&mut open)
                         .collapsible(false)
                         .resizable(false)
                         .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
-                        .fixed_size(egui::vec2(360.0, 120.0))
+                        .fixed_size(egui::vec2(380.0, 165.0))
                         .show(ctx, |ui| {
                             ui.label(
-                                egui::RichText::new(
-                                    "Are you sure you want to start a new empty project? Any unsaved changes in the current scene will be lost.",
-                                )
-                                .size(12.0)
-                                .color(ui::theme::tokens::ON_SURFACE),
+                                egui::RichText::new("Select project type:")
+                                    .strong()
+                                    .size(12.0)
+                                    .color(ui::theme::tokens::ON_SURFACE),
                             );
+                            ui.add_space(6.0);
+                            ui.horizontal(|ui| {
+                                for kind in NewProjectKind::ALL {
+                                    let selected = studio.new_project_kind == kind;
+                                    if ui.selectable_label(selected, kind.label()).clicked() {
+                                        studio.new_project_kind = kind;
+                                    }
+                                }
+                            });
+                            if has_unsaved {
+                                ui.add_space(8.0);
+                                ui.label(
+                                    egui::RichText::new(
+                                        "Unsaved changes in the current scene will be lost.",
+                                    )
+                                    .size(11.5)
+                                    .color(ui::theme::tokens::ERROR),
+                                );
+                            }
                             ui.add_space(12.0);
                             ui.horizontal(|ui| {
                                 let confirm_btn = egui::Button::new(
-                                    egui::RichText::new("Start New Project")
+                                    egui::RichText::new("Create New Project")
                                         .strong()
                                         .color(ui::theme::tokens::ON_PRIMARY),
                                 )
-                                .fill(ui::theme::tokens::ERROR)
+                                .fill(ui::theme::tokens::PRIMARY_CONTAINER)
                                 .corner_radius(egui::CornerRadius::same(4));
                                 if ui.add(confirm_btn).clicked() {
-                                    top_actions.new_project = true;
+                                    studio.pending_new_project = Some(studio.new_project_kind);
                                     studio.confirm_new_project = false;
                                 }
                                 if ui.button("Cancel").clicked() {
@@ -1157,6 +1507,50 @@ impl GpuState {
                     studio.confirm_exit = open && studio.confirm_exit;
                 }
             }
+            if let Some(pending_qs) = studio.pending_quick_start_confirm.take() {
+                if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+                    // Dismiss without discarding current scene.
+                } else {
+                    let mut open = true;
+                    let mut keep_open = true;
+                    egui::Window::new("Discard Unsaved Changes?")
+                        .open(&mut open)
+                        .collapsible(false)
+                        .resizable(false)
+                        .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+                        .fixed_size(egui::vec2(400.0, 145.0))
+                        .show(ctx, |ui| {
+                            ui.label(
+                                egui::RichText::new(
+                                    "Opening this project will discard unsaved changes in your current scene.",
+                                )
+                                .size(12.0)
+                                .color(ui::theme::tokens::ON_SURFACE),
+                            );
+                            ui.add_space(12.0);
+                            ui.horizontal(|ui| {
+                                let continue_btn = egui::Button::new(
+                                    egui::RichText::new("Discard & Open")
+                                        .strong()
+                                        .color(ui::theme::tokens::ON_PRIMARY),
+                                )
+                                .fill(ui::theme::tokens::PRIMARY_CONTAINER)
+                                .corner_radius(egui::CornerRadius::same(4));
+                                if ui.add(continue_btn).clicked() {
+                                    quick_action = pending_qs.clone();
+                                    quick_action_confirmed = true;
+                                    keep_open = false;
+                                }
+                                if ui.button("Cancel").clicked() {
+                                    keep_open = false;
+                                }
+                            });
+                        });
+                    if open && keep_open {
+                        studio.pending_quick_start_confirm = Some(pending_qs);
+                    }
+                }
+            }
             if let Some(err_msg) = studio.last_error.clone() {
                 if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
                     studio.last_error = None;
@@ -1186,54 +1580,187 @@ impl GpuState {
             }
         });
 
-        match quick_action {
-            ui::quick_start::QuickStartAction::OpenExample(example) => {
-                match example.load_copy() {
-                    Ok(loaded) => {
-                        studio.scene = loaded;
-                        studio.history = HistoryStack::new();
-                        studio.reset_transient_view_state();
-                        if let Some((target, yaw_deg, pitch_deg, distance)) = example.camera_pose()
-                        {
-                            studio.camera_3d.target = glam::Vec3::from(target);
-                            studio.camera_3d.yaw = yaw_deg.to_radians();
-                            studio.camera_3d.pitch = pitch_deg.to_radians();
-                            studio.camera_3d.distance = distance;
+        let mut ui_dirty_post_ui = false;
+        let quick_action_needs_confirm = matches!(
+            quick_action,
+            ui::quick_start::QuickStartAction::OpenExample(_)
+                | ui::quick_start::QuickStartAction::RecoverSession
+                | ui::quick_start::QuickStartAction::OpenRecent(_)
+        ) && studio
+            .project_files
+            .has_unsaved_changes(studio.scene.revision)
+            && !quick_action_confirmed;
+
+        if quick_action_needs_confirm {
+            studio.pending_quick_start_confirm = Some(quick_action);
+            ui_dirty_post_ui = true;
+        } else {
+            match quick_action {
+                ui::quick_start::QuickStartAction::OpenExample(example) => {
+                    match example.load_copy() {
+                        Ok(loaded) => {
+                            studio.replace_scene(loaded, HistoryStack::new(), false);
+                            if let Some((target, yaw_deg, pitch_deg, distance)) =
+                                example.camera_pose()
+                            {
+                                studio.camera_3d.target = glam::Vec3::from(target);
+                                studio.camera_3d.yaw = yaw_deg.to_radians();
+                                studio.camera_3d.pitch = pitch_deg.to_radians();
+                                studio.camera_3d.distance = distance;
+                            }
+                            // Keep current_path = None so Ctrl+S always prompts Save As
+                            // and never overwrites the original example file.
+                            studio.project_files.current_path = None;
+                            studio
+                                .project_files
+                                .mark_baseline_revision(studio.scene.revision);
+                            ui_dirty_post_ui = true;
                         }
-                        // Keep current_path = None so Ctrl+S always prompts Save As
-                        // and never overwrites the original example file.
-                        studio.project_files.current_path = None;
-                        studio
-                            .project_files
-                            .mark_baseline_revision(studio.scene.revision);
-                    }
-                    Err(err) => {
-                        studio.quick_start.open = true;
-                        studio.quick_start.error_message = Some(err);
+                        Err(err) => {
+                            studio.quick_start.open = true;
+                            studio.quick_start.error_message = Some(err);
+                            ui_dirty_post_ui = true;
+                        }
                     }
                 }
-            }
-            ui::quick_start::QuickStartAction::RecoverSession => {
-                match studio.project_files.load_recovery_snapshot() {
-                    Ok(loaded) => {
-                        studio.scene = loaded;
-                        studio.history = HistoryStack::new();
-                        studio.reset_transient_view_state();
-                        studio.quick_start.has_recovery =
-                            studio.project_files.has_recovery_snapshot();
-                    }
-                    Err(err) => {
-                        studio.quick_start.open = true;
-                        studio.quick_start.error_message = Some(err);
+                ui::quick_start::QuickStartAction::RecoverSession => {
+                    match studio.project_files.load_recovery_snapshot() {
+                        Ok(loaded) => {
+                            studio.replace_scene(loaded, HistoryStack::new(), false);
+                            studio.quick_start.has_recovery =
+                                studio.project_files.has_recovery_snapshot();
+                            ui_dirty_post_ui = true;
+                        }
+                        Err(err) => {
+                            studio.quick_start.open = true;
+                            studio.quick_start.error_message = Some(err);
+                            ui_dirty_post_ui = true;
+                        }
                     }
                 }
+                ui::quick_start::QuickStartAction::OpenRecent(path) => {
+                    match studio.project_files.load_from_path(path.clone()) {
+                        Ok(loaded) => {
+                            studio.replace_scene(loaded, HistoryStack::new(), false);
+                            studio.settings.record_recent_project(path);
+                            if let Err(err) = studio.settings.save(&studio.paths) {
+                                tracing::error!("{err}");
+                                studio.last_error = Some(err.to_string());
+                            }
+                            ui_dirty_post_ui = true;
+                        }
+                        Err(err) => {
+                            studio.quick_start.open = true;
+                            studio.quick_start.error_message = Some(err);
+                            ui_dirty_post_ui = true;
+                        }
+                    }
+                }
+                ui::quick_start::QuickStartAction::NewPixel
+                | ui::quick_start::QuickStartAction::NewVoxel
+                | ui::quick_start::QuickStartAction::OpenAiWorkspace => {
+                    let target_kind = match quick_action {
+                        ui::quick_start::QuickStartAction::NewPixel => NewProjectKind::Pixel,
+                        _ => NewProjectKind::Voxel,
+                    };
+                    let has_unsaved = studio
+                        .project_files
+                        .has_unsaved_changes(studio.scene.revision);
+                    let has_saved_file = studio.project_files.current_path.is_some();
+                    if has_unsaved || has_saved_file {
+                        studio.pending_mode_switch = Some(PendingModeSwitch { target_kind });
+                        ui_dirty_post_ui = true;
+                    } else {
+                        studio.pending_new_project = Some(target_kind);
+                    }
+                }
+                ui::quick_start::QuickStartAction::NewCharacter => {
+                    let has_unsaved = studio
+                        .project_files
+                        .has_unsaved_changes(studio.scene.revision);
+                    let has_saved_file = studio.project_files.current_path.is_some();
+                    if !has_unsaved && !has_saved_file {
+                        match create_character_project_scene() {
+                            Ok((next_scene, next_history)) => {
+                                studio.replace_scene(next_scene, next_history, true);
+                                studio.project_files.current_path = None;
+                                studio
+                                    .project_files
+                                    .mark_baseline_revision(studio.scene.revision);
+                                ui_dirty_post_ui = true;
+                            }
+                            Err(err) => {
+                                tracing::error!("{err}");
+                                studio.last_error = Some(err);
+                                ui_dirty_post_ui = true;
+                            }
+                        }
+                    } else if let Err(err) = ui::quick_start::apply_quick_start_preset(
+                        &quick_action,
+                        &mut studio.scene,
+                        &mut studio.history,
+                    ) {
+                        studio.last_error = Some(err);
+                        ui_dirty_post_ui = true;
+                    } else {
+                        ui_dirty_post_ui = true;
+                    }
+                }
+                ui::quick_start::QuickStartAction::None => {}
             }
-            ui::quick_start::QuickStartAction::OpenRecent(path) => {
-                match studio.project_files.load_from_path(path.clone()) {
+        }
+
+        match studio.jobs.turntable_gif.poll() {
+            Ok(Some(res)) => {
+                studio.export_dialog.status_message = Some(res);
+                ui_dirty_post_ui = true;
+            }
+            Ok(None) => {}
+            Err(err) => {
+                studio.export_dialog.status_message = Some(Err(err.into()));
+                ui_dirty_post_ui = true;
+            }
+        }
+        match studio.jobs.import_mesh.poll() {
+            Ok(Some(Some((_path, res)))) => {
+                match res {
+                    Ok((name, mesh)) => {
+                        if let Err(err) = studio.history.execute(
+                            &mut studio.scene,
+                            Command::Transaction(vec![
+                                Command::ImportLowPolyMesh {
+                                    name,
+                                    mesh: Box::new(mesh),
+                                },
+                                Command::SetMode(tessel_core::AppMode::LowPoly),
+                            ]),
+                        ) {
+                            let msg = format!("Import 3D mesh failed: {err}");
+                            tracing::error!("{msg}");
+                            studio.last_error = Some(msg);
+                        }
+                    }
+                    Err(err) => {
+                        let msg = format!("Import 3D mesh failed: {err}");
+                        tracing::error!("{msg}");
+                        studio.last_error = Some(msg);
+                    }
+                }
+                ui_dirty_post_ui = true;
+            }
+            Ok(Some(None)) | Ok(None) => {}
+            Err(err) => {
+                studio.last_error = Some(err.into());
+                ui_dirty_post_ui = true;
+            }
+        }
+        match studio.jobs.open_project.poll() {
+            Ok(Some(Some((path, res)))) => {
+                match res {
                     Ok(loaded) => {
-                        studio.scene = loaded;
-                        studio.history = HistoryStack::new();
-                        studio.reset_transient_view_state();
+                        let rev = loaded.revision;
+                        studio.replace_scene(loaded, HistoryStack::new(), false);
+                        studio.project_files.finish_open(path.clone(), rev);
                         studio.settings.record_recent_project(path);
                         if let Err(err) = studio.settings.save(&studio.paths) {
                             tracing::error!("{err}");
@@ -1241,112 +1768,79 @@ impl GpuState {
                         }
                     }
                     Err(err) => {
-                        studio.quick_start.open = true;
-                        studio.quick_start.error_message = Some(err);
-                    }
-                }
-            }
-            other => {
-                if let Err(err) = ui::quick_start::apply_quick_start_preset(
-                    &other,
-                    &mut studio.scene,
-                    &mut studio.history,
-                ) {
-                    studio.last_error = Some(err);
-                }
-            }
-        }
-
-        match studio.jobs.turntable_gif.poll() {
-            Ok(Some(res)) => studio.export_dialog.status_message = Some(res),
-            Ok(None) => {}
-            Err(err) => studio.export_dialog.status_message = Some(Err(err.into())),
-        }
-        match studio.jobs.import_mesh.poll() {
-            Ok(Some(Some((_path, res)))) => match res {
-                Ok((name, mesh)) => {
-                    if let Err(err) = studio.history.execute(
-                        &mut studio.scene,
-                        Command::Transaction(vec![
-                            Command::ImportLowPolyMesh { name, mesh },
-                            Command::SetMode(tessel_core::AppMode::LowPoly),
-                        ]),
-                    ) {
-                        let msg = format!("Import 3D mesh failed: {err}");
+                        let msg = format!("Open project failed: {err}");
                         tracing::error!("{msg}");
                         studio.last_error = Some(msg);
                     }
                 }
-                Err(err) => {
-                    let msg = format!("Import 3D mesh failed: {err}");
-                    tracing::error!("{msg}");
-                    studio.last_error = Some(msg);
-                }
-            },
+                ui_dirty_post_ui = true;
+            }
             Ok(Some(None)) | Ok(None) => {}
-            Err(err) => studio.last_error = Some(err.into()),
-        }
-        match studio.jobs.open_project.poll() {
-            Ok(Some(Some((path, res)))) => match res {
-                Ok(loaded) => {
-                    let rev = loaded.revision;
-                    studio.scene = loaded;
-                    studio.history = HistoryStack::new();
-                    studio.reset_transient_view_state();
-                    studio.project_files.finish_open(path.clone(), rev);
-                    studio.settings.record_recent_project(path);
-                    if let Err(err) = studio.settings.save(&studio.paths) {
-                        tracing::error!("{err}");
-                        studio.last_error = Some(err.to_string());
-                    }
-                }
-                Err(err) => {
-                    let msg = format!("Open project failed: {err}");
-                    tracing::error!("{msg}");
-                    studio.last_error = Some(msg);
-                }
-            },
-            Ok(Some(None)) | Ok(None) => {}
-            Err(err) => studio.last_error = Some(err.into()),
+            Err(err) => {
+                studio.last_error = Some(err.into());
+                ui_dirty_post_ui = true;
+            }
         }
         match studio.jobs.save_project.poll() {
-            Ok(Some(Some(outcome))) => match outcome.result {
-                Ok(()) => {
-                    let up_to_date = studio.scene.revision == outcome.revision;
-                    if up_to_date {
-                        studio
-                            .project_files
-                            .finish_save(outcome.path.clone(), outcome.revision);
-                        studio.quick_start.has_recovery =
-                            studio.project_files.has_recovery_snapshot();
-                    } else {
-                        studio.project_files.current_path = Some(outcome.path.clone());
+            Ok(Some(Some(SaveJobOutcome::Saved {
+                path,
+                revision,
+                generation,
+                save_and_quit,
+                result,
+            }))) => {
+                match result {
+                    Ok(()) => {
+                        let same_gen = generation == studio.scene_generation;
+                        let up_to_date = same_gen && studio.scene.revision == revision;
+                        if same_gen {
+                            if up_to_date {
+                                studio.project_files.finish_save(path.clone(), revision);
+                                studio.quick_start.has_recovery =
+                                    studio.project_files.has_recovery_snapshot();
+                            } else {
+                                studio.project_files.current_path = Some(path.clone());
+                            }
+                            studio.settings.record_recent_project(path);
+                            if let Err(err) = studio.settings.save(&studio.paths) {
+                                tracing::error!("{err}");
+                                studio.last_error = Some(err.to_string());
+                            }
+                        }
+                        if save_and_quit {
+                            if up_to_date {
+                                studio.quit_confirmed = true;
+                            } else {
+                                studio.confirm_exit = true;
+                                studio.last_error = Some(
+                                    "Scene was modified while saving; please save again before quitting."
+                                        .into(),
+                                );
+                            }
+                        }
                     }
-                    studio.settings.record_recent_project(outcome.path);
-                    if let Err(err) = studio.settings.save(&studio.paths) {
-                        tracing::error!("{err}");
-                        studio.last_error = Some(err.to_string());
-                    }
-                    if outcome.save_and_quit {
-                        if up_to_date {
-                            studio.quit_confirmed = true;
-                        } else {
+                    Err(err) => {
+                        let msg = format!("Save project failed: {err}");
+                        tracing::error!("{msg}");
+                        studio.last_error = Some(msg);
+                        if save_and_quit {
                             studio.confirm_exit = true;
-                            studio.last_error = Some(
-                                "Scene was modified while saving; please save again before quitting."
-                                    .into(),
-                            );
                         }
                     }
                 }
-                Err(err) => {
-                    let msg = format!("Save project failed: {err}");
-                    tracing::error!("{msg}");
-                    studio.last_error = Some(msg);
+                ui_dirty_post_ui = true;
+            }
+            Ok(Some(Some(SaveJobOutcome::Cancelled { save_and_quit }))) => {
+                if save_and_quit {
+                    studio.confirm_exit = true;
+                    ui_dirty_post_ui = true;
                 }
-            },
+            }
             Ok(Some(None)) | Ok(None) => {}
-            Err(err) => studio.last_error = Some(err.into()),
+            Err(err) => {
+                studio.last_error = Some(err.into());
+                ui_dirty_post_ui = true;
+            }
         }
 
         if let ui::export_dialog::ExportAction::TurntableGif(args) = export_action {
@@ -1420,7 +1914,7 @@ impl GpuState {
             studio.mcp_dialog.status_message =
                 Some("Rotated MCP token. Update your client config.".into());
         }
-        if top_actions.save_project || save_and_quit {
+        if top_actions.save_project || top_actions.save_as_project || save_and_quit {
             if studio.jobs.save_project.is_busy() {
                 if save_and_quit {
                     studio.confirm_exit = true;
@@ -1432,8 +1926,14 @@ impl GpuState {
                     .capture_png_bytes(&self.device, &self.queue)
                     .map_err(|err| tracing::warn!("project thumbnail PNG capture failed: {err}"))
                     .ok();
-                let current_path = studio.project_files.current_path.clone();
+                let force_save_as = top_actions.save_as_project && !save_and_quit;
+                let current_path = if force_save_as {
+                    None
+                } else {
+                    studio.project_files.current_path.clone()
+                };
                 let scene_snapshot = studio.scene.clone();
+                let generation = studio.scene_generation;
                 studio.jobs.save_project.spawn(move || {
                     let target = match current_path {
                         Some(p) => Some(p),
@@ -1442,7 +1942,9 @@ impl GpuState {
                             .set_file_name("untitled.tessel")
                             .save_file(),
                     };
-                    let path = target?;
+                    let Some(path) = target else {
+                        return Some(SaveJobOutcome::Cancelled { save_and_quit });
+                    };
                     let revision = scene_snapshot.revision;
                     let result = tessel_io::save_tessel_project_with_thumbnail(
                         &path,
@@ -1450,9 +1952,10 @@ impl GpuState {
                         thumb.as_deref(),
                     )
                     .map_err(|e| e.to_string());
-                    Some(SaveJobOutcome {
+                    Some(SaveJobOutcome::Saved {
                         path,
                         revision,
+                        generation,
                         save_and_quit,
                         result,
                     })
@@ -1468,14 +1971,25 @@ impl GpuState {
                 Some((path, res))
             });
         }
-        if top_actions.new_project {
-            studio.scene = SceneState::new();
-            studio.history = HistoryStack::new();
-            studio.reset_transient_view_state();
-            studio.project_files.current_path = None;
-            studio
-                .project_files
-                .mark_baseline_revision(studio.scene.revision);
+        if let Some(kind) = studio.pending_new_project.take() {
+            match create_project_scene(kind) {
+                Ok((next_scene, next_history)) => {
+                    studio.replace_scene(next_scene, next_history, true);
+                    studio.project_files.current_path = None;
+                    studio
+                        .project_files
+                        .mark_baseline_revision(studio.scene.revision);
+                    ui_dirty_post_ui = true;
+                }
+                Err(err) => {
+                    tracing::error!("{err}");
+                    studio.last_error = Some(err);
+                    ui_dirty_post_ui = true;
+                }
+            }
+        }
+        if ui_dirty_post_ui {
+            self.egui_ctx.request_repaint();
         }
 
         let desired_title = format_window_title(
@@ -1509,6 +2023,16 @@ impl GpuState {
             .set_autosave_paused(studio.quick_start.open && studio.quick_start.has_recovery);
         studio.project_files.tick_autosave(&studio.scene);
 
+        let show_3d_gizmo = ui::viewport::is_transform_gizmo_enabled(
+            &studio.scene,
+            studio.interaction_tool,
+            studio.free_view,
+            studio.render_preview,
+            studio.show_transform_gizmo,
+        );
+        self.viewport_renderer.set_gizmo_mode(studio.gizmo_mode);
+        self.viewport_renderer.set_show_gizmo(show_3d_gizmo);
+        self.viewport_renderer.set_placement_ghost(placement_ghost);
         self.viewport_renderer.sync_scene(
             &self.device,
             &self.queue,
@@ -1518,11 +2042,15 @@ impl GpuState {
         );
         studio.scene.dirty_viewport = false;
 
-        let egui_repaint = full_output
-            .viewport_output
-            .get(&egui::ViewportId::ROOT)
-            .map(|v| v.repaint_delay)
-            .unwrap_or(Duration::MAX);
+        let egui_repaint = if ui_dirty_post_ui {
+            Duration::ZERO
+        } else {
+            full_output
+                .viewport_output
+                .get(&egui::ViewportId::ROOT)
+                .map(|v| v.repaint_delay)
+                .unwrap_or(Duration::MAX)
+        };
         let next_repaint = compute_next_repaint_delay(
             egui_repaint,
             studio.jobs.any_busy(),
@@ -2064,5 +2592,207 @@ mod tests {
             ),
             Some(Duration::from_millis(25))
         );
+    }
+
+    #[test]
+    fn create_project_scene_initializes_requested_mode() {
+        let (pixel_scene, _) = create_project_scene(NewProjectKind::Pixel).unwrap();
+        assert_eq!(pixel_scene.active_mode, tessel_core::AppMode::Pixel);
+        assert!(pixel_scene.active_pixel_node().is_some());
+
+        let (voxel_scene, _) = create_project_scene(NewProjectKind::Voxel).unwrap();
+        assert_eq!(voxel_scene.active_mode, tessel_core::AppMode::Voxel);
+        assert!(voxel_scene.active_voxel_node().is_some());
+
+        let (lowpoly_scene, _) = create_project_scene(NewProjectKind::LowPoly).unwrap();
+        assert_eq!(lowpoly_scene.active_mode, tessel_core::AppMode::LowPoly);
+    }
+
+    #[test]
+    fn mode_switch_between_canvas_modes_starts_new_project_and_prompts_when_dirty() {
+        let mut scene = SceneState::new();
+        let mut history = HistoryStack::new();
+        let mut character_origin = NewProjectKind::Voxel;
+        let mut pending = None;
+        let mut pending_new_project = None;
+
+        // 1. Empty clean Voxel scene switches immediately to a brand-new Pixel project.
+        request_mode_switch(
+            &mut scene,
+            &mut history,
+            &mut character_origin,
+            &mut pending,
+            &mut pending_new_project,
+            false,
+            false,
+            tessel_core::AppMode::Pixel,
+        )
+        .unwrap();
+        assert!(pending.is_none());
+        assert_eq!(pending_new_project, Some(NewProjectKind::Pixel));
+
+        // 2. Clean saved project (`has_saved_file == true`) still prompts before discarding.
+        pending_new_project = None;
+        request_mode_switch(
+            &mut scene,
+            &mut history,
+            &mut character_origin,
+            &mut pending,
+            &mut pending_new_project,
+            false,
+            true,
+            tessel_core::AppMode::LowPoly,
+        )
+        .unwrap();
+        assert_eq!(
+            pending,
+            Some(PendingModeSwitch {
+                target_kind: NewProjectKind::LowPoly
+            })
+        );
+        assert!(pending_new_project.is_none());
+
+        // 3. Empty LowPoly -> Character -> LowPoly stays in-project (never creates a new project),
+        //    while LowPoly -> Character -> Voxel starts a new project.
+        let (mut lp_scene, mut lp_history) = create_project_scene(NewProjectKind::LowPoly).unwrap();
+        assert!(lp_scene.lowpoly_meshes.is_empty());
+        let mut lp_origin = NewProjectKind::LowPoly;
+        pending = None;
+        pending_new_project = None;
+        request_mode_switch(
+            &mut lp_scene,
+            &mut lp_history,
+            &mut lp_origin,
+            &mut pending,
+            &mut pending_new_project,
+            false,
+            false,
+            tessel_core::AppMode::Character,
+        )
+        .unwrap();
+        assert_eq!(lp_scene.active_mode, tessel_core::AppMode::Character);
+        assert_eq!(lp_origin, NewProjectKind::LowPoly);
+        assert!(pending.is_none());
+        assert!(pending_new_project.is_none());
+
+        // Returning to LowPoly stays in-project even though LowPoly has 0 meshes.
+        request_mode_switch(
+            &mut lp_scene,
+            &mut lp_history,
+            &mut lp_origin,
+            &mut pending,
+            &mut pending_new_project,
+            false,
+            false,
+            tessel_core::AppMode::LowPoly,
+        )
+        .unwrap();
+        assert_eq!(lp_scene.active_mode, tessel_core::AppMode::LowPoly);
+        assert!(pending.is_none());
+        assert!(pending_new_project.is_none());
+
+        // Re-enter Character from LowPoly, then switch to Voxel -> must start new project!
+        request_mode_switch(
+            &mut lp_scene,
+            &mut lp_history,
+            &mut lp_origin,
+            &mut pending,
+            &mut pending_new_project,
+            false,
+            false,
+            tessel_core::AppMode::Character,
+        )
+        .unwrap();
+        request_mode_switch(
+            &mut lp_scene,
+            &mut lp_history,
+            &mut lp_origin,
+            &mut pending,
+            &mut pending_new_project,
+            false,
+            false,
+            tessel_core::AppMode::Voxel,
+        )
+        .unwrap();
+        assert_eq!(pending_new_project, Some(NewProjectKind::Voxel));
+
+        // 4. Voxel -> Character -> Voxel stays in-project, while Voxel -> Character -> LowPoly prompts.
+        let (mut vox_scene, mut vox_history) = create_project_scene(NewProjectKind::Voxel).unwrap();
+        let mut vox_origin = NewProjectKind::Voxel;
+        pending = None;
+        pending_new_project = None;
+        request_mode_switch(
+            &mut vox_scene,
+            &mut vox_history,
+            &mut vox_origin,
+            &mut pending,
+            &mut pending_new_project,
+            true,
+            false,
+            tessel_core::AppMode::Character,
+        )
+        .unwrap();
+        assert_eq!(vox_scene.active_mode, tessel_core::AppMode::Character);
+        assert_eq!(vox_origin, NewProjectKind::Voxel);
+
+        // Character -> LowPoly (came from Voxel) prompts for new project.
+        request_mode_switch(
+            &mut vox_scene,
+            &mut vox_history,
+            &mut vox_origin,
+            &mut pending,
+            &mut pending_new_project,
+            true,
+            false,
+            tessel_core::AppMode::LowPoly,
+        )
+        .unwrap();
+        assert_eq!(
+            pending,
+            Some(PendingModeSwitch {
+                target_kind: NewProjectKind::LowPoly
+            })
+        );
+        assert_eq!(vox_scene.active_mode, tessel_core::AppMode::Character);
+
+        // Character -> Voxel (came from Voxel) returns cleanly in-project without prompt.
+        pending = None;
+        request_mode_switch(
+            &mut vox_scene,
+            &mut vox_history,
+            &mut vox_origin,
+            &mut pending,
+            &mut pending_new_project,
+            true,
+            false,
+            tessel_core::AppMode::Voxel,
+        )
+        .unwrap();
+        assert!(pending.is_none());
+        assert!(pending_new_project.is_none());
+        assert_eq!(vox_scene.active_mode, tessel_core::AppMode::Voxel);
+    }
+
+    #[test]
+    fn replace_scene_bumps_generation_resets_render_preview_and_clears_recovery() {
+        let mut studio = StudioState::default();
+        let tmp_recovery = std::env::temp_dir().join("tessel_replace_scene_recovery_test.tessel");
+        let _ = std::fs::write(&tmp_recovery, b"stale-autosave");
+        studio.project_files = ProjectFileManager::with_recovery_path(tmp_recovery.clone());
+        studio.quick_start.has_recovery = studio.project_files.has_recovery_snapshot();
+        assert!(studio.quick_start.has_recovery);
+
+        studio.render_preview = true;
+        studio.new_project_kind = NewProjectKind::Voxel;
+        let prev_gen = studio.scene_generation;
+
+        let (next_scene, next_history) = create_project_scene(NewProjectKind::LowPoly).unwrap();
+        studio.replace_scene(next_scene, next_history, true);
+
+        assert_eq!(studio.scene_generation, prev_gen.wrapping_add(1));
+        assert!(!studio.render_preview);
+        assert_eq!(studio.new_project_kind, NewProjectKind::LowPoly);
+        assert!(!tmp_recovery.exists());
+        assert!(!studio.quick_start.has_recovery);
     }
 }

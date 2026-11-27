@@ -8,12 +8,14 @@ use super::theme::tokens;
 pub struct TopBarActions {
     pub open_mcp: bool,
     pub save_project: bool,
+    pub save_as_project: bool,
     pub open_project: bool,
     pub new_project: bool,
     pub import_mesh: bool,
     pub open_settings: bool,
     pub open_welcome: bool,
     pub open_about: bool,
+    pub request_mode_switch: Option<AppMode>,
 }
 
 pub fn show_top_bar(
@@ -47,9 +49,23 @@ pub fn show_top_bar(
                 if icons::hud_icon_button(ui, ToolIcon::Open, "Open project", false) {
                     actions.open_project = true;
                 }
-                if icons::hud_icon_button(ui, ToolIcon::Save, "Save project", false) {
-                    actions.save_project = true;
-                }
+                let save_btn = ui.menu_button(
+                    RichText::new(ToolIcon::Save.glyph())
+                        .size(16.0)
+                        .color(tokens::ON_SURFACE),
+                    |ui| {
+                        ui.set_min_width(145.0);
+                        if ui.button("Save (Ctrl+S)").clicked() {
+                            actions.save_project = true;
+                            ui.close_menu();
+                        }
+                        if ui.button("Save As... (Ctrl+Shift+S)").clicked() {
+                            actions.save_as_project = true;
+                            ui.close_menu();
+                        }
+                    },
+                );
+                save_btn.response.on_hover_text("Save / Save As");
                 if icons::hud_icon_button(
                     ui,
                     ToolIcon::Import,
@@ -69,7 +85,7 @@ pub fn show_top_bar(
                     };
                     let selected = scene.active_mode == mode;
                     if icons::hud_icon_button(ui, icon, mode.label(), selected) && !selected {
-                        super::exec_history(ui.ctx(), history, scene, Command::SetMode(mode));
+                        actions.request_mode_switch = Some(mode);
                     }
                 }
 

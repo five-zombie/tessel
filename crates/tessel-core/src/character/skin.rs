@@ -25,13 +25,25 @@ pub struct AutoSkinSolver {
     segments: Vec<(Vec3, Vec3)>,
     /// Lateral side tag per bone (`+1` = +X left limb, `-1` = -X right limb, `0` = midline).
     bone_sides: Vec<i8>,
+    /// Whether each bone participates in smooth auto-weight deformation (`Bone::deform`).
+    bone_deform: Vec<bool>,
     inverse_bind_matrices: Vec<[f32; 16]>,
 }
 
 impl AutoSkinSolver {
     /// Builds a rest-pose skinning solver from `rig`, scaled uniformly by `scale`.
+    /// Returns `None` when the rig has no bones or when zero bones have `deform == true`
+    /// and no valid rigid bindings exist on rigged nodes.
     pub fn from_rig(rig: &CharacterRig, scale: f32) -> Option<Self> {
         if rig.bones.is_empty() {
+            return None;
+        }
+        let has_deform_bone = rig.bones.iter().any(|b| b.deform);
+        let has_valid_binding = rig
+            .bindings
+            .iter()
+            .any(|b| rig.should_skin_node(b.node_id) && rig.bone(b.bone_id).is_some());
+        if !has_deform_bone && !has_valid_binding {
             return None;
         }
         let s = scale.max(1e-6);
@@ -67,6 +79,7 @@ impl AutoSkinSolver {
 
         let mut segments = Vec::with_capacity(rig.bones.len());
         let mut bone_sides = Vec::with_capacity(rig.bones.len());
+        let mut bone_deform = Vec::with_capacity(rig.bones.len());
         let mut inverse_bind_matrices = Vec::with_capacity(rig.bones.len());
 
         for bone in &rig.bones {
@@ -104,6 +117,7 @@ impl AutoSkinSolver {
             };
             segments.push((start, end));
             bone_sides.push(side);
+            bone_deform.push(bone.deform);
             inverse_bind_matrices.push(mat.inverse().to_cols_array());
         }
 
@@ -130,8 +144,26 @@ impl AutoSkinSolver {
             node_allowed_joints,
             segments,
             bone_sides,
+            bone_deform,
             inverse_bind_matrices,
         })
+    }
+
+    /// Returns `true` when `node_id` has at least one active skinning influence in this solver
+    /// (explicit rigid binding, or at least one `deform == true` bone within its mask / skeleton).
+    pub fn node_has_skin_influence(&self, node_id: NodeId) -> bool {
+        if self.node_rigid_joint.contains_key(&node_id) {
+            return true;
+        }
+        if let Some(mask) = self.node_allowed_joints.get(&node_id) {
+            return mask.iter().any(|&j| {
+                self.bone_deform
+                    .get(usize::from(j))
+                    .copied()
+                    .unwrap_or(false)
+            });
+        }
+        self.bone_deform.iter().any(|&d| d)
     }
 
     /// Column-major 4x4 inverse bind matrices matching `rig.bones` order.
@@ -211,6 +243,9 @@ impl AutoSkinSolver {
             let Ok(joint) = u16::try_from(idx) else {
                 break;
             };
+            if !self.bone_deform.get(idx).copied().unwrap_or(true) {
+                continue;
+            }
             if let Some(mask) = allowed {
                 if !mask.contains(&joint) {
                     continue;
@@ -241,9 +276,57 @@ impl AutoSkinSolver {
 
         let sum: f32 = top_weights.iter().sum();
         if !sum.is_finite() || sum <= 0.0 {
-            return VertexSkinWeights {
-                joints: [0, 0, 0, 0],
-                weights: [1.0, 0.0, 0.0, 0.0],
+            if let Some(mask) = allowed {
+                // Respect node_bone_masks strictly (ignoring lateral filter) so a masked
+                // sub-skeleton never leaks outside its mask; if every masked bone has
+                // deform == false, return zero weights so the vertex remains undeformed.
+                let closest_deform_in_mask = mask
+                    .iter()
+                    .copied()
+                    .filter(|&j| {
+                        self.bone_deform
+                            .get(usize::from(j))
+                            .copied()
+                            .unwrap_or(false)
+                    })
+                    .min_by(|&a, &b| {
+                        let da = self
+                            .segments
+                            .get(usize::from(a))
+                            .map(|&(sa, sb)| point_to_segment_distance(world_pos, sa, sb))
+                            .unwrap_or(f32::INFINITY);
+                        let db = self
+                            .segments
+                            .get(usize::from(b))
+                            .map(|&(sa, sb)| point_to_segment_distance(world_pos, sa, sb))
+                            .unwrap_or(f32::INFINITY);
+                        da.total_cmp(&db)
+                    });
+                return match closest_deform_in_mask {
+                    Some(joint) => VertexSkinWeights {
+                        joints: [joint, 0, 0, 0],
+                        weights: [1.0, 0.0, 0.0, 0.0],
+                    },
+                    None => VertexSkinWeights {
+                        joints: [0, 0, 0, 0],
+                        weights: [0.0, 0.0, 0.0, 0.0],
+                    },
+                };
+            }
+            return match self
+                .bone_deform
+                .iter()
+                .position(|&d| d)
+                .and_then(|i| u16::try_from(i).ok())
+            {
+                Some(joint) => VertexSkinWeights {
+                    joints: [joint, 0, 0, 0],
+                    weights: [1.0, 0.0, 0.0, 0.0],
+                },
+                None => VertexSkinWeights {
+                    joints: [0, 0, 0, 0],
+                    weights: [0.0, 0.0, 0.0, 0.0],
+                },
             };
         }
 
@@ -323,6 +406,9 @@ impl SkinnedBoundsCache {
 
         let is_skinned_visible = |node_id: NodeId| -> bool {
             if excluded_nodes.contains(&node_id) {
+                return false;
+            }
+            if !rig.should_skin_node(node_id) {
                 return false;
             }
             if rig.node_parent_overrides.contains_key(&node_id) {
@@ -567,5 +653,96 @@ mod tests {
 
         // Unknown / unmeshed sub-skeleton returns None so callers fall back to joints.
         assert!(cache.sub_skeleton_min_y(&rig, "P2_").is_none());
+    }
+
+    #[test]
+    fn auto_skin_solver_skips_non_deform_helper_bones() {
+        let mut rig = CharacterRig::biped_template();
+        // Disable deform on Head (BoneId 2) so vertices near the head fall back to Torso/Root, never Head.
+        rig.bone_mut(BoneId(2)).unwrap().deform = false;
+        let solver = AutoSkinSolver::from_rig(&rig, 1.0).unwrap();
+        let w = solver.weights_for_vertex(None, Vec3::new(0.0, 1.65, 0.0));
+        for k in 0..4 {
+            if w.weights[k] > 0.0 {
+                assert_ne!(
+                    w.joints[k], 2,
+                    "non-deform helper bone must not receive smooth auto-skin weight"
+                );
+            }
+        }
+        assert!((w.weights.iter().sum::<f32>() - 1.0).abs() < 1e-5);
+
+        // Masked vertex across X=0 must stay within its allowed mask, never snapping to global Root (0).
+        let masked_node = NodeId(77);
+        rig.node_bone_masks.insert(masked_node, vec![BoneId(5)]); // LeftLeg (+X)
+        let solver_masked = AutoSkinSolver::from_rig(&rig, 1.0).unwrap();
+        let w_cross =
+            solver_masked.weights_for_vertex(Some(masked_node), Vec3::new(-0.5, 0.2, 0.0));
+        assert_eq!(
+            w_cross.joints[0], 5,
+            "masked fallback must stay in node_bone_masks"
+        );
+
+        // Mask containing ONLY non-deform bone(s) must never leak out to global Root (0).
+        let helper_masked_node = NodeId(78);
+        rig.node_bone_masks
+            .insert(helper_masked_node, vec![BoneId(2)]); // Head (deform = false)
+        let solver_helper = AutoSkinSolver::from_rig(&rig, 1.0).unwrap();
+        assert!(!solver_helper.node_has_skin_influence(helper_masked_node));
+        let w_helper =
+            solver_helper.weights_for_vertex(Some(helper_masked_node), Vec3::new(0.0, 1.65, 0.0));
+        assert_eq!(w_helper.weights, [0.0, 0.0, 0.0, 0.0]);
+
+        // All bones deform=false with no rigid bindings -> solver returns None.
+        for b in &mut rig.bones {
+            b.deform = false;
+        }
+        assert!(AutoSkinSolver::from_rig(&rig, 1.0).is_none());
+
+        // All bones deform=false WITH one rigid binding -> unbound nodes get zero weights, not bone 0.
+        let prop_node = NodeId(79);
+        let unbound_node = NodeId(80);
+        rig.bindings.push(SkinBinding {
+            node_id: prop_node,
+            bone_id: BoneId(0),
+        });
+        let solver_rigid_only = AutoSkinSolver::from_rig(&rig, 1.0).unwrap();
+        assert!(solver_rigid_only.node_has_skin_influence(prop_node));
+        assert!(!solver_rigid_only.node_has_skin_influence(unbound_node));
+        let w_unbound =
+            solver_rigid_only.weights_for_vertex(Some(unbound_node), Vec3::new(0.0, 1.0, 0.0));
+        assert_eq!(w_unbound.weights, [0.0, 0.0, 0.0, 0.0]);
+    }
+
+    #[test]
+    fn skinned_bounds_cache_excludes_unrigged_nodes() {
+        let mut scene = SceneState::new();
+        let node_id = scene.allocate_node_id();
+        let mut mesh = crate::mesh::LowPolyMesh::new();
+        mesh.vertices = vec![
+            Vec3::new(0.0, -2.5, 0.0),
+            Vec3::new(1.0, -2.5, 0.0),
+            Vec3::new(0.5, -2.0, 0.5),
+        ];
+        scene.nodes.insert(
+            node_id,
+            crate::scene::SceneNode {
+                id: node_id,
+                name: "TerrainFloor".into(),
+                kind: crate::scene::NodeKind::LowPolyMesh,
+                visible: true,
+                parent: None,
+                transform: crate::scene::Transform::default(),
+            },
+        );
+        scene.lowpoly_meshes.insert(node_id, mesh);
+
+        let mut rig = CharacterRig::humanoid_template();
+        rig.unrigged_nodes.insert(node_id);
+        let cache = SkinnedBoundsCache::from_scene(&scene, &rig).unwrap();
+        assert!(
+            cache.sub_skeleton_min_y(&rig, "").is_none(),
+            "unrigged nodes must not be sampled into SkinnedBoundsCache"
+        );
     }
 }

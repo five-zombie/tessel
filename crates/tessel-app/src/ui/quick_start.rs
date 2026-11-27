@@ -133,6 +133,7 @@ impl BuiltinExample {
     }
 }
 
+#[derive(Debug, Clone)]
 pub enum QuickStartAction {
     None,
     NewPixel,
@@ -492,37 +493,24 @@ fn example_card(
     response.on_hover_cursor(egui::CursorIcon::PointingHand)
 }
 
+/// Applies in-place Quick Start character preset when augmenting an active project.
+/// Note: `NewPixel`, `NewVoxel`, and `OpenAiWorkspace` are handled in `app.rs` through the
+/// new-project lifecycle (`create_project_scene` / `request_mode_switch`).
 pub fn apply_quick_start_preset(
     action: &QuickStartAction,
     scene: &mut SceneState,
     history: &mut HistoryStack,
 ) -> Result<(), String> {
-    match action {
-        QuickStartAction::NewPixel => {
-            history
-                .execute(scene, Command::SetMode(AppMode::Pixel))
-                .map_err(|e| e.to_string())?;
-        }
-        QuickStartAction::NewVoxel | QuickStartAction::OpenAiWorkspace => {
-            history
-                .execute(scene, Command::SetMode(AppMode::Voxel))
-                .map_err(|e| e.to_string())?;
-        }
-        QuickStartAction::NewCharacter => {
-            history
-                .execute(
-                    scene,
-                    Command::Transaction(vec![
-                        Command::ApplyBipedRig,
-                        Command::SetMode(AppMode::Character),
-                    ]),
-                )
-                .map_err(|e| e.to_string())?;
-        }
-        QuickStartAction::None
-        | QuickStartAction::OpenExample(_)
-        | QuickStartAction::RecoverSession
-        | QuickStartAction::OpenRecent(_) => {}
+    if matches!(action, QuickStartAction::NewCharacter) {
+        history
+            .execute(
+                scene,
+                Command::Transaction(vec![
+                    Command::ApplyBipedRig,
+                    Command::SetMode(AppMode::Character),
+                ]),
+            )
+            .map_err(|e| e.to_string())?;
     }
     Ok(())
 }

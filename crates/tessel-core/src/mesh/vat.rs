@@ -105,6 +105,28 @@ pub fn bake_vertex_animation_texture(
         .character_rig
         .as_ref()
         .and_then(|r| AutoSkinSolver::from_rig(r, 1.0));
+    let rig_targets_node = eval_scene
+        .character_rig
+        .as_ref()
+        .is_some_and(|r| r.should_skin_node(params.node_id));
+    let precomputed_weights: Option<Vec<crate::character::VertexSkinWeights>> = if rig_targets_node
+    {
+        skin_solver.as_ref().map(|solver| {
+            let rest_node_mat = eval_scene.node_rest_world_matrix(params.node_id);
+            mesh.vertices
+                .iter()
+                .enumerate()
+                .map(|(vi, &v)| {
+                    mesh.skin_weights.get(&vi).copied().unwrap_or_else(|| {
+                        let rest_wp = rest_node_mat.transform_point3(v);
+                        solver.weights_for_vertex(Some(params.node_id), rest_wp)
+                    })
+                })
+                .collect()
+        })
+    } else {
+        None
+    };
 
     for frame in 0..frame_count {
         let t = if frame + 1 == frame_count {
@@ -135,11 +157,15 @@ pub fn bake_vertex_animation_texture(
             ),
             _ => base_node_mat,
         };
-        let skip_skin = parent_override.is_some();
-        let skin_mats = skin_solver
-            .as_ref()
-            .zip(eval_scene.character_rig.as_ref())
-            .map(|(solver, rig)| solver.skin_matrices(rig));
+        let skip_skin = parent_override.is_some() || !rig_targets_node;
+        let skin_mats = if skip_skin {
+            None
+        } else {
+            skin_solver
+                .as_ref()
+                .zip(eval_scene.character_rig.as_ref())
+                .map(|(solver, rig)| solver.skin_matrices(rig))
+        };
 
         let mut verts = Vec::with_capacity(vertex_count);
         for (vi, &v) in mesh.vertices.iter().enumerate() {
@@ -162,14 +188,13 @@ pub fn bake_vertex_animation_texture(
             }
             let mut wp = node_mat.transform_point3(lv);
             if !skip_skin {
-                if let (Some(solver), Some(mats)) = (&skin_solver, &skin_mats) {
-                    let w = mesh
-                        .skin_weights
-                        .get(&vi)
-                        .copied()
-                        .unwrap_or_else(|| solver.weights_for_vertex(Some(params.node_id), wp));
-                    let (sp, _) = solver.deform_point_normal(mats, w, wp, Vec3::Y);
-                    wp = sp;
+                if let (Some(solver), Some(mats), Some(weights_slice)) =
+                    (&skin_solver, &skin_mats, &precomputed_weights)
+                {
+                    if let Some(&w) = weights_slice.get(vi) {
+                        let (sp, _) = solver.deform_point_normal(mats, w, wp, Vec3::Y);
+                        wp = sp;
+                    }
                 }
             }
             pos_min = pos_min.min(wp);
@@ -343,5 +368,66 @@ mod tests {
         let mut truncated = vat.clone();
         truncated.position_rgba.truncate(2);
         assert!(sample_vat_position(&truncated, 0, 0.0).is_none());
+    }
+
+    #[test]
+    fn g1_vat_bake_skips_skinning_for_unrigged_node() {
+        let mut scene = SceneState::new();
+        Command::CreatePrimitiveMesh {
+            name: "StaticProp".to_string(),
+            kind: PrimitiveKind::Cube,
+            size: 1.0,
+            material: PaletteIndex::new(1).unwrap(),
+        }
+        .apply(&mut scene)
+        .unwrap();
+        let node_id = scene.active_lowpoly_node().unwrap();
+        let orig_v0 = scene.lowpoly_meshes[&node_id].vertices[0];
+
+        Command::ApplyBipedRig.apply(&mut scene).unwrap();
+        let root_id = scene.character_rig.as_ref().unwrap().bones[0].id;
+        Command::AddAnimationClip {
+            name: "Lift".to_string(),
+            duration_secs: 1.0,
+        }
+        .apply(&mut scene)
+        .unwrap();
+        let clip_idx = scene.character_rig.as_ref().unwrap().animations.len() - 1;
+        Command::SetAnimationKeyframe {
+            clip_index: clip_idx,
+            bone_id: root_id,
+            keyframe: crate::character::Keyframe {
+                time_secs: 0.5,
+                translation: Vec3::new(0.0, 5.0, 0.0),
+                rotation: glam::Quat::IDENTITY,
+                scale: Vec3::ONE,
+                interpolation: Default::default(),
+            },
+        }
+        .apply(&mut scene)
+        .unwrap();
+        Command::SetNodeRigSkinned {
+            node_id,
+            skinned: false,
+        }
+        .apply(&mut scene)
+        .unwrap();
+
+        let vat = bake_vertex_animation_texture(
+            &scene,
+            &VatBakeParams {
+                node_id,
+                clip_index: clip_idx,
+                fps: 4.0,
+                max_frames: 8,
+            },
+        )
+        .unwrap();
+        let mid_frame = vat.metadata.frame_count / 2;
+        let sampled = sample_vat_position(&vat, 0, mid_frame as f32).unwrap();
+        assert!(
+            (sampled - orig_v0).length() < 0.02,
+            "unrigged VAT vertex must stay at rest position, got {sampled:?} vs {orig_v0:?}"
+        );
     }
 }

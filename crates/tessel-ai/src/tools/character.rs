@@ -95,13 +95,25 @@ pub(super) fn character_tools() -> Vec<Value> {
             }
         }),
         json!({
+            "name": "character_set_node_skinned",
+            "description": "Enable or disable character rig skinning deformation for a scene node (pass skinned=false to keep terrain, floors, or static props undeformed across viewport, bounds, and .glb export).",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "node_id": { "type": "integer", "minimum": 1 },
+                    "skinned": { "type": "boolean" }
+                },
+                "required": ["node_id", "skinned"]
+            }
+        }),
+        json!({
             "name": "character_set_bone_pose",
             "description": "Set a bone's live pose rotation_deg [pitch, yaw, roll] and/or translation [dx, dy, dz] offset from rest pose on the active character rig (captured by character_snapshot_pose_to_keyframe). Right-Handed (+Y Up, +Z Front, +X Left): positive pitch (+X) tilts/falls FORWARD, negative pitch (-X) tilts/falls BACKWARD in character-local space. Pass dry_run=true to preview resulting orientation vectors and world position without mutating the rig.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "bone_id": { "type": "integer", "minimum": 0 },
-                    "rotation_deg": { "type": "array", "items": { "type": "number" }, "minItems": 3, "maxItems": 3, "description": "Local Euler degrees [pitch_x, yaw_y, roll_z] (Right-Handed +Y Up/+Z Front/+X Left: +X pitch tilts forward, +Y yaw turns toward +X/Left)" },
+                    "rotation_deg": { "type": "array", "items": { "type": "number" }, "minItems": 3, "maxItems": 3, "description": "Local Euler degrees [pitch_x, yaw_y, roll_z] (Right-Handed +Y Up/+Z Front/+X Left: +X pitch tilts +Y forward/+Z, +Y yaw turns +Z toward +X/Left, +Z roll tilts +X toward +Y)" },
                     "translation": { "type": "array", "items": { "type": "number" }, "minItems": 3, "maxItems": 3, "description": "Optional local translation offset [dx, dy, dz] relative to rest pose" },
                     "dry_run": { "type": "boolean", "description": "When true, returns resulting local/world orientation vectors and world position without mutating the scene or undo history (default false)" }
                 },
@@ -633,6 +645,30 @@ pub(super) fn character_tools() -> Vec<Value> {
                     "roll_deg": { "type": "number", "minimum": -60.0, "maximum": 90.0 }
                 },
                 "required": ["heel_id", "ball_id", "toe_id", "roll_deg"]
+            }
+        }),
+        json!({
+            "name": "character_export_rig",
+            "description": "Export the active character rig as a portable standalone .tesselrig.json (schema v1) template inside the allowed export directory, stripping scene-specific NodeId bindings/masks.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "filename": { "type": "string", "description": "Relative output path inside the export directory (e.g. 'hero.tesselrig.json')" },
+                    "name": { "type": "string", "description": "Optional human-readable rig template name (defaults to file stem)" }
+                },
+                "required": ["filename"]
+            }
+        }),
+        json!({
+            "name": "character_import_rig",
+            "description": "Import a standalone character rig from a .tesselrig.json (schema v1) or .glb skeleton file inside the allowed export directory and apply it undoably via Command::SetCharacterRig.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "filename": { "type": "string", "description": "Relative path inside the export directory to a .tesselrig.json or .glb file" },
+                    "preserve_unrigged": { "type": "boolean", "description": "Preserve current scene unrigged_nodes exclusions when replacing the rig (default true)" }
+                },
+                "required": ["filename"]
             }
         }),
     ]

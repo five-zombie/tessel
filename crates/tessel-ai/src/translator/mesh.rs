@@ -108,14 +108,26 @@ pub(super) fn execute(
                     *vert *= actual_v;
                 }
                 apply_primitive_anchor(&mut mesh, anchor);
-                history.execute(scene, Command::ImportLowPolyMesh { name, mesh })?;
+                history.execute(
+                    scene,
+                    Command::ImportLowPolyMesh {
+                        name,
+                        mesh: Box::new(mesh),
+                    },
+                )?;
                 let was_clamped = (actual_v - v).abs().max_element() > 1e-6;
                 (json!(actual_v.to_array()), was_clamped)
             } else if anchor != PrimitiveAnchor::Bottom {
                 let actual_s = size.max(min_s);
                 let mut mesh = tessel_core::mesh::ops::create_primitive(kind, actual_s, material);
                 apply_primitive_anchor(&mut mesh, anchor);
-                history.execute(scene, Command::ImportLowPolyMesh { name, mesh })?;
+                history.execute(
+                    scene,
+                    Command::ImportLowPolyMesh {
+                        name,
+                        mesh: Box::new(mesh),
+                    },
+                )?;
                 (json!(actual_s), (actual_s - size).abs() > 1e-6)
             } else {
                 history.execute(
@@ -368,7 +380,13 @@ pub(super) fn execute(
             let vert_count = mesh.vertices.len();
             let face_count = mesh.faces.len();
             let (lo, hi) = mesh.bounds();
-            history.execute(scene, Command::ImportLowPolyMesh { name, mesh })?;
+            history.execute(
+                scene,
+                Command::ImportLowPolyMesh {
+                    name,
+                    mesh: Box::new(mesh),
+                },
+            )?;
             let created_id = scene.selected_node;
             if let (Some(node_id), true) =
                 (created_id, pos.is_some() || rot.is_some() || sc.is_some())
@@ -442,7 +460,13 @@ pub(super) fn execute(
             let vert_count = mesh.vertices.len();
             let face_count = mesh.faces.len();
             let (lo, hi) = mesh.bounds();
-            history.execute(scene, Command::ImportLowPolyMesh { name, mesh })?;
+            history.execute(
+                scene,
+                Command::ImportLowPolyMesh {
+                    name,
+                    mesh: Box::new(mesh),
+                },
+            )?;
             let created_id = scene.selected_node;
             if let (Some(node_id), true) =
                 (created_id, pos.is_some() || rot.is_some() || sc.is_some())
@@ -525,7 +549,13 @@ pub(super) fn execute(
             let vert_count = mesh.vertices.len();
             let face_count = mesh.faces.len();
             let (lo, hi) = mesh.bounds();
-            history.execute(scene, Command::ImportLowPolyMesh { name, mesh })?;
+            history.execute(
+                scene,
+                Command::ImportLowPolyMesh {
+                    name,
+                    mesh: Box::new(mesh),
+                },
+            )?;
             let created_id = scene.selected_node;
             if let (Some(node_id), true) =
                 (created_id, pos.is_some() || rot.is_some() || sc.is_some())
@@ -665,7 +695,13 @@ pub(super) fn execute(
                 None
             };
             let sc = parse_opt_vec3(args, "scale")?;
-            history.execute(scene, Command::ImportLowPolyMesh { name, mesh })?;
+            history.execute(
+                scene,
+                Command::ImportLowPolyMesh {
+                    name,
+                    mesh: Box::new(mesh),
+                },
+            )?;
             let created_id = scene.selected_node;
             if let (Some(node_id), true) =
                 (created_id, pos.is_some() || rot.is_some() || sc.is_some())
@@ -763,7 +799,13 @@ pub(super) fn execute(
                 .and_then(Value::as_str)
                 .map(ToString::to_string)
                 .unwrap_or(default_name);
-            history.execute(scene, Command::ImportLowPolyMesh { name, mesh })?;
+            history.execute(
+                scene,
+                Command::ImportLowPolyMesh {
+                    name,
+                    mesh: Box::new(mesh),
+                },
+            )?;
             Ok(json!({
                 "ok": true,
                 "node_id": scene.selected_node.map(|n| n.0),
@@ -950,6 +992,366 @@ pub(super) fn execute(
                 },
             )?;
             Ok(json!({ "ok": true, "node_id": node_id.0, "width": w, "height": h }))
+        }
+        "mesh_set_npr_slot" => {
+            let node_id = args
+                .get("node_id")
+                .and_then(Value::as_u64)
+                .map(NodeId)
+                .or_else(|| scene.active_lowpoly_node())
+                .ok_or_else(|| AiError::InvalidArguments("no low-poly mesh found".into()))?;
+            let slot_str = args
+                .get("slot")
+                .and_then(Value::as_str)
+                .ok_or_else(|| AiError::InvalidArguments("missing 'slot'".into()))?;
+            let slot = match slot_str.to_ascii_lowercase().as_str() {
+                "matcap" => tessel_core::NprTextureSlot::MatCap,
+                "face_sdf" => tessel_core::NprTextureSlot::FaceSdf,
+                "hatching_ramp" => tessel_core::NprTextureSlot::HatchingRamp,
+                other => {
+                    return Err(AiError::InvalidArguments(format!(
+                        "unknown NPR slot '{other}', expected matcap|face_sdf|hatching_ramp"
+                    )))
+                }
+            };
+            let clear = args.get("clear").and_then(Value::as_bool).unwrap_or(false);
+            let mut loaded_dims: Option<(u32, u32)> = None;
+            if clear {
+                history.execute(
+                    scene,
+                    Command::SetMeshNprSlot {
+                        node_id,
+                        slot,
+                        texture: None,
+                    },
+                )?;
+            } else if let Some(filename) = args.get("filename").and_then(Value::as_str) {
+                let target = resolve_safe_export_path(allowed_export_dir, filename)?;
+                let tex = import_mesh_texture_from_path(&target)?;
+                loaded_dims = Some((tex.width, tex.height));
+                history.execute(
+                    scene,
+                    Command::SetMeshNprSlot {
+                        node_id,
+                        slot,
+                        texture: Some(tex),
+                    },
+                )?;
+            }
+            let mut mat = scene
+                .lowpoly_meshes
+                .get(&node_id)
+                .ok_or(tessel_core::CoreError::LowPolyMeshNotFound(node_id))?
+                .material;
+            let mut mat_changed = false;
+            if let Some(val) = args.get("matcap_strength").filter(|v| !v.is_null()) {
+                let v = val.as_f64().ok_or_else(|| {
+                    AiError::InvalidArguments("'matcap_strength' must be a finite number".into())
+                })? as f32;
+                if !v.is_finite() {
+                    return Err(AiError::InvalidArguments(
+                        "'matcap_strength' must be finite".into(),
+                    ));
+                }
+                mat.matcap_strength = v.clamp(0.0, 1.0);
+                mat_changed = true;
+            }
+            if let Some(val) = args.get("hatching_scale").filter(|v| !v.is_null()) {
+                let v = val.as_f64().ok_or_else(|| {
+                    AiError::InvalidArguments("'hatching_scale' must be a finite number".into())
+                })? as f32;
+                if !v.is_finite() {
+                    return Err(AiError::InvalidArguments(
+                        "'hatching_scale' must be finite".into(),
+                    ));
+                }
+                mat.hatching_scale = v.clamp(0.1, 64.0);
+                mat_changed = true;
+            }
+            if let Some(val) = args.get("face_sdf_light_override").filter(|v| !v.is_null()) {
+                let arr = val.as_array().ok_or_else(|| {
+                    AiError::InvalidArguments("'face_sdf_light_override' must be [x, y, z]".into())
+                })?;
+                if arr.len() != 3 {
+                    return Err(AiError::InvalidArguments(
+                        "'face_sdf_light_override' must be [x, y, z]".into(),
+                    ));
+                }
+                let x = arr[0].as_f64().ok_or_else(|| {
+                    AiError::InvalidArguments("face_sdf_light_override[0] must be number".into())
+                })? as f32;
+                let y = arr[1].as_f64().ok_or_else(|| {
+                    AiError::InvalidArguments("face_sdf_light_override[1] must be number".into())
+                })? as f32;
+                let z = arr[2].as_f64().ok_or_else(|| {
+                    AiError::InvalidArguments("face_sdf_light_override[2] must be number".into())
+                })? as f32;
+                if !x.is_finite() || !y.is_finite() || !z.is_finite() {
+                    return Err(AiError::InvalidArguments(
+                        "'face_sdf_light_override' must be finite".into(),
+                    ));
+                }
+                mat.face_sdf_light_override = Some([x, y, z]);
+                mat_changed = true;
+            }
+            if mat_changed {
+                history.execute(
+                    scene,
+                    Command::SetMeshMaterial {
+                        node_id,
+                        material: mat,
+                    },
+                )?;
+            }
+            Ok(json!({
+                "ok": true,
+                "node_id": node_id.0,
+                "slot": slot_str,
+                "cleared": clear,
+                "width": loaded_dims.map(|d| d.0),
+                "height": loaded_dims.map(|d| d.1),
+                "matcap_strength": mat.matcap_strength,
+                "hatching_scale": mat.hatching_scale,
+                "face_sdf_light_override": mat.face_sdf_light_override
+            }))
+        }
+        "mesh_set_uv_seams" => {
+            let node_id = args
+                .get("node_id")
+                .and_then(Value::as_u64)
+                .map(NodeId)
+                .or_else(|| scene.active_lowpoly_node())
+                .ok_or_else(|| AiError::InvalidArguments("no low-poly mesh found".into()))?;
+            let raw_edges = args
+                .get("edges")
+                .and_then(Value::as_array)
+                .ok_or_else(|| AiError::InvalidArguments("missing 'edges' array".into()))?;
+            if raw_edges.len() > 65_536 {
+                return Err(AiError::InvalidArguments(
+                    "'edges' exceeds 65536 limit".into(),
+                ));
+            }
+            let mut edges = Vec::with_capacity(raw_edges.len());
+            for entry in raw_edges {
+                let pair = entry.as_array().ok_or_else(|| {
+                    AiError::InvalidArguments("each seam edge must be [v0, v1]".into())
+                })?;
+                if pair.len() != 2 {
+                    return Err(AiError::InvalidArguments(
+                        "each seam edge must have exactly 2 vertex indices".into(),
+                    ));
+                }
+                let a = pair[0].as_u64().ok_or_else(|| {
+                    AiError::InvalidArguments("seam vertex index must be non-negative int".into())
+                })? as usize;
+                let b = pair[1].as_u64().ok_or_else(|| {
+                    AiError::InvalidArguments("seam vertex index must be non-negative int".into())
+                })? as usize;
+                edges.push((a, b));
+            }
+            let replace = match args.get("replace").filter(|v| !v.is_null()) {
+                None => false,
+                Some(v) => v.as_bool().ok_or_else(|| {
+                    AiError::InvalidArguments("'replace' must be a boolean".into())
+                })?,
+            };
+            let unwrap = match args.get("unwrap").filter(|v| !v.is_null()) {
+                None => false,
+                Some(v) => v.as_bool().ok_or_else(|| {
+                    AiError::InvalidArguments("'unwrap' must be a boolean".into())
+                })?,
+            };
+            history.execute(
+                scene,
+                Command::SetMeshUvSeams {
+                    node_id,
+                    edges,
+                    replace,
+                    unwrap,
+                },
+            )?;
+            let seam_count = scene
+                .lowpoly_meshes
+                .get(&node_id)
+                .map_or(0, |m| m.uv_seams.len());
+            Ok(json!({
+                "ok": true,
+                "node_id": node_id.0,
+                "seam_count": seam_count,
+                "unwrapped": unwrap
+            }))
+        }
+        "mesh_normalize_texel_density" => {
+            let node_id = args
+                .get("node_id")
+                .and_then(Value::as_u64)
+                .map(NodeId)
+                .or_else(|| scene.active_lowpoly_node())
+                .ok_or_else(|| AiError::InvalidArguments("no low-poly mesh found".into()))?;
+            let texture_size = match args.get("texture_size").filter(|v| !v.is_null()) {
+                None => 256u32,
+                Some(v) => {
+                    let raw = v.as_u64().ok_or_else(|| {
+                        AiError::InvalidArguments("'texture_size' must be an integer".into())
+                    })?;
+                    if !(16..=4096).contains(&raw) {
+                        return Err(AiError::InvalidArguments(
+                            "'texture_size' must be within 16..=4096".into(),
+                        ));
+                    }
+                    raw as u32
+                }
+            };
+            let target_px_per_unit = match args.get("target_px_per_unit").filter(|v| !v.is_null()) {
+                None => None,
+                Some(v) => {
+                    let f = v.as_f64().ok_or_else(|| {
+                        AiError::InvalidArguments("'target_px_per_unit' must be a number".into())
+                    })? as f32;
+                    if !f.is_finite() || f <= 0.0 {
+                        return Err(AiError::InvalidArguments(
+                            "'target_px_per_unit' must be > 0".into(),
+                        ));
+                    }
+                    Some(f)
+                }
+            };
+            let padding_uv = match args.get("padding_uv").filter(|v| !v.is_null()) {
+                None => 0.01f32,
+                Some(v) => {
+                    let f = v.as_f64().ok_or_else(|| {
+                        AiError::InvalidArguments("'padding_uv' must be a number".into())
+                    })? as f32;
+                    if !f.is_finite() {
+                        return Err(AiError::InvalidArguments(
+                            "'padding_uv' must be finite".into(),
+                        ));
+                    }
+                    f.clamp(0.0, 0.05)
+                }
+            };
+            history.execute(
+                scene,
+                Command::NormalizeMeshTexelDensity {
+                    node_id,
+                    texture_size,
+                    target_px_per_unit,
+                    padding_uv,
+                },
+            )?;
+            Ok(json!({
+                "ok": true,
+                "node_id": node_id.0,
+                "texture_size": texture_size,
+                "padding_uv": padding_uv
+            }))
+        }
+        "mesh_sculpt_stroke" => {
+            let node_id = args
+                .get("node_id")
+                .and_then(Value::as_u64)
+                .map(NodeId)
+                .or_else(|| scene.active_lowpoly_node())
+                .ok_or_else(|| AiError::InvalidArguments("no low-poly mesh found".into()))?;
+            let brush_str = args
+                .get("brush")
+                .and_then(Value::as_str)
+                .ok_or_else(|| AiError::InvalidArguments("missing 'brush'".into()))?;
+            let brush = match brush_str.to_ascii_lowercase().as_str() {
+                "smooth" => tessel_core::SculptBrushKind::Smooth,
+                "inflate" => tessel_core::SculptBrushKind::Inflate,
+                "grab" => tessel_core::SculptBrushKind::Grab,
+                "crease" => tessel_core::SculptBrushKind::Crease,
+                other => {
+                    return Err(AiError::InvalidArguments(format!(
+                        "unknown sculpt brush '{other}', expected smooth|inflate|grab|crease"
+                    )))
+                }
+            };
+            let parse_vec3 = |key: &str, default: Option<[f32; 3]>| -> Result<[f32; 3], AiError> {
+                match args.get(key).filter(|v| !v.is_null()) {
+                    None => default.ok_or_else(|| {
+                        AiError::InvalidArguments(format!("missing '{key}' [x, y, z]"))
+                    }),
+                    Some(val) => {
+                        let arr = val.as_array().ok_or_else(|| {
+                            AiError::InvalidArguments(format!("'{key}' must be [x, y, z]"))
+                        })?;
+                        if arr.len() != 3 {
+                            return Err(AiError::InvalidArguments(format!(
+                                "'{key}' must have 3 numbers"
+                            )));
+                        }
+                        let mut out = [0.0f32; 3];
+                        for (i, item) in arr.iter().enumerate() {
+                            let f = item.as_f64().ok_or_else(|| {
+                                AiError::InvalidArguments(format!("'{key}[{i}]' must be number"))
+                            })? as f32;
+                            if !f.is_finite() {
+                                return Err(AiError::InvalidArguments(format!(
+                                    "'{key}[{i}]' must be finite"
+                                )));
+                            }
+                            out[i] = f;
+                        }
+                        Ok(out)
+                    }
+                }
+            };
+            let center = parse_vec3("center", None)?;
+            let normal = parse_vec3("normal", Some([0.0, 1.0, 0.0]))?;
+            let drag_delta = parse_vec3("drag_delta", Some([0.0, 0.0, 0.0]))?;
+            let radius = args
+                .get("radius")
+                .and_then(Value::as_f64)
+                .map(|v| v as f32)
+                .ok_or_else(|| AiError::InvalidArguments("missing finite 'radius'".into()))?;
+            if !radius.is_finite() || radius <= 0.0 {
+                return Err(AiError::InvalidArguments("'radius' must be > 0".into()));
+            }
+            let strength = match args.get("strength").filter(|v| !v.is_null()) {
+                None => 0.5f32,
+                Some(v) => {
+                    let f = v.as_f64().ok_or_else(|| {
+                        AiError::InvalidArguments("'strength' must be a number".into())
+                    })? as f32;
+                    if !f.is_finite() {
+                        return Err(AiError::InvalidArguments(
+                            "'strength' must be finite".into(),
+                        ));
+                    }
+                    f.clamp(-1.0, 1.0)
+                }
+            };
+            let mirror_x = match args.get("mirror_x").filter(|v| !v.is_null()) {
+                None => false,
+                Some(v) => v.as_bool().ok_or_else(|| {
+                    AiError::InvalidArguments("'mirror_x' must be a boolean".into())
+                })?,
+            };
+            history.execute(
+                scene,
+                Command::SculptMeshStroke {
+                    node_id,
+                    params: tessel_core::SculptStrokeParams {
+                        brush,
+                        center,
+                        normal,
+                        drag_delta,
+                        radius,
+                        strength,
+                        mirror_x,
+                    },
+                },
+            )?;
+            Ok(json!({
+                "ok": true,
+                "node_id": node_id.0,
+                "brush": brush_str,
+                "radius": radius,
+                "strength": strength,
+                "mirror_x": mirror_x
+            }))
         }
         "mesh_bake_maps" => {
             let node_id = args
@@ -1251,10 +1653,12 @@ pub(super) fn execute(
                 .get("radius_px")
                 .and_then(Value::as_f64)
                 .unwrap_or(10.0) as f32;
-            let mirror_x = args
-                .get("mirror_x")
-                .and_then(Value::as_bool)
-                .unwrap_or(false);
+            let mirror_x = match args.get("mirror_x").filter(|v| !v.is_null()) {
+                None => false,
+                Some(v) => v.as_bool().ok_or_else(|| {
+                    AiError::InvalidArguments("'mirror_x' must be a boolean".into())
+                })?,
+            };
             let radius_world_arg = args
                 .get("radius_world")
                 .and_then(Value::as_f64)

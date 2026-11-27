@@ -7,7 +7,7 @@ Create **Pixel**, **Voxel**, **Low-Poly**, and **Rigged Character Animations** �
 
 [![License: Apache-2.0](https://img.shields.io/badge/License-Apache--2.0-orange.svg)](./LICENSE)
 [![Built with Rust](https://img.shields.io/badge/Pure%20Rust-wgpu%20%7C%20egui%20%7C%20winit-DEA584.svg)](https://www.rust-lang.org/)
-[![MCP Tools](https://img.shields.io/badge/MCP%20Tools-160%20Verified-4C8BF5.svg)](#quick-start)
+[![MCP Tools](https://img.shields.io/badge/MCP%20Tools-164%20Verified-4C8BF5.svg)](#quick-start)
 [![Platforms](https://img.shields.io/badge/Platforms-Linux%20%7C%20Windows%20%7C%20macOS-2EA043.svg)](#download--install)
 
 [**Download Latest Release**](https://github.com/five-zombie/tessel/releases/latest) • [**Showcase Gallery**](#-showcase-gallery-included-examples) • [**Available Features**](#-available-features) • [**Quick Start**](#-quick-start)
@@ -104,16 +104,19 @@ Every release includes `SHA256SUMS.txt` checksums.
 
 ## ✨ Available Features
 
-- **MCP-First Studio Engine (160 Verified Tools)**:
-  - Deterministic Command Bus exposed via `stdio`, live GUI HTTP (`127.0.0.1` with bearer-token auth & `/health` latency telemetry), and headless `tessel batch` CLI runner with atomic batching and full Undo/Redo.
+- **MCP-First Studio Engine (164 Verified Tools)**:
+  - Deterministic Command Bus exposed via `stdio`, live GUI HTTP (`127.0.0.1` with bearer-token auth, `Origin` validation, bounded worker pool, & `/health` latency telemetry), and headless `tessel batch` CLI runner with atomic batching, full Undo/Redo, and rotating file logs (`tracing-appender`).
 - **4 Integrated Creative Modes**:
   - **Pixel**: Up to `512×512` multi-layer 2D sprite & texture studio with frame-by-frame animation, onion skinning, flood fill, X/Y symmetry, `.png` / `.gif` / sprite sheet export, and **Pixel → Voxel** conversion.
   - **Voxel**: Sparse chunked 3D voxel engine with **Greedy Meshing**, per-vertex Ambient Occlusion, 3D DDA raycast picking, X/Y/Z symmetry, `.vox` import/export, and **Voxel → Low-Poly** conversion.
-  - **Low-Poly & Texturing**: Procedural **terrain generator** (`mesh_create_terrain`), `loft`, `lathe`, `curve_tube`, `extruded_polygon`, **Procedural Ribbon**, primitives, **Morph Targets**, **Proxy Cage** deformation, **Vertex Animation Textures (VAT)**, CPU map baking (**AO, Curvature, Thickness**), **Smart Material Lite** (edge wear + cavity dirt), non-destructive paint layers, seam-crossing 3D brush, PBR + normal maps, and extended texture decoding (`PNG`, `JPEG`, `TGA`, `TIFF`, `EXR`).
-  - **Character & Kinematic Animation v2**: 19-bone humanoid, **Bone Grid** cloth rigs, & multi-rig skeletons, auto-skinning with per-node bone masks & interactive **Weight Painting brush**, **Stick Gizmo**, analytic **two-bone IK** & multi-bone **CCD chain IK**, multi-track animation (`BoneChannel` SLERP, `CubicBezier` / `CUBICSPLINE`, `MorphWeightTrack`, `VisibilityTrack` `STEP`, `ParentSwitchTrack` for dynamic prop drops, `NodeTransformTrack`), **12 FPS *stepped* playback & bake**, multi-layer clip baking, and **Surface-Raycast Grounding v2** (overhangs, multi-surface `LowPolyMesh` + `VoxelVolume`, heel+toe multi-ray footprints, foot normal alignment, pelvis tilt).
-- **Real-Time Shadows & NPR / *Sumi-e* Pipeline**:
-  - **2048×2048 Directional Shadow Map** with *normal-offset bias*, 3×3 PCF, and per-mesh `cast_shadow`/`receive_shadow`.
-  - **NPR / *Sumi-e* Foundation & Preview**: `COLOR_0` vertex colors, `AlphaMode::Opaque`/`Mask`/`Blend`, `KHR_materials_unlit`, baked smooth outline normals, `mesh_validate_topology`, automatic UV gutter dilation, `outline_hull.wgsl` inverted-hull outlines, 3-band ink ramp, dark Fresnel rim, triplanar *washi* paper grain, depth ink-fade, Orthographic/Telephoto camera modes, and `silhouette_check` / `luminance_value_check` modes.
+  - **Low-Poly, Sculpting & Texturing**: Procedural **terrain generator** (`mesh_create_terrain`), `loft`, `lathe`, `curve_tube`, `extruded_polygon`, **Procedural Ribbon**, primitives, **Organic Sculpting Brush** (Smooth, Inflate, Grab, Crease + X-mirror), **non-destructive `MeshModifier` stack** (Mirror, Bevel, Solidify, Decimate), **Morph Targets**, **Proxy Cage** deformation, **Vertex Animation Textures (VAT)**, **Auto-UV + manual UV seam editor + texel-density normalizer**, CPU map baking (**AO, Curvature, Thickness**), **Smart Material Lite**, non-destructive paint layers, seam-crossing 3D brush, ORM packing, `CollisionHull` metadata, `mesh_preflight` QA gate, and extended texture decoding (`PNG`, `JPEG`, `TGA`, `TIFF`, `EXR`).
+  - **Character & Kinematic Animation v2**: 19-bone humanoid, **Bone Grid** cloth rigs, & multi-rig skeletons with bone limits/X-mirror, auto-skinning + per-node bone masks & interactive **Weight Painting brush**, **Stick Gizmo**, analytic **two-bone IK**, multi-bone **CCD chain IK**, IK/FK blend & Look-At/CopyTransform constraints, **Reverse Foot Roll**, `BoneGroup`, `RigSocket`, Mixamo retargeting, **Pose Library**, **Animation Events**, `BoneColliderMeta`, multi-track animation (`BoneChannel` SLERP, `CubicBezier` / `CUBICSPLINE`, `MorphWeightTrack`, `VisibilityTrack` `STEP`, `ParentSwitchTrack`, `NodeTransformTrack`), **12 FPS *stepped* playback & bake**, multi-layer clip & Spring/Jiggle baking, and **Surface-Raycast Grounding v2**.
+- **Real-Time Shadows, Look-Dev & NPR / *Sumi-e* Pipeline**:
+  - **2048×2048 Directional Shadow Map** with *normal-offset bias*, 3×3 PCF, per-mesh `cast_shadow`/`receive_shadow`, **Look-Dev HDRI/IBL presets**, GPU buffer pooling, and optional **4× MSAA** viewport targets.
+  - **NPR / *Sumi-e* Foundation & Preview**: `COLOR_0` vertex colors, `AlphaMode::Opaque`/`Mask`/`Blend`, `KHR_materials_unlit`, baked smooth outline normals, `mesh_validate_topology`, automatic UV gutter dilation, `outline_hull.wgsl` inverted-hull outlines, **MatCap**, **Face SDF Shadow Map**, and **Multi-Level Hatching Ramp** slots, 3-band ink ramp, dark Fresnel rim, triplanar *washi* paper grain, depth ink-fade, Orthographic/Telephoto camera modes, and `silhouette_check` / `luminance_value_check` modes.
+- **Studio UX, Viewport Gizmos & Project Isolation**:
+  - **Select vs. Place** tool separation with raycast wireframe ghost placement, **Move** gizmo, and a **Floating Circular Rotate Gizmo** (semi-transparent white fill on press, bottom-right `Free` / `X` / `Y` / `Z` pills, `Shift` 15° snap, and real-time angle ruler).
+  - **New Project** mode selector (**Pixel**, **Voxel**, **Low-Poly**), **Save / Save As...** (`Ctrl/Cmd+S` / `Ctrl/Cmd+Shift+S`), and clean project isolation when switching between `Pixel`, `Voxel`, and `Low-Poly` (while `Voxel ↔ Character` and `Low-Poly ↔ Character` stay in-project for rigging & animation).
 - **Built-In Welcome Showcase & Export**:
   - **Welcome to Tessel** launcher ships with all 4 embedded `.tessel` examples (with live thumbnails) that always open as safe untitled copies.
   - Export to **`.glb`** (engine scale presets for Godot 4, Unity, Unreal Engine, Three.js, 3D Print), `.obj`, `.stl`, `.vox`, `.png`, `.gif`, 3D animated turntable `.gif`, and atomic `.tessel` archives — with an OS-native default output directory (`<home_dir>/tessel-project`) and folder browser.
@@ -122,9 +125,9 @@ Every release includes `SHA256SUMS.txt` checksums.
 
 ## 🗺️ Next Features
 
-- **Direct AI Provider Parity & MCP Hardening**: Full `tools`/`tool_calls` parity for Gemini & Anthropic in Embedded Direct AI, strict MCP argument/HTTP origin hardening, and true cancellation for async AI requests.
-- **Rigging Completeness & Asset Pipeline (`v5.5`–`v5.9`)**: Bone translation/scale & rotation limits, IK/FK blending, constraints, auto-UV/LOD, non-destructive modifiers, and preflight export QA.
-- **Rendering & NPR Polish**: GPU buffer pooling & BVH raycast acceleration, optional Face SDF Shadow Map & MatCap texture slots, multi-level hatching ramps, and 4× MSAA viewport targets.
+- **Multi-Agent MCP Collaboration** *(Pending — Separate Premium Edition)*: Coordinated multi-agent scene authoring workflows.
+- **Remote Web Adapter** *(Pending — Separate Premium Plugin)*: Plug-and-play SSE & WebSocket/CBOR transport adapter for remote studio sessions.
+- **Ecosystem & Workflow Polish**: Expanded engine export presets, starter templates, and continued GUI ergonomics.
 
 ---
 
@@ -135,10 +138,11 @@ Every release includes `SHA256SUMS.txt` checksums.
 cargo run --release -p tessel-app
 ```
 
-- `1` / `2` / `3` / `4`: Switch between Pixel, Voxel, Low-Poly, and Character modes
+- `1` / `2` / `3` / `4`: Switch between Pixel, Voxel, Low-Poly, and Character modes (new project across `1`/`2`/`3`; in-project rigging with `4`)
+- `Ctrl/Cmd + N`: New Project (Pixel / Voxel / Low-Poly)
 - `Ctrl/Cmd + K`: Open Command Palette
 - `Ctrl/Cmd + E`: Open Export Dialog (`.glb` & multi-format)
-- `Ctrl/Cmd + S` / `Ctrl/Cmd + O`: Save / Open `.tessel` project
+- `Ctrl/Cmd + S` / `Ctrl/Cmd + Shift + S` / `Ctrl/Cmd + O`: Save / Save As / Open `.tessel` project
 - `Ctrl/Cmd + Z` / `Ctrl/Cmd + Y`: Undo / Redo
 
 ### Connect an AI Agent via MCP
@@ -167,7 +171,7 @@ tessel/
     ├── tessel-core/        # Headless domain engine, meshing, baking, rigging, IK, grounding & Command/Undo Bus
     ├── tessel-io/          # .glb, .obj, .stl, .vox, .png, .gif & atomic .tessel project I/O
     ├── tessel-render/      # wgpu 2D/3D PBR + NPR Sumi-e viewport, real shadow maps & overlay pipeline
-    ├── tessel-ai/          # Direct AI client, 160-tool MCP Server (stdio + local HTTP) & headless renderer
+    ├── tessel-ai/          # Direct AI client, 164-tool MCP Server (stdio + local HTTP) & headless renderer
     └── tessel-app/         # Desktop GUI (winit + egui), Welcome showcase & CLI entrypoint
 ```
 

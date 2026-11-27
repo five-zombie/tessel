@@ -19,7 +19,6 @@ impl Drop for ActiveWorkerGuard {
     }
 }
 
-#[derive(Default)]
 struct McpHttpMetrics {
     requests_total: AtomicU64,
     requests_completed: AtomicU64,
@@ -29,6 +28,23 @@ struct McpHttpMetrics {
     total_latency_us: AtomicU64,
     max_latency_us: AtomicU64,
     last_latency_us: AtomicU64,
+    log_limiter: crate::observability::LogRateLimiter,
+}
+
+impl Default for McpHttpMetrics {
+    fn default() -> Self {
+        Self {
+            requests_total: AtomicU64::new(0),
+            requests_completed: AtomicU64::new(0),
+            requests_rejected: AtomicU64::new(0),
+            requests_timed_out: AtomicU64::new(0),
+            slow_requests_total: AtomicU64::new(0),
+            total_latency_us: AtomicU64::new(0),
+            max_latency_us: AtomicU64::new(0),
+            last_latency_us: AtomicU64::new(0),
+            log_limiter: crate::observability::LogRateLimiter::new(Duration::from_secs(10), 3),
+        }
+    }
 }
 
 impl McpHttpMetrics {
@@ -98,6 +114,14 @@ impl LiveMcpServerHandle {
                             metrics_ref
                                 .requests_rejected
                                 .fetch_add(1, Ordering::Relaxed);
+                            if let crate::observability::LogDecision::Emit { suppressed } =
+                                metrics_ref.log_limiter.check("worker_pool_full")
+                            {
+                                tracing::warn!(
+                                    suppressed,
+                                    "Rejected MCP HTTP connection: worker pool full"
+                                );
+                            }
                             let _ = stream.set_nonblocking(false);
                             let _ = stream.set_write_timeout(Some(Duration::from_millis(100)));
                             write_http(
@@ -130,7 +154,15 @@ impl LiveMcpServerHandle {
                                 );
                             });
                         if let Err(err) = spawn_res {
-                            tracing::warn!(error = %err, "Failed to spawn MCP HTTP worker thread");
+                            if let crate::observability::LogDecision::Emit { suppressed } =
+                                metrics_ref.log_limiter.check("worker_spawn_failed")
+                            {
+                                tracing::warn!(
+                                    suppressed,
+                                    error = %err,
+                                    "Failed to spawn MCP HTTP worker thread"
+                                );
+                            }
                         }
                     }
                     Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
@@ -450,6 +482,14 @@ fn handle_http_connection(
 
     if bad_host_or_origin {
         metrics.requests_rejected.fetch_add(1, Ordering::Relaxed);
+        if let crate::observability::LogDecision::Emit { suppressed } =
+            metrics.log_limiter.check("bad_host_or_origin")
+        {
+            tracing::warn!(
+                suppressed,
+                "Rejected MCP HTTP request with non-loopback host or origin"
+            );
+        }
         write_http(
             stream,
             "403 Forbidden",
@@ -460,7 +500,11 @@ fn handle_http_connection(
 
     if !authorized {
         metrics.requests_rejected.fetch_add(1, Ordering::Relaxed);
-        tracing::warn!("Rejected unauthorized MCP HTTP request");
+        if let crate::observability::LogDecision::Emit { suppressed } =
+            metrics.log_limiter.check("unauthorized")
+        {
+            tracing::warn!(suppressed, "Rejected unauthorized MCP HTTP request");
+        }
         write_http(
             stream,
             "401 Unauthorized",

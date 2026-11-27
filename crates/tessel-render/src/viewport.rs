@@ -6,11 +6,11 @@ use image::{ImageFormat, RgbaImage};
 use tessel_core::voxel::greedy_mesh_volume;
 use tessel_core::{AppMode, SceneState, VoxelCoord};
 
-use crate::camera::{GizmoAxis, OrbitCamera};
+use crate::camera::{GizmoAxis, OrbitCamera, TransformGizmoMode};
 use crate::error::RenderError;
 use crate::grid_pass::GridPass;
 use crate::mesh_pass::MeshPass;
-use crate::overlay_pass::OverlayPass;
+use crate::overlay_pass::{OverlayPass, PlacementGhost};
 use crate::pixel_pass::{PixelCamera2D, PixelPass};
 use crate::shadow_pass::{ShadowPass, ShadowUniform};
 use crate::vertex::StudioVertex3D;
@@ -31,8 +31,11 @@ pub const DEFAULT_READBACK_TIMEOUT: Duration = Duration::from_secs(5);
 /// Owns the offscreen viewport render target and orchestrates 2D/3D viewport passes.
 pub struct ViewportRenderer {
     size: (u32, u32),
+    sample_count: u32,
     color_texture: wgpu::Texture,
     color_view: wgpu::TextureView,
+    msaa_color_texture: Option<wgpu::Texture>,
+    msaa_color_view: Option<wgpu::TextureView>,
     depth_texture: wgpu::Texture,
     depth_view: wgpu::TextureView,
     grid_pass: GridPass,
@@ -44,6 +47,12 @@ pub struct ViewportRenderer {
     last_playback_time_bits: Option<u32>,
     last_hover_voxel: Option<VoxelCoord>,
     last_gizmo_axis: Option<GizmoAxis>,
+    gizmo_mode: TransformGizmoMode,
+    last_gizmo_mode: TransformGizmoMode,
+    show_gizmo: bool,
+    last_show_gizmo: bool,
+    placement_ghost: Option<PlacementGhost>,
+    last_placement_ghost: Option<PlacementGhost>,
     last_light_angles: (f32, f32),
     scene_bounds: ([f32; 3], [f32; 3]),
     scratch_vertices: Vec<StudioVertex3D>,
@@ -53,17 +62,22 @@ pub struct ViewportRenderer {
 impl ViewportRenderer {
     pub fn new(device: &wgpu::Device, width: u32, height: u32) -> Self {
         let safe_size = (width.max(1), height.max(1));
+        let sample_count = 1u32;
         let (color_texture, color_view) = create_color_target(device, safe_size.0, safe_size.1);
-        let (depth_texture, depth_view) = create_depth_target(device, safe_size.0, safe_size.1);
-        let grid_pass = GridPass::new(device, VIEWPORT_FORMAT, DEPTH_FORMAT);
-        let shadow_pass = ShadowPass::new(device, VIEWPORT_FORMAT, DEPTH_FORMAT);
-        let mesh_pass = MeshPass::new(device, VIEWPORT_FORMAT, DEPTH_FORMAT);
-        let overlay_pass = OverlayPass::new(device, VIEWPORT_FORMAT, DEPTH_FORMAT);
+        let (depth_texture, depth_view) =
+            create_depth_target(device, safe_size.0, safe_size.1, sample_count);
+        let grid_pass = GridPass::new(device, VIEWPORT_FORMAT, DEPTH_FORMAT, sample_count);
+        let shadow_pass = ShadowPass::new(device, VIEWPORT_FORMAT, DEPTH_FORMAT, sample_count);
+        let mesh_pass = MeshPass::new(device, VIEWPORT_FORMAT, DEPTH_FORMAT, sample_count);
+        let overlay_pass = OverlayPass::new(device, VIEWPORT_FORMAT, DEPTH_FORMAT, sample_count);
         let pixel_pass = PixelPass::new(device, VIEWPORT_FORMAT);
         Self {
             size: safe_size,
+            sample_count,
             color_texture,
             color_view,
+            msaa_color_texture: None,
+            msaa_color_view: None,
             depth_texture,
             depth_view,
             grid_pass,
@@ -75,6 +89,12 @@ impl ViewportRenderer {
             last_playback_time_bits: None,
             last_hover_voxel: None,
             last_gizmo_axis: None,
+            gizmo_mode: TransformGizmoMode::Move,
+            last_gizmo_mode: TransformGizmoMode::Move,
+            show_gizmo: true,
+            last_show_gizmo: true,
+            placement_ghost: None,
+            last_placement_ghost: None,
             last_light_angles: (f32::NAN, f32::NAN),
             scene_bounds: ([f32::INFINITY; 3], [f32::NEG_INFINITY; 3]),
             scratch_vertices: Vec::new(),
@@ -86,8 +106,40 @@ impl ViewportRenderer {
         self.size
     }
 
+    pub fn sample_count(&self) -> u32 {
+        self.sample_count
+    }
+
     pub fn color_view(&self) -> &wgpu::TextureView {
         &self.color_view
+    }
+
+    /// Switches the 3D viewport MSAA sample count (`1` or `4`) and rebuilds multisampled
+    /// attachments and 3D render pipelines only when changed (`L1`).
+    pub fn set_sample_count(&mut self, device: &wgpu::Device, requested: u32) -> bool {
+        let normalized = if requested >= 4 { 4 } else { 1 };
+        if normalized == self.sample_count {
+            return false;
+        }
+        self.sample_count = normalized;
+        let (w, h) = self.size;
+        let (msaa_tex, msaa_view) = if normalized > 1 {
+            let (t, v) = create_msaa_color_target(device, w, h, normalized);
+            (Some(t), Some(v))
+        } else {
+            (None, None)
+        };
+        let (dtex, dview) = create_depth_target(device, w, h, normalized);
+        self.msaa_color_texture = msaa_tex;
+        self.msaa_color_view = msaa_view;
+        self.depth_texture = dtex;
+        self.depth_view = dview;
+        self.grid_pass = GridPass::new(device, VIEWPORT_FORMAT, DEPTH_FORMAT, normalized);
+        self.shadow_pass = ShadowPass::new(device, VIEWPORT_FORMAT, DEPTH_FORMAT, normalized);
+        self.mesh_pass = MeshPass::new(device, VIEWPORT_FORMAT, DEPTH_FORMAT, normalized);
+        self.overlay_pass = OverlayPass::new(device, VIEWPORT_FORMAT, DEPTH_FORMAT, normalized);
+        self.last_uploaded_revision = u64::MAX;
+        true
     }
 
     /// Resizes offscreen color & depth targets only when physical pixel dimensions change.
@@ -98,12 +150,35 @@ impl ViewportRenderer {
         }
         self.size = next;
         let (tex, view) = create_color_target(device, next.0, next.1);
-        let (dtex, dview) = create_depth_target(device, next.0, next.1);
+        let (msaa_tex, msaa_view) = if self.sample_count > 1 {
+            let (t, v) = create_msaa_color_target(device, next.0, next.1, self.sample_count);
+            (Some(t), Some(v))
+        } else {
+            (None, None)
+        };
+        let (dtex, dview) = create_depth_target(device, next.0, next.1, self.sample_count);
         self.color_texture = tex;
         self.color_view = view;
+        self.msaa_color_texture = msaa_tex;
+        self.msaa_color_view = msaa_view;
         self.depth_texture = dtex;
         self.depth_view = dview;
         true
+    }
+
+    /// Sets the active 3D transform gizmo mode (`Move`, `Rotate`, or `Scale`).
+    pub fn set_gizmo_mode(&mut self, mode: TransformGizmoMode) {
+        self.gizmo_mode = mode;
+    }
+
+    /// Shows or hides the 3D viewport transform gizmo overlay.
+    pub fn set_show_gizmo(&mut self, show: bool) {
+        self.show_gizmo = show;
+    }
+
+    /// Sets or clears the 3D wireframe ghost box shown during interactive object placement.
+    pub fn set_placement_ghost(&mut self, ghost: Option<PlacementGhost>) {
+        self.placement_ghost = ghost;
     }
 
     pub fn sync_scene(
@@ -114,22 +189,38 @@ impl ViewportRenderer {
         hover_voxel: Option<VoxelCoord>,
         active_gizmo_axis: Option<GizmoAxis>,
     ) {
+        let msaa_changed = self.set_sample_count(device, scene.npr_look.msaa_samples);
         let playback_time_bits = scene
             .character_rig
             .as_ref()
             .map(|r| r.playback_time.to_bits());
-        let scene_changed = self.last_uploaded_revision != scene.revision
+        let scene_changed = msaa_changed
+            || self.last_uploaded_revision != scene.revision
             || self.last_playback_time_bits != playback_time_bits
             || scene.dirty_viewport;
         let hover_changed = self.last_hover_voxel != hover_voxel;
-        let gizmo_changed = self.last_gizmo_axis != active_gizmo_axis;
+        let gizmo_changed = self.last_gizmo_axis != active_gizmo_axis
+            || self.last_gizmo_mode != self.gizmo_mode
+            || self.last_show_gizmo != self.show_gizmo;
+        let ghost_changed = self.last_placement_ghost != self.placement_ghost;
         let light_angles = (scene.light_azimuth, scene.light_elevation);
         let light_changed = self.last_light_angles != light_angles;
-        if scene_changed || hover_changed || gizmo_changed || light_changed {
-            self.overlay_pass
-                .update_lines(device, queue, scene, hover_voxel, active_gizmo_axis);
+        if scene_changed || hover_changed || gizmo_changed || ghost_changed || light_changed {
+            self.overlay_pass.update_lines(
+                device,
+                queue,
+                scene,
+                hover_voxel,
+                active_gizmo_axis,
+                self.gizmo_mode,
+                self.show_gizmo,
+                self.placement_ghost,
+            );
             self.last_hover_voxel = hover_voxel;
             self.last_gizmo_axis = active_gizmo_axis;
+            self.last_gizmo_mode = self.gizmo_mode;
+            self.last_show_gizmo = self.show_gizmo;
+            self.last_placement_ghost = self.placement_ghost;
             self.last_light_angles = light_angles;
         }
         if !scene_changed {
@@ -197,7 +288,11 @@ impl ViewportRenderer {
                 }
                 _ => base_node_mat,
             };
-            let skip_skin = parent_override.is_some();
+            let skip_skin = parent_override.is_some()
+                || !scene
+                    .character_rig
+                    .as_ref()
+                    .is_some_and(|r| r.should_skin_node(*node_id));
             let normal_mat = if node_mat.determinant().abs() > 1e-8 {
                 node_mat.inverse().transpose()
             } else {
@@ -256,7 +351,11 @@ impl ViewportRenderer {
                 }
                 _ => base_node_mat,
             };
-            let skip_skin = parent_override.is_some();
+            let skip_skin = parent_override.is_some()
+                || !scene
+                    .character_rig
+                    .as_ref()
+                    .is_some_and(|r| r.should_skin_node(*node_id));
             let normal_mat = if node_mat.determinant().abs() > 1e-8 {
                 node_mat.inverse().transpose()
             } else {
@@ -362,6 +461,9 @@ impl ViewportRenderer {
             let tri = active_mesh.to_triangulated_flat();
             let has_custom = active_mesh.texture.is_some()
                 || active_mesh.normal_map.is_some()
+                || active_mesh.matcap_map.is_some()
+                || active_mesh.face_sdf_map.is_some()
+                || active_mesh.hatching_ramp_map.is_some()
                 || active_mesh.material != tessel_core::MeshMaterial::default();
             if has_custom {
                 let mut t_verts = Vec::with_capacity(tri.vertices.len());
@@ -417,6 +519,9 @@ impl ViewportRenderer {
                 custom_items.push(crate::mesh_pass::CustomMeshUpload {
                     texture: mesh.texture.as_ref(),
                     normal_map: mesh.normal_map.as_ref(),
+                    matcap_map: mesh.matcap_map.as_ref(),
+                    face_sdf_map: mesh.face_sdf_map.as_ref(),
+                    hatching_ramp_map: mesh.hatching_ramp_map.as_ref(),
                     material: mesh.material,
                     vertices: t_verts,
                     indices: tri.indices,
@@ -562,14 +667,20 @@ impl ViewportRenderer {
                     scene.shading_mode,
                 );
 
+                let (color_view_target, resolve_target, store_op) =
+                    if let Some(msaa_view) = self.msaa_color_view.as_ref() {
+                        (msaa_view, Some(&self.color_view), wgpu::StoreOp::Discard)
+                    } else {
+                        (&self.color_view, None, wgpu::StoreOp::Store)
+                    };
                 let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                     label: Some("tessel-3d-viewport-pass"),
                     color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                        view: &self.color_view,
-                        resolve_target: None,
+                        view: color_view_target,
+                        resolve_target,
                         ops: wgpu::Operations {
                             load: wgpu::LoadOp::Clear(VIEWPORT_CLEAR_COLOR),
-                            store: wgpu::StoreOp::Store,
+                            store: store_op,
                         },
                     })],
                     depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
@@ -757,10 +868,35 @@ fn create_color_target(
     (texture, view)
 }
 
+fn create_msaa_color_target(
+    device: &wgpu::Device,
+    width: u32,
+    height: u32,
+    sample_count: u32,
+) -> (wgpu::Texture, wgpu::TextureView) {
+    let texture = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("tessel-viewport-msaa-color"),
+        size: wgpu::Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count,
+        dimension: wgpu::TextureDimension::D2,
+        format: VIEWPORT_FORMAT,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+        view_formats: &[],
+    });
+    let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+    (texture, view)
+}
+
 fn create_depth_target(
     device: &wgpu::Device,
     width: u32,
     height: u32,
+    sample_count: u32,
 ) -> (wgpu::Texture, wgpu::TextureView) {
     let texture = device.create_texture(&wgpu::TextureDescriptor {
         label: Some("tessel-viewport-depth"),
@@ -770,7 +906,7 @@ fn create_depth_target(
             depth_or_array_layers: 1,
         },
         mip_level_count: 1,
-        sample_count: 1,
+        sample_count,
         dimension: wgpu::TextureDimension::D2,
         format: DEPTH_FORMAT,
         usage: wgpu::TextureUsages::RENDER_ATTACHMENT,

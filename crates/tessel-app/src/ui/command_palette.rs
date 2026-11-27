@@ -174,6 +174,7 @@ pub struct CommandPaletteContext<'a> {
     pub export_open: &'a mut bool,
     pub import_mesh: &'a mut bool,
     pub new_project: &'a mut bool,
+    pub requested_mode: &'a mut Option<AppMode>,
 }
 
 pub fn show_command_palette(ctx: &egui::Context, c: CommandPaletteContext<'_>) {
@@ -186,6 +187,7 @@ pub fn show_command_palette(ctx: &egui::Context, c: CommandPaletteContext<'_>) {
         export_open,
         import_mesh,
         new_project,
+        requested_mode,
     } = c;
     if !state.open {
         return;
@@ -289,6 +291,7 @@ pub fn show_command_palette(ctx: &egui::Context, c: CommandPaletteContext<'_>) {
                 export_open,
                 import_mesh,
                 new_project,
+                requested_mode,
             },
         );
         state.open = false;
@@ -307,6 +310,7 @@ struct CommandPaletteExec<'a> {
     export_open: &'a mut bool,
     import_mesh: &'a mut bool,
     new_project: &'a mut bool,
+    requested_mode: &'a mut Option<AppMode>,
 }
 
 fn execute_action(ctx: &egui::Context, action: PaletteAction, e: CommandPaletteExec<'_>) {
@@ -318,11 +322,12 @@ fn execute_action(ctx: &egui::Context, action: PaletteAction, e: CommandPaletteE
         export_open,
         import_mesh,
         new_project,
+        requested_mode,
     } = e;
     match action {
         PaletteAction::Mode(mode) => {
             if scene.active_mode != mode {
-                super::exec_history(ctx, history, scene, Command::SetMode(mode));
+                *requested_mode = Some(mode);
             }
         }
         PaletteAction::NewProject => {
@@ -345,35 +350,37 @@ fn execute_action(ctx: &egui::Context, action: PaletteAction, e: CommandPaletteE
             _ => camera_3d.reset(),
         },
         PaletteAction::NewPixelCanvas => {
-            super::exec_history(
-                ctx,
-                history,
-                scene,
-                Command::Transaction(vec![
+            if scene.active_mode == AppMode::Pixel {
+                super::exec_history(
+                    ctx,
+                    history,
+                    scene,
                     Command::CreatePixelCanvas {
                         name: "Sprite 32x32".into(),
                         width: 32,
                         height: 32,
                     },
-                    Command::SetMode(AppMode::Pixel),
-                ]),
-            );
+                );
+            } else {
+                *requested_mode = Some(AppMode::Pixel);
+            }
         }
         PaletteAction::NewLowPolyCube => {
-            super::exec_history(
-                ctx,
-                history,
-                scene,
-                Command::Transaction(vec![
+            if matches!(scene.active_mode, AppMode::LowPoly | AppMode::Character) {
+                super::exec_history(
+                    ctx,
+                    history,
+                    scene,
                     Command::CreatePrimitiveMesh {
                         name: "Cube".into(),
                         kind: PrimitiveKind::Cube,
                         size: 0.8,
                         material: scene.active_color,
                     },
-                    Command::SetMode(AppMode::LowPoly),
-                ]),
-            );
+                );
+            } else {
+                *requested_mode = Some(AppMode::LowPoly);
+            }
         }
         PaletteAction::ApplyHumanoidRig => {
             super::exec_history(
@@ -449,6 +456,10 @@ fn execute_action(ctx: &egui::Context, action: PaletteAction, e: CommandPaletteE
             super::exec_history(ctx, history, scene, Command::ClearScene);
         }
         PaletteAction::SpawnStarterBipedVoxel => {
+            if scene.active_mode != AppMode::Voxel {
+                *requested_mode = Some(AppMode::Voxel);
+                return;
+            }
             super::exec_history(
                 ctx,
                 history,
@@ -512,7 +523,6 @@ fn execute_action(ctx: &egui::Context, action: PaletteAction, e: CommandPaletteE
                             color: Some(c_head),
                             hollow: false,
                         },
-                        Command::SetMode(AppMode::Voxel),
                     ]),
                 );
             }
@@ -544,6 +554,7 @@ mod tests {
         let mut export_open = false;
         let mut import_mesh = false;
         let mut new_project = false;
+        let mut requested_mode = None;
 
         let ctx = egui::Context::default();
         execute_action(
@@ -557,6 +568,7 @@ mod tests {
                 export_open: &mut export_open,
                 import_mesh: &mut import_mesh,
                 new_project: &mut new_project,
+                requested_mode: &mut requested_mode,
             },
         );
         assert_eq!(scene.active_mode, AppMode::Character);
@@ -576,8 +588,25 @@ mod tests {
                 export_open: &mut export_open,
                 import_mesh: &mut import_mesh,
                 new_project: &mut new_project,
+                requested_mode: &mut requested_mode,
             },
         );
         assert!(new_project);
+
+        execute_action(
+            &ctx,
+            PaletteAction::Mode(AppMode::Pixel),
+            CommandPaletteExec {
+                scene: &mut scene,
+                history: &mut history,
+                camera_3d: &mut cam3d,
+                camera_2d: &mut cam2d,
+                export_open: &mut export_open,
+                import_mesh: &mut import_mesh,
+                new_project: &mut new_project,
+                requested_mode: &mut requested_mode,
+            },
+        );
+        assert_eq!(requested_mode, Some(AppMode::Pixel));
     }
 }

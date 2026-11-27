@@ -123,6 +123,14 @@ pub struct SceneState {
     #[serde(default = "default_lowpoly_brush_radius")]
     pub lowpoly_brush_radius: f32,
     #[serde(default)]
+    pub sculpt_mode: bool,
+    #[serde(default)]
+    pub sculpt_brush: crate::mesh::SculptBrushKind,
+    #[serde(default = "default_sculpt_radius")]
+    pub sculpt_radius: f32,
+    #[serde(default = "default_sculpt_strength")]
+    pub sculpt_strength: f32,
+    #[serde(default)]
     pub weight_paint_mode: bool,
     #[serde(default = "default_weight_brush_radius")]
     pub weight_brush_radius: f32,
@@ -169,6 +177,14 @@ fn default_lowpoly_brush_radius() -> f32 {
     10.0
 }
 
+fn default_sculpt_radius() -> f32 {
+    0.35
+}
+
+fn default_sculpt_strength() -> f32 {
+    0.5
+}
+
 fn default_weight_brush_radius() -> f32 {
     0.35
 }
@@ -195,6 +211,10 @@ impl SceneState {
             lowpoly_paint_mode: false,
             lowpoly_mirror_x: false,
             lowpoly_brush_radius: default_lowpoly_brush_radius(),
+            sculpt_mode: false,
+            sculpt_brush: crate::mesh::SculptBrushKind::Smooth,
+            sculpt_radius: default_sculpt_radius(),
+            sculpt_strength: default_sculpt_strength(),
             weight_paint_mode: false,
             weight_brush_radius: default_weight_brush_radius(),
             weight_brush_strength: default_weight_brush_strength(),
@@ -227,7 +247,7 @@ impl SceneState {
     }
 
     /// Rewinds `next_node_id` when undoing the most recently allocated node so Redo reproduces the exact ID.
-    pub fn rollback_node_id(&mut self, id: NodeId) {
+    pub(crate) fn rollback_node_id(&mut self, id: NodeId) {
         if self.next_node_id == id.0.saturating_add(1) {
             self.next_node_id = id.0;
         }
@@ -235,6 +255,55 @@ impl SceneState {
 
     pub fn mark_modified(&mut self) {
         self.revision = self.revision.saturating_add(1);
+        self.dirty_viewport = true;
+    }
+
+    // --- Ephemeral UI & Viewport Preview Mutators (non-undoable by design) ---
+
+    pub fn set_pixel_tool(&mut self, tool: PixelTool) {
+        self.pixel_tool = tool;
+    }
+
+    pub fn toggle_pixel_symmetry_x(&mut self) {
+        self.pixel_symmetry.x = !self.pixel_symmetry.x;
+    }
+
+    pub fn toggle_pixel_symmetry_y(&mut self) {
+        self.pixel_symmetry.y = !self.pixel_symmetry.y;
+    }
+
+    pub fn set_active_color(&mut self, color: PaletteIndex) {
+        self.active_color = color;
+    }
+
+    pub fn select_face_ui(&mut self, face: Option<FaceId>) {
+        self.selected_face = face;
+        self.dirty_viewport = true;
+    }
+
+    pub fn select_bone_ui(&mut self, bone: Option<BoneId>) {
+        self.selected_bone = bone;
+        self.dirty_viewport = true;
+    }
+
+    pub fn set_viewport_dirty(&mut self, dirty: bool) {
+        self.dirty_viewport = dirty;
+    }
+
+    /// Ephemeral gizmo-drag preview: mutates a node's transform without bumping `revision`
+    /// so the caller can restore and commit a single `Command::SetNodeTransform` on drag release.
+    pub fn preview_node_transform(&mut self, id: NodeId, transform: Transform) {
+        if let Some(node) = self.nodes.get_mut(&id) {
+            node.transform = transform;
+            self.dirty_viewport = true;
+        }
+    }
+
+    /// Ephemeral sun-gizmo preview: updates light angles without bumping `revision`
+    /// so the caller can restore and commit a single `Command::SetLighting` on drag release.
+    pub fn preview_lighting(&mut self, azimuth: f32, elevation: f32) {
+        self.light_azimuth = azimuth;
+        self.light_elevation = elevation;
         self.dirty_viewport = true;
     }
 
@@ -263,6 +332,34 @@ impl SceneState {
             }
         }
         self.lowpoly_meshes.keys().next().copied()
+    }
+
+    /// Returns `true` when the workspace contains any authored objects or painted content
+    /// (non-empty low-poly meshes, occupied voxels, painted pixels, or rigged character bones).
+    pub fn has_authored_content(&self) -> bool {
+        if self.lowpoly_meshes.values().any(|m| !m.vertices.is_empty()) {
+            return true;
+        }
+        if self.voxel_volumes.values().any(|v| !v.is_empty()) {
+            return true;
+        }
+        if self.pixel_canvases.values().any(|canvas| {
+            canvas.frames.iter().any(|f| {
+                f.layers
+                    .iter()
+                    .any(|l| l.pixels().iter().any(Option::is_some))
+            })
+        }) {
+            return true;
+        }
+        if self
+            .character_rig
+            .as_ref()
+            .is_some_and(|rig| !rig.bones.is_empty())
+        {
+            return true;
+        }
+        false
     }
 
     /// Computes the live world-space transform matrix for `id` by walking its `parent` hierarchy
@@ -341,5 +438,54 @@ mod tests {
         );
         let too_long = "a".repeat(MAX_NODE_NAME_LEN + 1);
         assert!(validate_node_name(&too_long).is_err());
+    }
+
+    #[test]
+    fn has_authored_content_detects_pixels_voxels_meshes_and_rig() {
+        let mut state = SceneState::new();
+        assert!(!state.has_authored_content());
+
+        // Empty pixel canvas and empty voxel volume do not count as authored content.
+        let px_id = state.allocate_node_id();
+        state
+            .pixel_canvases
+            .insert(px_id, PixelCanvas::new(8, 8).unwrap());
+        let vx_id = state.allocate_node_id();
+        state.voxel_volumes.insert(vx_id, VoxelVolume::new());
+        assert!(!state.has_authored_content());
+
+        // Painting a single pixel marks the scene as having authored content.
+        state.pixel_canvases.get_mut(&px_id).unwrap().frames[0].layers[0].set(
+            crate::pixel::PixelCoord::new(0, 0),
+            Some(state.active_color),
+        );
+        assert!(state.has_authored_content());
+
+        // Clearing pixel returns to false, placing a voxel marks true.
+        state.pixel_canvases.get_mut(&px_id).unwrap().frames[0].layers[0]
+            .set(crate::pixel::PixelCoord::new(0, 0), None);
+        assert!(!state.has_authored_content());
+
+        state.voxel_volumes.get_mut(&vx_id).unwrap().set(
+            crate::voxel::VoxelCoord::new(0, 0, 0),
+            Some(state.active_color),
+        );
+        assert!(state.has_authored_content());
+
+        // Clearing voxel and adding a low-poly primitive mesh marks true.
+        state
+            .voxel_volumes
+            .get_mut(&vx_id)
+            .unwrap()
+            .set(crate::voxel::VoxelCoord::new(0, 0, 0), None);
+        assert!(!state.has_authored_content());
+
+        let mesh_id = state.allocate_node_id();
+        let mut mesh = LowPolyMesh::new();
+        state.lowpoly_meshes.insert(mesh_id, mesh.clone());
+        assert!(!state.has_authored_content());
+        mesh.vertices.push(glam::Vec3::ZERO);
+        state.lowpoly_meshes.insert(mesh_id, mesh);
+        assert!(state.has_authored_content());
     }
 }

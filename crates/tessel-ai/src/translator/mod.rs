@@ -96,11 +96,19 @@ pub fn scene_summary_json(scene: &SceneState) -> Value {
                 }
                 _ => json!({}),
             };
+            let skinned = scene.character_rig.as_ref().and_then(|rig| {
+                matches!(
+                    n.kind,
+                    tessel_core::NodeKind::VoxelVolume | tessel_core::NodeKind::LowPolyMesh
+                )
+                .then(|| rig.should_skin_node(n.id))
+            });
             json!({
                 "id": n.id.0,
                 "name": n.name,
                 "kind": format!("{:?}", n.kind),
                 "visible": n.visible,
+                "skinned": skinned,
                 "parent": n.parent.map(|p| p.0),
                 "position": n.transform.translation.to_array(),
                 "scale": n.transform.scale.to_array(),

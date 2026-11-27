@@ -3,7 +3,7 @@ use glam::Vec3;
 use tessel_core::{AppMode, SceneState, VoxelCoord};
 use wgpu::util::DeviceExt;
 
-use crate::camera::GizmoAxis;
+use crate::camera::{GizmoAxis, TransformGizmoMode};
 use crate::vertex::CameraUniform;
 
 pub const GIZMO_AXIS_LEN: f32 = 0.85;
@@ -27,11 +27,19 @@ pub struct OverlayPass {
     vertex_count: u32,
 }
 
+/// Wireframe ghost preview for interactive object placement on a grid or surface.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PlacementGhost {
+    pub position: [f32; 3],
+    pub half_extents: [f32; 3],
+}
+
 impl OverlayPass {
     pub fn new(
         device: &wgpu::Device,
         color_format: wgpu::TextureFormat,
         depth_format: wgpu::TextureFormat,
+        sample_count: u32,
     ) -> Self {
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("tessel-overlay-shader"),
@@ -126,7 +134,11 @@ impl OverlayPass {
                 stencil: wgpu::StencilState::default(),
                 bias: wgpu::DepthBiasState::default(),
             }),
-            multisample: wgpu::MultisampleState::default(),
+            multisample: wgpu::MultisampleState {
+                count: sample_count,
+                mask: !0,
+                alpha_to_coverage_enabled: false,
+            },
             multiview: None,
             cache: None,
         });
@@ -141,6 +153,7 @@ impl OverlayPass {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn update_lines(
         &mut self,
         device: &wgpu::Device,
@@ -148,6 +161,9 @@ impl OverlayPass {
         scene: &SceneState,
         hover_voxel: Option<VoxelCoord>,
         active_gizmo_axis: Option<GizmoAxis>,
+        gizmo_mode: TransformGizmoMode,
+        show_gizmo: bool,
+        placement_ghost: Option<PlacementGhost>,
     ) {
         let mut lines = Vec::new();
         let amber = [0.90, 0.54, 0.24, 0.95];
@@ -204,22 +220,29 @@ impl OverlayPass {
                         }
                         _ => base_node_mat,
                     };
-                    let skip_skin = parent_override.is_some();
+                    let skip_skin = parent_override.is_some()
+                        || !scene
+                            .character_rig
+                            .as_ref()
+                            .is_some_and(|r| r.should_skin_node(*node_id));
+                    let rest_node_mat = scene.node_rest_world_matrix(*node_id);
 
                     let mut world_verts: Vec<Vec3> = Vec::with_capacity(mesh.vertices.len());
                     for (vi, &v) in mesh.vertices.iter().enumerate() {
                         let mut lv = v;
-                        if let Some(rig) = scene.character_rig.as_ref() {
-                            for morph in &mesh.morphs {
-                                let w = rig
-                                    .morph_weights
-                                    .get(&(*node_id, morph.name.clone()))
-                                    .copied()
-                                    .unwrap_or(0.0);
-                                if w.abs() > 1e-5 {
-                                    if let Some(&delta) = morph.deltas.get(&vi) {
-                                        lv += delta * w;
-                                    }
+                        for morph in &mesh.morphs {
+                            let w = scene
+                                .character_rig
+                                .as_ref()
+                                .and_then(|rig| {
+                                    rig.morph_weights
+                                        .get(&(*node_id, morph.name.clone()))
+                                        .copied()
+                                })
+                                .unwrap_or(morph.default_weight);
+                            if w.abs() > 1e-5 {
+                                if let Some(&delta) = morph.deltas.get(&vi) {
+                                    lv += delta * w;
                                 }
                             }
                         }
@@ -227,7 +250,8 @@ impl OverlayPass {
                         if !skip_skin {
                             if let (Some(solver), Some(mats)) = (&skin_solver, &skin_mats) {
                                 let w = mesh.skin_weights.get(&vi).copied().unwrap_or_else(|| {
-                                    solver.weights_for_vertex(Some(*node_id), wp)
+                                    let rest_wp = rest_node_mat.transform_point3(v);
+                                    solver.weights_for_vertex(Some(*node_id), rest_wp)
                                 });
                                 let (sp, _) = solver.deform_point_normal(mats, w, wp, Vec3::Y);
                                 wp = sp;
@@ -338,15 +362,58 @@ impl OverlayPass {
         }
 
         if scene.active_mode != AppMode::Pixel {
-            if let Some(selected_id) = scene.selected_node {
-                if scene.nodes.contains_key(&selected_id) {
-                    let world_origin = scene
-                        .node_world_matrix(selected_id)
-                        .transform_point3(Vec3::ZERO);
-                    push_move_gizmo(&mut lines, world_origin, active_gizmo_axis);
+            if let Some(ghost) = placement_ghost {
+                let p = Vec3::from_array(ghost.position);
+                let he = Vec3::from_array(ghost.half_extents).max(Vec3::splat(0.05));
+                let ghost_color = [0.28, 0.90, 0.96, 0.95];
+                let min = Vec3::new(p.x - he.x, p.y, p.z - he.z);
+                let max = Vec3::new(p.x + he.x, p.y + he.y * 2.0, p.z + he.z);
+                push_wire_box(&mut lines, min, max, ghost_color);
+                let cross = he.x.max(he.z) * 0.6;
+                push_line(
+                    &mut lines,
+                    p - Vec3::X * cross,
+                    p + Vec3::X * cross,
+                    ghost_color,
+                );
+                push_line(
+                    &mut lines,
+                    p - Vec3::Z * cross,
+                    p + Vec3::Z * cross,
+                    ghost_color,
+                );
+            }
+            if show_gizmo {
+                if let Some(selected_id) = scene.selected_node {
+                    let rig_visible = scene
+                        .character_rig
+                        .as_ref()
+                        .and_then(|r| r.node_visibility.get(&selected_id).copied())
+                        .unwrap_or(true);
+                    if rig_visible && scene.nodes.get(&selected_id).is_some_and(|n| n.visible) {
+                        let world_origin = scene
+                            .node_world_matrix(selected_id)
+                            .transform_point3(Vec3::ZERO);
+                        match gizmo_mode {
+                            TransformGizmoMode::Move => {
+                                push_move_gizmo(&mut lines, world_origin, active_gizmo_axis);
+                            }
+                            TransformGizmoMode::Rotate => {
+                                // Rendered in screen-space as a floating circular trackball disc in tessel-app.
+                            }
+                            TransformGizmoMode::Scale => {
+                                let world_rot = node_world_rotation(scene, selected_id);
+                                push_scale_gizmo(
+                                    &mut lines,
+                                    world_origin,
+                                    world_rot,
+                                    active_gizmo_axis,
+                                );
+                            }
+                        }
+                    }
                 }
             }
-            push_light_direction_indicator(&mut lines, scene.light_azimuth, scene.light_elevation);
         }
 
         if lines.is_empty() {
@@ -508,36 +575,53 @@ fn push_move_gizmo(out: &mut Vec<OverlayVertex>, origin: Vec3, active: Option<Gi
     }
 }
 
-fn push_light_direction_indicator(out: &mut Vec<OverlayVertex>, azimuth: f32, elevation: f32) {
-    let cos_e = elevation.cos();
-    let dir = Vec3::new(
-        cos_e * azimuth.sin(),
-        elevation.sin(),
-        cos_e * azimuth.cos(),
-    )
-    .normalize_or_zero();
+fn node_world_rotation(scene: &SceneState, node_id: tessel_core::NodeId) -> glam::Quat {
+    let mut acc = glam::Quat::IDENTITY;
+    let mut cur = Some(node_id);
+    let mut depth = 0usize;
+    while let Some(id) = cur {
+        if depth >= 64 {
+            break;
+        }
+        let Some(node) = scene.nodes.get(&id) else {
+            break;
+        };
+        let q = if node.transform.rotation.length_squared().is_finite()
+            && node.transform.rotation.length_squared() > 1e-8
+        {
+            node.transform.rotation.normalize()
+        } else {
+            glam::Quat::IDENTITY
+        };
+        acc = (q * acc).normalize();
+        cur = node.parent;
+        depth += 1;
+    }
+    acc
+}
 
-    let sun_pos = dir * 2.4;
-    let tip = dir * 1.45;
-    let sun_color = [1.0, 0.86, 0.38, 0.95];
+fn push_scale_gizmo(
+    out: &mut Vec<OverlayVertex>,
+    origin: Vec3,
+    world_rot: glam::Quat,
+    active: Option<GizmoAxis>,
+) {
+    let axes = [
+        (GizmoAxis::X, world_rot * Vec3::X, [0.95, 0.30, 0.30, 1.0]),
+        (GizmoAxis::Y, world_rot * Vec3::Y, [0.35, 0.88, 0.42, 1.0]),
+        (GizmoAxis::Z, world_rot * Vec3::Z, [0.32, 0.58, 0.96, 1.0]),
+    ];
+    let highlight = [1.0, 0.92, 0.40, 1.0];
+    let half = Vec3::splat(0.055);
 
-    // Ray pointing toward scene origin
-    push_line(out, sun_pos, tip, sun_color);
-
-    // Small sun cross marker at `sun_pos`
-    let r = 0.09;
-    push_line(out, sun_pos - Vec3::X * r, sun_pos + Vec3::X * r, sun_color);
-    push_line(out, sun_pos - Vec3::Y * r, sun_pos + Vec3::Y * r, sun_color);
-    push_line(out, sun_pos - Vec3::Z * r, sun_pos + Vec3::Z * r, sun_color);
-
-    // Arrowhead pointing toward origin
-    let inward = -dir;
-    let ortho_a = if inward.y.abs() < 0.9 {
-        inward.cross(Vec3::Y).normalize_or_zero()
-    } else {
-        inward.cross(Vec3::X).normalize_or_zero()
-    };
-    let back = tip - inward * 0.1;
-    push_line(out, tip, back + ortho_a * 0.04, sun_color);
-    push_line(out, tip, back - ortho_a * 0.04, sun_color);
+    for (axis, dir, base_color) in axes {
+        let color = if active == Some(axis) {
+            highlight
+        } else {
+            base_color
+        };
+        let tip = origin + dir * GIZMO_AXIS_LEN;
+        push_line(out, origin, tip, color);
+        push_wire_box(out, tip - half, tip + half, color);
+    }
 }

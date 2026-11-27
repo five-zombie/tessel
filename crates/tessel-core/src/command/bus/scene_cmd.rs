@@ -70,6 +70,7 @@ pub(super) fn apply(cmd: &Command, scene: &mut SceneState) -> Result<UndoDelta, 
             let mut previous_rig = None;
             if let Some(rig) = scene.character_rig.as_mut() {
                 let has_refs = rig.bindings.iter().any(|b| b.node_id == *id)
+                    || rig.unrigged_nodes.contains(id)
                     || rig.node_bone_masks.contains_key(id)
                     || rig.node_visibility.contains_key(id)
                     || rig.node_transform_overrides.contains_key(id)
@@ -84,6 +85,7 @@ pub(super) fn apply(cmd: &Command, scene: &mut SceneState) -> Result<UndoDelta, 
                 if has_refs {
                     previous_rig = Some(Box::new(rig.clone()));
                     rig.bindings.retain(|b| b.node_id != *id);
+                    rig.unrigged_nodes.remove(id);
                     rig.node_bone_masks.remove(id);
                     rig.node_visibility.remove(id);
                     rig.node_transform_overrides.remove(id);
@@ -256,6 +258,9 @@ pub(super) fn apply(cmd: &Command, scene: &mut SceneState) -> Result<UndoDelta, 
                         node_id: id,
                         bone_id,
                     });
+                }
+                if rig.unrigged_nodes.contains(node_id) {
+                    rig.unrigged_nodes.insert(id);
                 }
             }
             scene.selected_node = Some(id);

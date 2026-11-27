@@ -72,6 +72,10 @@ impl ProjectFileManager {
         self.recovery_path.exists()
     }
 
+    pub fn clear_recovery_snapshot(&mut self) {
+        let _ = std::fs::remove_file(&self.recovery_path);
+    }
+
     pub fn load_recovery_snapshot(&mut self) -> Result<SceneState, String> {
         let loaded = load_tessel_project(&self.recovery_path).map_err(|e| e.to_string())?;
         // A recovered session has not been explicitly saved to a user file yet.

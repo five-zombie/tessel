@@ -8,19 +8,94 @@ use tessel_core::{
 use tessel_render::overlay_pass::GIZMO_AXIS_LEN;
 use tessel_render::{
     closest_point_on_axis, pick_move_gizmo, CameraPreset, GizmoAxis, OrbitCamera, PixelCamera2D,
+    PlacementGhost, TransformGizmoMode,
 };
 
 use super::icons::{self, ToolIcon};
+pub use super::rotate_gizmo::RotateAxisMode;
+use super::rotate_gizmo::{
+    compute_floating_rotate_transform, draw_floating_rotate_disc, node_is_effectively_visible,
+    node_world_rotation, parent_world_rotation, pressed_rotate_axis_key,
+    show_rotate_axis_and_ruler_hud, transform_differs, RotateDragState, ROTATE_DISC_RADIUS_PX,
+};
 use super::theme::tokens;
 
+/// Explicit 3D viewport interaction mode separating object selection/transform
+/// from mode-specific authoring and interactive primitive placement.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ViewportInteractionTool {
+    /// Click objects to select & drag gizmo without triggering voxel/sculpt/paint edits.
+    #[default]
+    Select,
+    /// Mode-specific authoring tool (voxel place/erase/paint, low-poly paint/sculpt).
+    Edit,
+    /// Interactive primitive placement with wireframe ghost preview raycast to surface/grid.
+    PlacePrimitive(tessel_core::PrimitiveKind),
+}
+
+/// Active 3D transform gizmo drag state (separated cleanly by mode).
 #[derive(Debug, Clone, Copy)]
-pub struct GizmoDragState {
-    pub node_id: NodeId,
-    pub axis: GizmoAxis,
-    pub start_transform: Transform,
-    pub start_world_pos: glam::Vec3,
-    pub parent_world_inv: glam::Mat4,
-    pub start_axis_t: f32,
+pub enum GizmoDragState {
+    Move {
+        node_id: NodeId,
+        axis: GizmoAxis,
+        start_transform: Transform,
+        start_world_pos: glam::Vec3,
+        parent_world_inv: glam::Mat4,
+        start_axis_t: f32,
+    },
+    Rotate(RotateDragState),
+    Scale {
+        node_id: NodeId,
+        axis: GizmoAxis,
+        start_transform: Transform,
+        start_pointer_pos: egui::Pos2,
+        drag_dir_2d: egui::Vec2,
+        drag_norm_px: f32,
+    },
+}
+
+impl GizmoDragState {
+    pub fn node_id(&self) -> NodeId {
+        match *self {
+            Self::Move { node_id, .. } | Self::Scale { node_id, .. } => node_id,
+            Self::Rotate(r) => r.node_id,
+        }
+    }
+
+    pub fn mode(&self) -> TransformGizmoMode {
+        match self {
+            Self::Move { .. } => TransformGizmoMode::Move,
+            Self::Rotate(_) => TransformGizmoMode::Rotate,
+            Self::Scale { .. } => TransformGizmoMode::Scale,
+        }
+    }
+
+    pub fn active_3d_axis(&self) -> Option<GizmoAxis> {
+        match *self {
+            Self::Move { axis, .. } | Self::Scale { axis, .. } => Some(axis),
+            Self::Rotate(_) => None,
+        }
+    }
+
+    pub fn initial_transform(&self) -> Transform {
+        match *self {
+            Self::Move {
+                start_transform, ..
+            }
+            | Self::Scale {
+                start_transform, ..
+            } => start_transform,
+            Self::Rotate(r) => r.initial_transform,
+        }
+    }
+
+    pub fn as_rotate(&self) -> Option<RotateDragState> {
+        match *self {
+            Self::Rotate(r) => Some(r),
+            Self::Move { .. } | Self::Scale { .. } => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -32,15 +107,70 @@ pub enum SceneGadgetDrag {
     Camera,
 }
 
+/// Per-gadget visibility toggles for the 3D viewport overlay (`camera` proxy & `sun` light).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ViewportGadgetVisibility {
+    pub camera: bool,
+    pub sun: bool,
+}
+
+impl Default for ViewportGadgetVisibility {
+    fn default() -> Self {
+        Self {
+            camera: true,
+            sun: true,
+        }
+    }
+}
+
 /// Cancels an in-progress gizmo drag and restores the node's pre-drag transform so no
 /// unrecorded mutation leaks outside the `Command` bus and `scene.revision` stays clean.
 pub fn cancel_gizmo_drag(scene: &mut SceneState, gizmo_drag: &mut Option<GizmoDragState>) {
     if let Some(drag) = gizmo_drag.take() {
-        if let Some(node) = scene.nodes.get_mut(&drag.node_id) {
-            node.transform = drag.start_transform;
-            scene.dirty_viewport = true;
-        }
+        scene.preview_node_transform(drag.node_id(), drag.initial_transform());
     }
+}
+
+/// Single authoritative gate deciding whether the 3D transform gizmo (Move / Floating Rotate / Scale)
+/// is active for the current viewport mode, tool state, and sidebar `Viewport Gizmo` checkbox.
+pub fn is_transform_gizmo_enabled(
+    scene: &SceneState,
+    interaction_tool: ViewportInteractionTool,
+    free_view: bool,
+    render_preview: bool,
+    show_viewport_gizmo: bool,
+) -> bool {
+    show_viewport_gizmo
+        && scene.active_mode != AppMode::Pixel
+        && !free_view
+        && !render_preview
+        && interaction_tool == ViewportInteractionTool::Select
+        && !(scene.active_mode == AppMode::Character && scene.weight_paint_mode)
+}
+
+/// Single authoritative helper for activating 3D transform gizmos from either the Inspector
+/// sidebar or the top-right Viewport HUD. Clears `free_view`, `render_preview`, and any
+/// conflicting paint/sculpt/weight-paint authoring modes.
+pub fn activate_transform_gizmo(
+    scene: &mut SceneState,
+    show_viewport_gizmo: &mut bool,
+    free_view: &mut bool,
+    render_preview: &mut bool,
+    interaction_tool: &mut ViewportInteractionTool,
+) {
+    *show_viewport_gizmo = true;
+    *free_view = false;
+    *render_preview = false;
+    *interaction_tool = ViewportInteractionTool::Select;
+    scene.lowpoly_paint_mode = false;
+    scene.sculpt_mode = false;
+    scene.weight_paint_mode = false;
+}
+
+fn has_visible_selected_node(scene: &SceneState) -> bool {
+    scene
+        .selected_node
+        .is_some_and(|id| node_is_effectively_visible(scene, id))
 }
 
 /// Cancels an in-progress scene gadget drag (e.g. Sun light) and restores its pre-drag state.
@@ -53,14 +183,13 @@ pub fn cancel_scene_gadget_drag(
         start_elevation,
     }) = scene_gadget_drag.take()
     {
-        scene.light_azimuth = start_azimuth;
-        scene.light_elevation = start_elevation;
-        scene.dirty_viewport = true;
+        scene.preview_lighting(start_azimuth, start_elevation);
     }
 }
 
 /// Displays the offscreen wgpu viewport texture, routes 2D/3D viewport input,
-/// renders the floating Zoom & Camera Preset HUD, and returns `(desired_physical_size, hover_voxel, hovered_gizmo_axis)`.
+/// renders the floating Zoom & Camera Preset HUD, and returns
+/// `(desired_physical_size, hover_voxel, hovered_gizmo_axis, placement_ghost)`.
 #[allow(clippy::too_many_arguments)]
 pub fn show_viewport(
     ctx: &egui::Context,
@@ -75,13 +204,24 @@ pub fn show_viewport(
     camera_2d: &mut PixelCamera2D,
     pixel_drag_start: &mut Option<PixelCoord>,
     gizmo_drag: &mut Option<GizmoDragState>,
+    gizmo_mode: &mut TransformGizmoMode,
+    rotate_axis_mode: &mut RotateAxisMode,
+    show_viewport_gizmo: &mut bool,
     scene_gadget_drag: &mut Option<SceneGadgetDrag>,
+    gadget_visibility: &mut ViewportGadgetVisibility,
+    interaction_tool: &mut ViewportInteractionTool,
     free_view: &mut bool,
     render_preview: &mut bool,
-) -> ((u32, u32), Option<VoxelCoord>, Option<GizmoAxis>) {
+) -> (
+    (u32, u32),
+    Option<VoxelCoord>,
+    Option<GizmoAxis>,
+    Option<PlacementGhost>,
+) {
     let mut desired_size = (1, 1);
     let mut hover_voxel = None;
-    let mut active_gizmo_axis = gizmo_drag.map(|d| d.axis);
+    let mut active_gizmo_axis = gizmo_drag.and_then(|d| d.active_3d_axis());
+    let mut placement_ghost: Option<PlacementGhost> = None;
     let frame = Frame::NONE.fill(tokens::SURFACE).inner_margin(Margin::ZERO);
 
     egui::CentralPanel::default().frame(frame).show(ctx, |ui| {
@@ -100,6 +240,15 @@ pub fn show_viewport(
             egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
             egui::Color32::WHITE,
         );
+
+        if scene.active_mode != AppMode::LowPoly
+            && matches!(
+                *interaction_tool,
+                ViewportInteractionTool::PlacePrimitive(_)
+            )
+        {
+            *interaction_tool = ViewportInteractionTool::Select;
+        }
 
         if scene.active_mode == AppMode::Pixel {
             cancel_scene_gadget_drag(scene, scene_gadget_drag);
@@ -131,9 +280,17 @@ pub fn show_viewport(
                     showcase_camera_target,
                     display_light,
                     scene_gadget_drag,
+                    *gadget_visibility,
                 )
             };
-            let gizmo_consumed = if *free_view || gadget_consumed {
+            let gizmo_enabled = is_transform_gizmo_enabled(
+                scene,
+                *interaction_tool,
+                *free_view,
+                *render_preview,
+                *show_viewport_gizmo,
+            );
+            let gizmo_consumed = if !gizmo_enabled || gadget_consumed {
                 cancel_gizmo_drag(scene, gizmo_drag);
                 active_gizmo_axis = None;
                 false
@@ -145,12 +302,14 @@ pub fn show_viewport(
                     history,
                     camera_3d,
                     gizmo_drag,
+                    *gizmo_mode,
+                    rotate_axis_mode,
                     &mut active_gizmo_axis,
                 )
             };
             let any_gadget_consumed = gadget_consumed || gizmo_consumed;
             let allow_primary_orbit = *free_view && !any_gadget_consumed;
-            if !gadget_consumed {
+            if !any_gadget_consumed {
                 handle_3d_viewport_input(
                     ui,
                     &response,
@@ -161,122 +320,56 @@ pub fn show_viewport(
             }
 
             if !any_gadget_consumed && !*free_view {
-                match scene.active_mode {
-                    AppMode::Voxel => {
-                        hover_voxel = compute_hover_voxel(rect, &response, scene, camera_3d);
-                        handle_voxel_click_input(ui, rect, &response, scene, history, camera_3d);
+                if let ViewportInteractionTool::PlacePrimitive(kind) = *interaction_tool {
+                    if ui.ctx().input(|i| i.key_pressed(egui::Key::Escape))
+                        || response.clicked_by(egui::PointerButton::Secondary)
+                    {
+                        *interaction_tool = ViewportInteractionTool::Select;
+                    } else if let Some(pointer) = response
+                        .hover_pos()
+                        .or_else(|| response.interact_pointer_pos())
+                    {
+                        let uv = [
+                            (pointer.x - rect.min.x) / rect.width().max(1.0),
+                            (pointer.y - rect.min.y) / rect.height().max(1.0),
+                        ];
+                        let aspect = rect.width() / rect.height().max(1.0);
+                        let (orig, dir) = camera_3d.screen_ray(uv, aspect);
+                        if let Some(hit) = raycast_placement_point(scene, orig, dir) {
+                            let half = 0.4_f32;
+                            placement_ghost = Some(PlacementGhost {
+                                position: hit.to_array(),
+                                half_extents: [half, half, half],
+                            });
+                            if response.clicked_by(egui::PointerButton::Primary) {
+                                place_primitive_at(ui.ctx(), scene, history, kind, hit);
+                                let keep_placing = ui.ctx().input(|i| i.modifiers.shift);
+                                if !keep_placing {
+                                    *interaction_tool = ViewportInteractionTool::Select;
+                                }
+                            }
+                        }
                     }
-                    AppMode::LowPoly => {
-                        let paint_active = scene.lowpoly_paint_mode
-                            && (response.clicked_by(egui::PointerButton::Primary)
-                                || response.dragged_by(egui::PointerButton::Primary));
-                        let pick_active = !scene.lowpoly_paint_mode
-                            && response.clicked_by(egui::PointerButton::Primary);
-                        if paint_active || pick_active {
-                            if let Some(pointer) = response.interact_pointer_pos() {
-                                let uv = [
-                                    (pointer.x - rect.min.x) / rect.width().max(1.0),
-                                    (pointer.y - rect.min.y) / rect.height().max(1.0),
-                                ];
-                                let aspect = rect.width() / rect.height().max(1.0);
-                                let (orig, dir) = camera_3d.screen_ray(uv, aspect);
-                                if paint_active {
-                                    if let Some(node_id) = scene.active_lowpoly_node() {
-                                        let node_mat = scene.node_world_matrix(node_id);
-                                        let inv = node_mat.inverse();
-                                        let local_orig = inv.transform_point3(orig);
-                                        let local_dir =
-                                            inv.transform_vector3(dir).normalize_or_zero();
-                                        let hit =
-                                            scene.lowpoly_meshes.get(&node_id).and_then(|mesh| {
-                                                tessel_core::mesh::ops::raycast_mesh_hit(
-                                                    mesh, local_orig, local_dir,
-                                                )
-                                            });
-                                        if let Some(h) = hit {
-                                            let color = scene
-                                                .palette
-                                                .get(scene.active_color)
-                                                .map(|e| e.color)
-                                                .unwrap_or(tessel_core::Rgba8::rgb(225, 226, 235));
-                                            if scene.lowpoly_mirror_x {
-                                                let mirror_uv = scene
-                                                    .lowpoly_meshes
-                                                    .get(&node_id)
-                                                    .map(|mesh| {
-                                                        let (min_b, max_b) = mesh.bounds();
-                                                        let mp = glam::Vec3::new(
-                                                            -h.point.x, h.point.y, h.point.z,
-                                                        );
-                                                        let mn = glam::Vec3::new(
-                                                            -h.normal.x,
-                                                            h.normal.y,
-                                                            h.normal.z,
-                                                        );
-                                                        tessel_core::box_atlas_uv(
-                                                            mp, mn, min_b, max_b,
-                                                        )
-                                                    });
-                                                let mut cmds = vec![Command::PaintMeshTexture {
-                                                    node_id,
-                                                    uv: h.uv,
-                                                    radius_px: scene.lowpoly_brush_radius,
-                                                    color,
-                                                }];
-                                                if let Some(muv) = mirror_uv {
-                                                    cmds.push(Command::PaintMeshTexture {
-                                                        node_id,
-                                                        uv: muv,
-                                                        radius_px: scene.lowpoly_brush_radius,
-                                                        color,
-                                                    });
-                                                }
-                                                super::exec_history(
-                                                    ui.ctx(),
-                                                    history,
-                                                    scene,
-                                                    Command::Transaction(cmds),
-                                                );
-                                            } else {
-                                                super::exec_history(
-                                                    ui.ctx(),
-                                                    history,
-                                                    scene,
-                                                    Command::PaintMeshTexture {
-                                                        node_id,
-                                                        uv: h.uv,
-                                                        radius_px: scene.lowpoly_brush_radius,
-                                                        color,
-                                                    },
-                                                );
-                                            }
-                                        }
-                                    }
-                                } else {
-                                    // Select mode: pick closest visible low-poly mesh & face
-                                    let mut best: Option<(f32, NodeId, tessel_core::FaceId)> = None;
-                                    for (&nid, mesh) in &scene.lowpoly_meshes {
-                                        let visible =
-                                            scene.nodes.get(&nid).is_some_and(|n| n.visible);
-                                        if !visible {
-                                            continue;
-                                        }
-                                        let node_mat = scene.node_world_matrix(nid);
-                                        let inv = node_mat.inverse();
-                                        let local_orig = inv.transform_point3(orig);
-                                        let local_dir =
-                                            inv.transform_vector3(dir).normalize_or_zero();
-                                        if let Some(h) = tessel_core::mesh::ops::raycast_mesh_hit(
-                                            mesh, local_orig, local_dir,
-                                        ) {
-                                            let world_hit = node_mat.transform_point3(h.point);
-                                            let dist_sq = (world_hit - orig).length_squared();
-                                            if best.is_none_or(|(d, _, _)| dist_sq < d) {
-                                                best = Some((dist_sq, nid, h.face_id));
-                                            }
-                                        }
-                                    }
-                                    if let Some((_, hit_nid, face_id)) = best {
+                } else {
+                    match scene.active_mode {
+                        AppMode::Voxel => {
+                            if *interaction_tool == ViewportInteractionTool::Edit {
+                                hover_voxel =
+                                    compute_hover_voxel(rect, &response, scene, camera_3d);
+                                handle_voxel_click_input(
+                                    ui, rect, &response, scene, history, camera_3d,
+                                );
+                            } else if response.clicked_by(egui::PointerButton::Primary) {
+                                if let Some(pointer) = response.interact_pointer_pos() {
+                                    let uv = [
+                                        (pointer.x - rect.min.x) / rect.width().max(1.0),
+                                        (pointer.y - rect.min.y) / rect.height().max(1.0),
+                                    ];
+                                    let aspect = rect.width() / rect.height().max(1.0);
+                                    let (orig, dir) = camera_3d.screen_ray(uv, aspect);
+                                    if let Some((hit_nid, face_id)) =
+                                        pick_scene_node(scene, orig, dir)
+                                    {
                                         if scene.selected_node != Some(hit_nid) {
                                             super::exec_history(
                                                 ui.ctx(),
@@ -285,95 +378,326 @@ pub fn show_viewport(
                                                 Command::SelectNode(Some(hit_nid)),
                                             );
                                         }
-                                        scene.selected_face = Some(face_id);
-                                        scene.mark_modified();
-                                    } else {
-                                        scene.selected_face = None;
-                                        scene.mark_modified();
+                                        scene.select_face_ui(face_id);
                                     }
                                 }
                             }
                         }
-                    }
-                    AppMode::Character => {
-                        let weight_paint_active = scene.weight_paint_mode
-                            && (response.clicked_by(egui::PointerButton::Primary)
-                                || (response.dragged_by(egui::PointerButton::Primary)
-                                    && response.drag_delta().length_sq() > 0.0));
-                        let pick_bone_active = !scene.weight_paint_mode
-                            && response.clicked_by(egui::PointerButton::Primary);
-                        if weight_paint_active {
-                            if let Some(pointer) = response.interact_pointer_pos() {
-                                let uv = [
-                                    (pointer.x - rect.min.x) / rect.width().max(1.0),
-                                    (pointer.y - rect.min.y) / rect.height().max(1.0),
-                                ];
-                                let aspect = rect.width() / rect.height().max(1.0);
-                                let (orig, dir) = camera_3d.screen_ray(uv, aspect);
-                                let target_bone = scene.selected_bone.or_else(|| {
-                                    scene
-                                        .character_rig
-                                        .as_ref()
-                                        .and_then(|r| r.bones.first().map(|b| b.id))
-                                });
-                                if let (Some(node_id), Some(bone_id)) =
-                                    (scene.active_lowpoly_node(), target_bone)
-                                {
-                                    let node_mat = scene.node_world_matrix(node_id);
-                                    if node_mat.determinant().abs() > 1e-8 {
-                                        let inv = node_mat.inverse();
-                                        let local_orig = inv.transform_point3(orig);
-                                        let local_dir =
-                                            inv.transform_vector3(dir).normalize_or_zero();
-                                        let hit =
-                                            scene.lowpoly_meshes.get(&node_id).and_then(|mesh| {
-                                                tessel_core::mesh::ops::raycast_mesh_hit(
-                                                    mesh, local_orig, local_dir,
-                                                )
-                                            });
-                                        if let Some(h) = hit {
-                                            if let Err(err) = history.execute(
-                                                scene,
-                                                Command::PaintMeshWeights {
-                                                    node_id,
-                                                    hit_point: h.point.to_array(),
-                                                    radius: scene.weight_brush_radius,
-                                                    bone_id,
-                                                    strength: scene.weight_brush_strength,
-                                                },
-                                            ) {
-                                                if err != tessel_core::CoreError::OutOfBounds {
-                                                    tracing::warn!(
-                                                        "weight paint stroke failed: {err}"
+                        AppMode::LowPoly => {
+                            let is_select = *interaction_tool == ViewportInteractionTool::Select;
+                            let sculpt_active = !is_select
+                                && scene.sculpt_mode
+                                && !scene.lowpoly_paint_mode
+                                && (response.clicked_by(egui::PointerButton::Primary)
+                                    || (response.dragged_by(egui::PointerButton::Primary)
+                                        && response.drag_delta().length_sq() > 0.0));
+                            let paint_active = !is_select
+                                && scene.lowpoly_paint_mode
+                                && (response.clicked_by(egui::PointerButton::Primary)
+                                    || response.dragged_by(egui::PointerButton::Primary));
+                            let pick_active = (is_select
+                                || (!scene.lowpoly_paint_mode && !scene.sculpt_mode))
+                                && response.clicked_by(egui::PointerButton::Primary);
+                            if sculpt_active || paint_active || pick_active {
+                                if let Some(pointer) = response.interact_pointer_pos() {
+                                    let uv = [
+                                        (pointer.x - rect.min.x) / rect.width().max(1.0),
+                                        (pointer.y - rect.min.y) / rect.height().max(1.0),
+                                    ];
+                                    let aspect = rect.width() / rect.height().max(1.0);
+                                    let (orig, dir) = camera_3d.screen_ray(uv, aspect);
+                                    if sculpt_active {
+                                        if let Some(node_id) = scene.active_lowpoly_node() {
+                                            let node_mat = scene.node_world_matrix(node_id);
+                                            if node_mat.determinant().abs() > 1e-8 {
+                                                let inv = node_mat.inverse();
+                                                let local_orig = inv.transform_point3(orig);
+                                                let local_dir =
+                                                    inv.transform_vector3(dir).normalize_or_zero();
+                                                let hit = scene
+                                                    .lowpoly_meshes
+                                                    .get(&node_id)
+                                                    .and_then(|mesh| {
+                                                        let bvh =
+                                                            tessel_core::MeshBvh::from_mesh(mesh);
+                                                        bvh.raycast(local_orig, local_dir)
+                                                    });
+                                                if let Some(h) = hit {
+                                                    let d = response.drag_delta();
+                                                    let scale =
+                                                        (camera_3d.distance * 0.004).max(0.002);
+                                                    let cam_fwd = dir.normalize_or_zero();
+                                                    let cam_right = cam_fwd
+                                                        .cross(glam::Vec3::Y)
+                                                        .normalize_or_zero();
+                                                    let cam_up = cam_right
+                                                        .cross(cam_fwd)
+                                                        .normalize_or_zero();
+                                                    let world_drag = cam_right * (d.x * scale)
+                                                        - cam_up * (d.y * scale);
+                                                    let local_drag =
+                                                        inv.transform_vector3(world_drag);
+                                                    super::exec_history(
+                                                        ui.ctx(),
+                                                        history,
+                                                        scene,
+                                                        Command::SculptMeshStroke {
+                                                            node_id,
+                                                            params:
+                                                                tessel_core::SculptStrokeParams {
+                                                                    brush: scene.sculpt_brush,
+                                                                    center: h.point.to_array(),
+                                                                    normal: h.normal.to_array(),
+                                                                    drag_delta: local_drag
+                                                                        .to_array(),
+                                                                    radius: scene.sculpt_radius,
+                                                                    strength: scene.sculpt_strength,
+                                                                    mirror_x: scene
+                                                                        .lowpoly_mirror_x,
+                                                                },
+                                                        },
                                                     );
+                                                }
+                                            }
+                                        }
+                                    } else if paint_active {
+                                        if let Some(node_id) = scene.active_lowpoly_node() {
+                                            let node_mat = scene.node_world_matrix(node_id);
+                                            let inv = node_mat.inverse();
+                                            let local_orig = inv.transform_point3(orig);
+                                            let local_dir =
+                                                inv.transform_vector3(dir).normalize_or_zero();
+                                            let hit = scene.lowpoly_meshes.get(&node_id).and_then(
+                                                |mesh| {
+                                                    tessel_core::mesh::ops::raycast_mesh_hit(
+                                                        mesh, local_orig, local_dir,
+                                                    )
+                                                },
+                                            );
+                                            if let Some(h) = hit {
+                                                let color = scene
+                                                    .palette
+                                                    .get(scene.active_color)
+                                                    .map(|e| e.color)
+                                                    .unwrap_or(tessel_core::Rgba8::rgb(
+                                                        225, 226, 235,
+                                                    ));
+                                                if scene.lowpoly_mirror_x {
+                                                    let mirror_uv = scene
+                                                        .lowpoly_meshes
+                                                        .get(&node_id)
+                                                        .map(|mesh| {
+                                                            let (min_b, max_b) = mesh.bounds();
+                                                            let mp = glam::Vec3::new(
+                                                                -h.point.x, h.point.y, h.point.z,
+                                                            );
+                                                            let mn = glam::Vec3::new(
+                                                                -h.normal.x,
+                                                                h.normal.y,
+                                                                h.normal.z,
+                                                            );
+                                                            tessel_core::box_atlas_uv(
+                                                                mp, mn, min_b, max_b,
+                                                            )
+                                                        });
+                                                    let mut cmds =
+                                                        vec![Command::PaintMeshTexture {
+                                                            node_id,
+                                                            uv: h.uv,
+                                                            radius_px: scene.lowpoly_brush_radius,
+                                                            color,
+                                                        }];
+                                                    if let Some(muv) = mirror_uv {
+                                                        cmds.push(Command::PaintMeshTexture {
+                                                            node_id,
+                                                            uv: muv,
+                                                            radius_px: scene.lowpoly_brush_radius,
+                                                            color,
+                                                        });
+                                                    }
+                                                    super::exec_history(
+                                                        ui.ctx(),
+                                                        history,
+                                                        scene,
+                                                        Command::Transaction(cmds),
+                                                    );
+                                                } else {
+                                                    super::exec_history(
+                                                        ui.ctx(),
+                                                        history,
+                                                        scene,
+                                                        Command::PaintMeshTexture {
+                                                            node_id,
+                                                            uv: h.uv,
+                                                            radius_px: scene.lowpoly_brush_radius,
+                                                            color,
+                                                        },
+                                                    );
+                                                }
+                                            }
+                                        }
+                                    } else if let Some((hit_nid, face_id)) =
+                                        pick_scene_node(scene, orig, dir)
+                                    {
+                                        if scene.selected_node != Some(hit_nid) {
+                                            super::exec_history(
+                                                ui.ctx(),
+                                                history,
+                                                scene,
+                                                Command::SelectNode(Some(hit_nid)),
+                                            );
+                                        }
+                                        scene.select_face_ui(face_id);
+                                    } else {
+                                        scene.select_face_ui(None);
+                                    }
+                                }
+                            }
+                        }
+                        AppMode::Character => {
+                            let weight_paint_active = scene.weight_paint_mode
+                                && (response.clicked_by(egui::PointerButton::Primary)
+                                    || (response.dragged_by(egui::PointerButton::Primary)
+                                        && response.drag_delta().length_sq() > 0.0));
+                            let pick_bone_active = !scene.weight_paint_mode
+                                && response.clicked_by(egui::PointerButton::Primary);
+                            if weight_paint_active {
+                                if let Some(pointer) = response.interact_pointer_pos() {
+                                    let uv = [
+                                        (pointer.x - rect.min.x) / rect.width().max(1.0),
+                                        (pointer.y - rect.min.y) / rect.height().max(1.0),
+                                    ];
+                                    let aspect = rect.width() / rect.height().max(1.0);
+                                    let (orig, dir) = camera_3d.screen_ray(uv, aspect);
+                                    let target_bone = scene.selected_bone.or_else(|| {
+                                        scene
+                                            .character_rig
+                                            .as_ref()
+                                            .and_then(|r| r.bones.first().map(|b| b.id))
+                                    });
+                                    if let (Some(node_id), Some(bone_id)) =
+                                        (scene.active_lowpoly_node(), target_bone)
+                                    {
+                                        let node_mat = scene.node_world_matrix(node_id);
+                                        if node_mat.determinant().abs() > 1e-8 {
+                                            let inv = node_mat.inverse();
+                                            let local_orig = inv.transform_point3(orig);
+                                            let local_dir =
+                                                inv.transform_vector3(dir).normalize_or_zero();
+                                            let hit = scene.lowpoly_meshes.get(&node_id).and_then(
+                                                |mesh| {
+                                                    tessel_core::mesh::ops::raycast_mesh_hit(
+                                                        mesh, local_orig, local_dir,
+                                                    )
+                                                },
+                                            );
+                                            if let Some(h) = hit {
+                                                if let Err(err) = history.execute(
+                                                    scene,
+                                                    Command::PaintMeshWeights {
+                                                        node_id,
+                                                        hit_point: h.point.to_array(),
+                                                        radius: scene.weight_brush_radius,
+                                                        bone_id,
+                                                        strength: scene.weight_brush_strength,
+                                                    },
+                                                ) {
+                                                    if err != tessel_core::CoreError::OutOfBounds {
+                                                        tracing::warn!(
+                                                            "weight paint stroke failed: {err}"
+                                                        );
+                                                    }
                                                 }
                                             }
                                         }
                                     }
                                 }
-                            }
-                        } else if pick_bone_active {
-                            if let Some(pointer) = response.interact_pointer_pos() {
-                                let uv = [
-                                    (pointer.x - rect.min.x) / rect.width().max(1.0),
-                                    (pointer.y - rect.min.y) / rect.height().max(1.0),
-                                ];
-                                let aspect = rect.width() / rect.height().max(1.0);
-                                let (orig, dir) = camera_3d.screen_ray(uv, aspect);
-                                if let Some(rig) = &scene.character_rig {
-                                    scene.selected_bone = rig.pick_bone(orig, dir, 0.16);
-                                    scene.mark_modified();
+                            } else if pick_bone_active {
+                                if let Some(pointer) = response.interact_pointer_pos() {
+                                    let uv = [
+                                        (pointer.x - rect.min.x) / rect.width().max(1.0),
+                                        (pointer.y - rect.min.y) / rect.height().max(1.0),
+                                    ];
+                                    let aspect = rect.width() / rect.height().max(1.0);
+                                    let (orig, dir) = camera_3d.screen_ray(uv, aspect);
+                                    if let Some(rig) = &scene.character_rig {
+                                        let picked = rig.pick_bone(orig, dir, 0.16);
+                                        scene.select_bone_ui(picked);
+                                    }
                                 }
                             }
                         }
+                        AppMode::Pixel => {}
                     }
-                    AppMode::Pixel => {}
                 }
             }
         }
 
+        let gizmo_visible = is_transform_gizmo_enabled(
+            scene,
+            *interaction_tool,
+            *free_view,
+            *render_preview,
+            *show_viewport_gizmo,
+        ) && has_visible_selected_node(scene);
+        let show_rotate_ui = gizmo_visible && *gizmo_mode == TransformGizmoMode::Rotate;
+        let show_scale_ui = gizmo_visible && *gizmo_mode == TransformGizmoMode::Scale;
+
+        if show_rotate_ui {
+            show_rotate_axis_and_ruler_hud(
+                ui,
+                rect,
+                rotate_axis_mode,
+                gizmo_drag.and_then(|d| d.as_rotate()),
+            );
+        }
+
         if scene.active_mode != AppMode::Pixel && !*render_preview {
-            draw_selection_brackets(ui, rect, scene, camera_3d);
+            let selected_bounds = scene.selected_node.and_then(|id| {
+                let playback_bits = scene
+                    .character_rig
+                    .as_ref()
+                    .map(|r| r.playback_time.to_bits())
+                    .unwrap_or(0);
+                let cache_key = (id, scene.revision, playback_bits);
+                let cache_id = egui::Id::new("tessel_selected_bounds_cache");
+                if let Some((cached_key, cached_bounds)) = ui.ctx().data(|d| {
+                    d.get_temp::<((NodeId, u64, u32), Option<(glam::Vec3, glam::Vec3)>)>(cache_id)
+                }) {
+                    if cached_key == cache_key {
+                        return cached_bounds;
+                    }
+                }
+                let computed = selected_node_world_bounds(scene, id);
+                ui.ctx()
+                    .data_mut(|d| d.insert_temp(cache_id, (cache_key, computed)));
+                computed
+            });
+            let selected_name = scene
+                .selected_node
+                .and_then(|id| scene.nodes.get(&id).map(|n| n.name.as_str()));
+            draw_selection_brackets(ui, rect, selected_bounds, selected_name, camera_3d);
+            if show_rotate_ui {
+                draw_floating_rotate_disc(
+                    ui,
+                    rect,
+                    &response,
+                    scene,
+                    camera_3d,
+                    gizmo_drag.and_then(|d| d.as_rotate()),
+                    *rotate_axis_mode,
+                );
+            } else if show_scale_ui {
+                draw_scale_gizmo_overlay(
+                    ui,
+                    rect,
+                    scene,
+                    camera_3d,
+                    active_gizmo_axis,
+                    *gizmo_drag,
+                    selected_bounds,
+                );
+            }
             draw_scene_gadgets(
                 ui,
                 rect,
@@ -382,26 +706,212 @@ pub fn show_viewport(
                 camera_3d,
                 showcase_camera,
                 *scene_gadget_drag,
+                *gadget_visibility,
             );
         }
 
         show_viewport_hud(
             ui,
             rect,
-            scene.active_mode,
+            scene,
             camera_3d,
             camera_3d_target,
             showcase_camera,
             camera_2d,
+            interaction_tool,
+            gizmo_mode,
+            show_viewport_gizmo,
             free_view,
             render_preview,
+            gadget_visibility,
         );
         if scene.active_mode != AppMode::Pixel && !*render_preview {
             draw_camera_compass(ui, rect, camera_3d);
         }
     });
 
-    (desired_size, hover_voxel, active_gizmo_axis)
+    (
+        desired_size,
+        hover_voxel,
+        active_gizmo_axis,
+        placement_ghost,
+    )
+}
+
+/// Raycasts a world-space ray against visible scene meshes/voxels and falls back to the `y = 0` ground plane.
+pub fn raycast_placement_point(
+    scene: &SceneState,
+    orig: glam::Vec3,
+    dir: glam::Vec3,
+) -> Option<glam::Vec3> {
+    let dir = dir.normalize_or_zero();
+    if dir.length_squared() < 1e-8 {
+        return None;
+    }
+    let mut best: Option<(f32, glam::Vec3)> = None;
+
+    for (&nid, mesh) in &scene.lowpoly_meshes {
+        if !scene.nodes.get(&nid).is_some_and(|n| n.visible) || mesh.faces.is_empty() {
+            continue;
+        }
+        let mat = scene.node_world_matrix(nid);
+        if mat.determinant().abs() <= 1e-8 {
+            continue;
+        }
+        let inv = mat.inverse();
+        let l_orig = inv.transform_point3(orig);
+        let l_dir = inv.transform_vector3(dir).normalize_or_zero();
+        if let Some(h) = tessel_core::mesh::ops::raycast_mesh_hit(mesh, l_orig, l_dir) {
+            let world_hit = mat.transform_point3(h.point);
+            let dist_sq = (world_hit - orig).length_squared();
+            if best.is_none_or(|(d, _)| dist_sq < d) {
+                best = Some((dist_sq, world_hit));
+            }
+        }
+    }
+
+    for (&nid, vol) in &scene.voxel_volumes {
+        if !scene.nodes.get(&nid).is_some_and(|n| n.visible) || vol.is_empty() {
+            continue;
+        }
+        let mat = scene.node_world_matrix(nid);
+        if mat.determinant().abs() <= 1e-8 {
+            continue;
+        }
+        let inv = mat.inverse();
+        let l_orig = inv.transform_point3(orig);
+        let l_dir = inv.transform_vector3(dir).normalize_or_zero();
+        if let Some(hit) = voxel_ops::raycast_voxels(vol, l_orig, l_dir, scene.unit_scale, 256) {
+            let s = scene.unit_scale;
+            let place_c = hit.adjacent();
+            let local_pt = glam::Vec3::new(
+                (place_c.x as f32 + 0.5) * s,
+                place_c.y as f32 * s,
+                (place_c.z as f32 + 0.5) * s,
+            );
+            let world_hit = mat.transform_point3(local_pt);
+            let dist_sq = (world_hit - orig).length_squared();
+            if best.is_none_or(|(d, _)| dist_sq < d) {
+                best = Some((dist_sq, world_hit));
+            }
+        }
+    }
+
+    if let Some((_, pt)) = best {
+        return Some(pt);
+    }
+
+    // Fallback: ground plane y = 0.
+    if dir.y.abs() > 1e-5 {
+        let t = -orig.y / dir.y;
+        if t > 0.0 && t.is_finite() {
+            let p = orig + dir * t;
+            if p.x.abs() <= 64.0 && p.z.abs() <= 64.0 {
+                return Some(glam::Vec3::new(p.x, 0.0, p.z));
+            }
+        }
+    }
+    None
+}
+
+/// Picks the closest visible `LowPolyMesh` or `VoxelVolume` node intersected by `(orig, dir)`.
+pub fn pick_scene_node(
+    scene: &SceneState,
+    orig: glam::Vec3,
+    dir: glam::Vec3,
+) -> Option<(NodeId, Option<tessel_core::FaceId>)> {
+    let dir = dir.normalize_or_zero();
+    if dir.length_squared() < 1e-8 {
+        return None;
+    }
+    let mut best: Option<(f32, NodeId, Option<tessel_core::FaceId>)> = None;
+
+    for (&nid, mesh) in &scene.lowpoly_meshes {
+        if !scene.nodes.get(&nid).is_some_and(|n| n.visible) || mesh.faces.is_empty() {
+            continue;
+        }
+        let mat = scene.node_world_matrix(nid);
+        if mat.determinant().abs() <= 1e-8 {
+            continue;
+        }
+        let inv = mat.inverse();
+        let l_orig = inv.transform_point3(orig);
+        let l_dir = inv.transform_vector3(dir).normalize_or_zero();
+        if let Some(h) = tessel_core::mesh::ops::raycast_mesh_hit(mesh, l_orig, l_dir) {
+            let world_hit = mat.transform_point3(h.point);
+            let dist_sq = (world_hit - orig).length_squared();
+            if best.is_none_or(|(d, _, _)| dist_sq < d) {
+                best = Some((dist_sq, nid, Some(h.face_id)));
+            }
+        }
+    }
+
+    for (&nid, vol) in &scene.voxel_volumes {
+        if !scene.nodes.get(&nid).is_some_and(|n| n.visible) || vol.is_empty() {
+            continue;
+        }
+        let mat = scene.node_world_matrix(nid);
+        if mat.determinant().abs() <= 1e-8 {
+            continue;
+        }
+        let inv = mat.inverse();
+        let l_orig = inv.transform_point3(orig);
+        let l_dir = inv.transform_vector3(dir).normalize_or_zero();
+        if let Some(hit) = voxel_ops::raycast_voxels(vol, l_orig, l_dir, scene.unit_scale, 256) {
+            let s = scene.unit_scale;
+            let local_pt = glam::Vec3::new(
+                (hit.voxel.x as f32 + 0.5) * s,
+                (hit.voxel.y as f32 + 0.5) * s,
+                (hit.voxel.z as f32 + 0.5) * s,
+            );
+            let world_hit = mat.transform_point3(local_pt);
+            let dist_sq = (world_hit - orig).length_squared();
+            if best.is_none_or(|(d, _, _)| dist_sq < d) {
+                best = Some((dist_sq, nid, None));
+            }
+        }
+    }
+
+    best.map(|(_, nid, fid)| (nid, fid))
+}
+
+fn place_primitive_at(
+    ctx: &egui::Context,
+    scene: &mut SceneState,
+    history: &mut HistoryStack,
+    kind: tessel_core::PrimitiveKind,
+    world_pos: glam::Vec3,
+) {
+    super::exec_history(
+        ctx,
+        history,
+        scene,
+        Command::CreatePrimitiveMesh {
+            name: kind.label().into(),
+            kind,
+            size: 0.8,
+            material: scene.active_color,
+        },
+    );
+    if let Some(node_id) = scene.selected_node {
+        if world_pos.length_squared() > 1e-8 {
+            let mut tx = scene
+                .nodes
+                .get(&node_id)
+                .map(|n| n.transform)
+                .unwrap_or_default();
+            tx.translation = world_pos;
+            super::exec_history(
+                ctx,
+                history,
+                scene,
+                Command::SetNodeTransform {
+                    node_id,
+                    transform: tx,
+                },
+            );
+        }
+    }
 }
 
 fn draw_camera_compass(ui: &egui::Ui, rect: egui::Rect, camera: &OrbitCamera) {
@@ -446,6 +956,232 @@ fn draw_camera_compass(ui: &egui::Ui, rect: egui::Rect, camera: &OrbitCamera) {
     }
 }
 
+const SCALE_HANDLE_HIT_RADIUS_PX: f32 = 12.0;
+
+fn pick_scale_handle_screen(
+    pos: egui::Pos2,
+    world_origin: glam::Vec3,
+    world_rot: glam::Quat,
+    camera: &OrbitCamera,
+    rect: egui::Rect,
+) -> Option<GizmoAxis> {
+    let mut best: Option<(GizmoAxis, f32)> = None;
+    for axis in GizmoAxis::ALL {
+        let tip_world = world_origin + (world_rot * axis.dir()) * GIZMO_AXIS_LEN;
+        if let Some(tip_px) = project_world_point(tip_world, camera, rect) {
+            let d = pos.distance(tip_px);
+            if d <= SCALE_HANDLE_HIT_RADIUS_PX && best.is_none_or(|(_, bd)| d < bd) {
+                best = Some((axis, d));
+            }
+        }
+    }
+    best.map(|(a, _)| a)
+}
+
+fn pick_oriented_scale_shaft(
+    ray_origin: glam::Vec3,
+    ray_dir: glam::Vec3,
+    world_origin: glam::Vec3,
+    world_rot: glam::Quat,
+    hit_tolerance: f32,
+) -> Option<GizmoAxis> {
+    let mut best: Option<(GizmoAxis, f32)> = None;
+    for axis in GizmoAxis::ALL {
+        let dir = (world_rot * axis.dir()).normalize_or_zero();
+        if let Some((t, dist)) = closest_point_on_axis(ray_origin, ray_dir, world_origin, dir) {
+            if (0.08..=GIZMO_AXIS_LEN + 0.14).contains(&t)
+                && dist <= hit_tolerance
+                && best.is_none_or(|(_, bd)| dist < bd)
+            {
+                best = Some((axis, dist));
+            }
+        }
+    }
+    best.map(|(a, _)| a)
+}
+
+/// Computes a stable 2D screen-space drag direction and normalization length (in logical pixels)
+/// for scaling along `world_axis_dir`, with a clean horizontal fallback when viewing axially.
+fn scale_screen_drag_basis(
+    world_origin: glam::Vec3,
+    world_axis_dir: glam::Vec3,
+    camera: &OrbitCamera,
+    rect: egui::Rect,
+) -> (egui::Vec2, f32) {
+    if let (Some(o_px), Some(t_px)) = (
+        project_world_point(world_origin, camera, rect),
+        project_world_point(world_origin + world_axis_dir * GIZMO_AXIS_LEN, camera, rect),
+    ) {
+        let diff = t_px - o_px;
+        let len = diff.length();
+        if len > 6.0 && len.is_finite() {
+            return (diff / len, len.max(48.0));
+        }
+    }
+    (egui::vec2(1.0, 0.0), 96.0)
+}
+
+/// Renders crisp screen-space X/Y/Z square handles at the tips of the node's local scale axes
+/// plus a live `W × H × D` and `Scale` badge below the selected object.
+#[allow(clippy::too_many_arguments)]
+fn draw_scale_gizmo_overlay(
+    ui: &egui::Ui,
+    rect: egui::Rect,
+    scene: &SceneState,
+    camera: &OrbitCamera,
+    active_axis: Option<GizmoAxis>,
+    gizmo_drag: Option<GizmoDragState>,
+    selected_bounds: Option<(glam::Vec3, glam::Vec3)>,
+) {
+    if rect.width() <= 1.0 || rect.height() <= 1.0 {
+        return;
+    }
+    let Some(node_id) = scene.selected_node else {
+        return;
+    };
+    if !node_is_effectively_visible(scene, node_id) {
+        return;
+    }
+    let Some(node) = scene.nodes.get(&node_id) else {
+        return;
+    };
+    let world_origin = scene
+        .node_world_matrix(node_id)
+        .transform_point3(glam::Vec3::ZERO);
+    let world_rot = node_world_rotation(scene, node_id);
+    let painter = ui.painter().with_clip_rect(rect);
+    let highlight = egui::Color32::from_rgb(255, 235, 102);
+
+    let axes = [
+        (GizmoAxis::X, "X", egui::Color32::from_rgb(240, 82, 82)),
+        (GizmoAxis::Y, "Y", egui::Color32::from_rgb(92, 220, 112)),
+        (GizmoAxis::Z, "Z", egui::Color32::from_rgb(86, 152, 245)),
+    ];
+    for (axis, label, base_col) in axes {
+        let tip_world = world_origin + (world_rot * axis.dir()) * GIZMO_AXIS_LEN;
+        if let Some(tip_px) = project_world_point(tip_world, camera, rect) {
+            let is_active = active_axis == Some(axis);
+            let fill = if is_active { highlight } else { base_col };
+            let box_size = if is_active { 12.0 } else { 10.0 };
+            let handle_rect = egui::Rect::from_center_size(tip_px, egui::vec2(box_size, box_size));
+            painter.rect_filled(handle_rect, CornerRadius::same(2), fill);
+            painter.rect_stroke(
+                handle_rect,
+                CornerRadius::same(2),
+                Stroke::new(1.2, egui::Color32::from_rgb(20, 23, 29)),
+                egui::StrokeKind::Outside,
+            );
+            painter.text(
+                tip_px + egui::vec2(0.0, -11.0),
+                egui::Align2::CENTER_CENTER,
+                label,
+                egui::FontId::monospace(9.5),
+                fill,
+            );
+        }
+    }
+
+    // Live sizing badge below the selected node's projected bounds (or origin).
+    let anchor = selected_bounds
+        .and_then(|(wmin, wmax)| {
+            let size = (wmax - wmin).abs();
+            project_bounds_to_screen_rect(wmin, wmax, camera, rect)
+                .map(|sel| (egui::pos2(sel.center().x, sel.bottom() + 14.0), Some(size)))
+        })
+        .or_else(|| {
+            project_world_point(world_origin, camera, rect)
+                .map(|c| (egui::pos2(c.x, c.y + 28.0), None))
+        });
+
+    if let Some((raw_pos, world_size)) = anchor {
+        let uniform = matches!(gizmo_drag, Some(GizmoDragState::Scale { .. }))
+            && ui.ctx().input(|i| i.modifiers.shift);
+        let s = node.transform.scale;
+        let suffix = if uniform { " [Uniform]" } else { "" };
+        let text = match world_size {
+            Some(sz) => format!(
+                "Size {:.2}×{:.2}×{:.2}m  Scale {:.2}, {:.2}, {:.2}{suffix}",
+                sz.x, sz.y, sz.z, s.x, s.y, s.z
+            ),
+            None => format!("Scale {:.2}, {:.2}, {:.2}{suffix}", s.x, s.y, s.z),
+        };
+        let galley =
+            painter.layout_no_wrap(text, egui::FontId::monospace(10.0), egui::Color32::WHITE);
+        let pill_w = galley.size().x + 12.0;
+        let pill_h = galley.size().y + 6.0;
+        let half_x = (pill_w * 0.5).min(rect.width() * 0.5);
+        let half_y = (pill_h * 0.5).min(rect.height() * 0.5);
+        let badge_pos = egui::pos2(
+            raw_pos.x.clamp(rect.left() + half_x, rect.right() - half_x),
+            raw_pos.y.clamp(rect.top() + half_y, rect.bottom() - half_y),
+        );
+        let pill_rect = egui::Rect::from_center_size(badge_pos, egui::vec2(pill_w, pill_h));
+        painter.rect_filled(
+            pill_rect,
+            CornerRadius::same(4),
+            egui::Color32::from_rgba_unmultiplied(0x14, 0x17, 0x1D, 220),
+        );
+        painter.rect_stroke(
+            pill_rect,
+            CornerRadius::same(4),
+            Stroke::new(1.0, tokens::OUTLINE_VARIANT),
+            egui::StrokeKind::Inside,
+        );
+        painter.galley(
+            pill_rect.center() - galley.size() * 0.5,
+            galley,
+            egui::Color32::WHITE,
+        );
+    }
+}
+
+/// Computes the updated local `Transform` after dragging a Scale gizmo handle by normalized
+/// screen distance `delta_t`. Preserves mirrored/negative scale signs and preserves exact aspect
+/// ratio under `uniform` (`Shift`) clamping within `0.005..=100.0`.
+pub fn compute_scale_gizmo_transform(
+    start_transform: Transform,
+    axis: GizmoAxis,
+    delta_t: f32,
+    uniform: bool,
+) -> Transform {
+    if !delta_t.is_finite() {
+        return start_transform;
+    }
+    let scale_axis = |v: f32, factor: f32| -> f32 {
+        let sign = if v < 0.0 { -1.0 } else { 1.0 };
+        sign * (v.abs() * factor).clamp(0.005, 100.0)
+    };
+    let raw_factor = (1.0 + delta_t).clamp(0.05, 20.0);
+    let mut out = start_transform;
+    if uniform {
+        let mags = [
+            start_transform.scale.x.abs().max(1e-6),
+            start_transform.scale.y.abs().max(1e-6),
+            start_transform.scale.z.abs().max(1e-6),
+        ];
+        let min_f = mags.iter().map(|&m| 0.005 / m).fold(0.05_f32, f32::max);
+        let max_f = mags.iter().map(|&m| 100.0 / m).fold(20.0_f32, f32::min);
+        let eff_factor = if min_f <= max_f {
+            raw_factor.clamp(min_f, max_f)
+        } else {
+            1.0
+        };
+        out.scale = glam::Vec3::new(
+            scale_axis(start_transform.scale.x, eff_factor),
+            scale_axis(start_transform.scale.y, eff_factor),
+            scale_axis(start_transform.scale.z, eff_factor),
+        );
+    } else {
+        match axis {
+            GizmoAxis::X => out.scale.x = scale_axis(start_transform.scale.x, raw_factor),
+            GizmoAxis::Y => out.scale.y = scale_axis(start_transform.scale.y, raw_factor),
+            GizmoAxis::Z => out.scale.z = scale_axis(start_transform.scale.z, raw_factor),
+        }
+    }
+    out
+}
+
+#[allow(clippy::too_many_arguments)]
 fn handle_gizmo_drag_input(
     rect: egui::Rect,
     response: &egui::Response,
@@ -453,6 +1189,8 @@ fn handle_gizmo_drag_input(
     history: &mut HistoryStack,
     camera: &OrbitCamera,
     gizmo_drag: &mut Option<GizmoDragState>,
+    gizmo_mode: TransformGizmoMode,
+    rotate_axis_mode: &mut RotateAxisMode,
     active_axis: &mut Option<GizmoAxis>,
 ) -> bool {
     let Some(node_id) = scene.selected_node else {
@@ -460,7 +1198,7 @@ fn handle_gizmo_drag_input(
         *active_axis = None;
         return false;
     };
-    if gizmo_drag.is_some_and(|d| d.node_id != node_id) {
+    if gizmo_drag.is_some_and(|d| d.node_id() != node_id || d.mode() != gizmo_mode) {
         cancel_gizmo_drag(scene, gizmo_drag);
         *active_axis = None;
     }
@@ -469,11 +1207,33 @@ fn handle_gizmo_drag_input(
         *active_axis = None;
         return false;
     };
+    if !node_is_effectively_visible(scene, node_id) {
+        cancel_gizmo_drag(scene, gizmo_drag);
+        *active_axis = None;
+        return false;
+    }
     let node_transform = node.transform;
     let parent_id = node.parent;
     let world_origin = scene
         .node_world_matrix(node_id)
         .transform_point3(glam::Vec3::ZERO);
+    let node_world_rot = node_world_rotation(scene, node_id);
+
+    // Allow unmodified X/Y/Z key press to toggle axis lock cleanly in Rotate mode.
+    let axis_key_pressed = if gizmo_mode == TransformGizmoMode::Rotate {
+        pressed_rotate_axis_key(&response.ctx)
+    } else {
+        None
+    };
+    if gizmo_drag.is_none() {
+        if let Some(pressed_axis) = axis_key_pressed {
+            *rotate_axis_mode = if *rotate_axis_mode == pressed_axis {
+                RotateAxisMode::Free
+            } else {
+                pressed_axis
+            };
+        }
+    }
 
     let pointer_ray = |pos: egui::Pos2| -> (glam::Vec3, glam::Vec3) {
         let uv = [
@@ -485,43 +1245,147 @@ fn handle_gizmo_drag_input(
     };
 
     if gizmo_drag.is_none() {
-        if let Some(hover) = response.hover_pos() {
-            let (orig, dir) = pointer_ray(hover);
-            *active_axis = pick_move_gizmo(orig, dir, world_origin, GIZMO_AXIS_LEN, 0.14);
+        *active_axis = match gizmo_mode {
+            TransformGizmoMode::Move => response.hover_pos().and_then(|hover| {
+                let (orig, dir) = pointer_ray(hover);
+                pick_move_gizmo(orig, dir, world_origin, GIZMO_AXIS_LEN, 0.14)
+            }),
+            TransformGizmoMode::Scale => response.hover_pos().and_then(|hover| {
+                pick_scale_handle_screen(hover, world_origin, node_world_rot, camera, rect).or_else(
+                    || {
+                        let (orig, dir) = pointer_ray(hover);
+                        pick_oriented_scale_shaft(orig, dir, world_origin, node_world_rot, 0.14)
+                    },
+                )
+            }),
+            TransformGizmoMode::Rotate => None,
+        };
+    }
+
+    let alt_down = response.ctx.input(|i| i.modifiers.alt);
+
+    // Plain click on any active gizmo handle without dragging is consumed by the gizmo
+    // so it does not leak through to object / face / bone picking behind it.
+    if gizmo_drag.is_none() && !alt_down && response.clicked_by(egui::PointerButton::Primary) {
+        if let Some(pos) = response.interact_pointer_pos() {
+            let hit = match gizmo_mode {
+                TransformGizmoMode::Rotate => project_world_point(world_origin, camera, rect)
+                    .is_some_and(|c| pos.distance(c) <= ROTATE_DISC_RADIUS_PX),
+                TransformGizmoMode::Scale => {
+                    pick_scale_handle_screen(pos, world_origin, node_world_rot, camera, rect)
+                        .is_some()
+                        || {
+                            let (orig, dir) = pointer_ray(pos);
+                            pick_oriented_scale_shaft(orig, dir, world_origin, node_world_rot, 0.16)
+                                .is_some()
+                        }
+                }
+                TransformGizmoMode::Move => {
+                    let (orig, dir) = pointer_ray(pos);
+                    pick_move_gizmo(orig, dir, world_origin, GIZMO_AXIS_LEN, 0.16).is_some()
+                }
+            };
+            if hit {
+                return true;
+            }
         }
     }
 
-    if response.drag_started_by(egui::PointerButton::Primary) {
-        if let Some(pos) = response.interact_pointer_pos() {
-            let (orig, dir) = pointer_ray(pos);
-            if let Some(axis) = pick_move_gizmo(orig, dir, world_origin, GIZMO_AXIS_LEN, 0.16) {
-                if let Some((start_t, _)) =
-                    closest_point_on_axis(orig, dir, world_origin, axis.dir())
-                {
-                    let parent_mat = parent_id
-                        .map(|pid| scene.node_world_matrix(pid))
-                        .unwrap_or(glam::Mat4::IDENTITY);
-                    let parent_world_inv = if parent_mat.determinant().abs() > 1e-8 {
-                        parent_mat.inverse()
-                    } else {
-                        glam::Mat4::IDENTITY
-                    };
-                    *gizmo_drag = Some(GizmoDragState {
-                        node_id,
-                        axis,
-                        start_transform: node_transform,
-                        start_world_pos: world_origin,
-                        parent_world_inv,
-                        start_axis_t: start_t,
-                    });
-                    *active_axis = Some(axis);
-                    return true;
+    if !alt_down && response.drag_started_by(egui::PointerButton::Primary) {
+        let start_pos = response
+            .ctx
+            .input(|i| i.pointer.press_origin())
+            .or_else(|| response.interact_pointer_pos());
+        if let Some(pos) = start_pos {
+            match gizmo_mode {
+                TransformGizmoMode::Move => {
+                    let (orig, dir) = pointer_ray(pos);
+                    if let Some(axis) =
+                        pick_move_gizmo(orig, dir, world_origin, GIZMO_AXIS_LEN, 0.16)
+                    {
+                        let parent_mat = parent_id
+                            .map(|pid| scene.node_world_matrix(pid))
+                            .unwrap_or(glam::Mat4::IDENTITY);
+                        let parent_det = parent_mat.determinant();
+                        let parent_world_inv = if parent_det.is_finite() && parent_det.abs() > 1e-8
+                        {
+                            parent_mat.inverse()
+                        } else {
+                            glam::Mat4::IDENTITY
+                        };
+                        if let Some((start_t, _)) =
+                            closest_point_on_axis(orig, dir, world_origin, axis.dir())
+                        {
+                            *gizmo_drag = Some(GizmoDragState::Move {
+                                node_id,
+                                axis,
+                                start_transform: node_transform,
+                                start_world_pos: world_origin,
+                                parent_world_inv,
+                                start_axis_t: start_t,
+                            });
+                            *active_axis = Some(axis);
+                            return true;
+                        }
+                    }
+                }
+                TransformGizmoMode::Rotate => {
+                    if let Some(disc_center) = project_world_point(world_origin, camera, rect) {
+                        if pos.distance(disc_center) <= ROTATE_DISC_RADIUS_PX {
+                            let cur_pos = response.interact_pointer_pos().unwrap_or(pos);
+                            let snap = response.ctx.input(|i| i.modifiers.shift);
+                            let parent_world_rot = parent_world_rotation(scene, parent_id);
+                            *gizmo_drag = Some(GizmoDragState::Rotate(RotateDragState {
+                                node_id,
+                                initial_transform: node_transform,
+                                anchor_transform: node_transform,
+                                start_world_pos: world_origin,
+                                parent_world_rot,
+                                anchor_pointer_pos: pos,
+                                current_pointer_pos: cur_pos,
+                                rotate_axis: *rotate_axis_mode,
+                                current_delta_deg: 0.0,
+                                snap_active: snap,
+                            }));
+                            *active_axis = None;
+                            return true;
+                        }
+                    }
+                }
+                TransformGizmoMode::Scale => {
+                    let (orig, dir) = pointer_ray(pos);
+                    if let Some(axis) =
+                        pick_scale_handle_screen(pos, world_origin, node_world_rot, camera, rect)
+                            .or_else(|| {
+                                pick_oriented_scale_shaft(
+                                    orig,
+                                    dir,
+                                    world_origin,
+                                    node_world_rot,
+                                    0.16,
+                                )
+                            })
+                    {
+                        let axis_dir = (node_world_rot * axis.dir()).normalize_or_zero();
+                        let (drag_dir_2d, drag_norm_px) =
+                            scale_screen_drag_basis(world_origin, axis_dir, camera, rect);
+                        *gizmo_drag = Some(GizmoDragState::Scale {
+                            node_id,
+                            axis,
+                            start_transform: node_transform,
+                            start_pointer_pos: pos,
+                            drag_dir_2d,
+                            drag_norm_px,
+                        });
+                        *active_axis = Some(axis);
+                        return true;
+                    }
                 }
             }
         }
     }
 
-    if let Some(drag) = *gizmo_drag {
+    if let Some(mut drag) = *gizmo_drag {
         if response.ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
             cancel_gizmo_drag(scene, gizmo_drag);
             *active_axis = None;
@@ -529,36 +1393,100 @@ fn handle_gizmo_drag_input(
         }
         if response.dragged_by(egui::PointerButton::Primary) {
             if let Some(pos) = response.interact_pointer_pos() {
-                let (orig, dir) = pointer_ray(pos);
-                if let Some((cur_t, _)) =
-                    closest_point_on_axis(orig, dir, drag.start_world_pos, drag.axis.dir())
-                {
-                    let world_delta = drag.axis.dir() * (cur_t - drag.start_axis_t);
-                    let local_delta = drag.parent_world_inv.transform_vector3(world_delta);
-                    if let Some(node) = scene.nodes.get_mut(&drag.node_id) {
-                        node.transform.translation = drag.start_transform.translation + local_delta;
-                        scene.dirty_viewport = true;
+                match &mut drag {
+                    GizmoDragState::Move {
+                        node_id,
+                        axis,
+                        start_transform,
+                        start_world_pos,
+                        parent_world_inv,
+                        start_axis_t,
+                    } => {
+                        let (orig, dir) = pointer_ray(pos);
+                        if let Some((cur_t, _)) =
+                            closest_point_on_axis(orig, dir, *start_world_pos, axis.dir())
+                        {
+                            let world_delta = axis.dir() * (cur_t - *start_axis_t);
+                            let local_delta = parent_world_inv.transform_vector3(world_delta);
+                            let mut preview_tx = *start_transform;
+                            preview_tx.translation = start_transform.translation + local_delta;
+                            scene.preview_node_transform(*node_id, preview_tx);
+                        }
+                    }
+                    GizmoDragState::Rotate(r) => {
+                        // Re-anchor cleanly on mid-drag X/Y/Z key press so there is zero jump
+                        // and releasing the key never reverts the axis.
+                        if let Some(pressed_axis) = axis_key_pressed {
+                            let next_axis = if r.rotate_axis == pressed_axis {
+                                RotateAxisMode::Free
+                            } else {
+                                pressed_axis
+                            };
+                            if let Some(cur_tx) = scene.nodes.get(&r.node_id).map(|n| n.transform) {
+                                r.anchor_transform = cur_tx;
+                            }
+                            r.anchor_pointer_pos = pos;
+                            r.rotate_axis = next_axis;
+                            *rotate_axis_mode = next_axis;
+                        }
+                        let snap = response.ctx.input(|i| i.modifiers.shift);
+                        let delta_px = pos - r.anchor_pointer_pos;
+                        let (preview_tx, delta_deg) = compute_floating_rotate_transform(
+                            r.anchor_transform,
+                            r.parent_world_rot,
+                            camera,
+                            r.start_world_pos,
+                            delta_px,
+                            r.rotate_axis,
+                            snap,
+                        );
+                        r.current_pointer_pos = pos;
+                        r.current_delta_deg = delta_deg;
+                        r.snap_active = snap;
+                        scene.preview_node_transform(r.node_id, preview_tx);
+                    }
+                    GizmoDragState::Scale {
+                        node_id,
+                        axis,
+                        start_transform,
+                        start_pointer_pos,
+                        drag_dir_2d,
+                        drag_norm_px,
+                    } => {
+                        let delta_t = (pos - *start_pointer_pos).dot(*drag_dir_2d) / *drag_norm_px;
+                        let uniform = response.ctx.input(|i| i.modifiers.shift);
+                        let preview_tx = compute_scale_gizmo_transform(
+                            *start_transform,
+                            *axis,
+                            delta_t,
+                            uniform,
+                        );
+                        scene.preview_node_transform(*node_id, preview_tx);
                     }
                 }
+                *gizmo_drag = Some(drag);
             }
             return true;
         }
         if response.drag_stopped_by(egui::PointerButton::Primary) {
-            if let Some(final_tx) = scene.nodes.get(&drag.node_id).map(|n| n.transform) {
-                if let Some(node) = scene.nodes.get_mut(&drag.node_id) {
-                    node.transform = drag.start_transform;
+            let drag_node_id = drag.node_id();
+            let initial_tx = drag.initial_transform();
+            if let Some(final_tx) = scene.nodes.get(&drag_node_id).map(|n| n.transform) {
+                scene.preview_node_transform(drag_node_id, initial_tx);
+                if transform_differs(final_tx, initial_tx) {
+                    super::exec_history(
+                        &response.ctx,
+                        history,
+                        scene,
+                        Command::SetNodeTransform {
+                            node_id: drag_node_id,
+                            transform: final_tx,
+                        },
+                    );
                 }
-                super::exec_history(
-                    &response.ctx,
-                    history,
-                    scene,
-                    Command::SetNodeTransform {
-                        node_id: drag.node_id,
-                        transform: final_tx,
-                    },
-                );
             }
             *gizmo_drag = None;
+            *active_axis = None;
             return true;
         }
         // Drag was interrupted without a normal stop (e.g. focus loss or modal); restore state.
@@ -573,14 +1501,19 @@ fn handle_gizmo_drag_input(
 fn show_viewport_hud(
     ui: &mut egui::Ui,
     rect: egui::Rect,
-    mode: AppMode,
+    scene: &mut SceneState,
     camera_3d: &mut OrbitCamera,
     camera_3d_target: &mut Option<OrbitCamera>,
     showcase_camera: &OrbitCamera,
     camera_2d: &mut PixelCamera2D,
+    interaction_tool: &mut ViewportInteractionTool,
+    gizmo_mode: &mut TransformGizmoMode,
+    show_viewport_gizmo: &mut bool,
     free_view: &mut bool,
     render_preview: &mut bool,
+    gadget_visibility: &mut ViewportGadgetVisibility,
 ) {
+    let mode = scene.active_mode;
     let hud_pos = rect.right_top() + egui::vec2(-10.0, 10.0);
     egui::Area::new(egui::Id::new("tessel_viewport_hud"))
         .anchor(
@@ -630,10 +1563,85 @@ fn show_viewport_hud(
                             if icons::hud_icon_button(
                                 ui,
                                 ToolIcon::Select,
-                                "Select Mode: click objects to select & drag gizmo to move",
-                                !*free_view,
+                                "Move Gizmo: select objects & drag X/Y/Z arrows to translate",
+                                is_transform_gizmo_enabled(
+                                    scene,
+                                    *interaction_tool,
+                                    *free_view,
+                                    *render_preview,
+                                    *show_viewport_gizmo,
+                                ) && *gizmo_mode == TransformGizmoMode::Move,
                             ) {
-                                *free_view = false;
+                                activate_transform_gizmo(
+                                    scene,
+                                    show_viewport_gizmo,
+                                    free_view,
+                                    render_preview,
+                                    interaction_tool,
+                                );
+                                *gizmo_mode = TransformGizmoMode::Move;
+                            }
+                            if icons::hud_icon_button(
+                                ui,
+                                ToolIcon::RotateButton,
+                                "Rotate Gizmo: drag floating disc (Free / X / Y / Z, Shift snap 15°)",
+                                is_transform_gizmo_enabled(
+                                    scene,
+                                    *interaction_tool,
+                                    *free_view,
+                                    *render_preview,
+                                    *show_viewport_gizmo,
+                                ) && *gizmo_mode == TransformGizmoMode::Rotate,
+                            ) {
+                                activate_transform_gizmo(
+                                    scene,
+                                    show_viewport_gizmo,
+                                    free_view,
+                                    render_preview,
+                                    interaction_tool,
+                                );
+                                *gizmo_mode = TransformGizmoMode::Rotate;
+                            }
+                            if icons::hud_icon_button(
+                                ui,
+                                ToolIcon::ScaleButton,
+                                "Scale Gizmo: drag X/Y/Z handles to resize object (Shift for uniform)",
+                                is_transform_gizmo_enabled(
+                                    scene,
+                                    *interaction_tool,
+                                    *free_view,
+                                    *render_preview,
+                                    *show_viewport_gizmo,
+                                ) && *gizmo_mode == TransformGizmoMode::Scale,
+                            ) {
+                                activate_transform_gizmo(
+                                    scene,
+                                    show_viewport_gizmo,
+                                    free_view,
+                                    render_preview,
+                                    interaction_tool,
+                                );
+                                *gizmo_mode = TransformGizmoMode::Scale;
+                            }
+                            if let ViewportInteractionTool::PlacePrimitive(kind) =
+                                *interaction_tool
+                            {
+                                if ui
+                                    .button(
+                                        egui::RichText::new(format!(
+                                            "Placing {} (Esc)",
+                                            kind.label()
+                                        ))
+                                        .size(10.5)
+                                        .color(tokens::PRIMARY),
+                                    )
+                                    .on_hover_text(
+                                        "Click viewport to place (Shift+click to repeat, Esc to cancel)",
+                                    )
+                                    .clicked()
+                                {
+                                    *interaction_tool = ViewportInteractionTool::Select;
+                                }
                             }
                             if icons::hud_icon_button(
                                 ui,
@@ -671,6 +1679,33 @@ fn show_viewport_hud(
                                 false,
                             ) {
                                 *camera_3d_target = Some(*showcase_camera);
+                            }
+                            ui.separator();
+                            let cam_tip = if gadget_visibility.camera {
+                                "Hide Camera Gizmo"
+                            } else {
+                                "Show Camera Gizmo"
+                            };
+                            if icons::hud_icon_button(
+                                ui,
+                                ToolIcon::CameraGizmo,
+                                cam_tip,
+                                gadget_visibility.camera,
+                            ) {
+                                gadget_visibility.camera = !gadget_visibility.camera;
+                            }
+                            let sun_tip = if gadget_visibility.sun {
+                                "Hide Sun Gizmo"
+                            } else {
+                                "Show Sun Gizmo"
+                            };
+                            if icons::hud_icon_button(
+                                ui,
+                                ToolIcon::Sun,
+                                sun_tip,
+                                gadget_visibility.sun,
+                            ) {
+                                gadget_visibility.sun = !gadget_visibility.sun;
                             }
                         }
                     });
@@ -849,7 +1884,7 @@ fn handle_pixel_viewport_input(
             .get(&node_id)
             .and_then(|c| c.sample_active_pixel(coord))
         {
-            scene.active_color = sampled;
+            scene.set_active_color(sampled);
         }
         return;
     }
@@ -1038,27 +2073,59 @@ pub fn selected_node_world_bounds(
     };
     if let Some(mesh) = scene.lowpoly_meshes.get(&node_id) {
         if !mesh.vertices.is_empty() {
-            if parent_override.is_none() {
-                if let Some(rig) = scene.character_rig.as_ref() {
-                    if let Some(solver) = tessel_core::AutoSkinSolver::from_rig(rig, 1.0) {
-                        let skin_mats = solver.skin_matrices(rig);
-                        let mut wmin = glam::Vec3::splat(f32::INFINITY);
-                        let mut wmax = glam::Vec3::splat(f32::NEG_INFINITY);
-                        for (vi, &v) in mesh.vertices.iter().enumerate() {
-                            let wp = mat.transform_point3(v);
-                            let w =
-                                mesh.skin_weights.get(&vi).copied().unwrap_or_else(|| {
-                                    solver.weights_for_vertex(Some(node_id), wp)
-                                });
-                            let (sp, _) =
-                                solver.deform_point_normal(&skin_mats, w, wp, glam::Vec3::Y);
-                            wmin = wmin.min(sp);
-                            wmax = wmax.max(sp);
-                        }
-                        if wmin.is_finite() && wmax.is_finite() {
-                            return Some((wmin, wmax));
+            let rest_mat = scene.node_rest_world_matrix(node_id);
+            let skin_ctx = if parent_override.is_none() {
+                scene
+                    .character_rig
+                    .as_ref()
+                    .filter(|r| r.should_skin_node(node_id))
+                    .and_then(|rig| {
+                        let solver = tessel_core::AutoSkinSolver::from_rig(rig, 1.0)?;
+                        let mats = solver.skin_matrices(rig);
+                        let is_identity = mats
+                            .iter()
+                            .all(|m| m.abs_diff_eq(glam::Mat4::IDENTITY, 1e-4));
+                        (!is_identity).then_some((solver, mats))
+                    })
+            } else {
+                None
+            };
+            let active_morphs: Vec<(f32, &std::collections::BTreeMap<usize, glam::Vec3>)> = mesh
+                .morphs
+                .iter()
+                .filter_map(|m| {
+                    let w = scene
+                        .character_rig
+                        .as_ref()
+                        .and_then(|rig| rig.morph_weights.get(&(node_id, m.name.clone())).copied())
+                        .unwrap_or(m.default_weight);
+                    (w.abs() > 1e-5).then_some((w, &m.deltas))
+                })
+                .collect();
+            if skin_ctx.is_some() || !active_morphs.is_empty() {
+                let mut wmin = glam::Vec3::splat(f32::INFINITY);
+                let mut wmax = glam::Vec3::splat(f32::NEG_INFINITY);
+                for (vi, &v) in mesh.vertices.iter().enumerate() {
+                    let mut lv = v;
+                    for &(w, deltas) in &active_morphs {
+                        if let Some(&delta) = deltas.get(&vi) {
+                            lv += delta * w;
                         }
                     }
+                    let mut wp = mat.transform_point3(lv);
+                    if let Some((solver, skin_mats)) = &skin_ctx {
+                        let w = mesh.skin_weights.get(&vi).copied().unwrap_or_else(|| {
+                            let rest_wp = rest_mat.transform_point3(v);
+                            solver.weights_for_vertex(Some(node_id), rest_wp)
+                        });
+                        let (sp, _) = solver.deform_point_normal(skin_mats, w, wp, glam::Vec3::Y);
+                        wp = sp;
+                    }
+                    wmin = wmin.min(wp);
+                    wmax = wmax.max(wp);
+                }
+                if wmin.is_finite() && wmax.is_finite() {
+                    return Some((wmin, wmax));
                 }
             }
             let (lmin, lmax) = mesh.bounds();
@@ -1067,13 +2134,57 @@ pub fn selected_node_world_bounds(
     }
     if let Some(vol) = scene.voxel_volumes.get(&node_id) {
         if !vol.is_empty() {
+            let s = scene.unit_scale;
+            if parent_override.is_none() {
+                if let Some(rig) = scene
+                    .character_rig
+                    .as_ref()
+                    .filter(|r| r.should_skin_node(node_id))
+                {
+                    if let Some(solver) = tessel_core::AutoSkinSolver::from_rig(rig, 1.0) {
+                        let skin_mats = solver.skin_matrices(rig);
+                        let is_identity = skin_mats
+                            .iter()
+                            .all(|m| m.abs_diff_eq(glam::Mat4::IDENTITY, 1e-4));
+                        if !is_identity {
+                            let rest_mat = scene.node_rest_world_matrix(node_id);
+                            let mut wmin = glam::Vec3::splat(f32::INFINITY);
+                            let mut wmax = glam::Vec3::splat(f32::NEG_INFINITY);
+                            let half = glam::Vec3::splat(s * 0.5);
+                            for (coord, _) in vol.iter_voxels() {
+                                let base = glam::Vec3::new(
+                                    coord.x as f32 * s,
+                                    coord.y as f32 * s,
+                                    coord.z as f32 * s,
+                                );
+                                let center_local = base + half;
+                                let rest_wp = rest_mat.transform_point3(center_local);
+                                let w = solver.weights_for_vertex(Some(node_id), rest_wp);
+                                for corner in [base, base + glam::Vec3::splat(s)] {
+                                    let wp = mat.transform_point3(corner);
+                                    let (sp, _) = solver.deform_point_normal(
+                                        &skin_mats,
+                                        w,
+                                        wp,
+                                        glam::Vec3::Y,
+                                    );
+                                    wmin = wmin.min(sp);
+                                    wmax = wmax.max(sp);
+                                }
+                            }
+                            if wmin.is_finite() && wmax.is_finite() {
+                                return Some((wmin, wmax));
+                            }
+                        }
+                    }
+                }
+            }
             let mut min_c = glam::IVec3::splat(i32::MAX);
             let mut max_c = glam::IVec3::splat(i32::MIN);
             for (coord, _) in vol.iter_voxels() {
                 min_c = min_c.min(glam::IVec3::new(coord.x, coord.y, coord.z));
                 max_c = max_c.max(glam::IVec3::new(coord.x, coord.y, coord.z));
             }
-            let s = scene.unit_scale;
             let lmin = min_c.as_vec3() * s;
             let lmax = (max_c + glam::IVec3::ONE).as_vec3() * s;
             return Some(transform_aabb(mat, lmin, lmax));
@@ -1148,13 +2259,11 @@ pub fn project_bounds_to_screen_rect(
 fn draw_selection_brackets(
     ui: &egui::Ui,
     viewport_rect: egui::Rect,
-    scene: &SceneState,
+    selected_bounds: Option<(glam::Vec3, glam::Vec3)>,
+    selected_name: Option<&str>,
     camera: &OrbitCamera,
 ) {
-    let Some(node_id) = scene.selected_node else {
-        return;
-    };
-    let Some((wmin, wmax)) = selected_node_world_bounds(scene, node_id) else {
+    let Some((wmin, wmax)) = selected_bounds else {
         return;
     };
     let Some(sel) = project_bounds_to_screen_rect(wmin, wmax, camera, viewport_rect) else {
@@ -1182,7 +2291,7 @@ fn draw_selection_brackets(
     painter.line_segment([br, egui::pos2(br.x - arm_x, br.y)], stroke);
     painter.line_segment([br, egui::pos2(br.x, br.y - arm_y)], stroke);
 
-    if let Some(name) = scene.nodes.get(&node_id).map(|n| n.name.as_str()) {
+    if let Some(name) = selected_name {
         let tag_pos = egui::pos2(tl.x + 2.0, (tl.y - 16.0).max(viewport_rect.top() + 4.0));
         painter.text(
             tag_pos,
@@ -1235,11 +2344,118 @@ pub fn project_world_point(
     Some(egui::pos2(sx, sy))
 }
 
-/// Applies pointer drag delta in screen pixels to `(light_azimuth, light_elevation)`.
-pub fn apply_sun_drag_delta(azimuth: f32, elevation: f32, delta_px: egui::Vec2) -> (f32, f32) {
-    let next_az = (azimuth - delta_px.x * 0.012).rem_euclid(std::f32::consts::TAU);
-    let next_el = (elevation - delta_px.y * 0.010).clamp(MIN_SUN_ELEVATION, MAX_SUN_ELEVATION);
-    (next_az, next_el)
+pub(super) fn screen_basis_at_point(
+    camera: &OrbitCamera,
+    world_pos: glam::Vec3,
+) -> (glam::Vec3, glam::Vec3) {
+    let forward = if camera.orthographic {
+        (camera.target - camera.position()).normalize_or_zero()
+    } else {
+        let to_pt = world_pos - camera.position();
+        if to_pt.length_squared() > 1e-6 {
+            to_pt.normalize()
+        } else {
+            (camera.target - camera.position()).normalize_or_zero()
+        }
+    };
+    let mut right = forward.cross(glam::Vec3::Y);
+    if right.length_squared() < 1e-6 {
+        right = glam::Vec3::X;
+    } else {
+        right = right.normalize();
+    }
+    let up = right.cross(forward).normalize_or_zero();
+    (right, up)
+}
+
+/// Solves a damped 2x2 Jacobian step `(d_az, d_el)` so dragging along `delta_px`
+/// moves the spherical gadget along the active `view_camera` screen basis at `world_pos`.
+fn solve_spherical_screen_drag(
+    az: f32,
+    el: f32,
+    world_pos: glam::Vec3,
+    view_camera: &OrbitCamera,
+    delta_px: egui::Vec2,
+    sensitivity: f32,
+) -> (f32, f32) {
+    let (right, up) = screen_basis_at_point(view_camera, world_pos);
+    let (sin_az, cos_az) = az.sin_cos();
+    let (sin_el, cos_el) = el.sin_cos();
+
+    // Unit tangent directions for +azimuth and +elevation on the orbit sphere.
+    let t_az = glam::Vec3::new(cos_az, 0.0, -sin_az);
+    let t_el = glam::Vec3::new(-sin_el * sin_az, cos_el, -sin_el * cos_az);
+
+    // Screen-space columns (x = right, y = down = -up).
+    let j00 = t_az.dot(right);
+    let j10 = -t_az.dot(up);
+    let j01 = t_el.dot(right);
+    let j11 = -t_el.dot(up);
+
+    // Damped least-squares: (J^T J + lambda I)^-1 J^T * b
+    let lambda = 0.08_f32;
+    let a = j00 * j00 + j10 * j10 + lambda;
+    let b = j00 * j01 + j10 * j11;
+    let c = j01 * j01 + j11 * j11 + lambda;
+    let det = a * c - b * b;
+
+    let rhs_0 = j00 * delta_px.x + j10 * delta_px.y;
+    let rhs_1 = j01 * delta_px.x + j11 * delta_px.y;
+
+    let (d_az, d_el) = if det.abs() > 1e-6 {
+        (
+            (c * rhs_0 - b * rhs_1) / det * sensitivity,
+            (-b * rhs_0 + a * rhs_1) / det * sensitivity,
+        )
+    } else {
+        (rhs_0 * sensitivity, rhs_1 * sensitivity)
+    };
+    (az + d_az, el + d_el)
+}
+
+/// Applies pointer drag delta in screen pixels to `(light_azimuth, light_elevation)`
+/// relative to the active viewport `camera` screen basis (`right` and `up`).
+pub fn apply_sun_drag_delta(
+    azimuth: f32,
+    elevation: f32,
+    delta_px: egui::Vec2,
+    camera: &OrbitCamera,
+) -> (f32, f32) {
+    let sun_world =
+        light_world_position(camera.target, azimuth, elevation, sun_gizmo_radius(camera));
+    let (next_az, next_el) =
+        solve_spherical_screen_drag(azimuth, elevation, sun_world, camera, delta_px, 0.011);
+    (
+        next_az.rem_euclid(std::f32::consts::TAU),
+        next_el.clamp(MIN_SUN_ELEVATION, MAX_SUN_ELEVATION),
+    )
+}
+
+/// Applies pointer drag delta in screen pixels to `showcase_camera` relative to the
+/// active viewport `view_camera` screen basis (`right` and `up`).
+pub fn apply_camera_gizmo_drag_delta(
+    showcase_camera: &mut OrbitCamera,
+    view_camera: &OrbitCamera,
+    delta_px: egui::Vec2,
+    pan_mode: bool,
+) {
+    let pos = showcase_camera.position();
+    if pan_mode {
+        let (right, up) = screen_basis_at_point(view_camera, pos);
+        let scale = view_camera.distance * 0.0018;
+        showcase_camera.target += (right * delta_px.x - up * delta_px.y) * scale;
+    } else {
+        let (next_yaw, next_pitch) = solve_spherical_screen_drag(
+            showcase_camera.yaw,
+            showcase_camera.pitch,
+            pos,
+            view_camera,
+            delta_px,
+            0.008,
+        );
+        showcase_camera.yaw = next_yaw;
+        showcase_camera.pitch = next_pitch.clamp(-1.52, 1.52);
+    }
 }
 
 fn sun_gizmo_radius(camera: &OrbitCamera) -> f32 {
@@ -1259,15 +2475,26 @@ fn handle_scene_gadget_input(
     showcase_camera_target: &mut Option<OrbitCamera>,
     display_light: (f32, f32),
     gadget_drag: &mut Option<SceneGadgetDrag>,
+    visibility: ViewportGadgetVisibility,
 ) -> bool {
-    let sun_world = light_world_position(
-        camera_3d.target,
-        display_light.0,
-        display_light.1,
-        sun_gizmo_radius(camera_3d),
-    );
-    let sun_screen = project_world_point(sun_world, camera_3d, rect);
-    let cam_screen = project_world_point(showcase_camera.position(), camera_3d, rect);
+    cancel_hidden_scene_gadget_drag(scene, gadget_drag, visibility);
+
+    let sun_screen = if visibility.sun {
+        let sun_world = light_world_position(
+            camera_3d.target,
+            display_light.0,
+            display_light.1,
+            sun_gizmo_radius(camera_3d),
+        );
+        project_world_point(sun_world, camera_3d, rect)
+    } else {
+        None
+    };
+    let cam_screen = if visibility.camera {
+        project_world_point(showcase_camera.position(), camera_3d, rect)
+    } else {
+        None
+    };
 
     if response.double_clicked_by(egui::PointerButton::Primary) {
         if let (Some(pos), Some(cs)) = (response.interact_pointer_pos(), cam_screen) {
@@ -1311,11 +2538,13 @@ fn handle_scene_gadget_input(
             } => {
                 if response.dragged_by(egui::PointerButton::Primary) {
                     let delta = response.drag_delta();
-                    let (az, el) =
-                        apply_sun_drag_delta(scene.light_azimuth, scene.light_elevation, delta);
-                    scene.light_azimuth = az;
-                    scene.light_elevation = el;
-                    scene.dirty_viewport = true;
+                    let (az, el) = apply_sun_drag_delta(
+                        scene.light_azimuth,
+                        scene.light_elevation,
+                        delta,
+                        camera_3d,
+                    );
+                    scene.preview_lighting(az, el);
                     return true;
                 }
                 if response.drag_stopped_by(egui::PointerButton::Primary) {
@@ -1341,11 +2570,8 @@ fn handle_scene_gadget_input(
                 if response.dragged_by(egui::PointerButton::Primary) {
                     *showcase_camera_target = None;
                     let delta = response.drag_delta();
-                    if ui.input(|i| i.modifiers.shift) {
-                        showcase_camera.pan(delta.x, delta.y);
-                    } else {
-                        showcase_camera.orbit(delta.x, delta.y);
-                    }
+                    let pan_mode = ui.input(|i| i.modifiers.shift);
+                    apply_camera_gizmo_drag_delta(showcase_camera, camera_3d, delta, pan_mode);
                     return true;
                 }
                 if response.drag_stopped_by(egui::PointerButton::Primary) {
@@ -1360,6 +2586,23 @@ fn handle_scene_gadget_input(
     false
 }
 
+fn cancel_hidden_scene_gadget_drag(
+    scene: &mut SceneState,
+    gadget_drag: &mut Option<SceneGadgetDrag>,
+    visibility: ViewportGadgetVisibility,
+) {
+    match *gadget_drag {
+        Some(SceneGadgetDrag::Sun { .. }) if !visibility.sun => {
+            cancel_scene_gadget_drag(scene, gadget_drag);
+        }
+        Some(SceneGadgetDrag::Camera) if !visibility.camera => {
+            *gadget_drag = None;
+        }
+        _ => {}
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn draw_scene_gadgets(
     ui: &egui::Ui,
     viewport_rect: egui::Rect,
@@ -1368,137 +2611,155 @@ fn draw_scene_gadgets(
     camera_3d: &OrbitCamera,
     showcase_camera: &OrbitCamera,
     active_drag: Option<SceneGadgetDrag>,
+    visibility: ViewportGadgetVisibility,
 ) {
+    if !visibility.sun && !visibility.camera {
+        return;
+    }
     let painter = ui.painter_at(viewport_rect);
     let hover = response.hover_pos();
 
     // 1. Draggable Sun / Key Light gizmo
-    let sun_world = light_world_position(
-        camera_3d.target,
-        display_light.0,
-        display_light.1,
-        sun_gizmo_radius(camera_3d),
-    );
-    if let Some(sun_pos) = project_world_point(sun_world, camera_3d, viewport_rect) {
-        let sun_active = matches!(active_drag, Some(SceneGadgetDrag::Sun { .. }))
-            || hover.is_some_and(|h| h.distance(sun_pos) <= GADGET_HIT_RADIUS_PX);
-        let sun_gold = egui::Color32::from_rgb(255, 206, 84);
-        let sun_ray_col =
-            egui::Color32::from_rgba_unmultiplied(255, 206, 84, if sun_active { 170 } else { 95 });
-        if let Some(target_pos) = project_world_point(camera_3d.target, camera_3d, viewport_rect) {
-            painter.line_segment([sun_pos, target_pos], Stroke::new(1.4_f32, sun_ray_col));
-        }
-        let fill = if sun_active {
-            egui::Color32::from_rgba_unmultiplied(68, 52, 18, 235)
-        } else {
-            egui::Color32::from_rgba_unmultiplied(28, 30, 38, 215)
-        };
-        painter.circle_filled(sun_pos, 14.5, fill);
-        painter.circle_stroke(
-            sun_pos,
-            14.5,
-            Stroke::new(if sun_active { 2.2_f32 } else { 1.5_f32 }, sun_gold),
+    if visibility.sun {
+        let sun_world = light_world_position(
+            camera_3d.target,
+            display_light.0,
+            display_light.1,
+            sun_gizmo_radius(camera_3d),
         );
-        painter.text(
-            sun_pos,
-            egui::Align2::CENTER_CENTER,
-            ToolIcon::Sun.glyph(),
-            egui::FontId::proportional(16.0),
-            sun_gold,
-        );
-        if sun_active {
+        if let Some(sun_pos) = project_world_point(sun_world, camera_3d, viewport_rect) {
+            let sun_active = matches!(active_drag, Some(SceneGadgetDrag::Sun { .. }))
+                || hover.is_some_and(|h| h.distance(sun_pos) <= GADGET_HIT_RADIUS_PX);
+            let sun_gold = egui::Color32::from_rgb(255, 206, 84);
+            let sun_ray_col = egui::Color32::from_rgba_unmultiplied(
+                255,
+                206,
+                84,
+                if sun_active { 170 } else { 95 },
+            );
+            if let Some(target_pos) =
+                project_world_point(camera_3d.target, camera_3d, viewport_rect)
+            {
+                painter.line_segment([sun_pos, target_pos], Stroke::new(1.4_f32, sun_ray_col));
+            }
+            let fill = if sun_active {
+                egui::Color32::from_rgba_unmultiplied(68, 52, 18, 235)
+            } else {
+                egui::Color32::from_rgba_unmultiplied(28, 30, 38, 215)
+            };
+            painter.circle_filled(sun_pos, 14.5, fill);
+            painter.circle_stroke(
+                sun_pos,
+                14.5,
+                Stroke::new(if sun_active { 2.2_f32 } else { 1.5_f32 }, sun_gold),
+            );
             painter.text(
-                sun_pos + egui::vec2(0.0, 21.0),
-                egui::Align2::CENTER_TOP,
-                format!(
-                    "SUN {:.0}° / {:.0}°",
-                    display_light.0.to_degrees(),
-                    display_light.1.to_degrees()
-                ),
-                egui::FontId::monospace(10.0),
+                sun_pos,
+                egui::Align2::CENTER_CENTER,
+                ToolIcon::Sun.glyph(),
+                egui::FontId::proportional(16.0),
                 sun_gold,
             );
+            if sun_active {
+                painter.text(
+                    sun_pos + egui::vec2(0.0, 21.0),
+                    egui::Align2::CENTER_TOP,
+                    format!(
+                        "SUN {:.0}° / {:.0}°",
+                        display_light.0.to_degrees(),
+                        display_light.1.to_degrees()
+                    ),
+                    egui::FontId::monospace(10.0),
+                    sun_gold,
+                );
+            }
         }
     }
 
     // 2. Draggable Camera / Projector proxy gizmo + frustum pyramid
-    let cam_origin = showcase_camera.position();
-    if let Some(cam_pos) = project_world_point(cam_origin, camera_3d, viewport_rect) {
-        let cam_active = matches!(active_drag, Some(SceneGadgetDrag::Camera))
-            || hover.is_some_and(|h| h.distance(cam_pos) <= GADGET_HIT_RADIUS_PX);
-        let cam_cyan = egui::Color32::from_rgb(92, 196, 255);
-        let frustum_col =
-            egui::Color32::from_rgba_unmultiplied(92, 196, 255, if cam_active { 200 } else { 120 });
-
-        let fwd = (showcase_camera.target - cam_origin).normalize_or_zero();
-        let right = fwd.cross(glam::Vec3::Y).normalize_or_zero();
-        let up = right.cross(fwd).normalize_or_zero();
-        let frustum_center = cam_origin + fwd * 0.65;
-        let hw = 0.24;
-        let hh = 0.15;
-        let corners_world = [
-            frustum_center - right * hw + up * hh,
-            frustum_center + right * hw + up * hh,
-            frustum_center + right * hw - up * hh,
-            frustum_center - right * hw - up * hh,
-        ];
-        let corners_2d: [Option<egui::Pos2>; 4] = [
-            project_world_point(corners_world[0], camera_3d, viewport_rect),
-            project_world_point(corners_world[1], camera_3d, viewport_rect),
-            project_world_point(corners_world[2], camera_3d, viewport_rect),
-            project_world_point(corners_world[3], camera_3d, viewport_rect),
-        ];
-        for c in corners_2d.into_iter().flatten() {
-            painter.line_segment([cam_pos, c], Stroke::new(1.3_f32, frustum_col));
-        }
-        for i in 0..4 {
-            if let (Some(a), Some(b)) = (corners_2d[i], corners_2d[(i + 1) % 4]) {
-                painter.line_segment([a, b], Stroke::new(1.3_f32, frustum_col));
-            }
-        }
-        if let Some(target_pos) =
-            project_world_point(showcase_camera.target, camera_3d, viewport_rect)
-        {
-            painter.line_segment(
-                [cam_pos, target_pos],
-                Stroke::new(
-                    1.0_f32,
-                    egui::Color32::from_rgba_unmultiplied(
-                        92,
-                        196,
-                        255,
-                        if cam_active { 125 } else { 55 },
-                    ),
-                ),
+    if visibility.camera {
+        let cam_origin = showcase_camera.position();
+        if let Some(cam_pos) = project_world_point(cam_origin, camera_3d, viewport_rect) {
+            let cam_active = matches!(active_drag, Some(SceneGadgetDrag::Camera))
+                || hover.is_some_and(|h| h.distance(cam_pos) <= GADGET_HIT_RADIUS_PX);
+            let cam_cyan = egui::Color32::from_rgb(92, 196, 255);
+            let frustum_col = egui::Color32::from_rgba_unmultiplied(
+                92,
+                196,
+                255,
+                if cam_active { 200 } else { 120 },
             );
-        }
 
-        let fill = if cam_active {
-            egui::Color32::from_rgba_unmultiplied(20, 48, 68, 235)
-        } else {
-            egui::Color32::from_rgba_unmultiplied(28, 30, 38, 215)
-        };
-        painter.circle_filled(cam_pos, 14.5, fill);
-        painter.circle_stroke(
-            cam_pos,
-            14.5,
-            Stroke::new(if cam_active { 2.2_f32 } else { 1.5_f32 }, cam_cyan),
-        );
-        painter.text(
-            cam_pos,
-            egui::Align2::CENTER_CENTER,
-            ToolIcon::SceneCamera.glyph(),
-            egui::FontId::proportional(15.5),
-            cam_cyan,
-        );
-        if cam_active {
+            let fwd = (showcase_camera.target - cam_origin).normalize_or_zero();
+            let right = fwd.cross(glam::Vec3::Y).normalize_or_zero();
+            let up = right.cross(fwd).normalize_or_zero();
+            let frustum_center = cam_origin + fwd * 0.65;
+            let hw = 0.24;
+            let hh = 0.15;
+            let corners_world = [
+                frustum_center - right * hw + up * hh,
+                frustum_center + right * hw + up * hh,
+                frustum_center + right * hw - up * hh,
+                frustum_center - right * hw - up * hh,
+            ];
+            let corners_2d: [Option<egui::Pos2>; 4] = [
+                project_world_point(corners_world[0], camera_3d, viewport_rect),
+                project_world_point(corners_world[1], camera_3d, viewport_rect),
+                project_world_point(corners_world[2], camera_3d, viewport_rect),
+                project_world_point(corners_world[3], camera_3d, viewport_rect),
+            ];
+            for c in corners_2d.into_iter().flatten() {
+                painter.line_segment([cam_pos, c], Stroke::new(1.3_f32, frustum_col));
+            }
+            for i in 0..4 {
+                if let (Some(a), Some(b)) = (corners_2d[i], corners_2d[(i + 1) % 4]) {
+                    painter.line_segment([a, b], Stroke::new(1.3_f32, frustum_col));
+                }
+            }
+            if let Some(target_pos) =
+                project_world_point(showcase_camera.target, camera_3d, viewport_rect)
+            {
+                painter.line_segment(
+                    [cam_pos, target_pos],
+                    Stroke::new(
+                        1.0_f32,
+                        egui::Color32::from_rgba_unmultiplied(
+                            92,
+                            196,
+                            255,
+                            if cam_active { 125 } else { 55 },
+                        ),
+                    ),
+                );
+            }
+
+            let fill = if cam_active {
+                egui::Color32::from_rgba_unmultiplied(20, 48, 68, 235)
+            } else {
+                egui::Color32::from_rgba_unmultiplied(28, 30, 38, 215)
+            };
+            painter.circle_filled(cam_pos, 14.5, fill);
+            painter.circle_stroke(
+                cam_pos,
+                14.5,
+                Stroke::new(if cam_active { 2.2_f32 } else { 1.5_f32 }, cam_cyan),
+            );
             painter.text(
-                cam_pos + egui::vec2(0.0, 21.0),
-                egui::Align2::CENTER_TOP,
-                "CAM (drag / 2x click)",
-                egui::FontId::monospace(10.0),
+                cam_pos,
+                egui::Align2::CENTER_CENTER,
+                ToolIcon::SceneCamera.glyph(),
+                egui::FontId::proportional(15.5),
                 cam_cyan,
             );
+            if cam_active {
+                painter.text(
+                    cam_pos + egui::vec2(0.0, 21.0),
+                    egui::Align2::CENTER_TOP,
+                    "CAM (drag / 2x click)",
+                    egui::FontId::monospace(10.0),
+                    cam_cyan,
+                );
+            }
         }
     }
 }
@@ -1546,12 +2807,93 @@ mod tests {
 
     #[test]
     fn apply_sun_drag_delta_updates_azimuth_and_clamps_elevation() {
-        let (az, el) = apply_sun_drag_delta(0.5, 0.8, egui::vec2(100.0, -500.0));
+        let cam = OrbitCamera::new();
+        let (az, el) = apply_sun_drag_delta(0.5, 0.8, egui::vec2(10.0, -500.0), &cam);
         assert!((0.0..std::f32::consts::TAU).contains(&az));
         assert!((el - MAX_SUN_ELEVATION).abs() < 1e-5);
 
-        let (_, el_low) = apply_sun_drag_delta(0.5, 0.2, egui::vec2(0.0, 500.0));
+        let (_, el_low) = apply_sun_drag_delta(0.5, 0.4, egui::vec2(0.0, 500.0), &cam);
         assert!((el_low - MIN_SUN_ELEVATION).abs() < 1e-5);
+    }
+
+    #[test]
+    fn sun_and_camera_gizmo_drag_follow_screen_view_across_camera_angles() {
+        let vp = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 600.0));
+        let mut cam_front = OrbitCamera::new();
+        cam_front.yaw = 0.0;
+        cam_front.pitch = 0.25;
+        let mut cam_back = OrbitCamera::new();
+        cam_back.yaw = std::f32::consts::PI;
+        cam_back.pitch = 0.25;
+        let mut cam_side = OrbitCamera::new();
+        cam_side.yaw = std::f32::consts::FRAC_PI_2;
+        cam_side.pitch = 0.25;
+
+        for view_cam in [cam_front, cam_back, cam_side] {
+            // Sun drag right (+x) moves projected sun right (+x) on screen; drag down (+y) moves down (+y).
+            let az0 = 0.6;
+            let el0 = 0.7;
+            let r = sun_gizmo_radius(&view_cam);
+            let s0 = project_world_point(
+                light_world_position(view_cam.target, az0, el0, r),
+                &view_cam,
+                vp,
+            )
+            .unwrap();
+            let (az_r, el_r) = apply_sun_drag_delta(az0, el0, egui::vec2(12.0, 0.0), &view_cam);
+            let sr = project_world_point(
+                light_world_position(view_cam.target, az_r, el_r, r),
+                &view_cam,
+                vp,
+            )
+            .unwrap();
+            assert!(
+                sr.x > s0.x,
+                "sun drag right should move screen x right for yaw={}",
+                view_cam.yaw
+            );
+
+            let (az_d, el_d) = apply_sun_drag_delta(az0, el0, egui::vec2(0.0, 12.0), &view_cam);
+            let sd = project_world_point(
+                light_world_position(view_cam.target, az_d, el_d, r),
+                &view_cam,
+                vp,
+            )
+            .unwrap();
+            assert!(
+                sd.y > s0.y,
+                "sun drag down should move screen y down for yaw={}",
+                view_cam.yaw
+            );
+
+            // Showcase camera drag right/down (both orbit and shift-pan) follows screen cursor.
+            let mut sc_orbit = OrbitCamera::new();
+            sc_orbit.yaw = -0.5;
+            sc_orbit.pitch = 0.4;
+            let c0 = project_world_point(sc_orbit.position(), &view_cam, vp).unwrap();
+            let mut sc_right = sc_orbit;
+            apply_camera_gizmo_drag_delta(&mut sc_right, &view_cam, egui::vec2(14.0, 0.0), false);
+            let cr = project_world_point(sc_right.position(), &view_cam, vp).unwrap();
+            assert!(
+                cr.x > c0.x,
+                "camera orbit drag right should move screen x right for yaw={}",
+                view_cam.yaw
+            );
+
+            let mut sc_down = sc_orbit;
+            apply_camera_gizmo_drag_delta(&mut sc_down, &view_cam, egui::vec2(0.0, 14.0), false);
+            let cd = project_world_point(sc_down.position(), &view_cam, vp).unwrap();
+            assert!(
+                cd.y > c0.y,
+                "camera orbit drag down should move screen y down for yaw={}",
+                view_cam.yaw
+            );
+
+            let mut sc_pan = sc_orbit;
+            apply_camera_gizmo_drag_delta(&mut sc_pan, &view_cam, egui::vec2(20.0, 10.0), true);
+            let cp = project_world_point(sc_pan.position(), &view_cam, vp).unwrap();
+            assert!(cp.x > c0.x && cp.y > c0.y);
+        }
     }
 
     #[test]
@@ -1604,7 +2946,7 @@ mod tests {
         // Simulate mid-drag node mutation followed by cancel.
         scene.nodes.get_mut(&node_id).unwrap().transform.translation =
             glam::Vec3::new(3.0, 2.0, -1.0);
-        let mut gizmo_drag = Some(GizmoDragState {
+        let mut gizmo_drag = Some(GizmoDragState::Move {
             node_id,
             axis: GizmoAxis::X,
             start_transform: start_tx,
@@ -1634,5 +2976,231 @@ mod tests {
         assert!((scene.light_elevation - orig_el).abs() < 1e-6);
         assert_eq!(scene.revision, start_rev);
         assert!(scene.dirty_viewport);
+    }
+
+    #[test]
+    fn hiding_gadget_cancels_only_hidden_drag() {
+        let mut scene = SceneState::new();
+        let orig_az = scene.light_azimuth;
+        let orig_el = scene.light_elevation;
+
+        scene.light_azimuth = 2.0;
+        let mut drag = Some(SceneGadgetDrag::Sun {
+            start_azimuth: orig_az,
+            start_elevation: orig_el,
+        });
+        cancel_hidden_scene_gadget_drag(
+            &mut scene,
+            &mut drag,
+            ViewportGadgetVisibility {
+                camera: false,
+                sun: true,
+            },
+        );
+        assert!(drag.is_some());
+
+        cancel_hidden_scene_gadget_drag(
+            &mut scene,
+            &mut drag,
+            ViewportGadgetVisibility {
+                camera: true,
+                sun: false,
+            },
+        );
+        assert!(drag.is_none());
+        assert!((scene.light_azimuth - orig_az).abs() < 1e-6);
+
+        let mut cam_drag = Some(SceneGadgetDrag::Camera);
+        cancel_hidden_scene_gadget_drag(
+            &mut scene,
+            &mut cam_drag,
+            ViewportGadgetVisibility {
+                camera: false,
+                sun: true,
+            },
+        );
+        assert!(cam_drag.is_none());
+    }
+
+    #[test]
+    fn raycast_placement_hits_ground_and_mesh_surface() {
+        let mut scene = SceneState::new();
+        // Downward ray hits y = 0 ground plane at (2, 0, -1).
+        let pt = raycast_placement_point(
+            &scene,
+            glam::Vec3::new(2.0, 5.0, -1.0),
+            glam::Vec3::new(0.0, -1.0, 0.0),
+        )
+        .unwrap();
+        assert!((pt - glam::Vec3::new(2.0, 0.0, -1.0)).length() < 1e-4);
+
+        // Upward ray misses ground plane.
+        assert!(raycast_placement_point(
+            &scene,
+            glam::Vec3::new(0.0, 2.0, 0.0),
+            glam::Vec3::new(0.0, 1.0, 0.0),
+        )
+        .is_none());
+
+        // Adding a cube at origin causes downward ray at (0, 5, 0) to land on top of cube (y > 0.5).
+        Command::CreatePrimitiveMesh {
+            name: "Cube".into(),
+            kind: tessel_core::PrimitiveKind::Cube,
+            size: 1.0,
+            material: scene.active_color,
+        }
+        .apply(&mut scene)
+        .unwrap();
+        let top_hit = raycast_placement_point(
+            &scene,
+            glam::Vec3::new(0.0, 5.0, 0.0),
+            glam::Vec3::new(0.0, -1.0, 0.0),
+        )
+        .unwrap();
+        assert!(top_hit.y > 0.5, "expected hit on cube top, got {top_hit:?}");
+    }
+
+    #[test]
+    fn pick_scene_node_selects_voxel_and_mesh_objects() {
+        let mut scene = SceneState::new();
+        Command::CreateVoxelVolume { name: "Vox".into() }
+            .apply(&mut scene)
+            .unwrap();
+        let vox_id = scene.active_voxel_node().unwrap();
+        Command::SetVoxels {
+            node_id: vox_id,
+            edits: vec![VoxelEdit {
+                coord: VoxelCoord::new(0, 0, 0),
+                color: Some(scene.active_color),
+            }],
+        }
+        .apply(&mut scene)
+        .unwrap();
+
+        let (picked, face) = pick_scene_node(
+            &scene,
+            glam::Vec3::new(0.05, 2.0, 0.05),
+            glam::Vec3::new(0.0, -1.0, 0.0),
+        )
+        .unwrap();
+        assert_eq!(picked, vox_id);
+        assert!(face.is_none());
+    }
+
+    #[test]
+    fn scale_gizmo_transform_handles_axis_uniform_clamp_and_nan() {
+        let start = Transform::default();
+
+        // Per-axis X scale by +0.5 -> scale.x = 1.5, Y/Z unchanged.
+        let tx_x = compute_scale_gizmo_transform(start, GizmoAxis::X, 0.5, false);
+        assert!((tx_x.scale.x - 1.5).abs() < 1e-4);
+        assert!((tx_x.scale.y - 1.0).abs() < 1e-4);
+        assert!((tx_x.scale.z - 1.0).abs() < 1e-4);
+
+        // Uniform Shift scale by +1.0 -> all axes doubled.
+        let tx_u = compute_scale_gizmo_transform(start, GizmoAxis::Y, 1.0, true);
+        assert!((tx_u.scale - glam::Vec3::splat(2.0)).length() < 1e-4);
+
+        // Extreme negative drag clamps safely above zero (never flips negative).
+        let tx_min = compute_scale_gizmo_transform(start, GizmoAxis::Z, -50.0, false);
+        assert!(tx_min.scale.z >= 0.005);
+
+        // Mirrored (negative) scale preserves its sign.
+        let mut mirrored = start;
+        mirrored.scale = glam::Vec3::new(-2.0, 1.0, 1.0);
+        let tx_mir = compute_scale_gizmo_transform(mirrored, GizmoAxis::X, 0.5, false);
+        assert!(
+            (tx_mir.scale.x + 3.0).abs() < 1e-4,
+            "got {:?}",
+            tx_mir.scale
+        );
+
+        // Uniform clamping preserves exact aspect ratio on non-uniform scales.
+        let mut non_uniform = start;
+        non_uniform.scale = glam::Vec3::new(10.0, 20.0, 50.0);
+        let tx_clamped = compute_scale_gizmo_transform(non_uniform, GizmoAxis::X, 5.0, true);
+        assert!((tx_clamped.scale.z - 100.0).abs() < 1e-3);
+        assert!((tx_clamped.scale.x / tx_clamped.scale.z - 0.2).abs() < 1e-4);
+        assert!((tx_clamped.scale.y / tx_clamped.scale.z - 0.4).abs() < 1e-4);
+
+        // Non-finite delta returns start transform untouched.
+        let tx_nan = compute_scale_gizmo_transform(start, GizmoAxis::X, f32::NAN, false);
+        assert_eq!(tx_nan, start);
+    }
+
+    #[test]
+    fn g1_selected_node_world_bounds_skips_skinning_for_unrigged_node() {
+        let mut scene = SceneState::new();
+        Command::CreatePrimitiveMesh {
+            name: "StaticProp".into(),
+            kind: tessel_core::PrimitiveKind::Cube,
+            size: 1.0,
+            material: scene.active_color,
+        }
+        .apply(&mut scene)
+        .unwrap();
+        let node_id = scene.selected_node.unwrap();
+        let rest_bounds = selected_node_world_bounds(&scene, node_id).unwrap();
+
+        Command::ApplyBipedRig.apply(&mut scene).unwrap();
+        let root_id = scene.character_rig.as_ref().unwrap().bones[0].id;
+        Command::SetBoneTranslation {
+            bone_id: root_id,
+            translation: glam::Vec3::new(0.0, 10.0, 0.0),
+        }
+        .apply(&mut scene)
+        .unwrap();
+
+        let skinned_bounds = selected_node_world_bounds(&scene, node_id).unwrap();
+        assert!(
+            skinned_bounds.0.y > rest_bounds.0.y + 5.0,
+            "skinned node bounds should follow root bone translation"
+        );
+
+        Command::SetNodeRigSkinned {
+            node_id,
+            skinned: false,
+        }
+        .apply(&mut scene)
+        .unwrap();
+        let unrigged_bounds = selected_node_world_bounds(&scene, node_id).unwrap();
+        assert!(
+            (unrigged_bounds.0 - rest_bounds.0).length() < 1e-4
+                && (unrigged_bounds.1 - rest_bounds.1).length() < 1e-4,
+            "unrigged node bounds must stay at rest transform"
+        );
+
+        // VoxelVolume bounds must also follow skinning when rigged and stay at rest when unrigged.
+        Command::CreateVoxelVolume {
+            name: "VoxHero".into(),
+        }
+        .apply(&mut scene)
+        .unwrap();
+        let vox_id = scene.active_voxel_node().unwrap();
+        Command::SetVoxels {
+            node_id: vox_id,
+            edits: vec![VoxelEdit {
+                coord: VoxelCoord::new(0, 8, 0),
+                color: Some(scene.active_color),
+            }],
+        }
+        .apply(&mut scene)
+        .unwrap();
+        let vox_skinned = selected_node_world_bounds(&scene, vox_id).unwrap();
+        assert!(
+            vox_skinned.0.y > 5.0,
+            "skinned voxel bounds should follow root bone translation"
+        );
+        Command::SetNodeRigSkinned {
+            node_id: vox_id,
+            skinned: false,
+        }
+        .apply(&mut scene)
+        .unwrap();
+        let vox_unrigged = selected_node_world_bounds(&scene, vox_id).unwrap();
+        assert!(
+            vox_unrigged.0.y < 1.5,
+            "unrigged voxel bounds must stay at rest transform"
+        );
     }
 }

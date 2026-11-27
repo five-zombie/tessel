@@ -33,7 +33,20 @@ fn default_true() -> bool {
     true
 }
 
-/// Sub-Unit: PBR surface material properties for a `LowPolyMesh` (rendered live & exported to `.glb`).
+fn default_one() -> f32 {
+    1.0
+}
+
+/// Identifies an optional NPR / Sumi-e texture slot on a `LowPolyMesh` (`L2`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NprTextureSlot {
+    MatCap,
+    FaceSdf,
+    HatchingRamp,
+}
+
+/// Sub-Unit: PBR & NPR surface material properties for a `LowPolyMesh` (rendered live & exported to `.glb`).
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct MeshMaterial {
     pub metallic: f32,
@@ -49,6 +62,15 @@ pub struct MeshMaterial {
     pub alpha_mode: AlphaMode,
     #[serde(default)]
     pub unlit: bool,
+    /// Blend strength (`0.0..=1.0`) for the optional custom MatCap texture slot (`L2`).
+    #[serde(default)]
+    pub matcap_strength: f32,
+    /// UV tiling scale for the optional multi-level hatching ramp texture (`L2`).
+    #[serde(default = "default_one")]
+    pub hatching_scale: f32,
+    /// Optional light direction override `[x, y, z]` for Face SDF shadow evaluation (`L2`).
+    #[serde(default)]
+    pub face_sdf_light_override: Option<[f32; 3]>,
 }
 
 impl Default for MeshMaterial {
@@ -62,6 +84,9 @@ impl Default for MeshMaterial {
             receive_shadow: true,
             alpha_mode: AlphaMode::Opaque,
             unlit: false,
+            matcap_strength: 0.0,
+            hatching_scale: 1.0,
+            face_sdf_light_override: None,
         }
     }
 }
@@ -94,6 +119,15 @@ pub struct LowPolyMesh {
     pub normal_map: Option<MeshTexture>,
     #[serde(default)]
     pub ao_map: Option<MeshTexture>,
+    /// Optional custom MatCap spherical reflection texture (`L2`).
+    #[serde(default)]
+    pub matcap_map: Option<MeshTexture>,
+    /// Optional Face SDF shadow threshold map for anime / sumi-e face lighting (`L2`).
+    #[serde(default)]
+    pub face_sdf_map: Option<MeshTexture>,
+    /// Optional multi-level hatching ramp texture (`L2`).
+    #[serde(default)]
+    pub hatching_ramp_map: Option<MeshTexture>,
     #[serde(default)]
     pub smooth_shading: bool,
     #[serde(default)]
@@ -120,6 +154,9 @@ pub struct LowPolyMesh {
     /// Explicit interior ink-crease edges `(vertex_a, vertex_b)` for NPR / stylized line art.
     #[serde(default)]
     pub crease_edges: Vec<(usize, usize)>,
+    /// Explicit manual UV seam edges `(vertex_a, vertex_b)` canonicalized as `a <= b` (`M1`).
+    #[serde(default)]
+    pub uv_seams: Vec<(usize, usize)>,
     /// Optional custom/proxy vertex normals (e.g. transferred sphere normals for clean anime/sumi-e faces).
     #[serde(default)]
     pub proxy_normals: BTreeMap<usize, Vec3>,

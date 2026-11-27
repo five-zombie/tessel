@@ -34,6 +34,10 @@ impl UndoDelta {
                 scene.node_extras.remove(id);
                 scene.collision_hulls.remove(id);
                 scene.mesh_instances.remove(id);
+                if let Some(rig) = scene.character_rig.as_mut() {
+                    rig.bindings.retain(|b| b.node_id != *id);
+                    rig.unrigged_nodes.remove(id);
+                }
                 scene.rollback_node_id(*id);
                 scene.selected_node = *previous_selection;
             }
@@ -255,6 +259,34 @@ impl UndoDelta {
                     .ok_or(CoreError::LowPolyMeshNotFound(*node_id))?;
                 mesh.ao_map = previous.clone();
             }
+            Self::RestoreMeshNprSlot {
+                node_id,
+                slot,
+                previous,
+            } => {
+                let mesh = scene
+                    .lowpoly_meshes
+                    .get_mut(node_id)
+                    .ok_or(CoreError::LowPolyMeshNotFound(*node_id))?;
+                match slot {
+                    crate::mesh::NprTextureSlot::MatCap => mesh.matcap_map = previous.clone(),
+                    crate::mesh::NprTextureSlot::FaceSdf => mesh.face_sdf_map = previous.clone(),
+                    crate::mesh::NprTextureSlot::HatchingRamp => {
+                        mesh.hatching_ramp_map = previous.clone()
+                    }
+                }
+            }
+            Self::RestoreMeshVertexPositions { node_id, previous } => {
+                let mesh = scene
+                    .lowpoly_meshes
+                    .get_mut(node_id)
+                    .ok_or(CoreError::LowPolyMeshNotFound(*node_id))?;
+                for &(vi, pos) in previous {
+                    if let Some(v) = mesh.vertices.get_mut(vi) {
+                        *v = pos;
+                    }
+                }
+            }
             Self::RestoreMeshPaintLayers {
                 node_id,
                 previous_layers,
@@ -313,6 +345,23 @@ impl UndoDelta {
             }
             Self::RestoreCharacterRig(prev) => {
                 scene.character_rig = prev.clone();
+                if let Some(sel_bone) = scene.selected_bone {
+                    let still_exists = scene
+                        .character_rig
+                        .as_ref()
+                        .is_some_and(|r| r.bone(sel_bone).is_some());
+                    if !still_exists {
+                        scene.selected_bone = None;
+                    }
+                }
+            }
+            Self::RestoreBoneName { bone_id, previous } => {
+                let rig = scene
+                    .character_rig
+                    .as_mut()
+                    .ok_or(CoreError::CharacterRigNotFound)?;
+                let bone = rig.bone_mut(*bone_id).ok_or(CoreError::OutOfBounds)?;
+                bone.name = previous.clone();
             }
             Self::RestoreBoneRotation { bone_id, previous } => {
                 let rig = scene
@@ -375,6 +424,20 @@ impl UndoDelta {
                         node_id: *node_id,
                         bone_id: *bid,
                     });
+                }
+            }
+            Self::RestoreNodeRigSkinned {
+                node_id,
+                previous_unrigged,
+            } => {
+                let rig = scene
+                    .character_rig
+                    .as_mut()
+                    .ok_or(CoreError::CharacterRigNotFound)?;
+                if *previous_unrigged {
+                    rig.unrigged_nodes.insert(*node_id);
+                } else {
+                    rig.unrigged_nodes.remove(node_id);
                 }
             }
             Self::PopAnimationClip {

@@ -4148,8 +4148,10 @@ fn b2_pin_primitive_bottom_anchor_bone_rotation_sign_and_png_export_mode() {
     let mut scene = SceneState::new();
     let mut history = HistoryStack::new();
 
-    // 1. Primitive bottom-anchoring: y in [0, size_y], centered in X/Z.
-    for kind in ["cube", "cylinder", "sphere", "cone", "capsule"] {
+    // 1. Primitive bottom-anchoring: y in [0, size_y], centered in X/Z (all 7 primitives).
+    for kind in [
+        "cube", "plane", "cylinder", "cone", "sphere", "torus", "capsule",
+    ] {
         let res = execute_tool_call(
             "mesh_create_primitive",
             &json!({ "name": format!("Pin_{kind}"), "kind": kind, "size": [0.4, 1.2, 0.6] }),
@@ -4165,11 +4167,25 @@ fn b2_pin_primitive_bottom_anchor_bone_rotation_sign_and_png_export_mode() {
             "{kind} min.y must be 0.0, got {}",
             bmin.y
         );
-        assert!(
-            (bmax.y - 1.2).abs() < 1e-4,
-            "{kind} max.y must be 1.2, got {}",
-            bmax.y
-        );
+        if kind == "plane" {
+            assert!(
+                bmax.y.abs() < 1e-4,
+                "plane max.y must be 0.0, got {}",
+                bmax.y
+            );
+        } else if kind == "torus" {
+            assert!(
+                bmax.y > 0.0,
+                "torus max.y must be > 0.0 when bottom-anchored, got {}",
+                bmax.y
+            );
+        } else {
+            assert!(
+                (bmax.y - 1.2).abs() < 1e-4,
+                "{kind} max.y must be 1.2, got {}",
+                bmax.y
+            );
+        }
         assert!((bmin.x + bmax.x).abs() < 1e-4, "{kind} X must be centered");
         assert!((bmin.z + bmax.z).abs() < 1e-4, "{kind} Z must be centered");
     }
@@ -4225,7 +4241,28 @@ fn b2_pin_primitive_bottom_anchor_bone_rotation_sign_and_png_export_mode() {
         "+Y yaw must turn +Z toward +X (Left)"
     );
 
-    // 3. Mode-dependent PNG export: LowPoly mode rejects PNG (requires PixelCanvas), allows GLB.
+    execute_tool_call(
+        "character_set_bone_pose",
+        &json!({ "bone_id": 2, "rotation_deg": [0.0, 0.0, 45.0] }),
+        &mut scene,
+        &mut history,
+        &dir,
+    )
+    .unwrap();
+    let roll_rot = scene
+        .character_rig
+        .as_ref()
+        .unwrap()
+        .bone(BoneId(2))
+        .unwrap()
+        .pose_local
+        .rotation;
+    assert!(
+        (roll_rot * glam::Vec3::X).y > 0.5,
+        "+Z roll must tilt +X toward +Y"
+    );
+
+    // 3. Mode-dependent PNG/GIF export: LowPoly mode rejects PNG & GIF (requires PixelCanvas), allows GLB.
     let png_err = execute_tool_call(
         "project_export",
         &json!({ "filename": "should_fail.png", "format": "png" }),
@@ -4234,6 +4271,14 @@ fn b2_pin_primitive_bottom_anchor_bone_rotation_sign_and_png_export_mode() {
         &dir,
     );
     assert!(png_err.is_err(), "PNG export in LowPoly mode must error");
+    let gif_err = execute_tool_call(
+        "project_export",
+        &json!({ "filename": "should_fail.gif", "format": "gif" }),
+        &mut scene,
+        &mut history,
+        &dir,
+    );
+    assert!(gif_err.is_err(), "GIF export in LowPoly mode must error");
 
     execute_tool_call(
         "pixel_create_canvas",

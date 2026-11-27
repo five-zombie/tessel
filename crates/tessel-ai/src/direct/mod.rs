@@ -113,6 +113,8 @@ pub fn is_destructive_or_file_write_tool(name: &str) -> bool {
             | "mesh_bake_maps"
             | "pixel_export_sprite_sheet"
             | "viewport_render_turntable_gif"
+            | "character_export_rig"
+            | "character_import_rig"
     )
 }
 
@@ -440,54 +442,6 @@ fn extract_provider_error_summary(raw_body: &str) -> String {
     raw_body.to_string()
 }
 
-fn is_token_char(b: u8) -> bool {
-    b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'+' | b'/' | b'=')
-}
-
-fn redact_prefixed_tokens(input: &str, prefix: &str, case_insensitive: bool) -> String {
-    let mut out = String::with_capacity(input.len());
-    let mut i = 0;
-    let bytes = input.as_bytes();
-    let plen = prefix.len();
-    while i < input.len() {
-        let at_boundary = i == 0 || (!bytes[i - 1].is_ascii_alphanumeric() && bytes[i - 1] != b'_');
-        let matched = if at_boundary && i + plen <= input.len() && input.is_char_boundary(i + plen)
-        {
-            let slice = &input[i..i + plen];
-            if case_insensitive {
-                slice.eq_ignore_ascii_case(prefix)
-            } else {
-                slice == prefix
-            }
-        } else {
-            false
-        };
-        if matched {
-            let mut end = i + plen;
-            while end < bytes.len() && is_token_char(bytes[end]) {
-                end += 1;
-            }
-            if end > i + plen {
-                if prefix.ends_with(' ') {
-                    out.push_str(&input[i..i + plen]);
-                    out.push_str("<redacted>");
-                } else {
-                    out.push_str("<redacted>");
-                }
-                i = end;
-                continue;
-            }
-        }
-        if let Some(ch) = input[i..].chars().next() {
-            out.push(ch);
-            i += ch.len_utf8();
-        } else {
-            break;
-        }
-    }
-    out
-}
-
 /// Extracts a bounded, single-line, secret-redacted summary from a non-2xx provider response body.
 pub fn sanitize_provider_error_body(raw_body: &str, api_key: &str) -> String {
     let extracted = extract_provider_error_summary(raw_body);
@@ -510,10 +464,7 @@ pub fn sanitize_provider_error_body(raw_body: &str, api_key: &str) -> String {
     if !key.is_empty() {
         sanitized = sanitized.replace(key, "<redacted>");
     }
-    sanitized = redact_prefixed_tokens(&sanitized, "bearer ", true);
-    sanitized = redact_prefixed_tokens(&sanitized, "sk-", false);
-    sanitized = redact_prefixed_tokens(&sanitized, "AIza", false);
-    sanitized = redact_prefixed_tokens(&sanitized, "tsl_", false);
+    sanitized = crate::observability::redact_sensitive_text(&sanitized);
 
     if sanitized.is_empty() {
         return "upstream provider returned an error".into();

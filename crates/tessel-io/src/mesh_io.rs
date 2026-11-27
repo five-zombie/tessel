@@ -1,11 +1,13 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write;
 use std::fs;
 use std::path::Path;
 
-use glam::Vec3;
+use glam::{Mat4, Quat, Vec3, Vec4};
+use tessel_core::scene::{validate_node_name, MAX_NODE_NAME_LEN};
 use tessel_core::{
-    Face, LowPolyMesh, MeshTexture, MorphTarget, PaletteIndex, SceneState, VertexSkinWeights,
+    AnimationClip, Bone, BoneChannel, BoneId, CharacterRig, Face, Keyframe, KeyframeInterpolation,
+    LowPolyMesh, MeshTexture, MorphTarget, PaletteIndex, SceneState, Transform, VertexSkinWeights,
 };
 
 use crate::error::IoError;
@@ -77,6 +79,9 @@ const MAX_IMPORT_FACES: usize = 500_000;
 const MAX_IMPORT_ACCESSOR_ITEMS: usize = 2_000_000;
 const MAX_IMPORT_MORPH_TARGETS: usize = 128;
 const MAX_OBJ_FACE_VERTICES: usize = 256;
+const MAX_IMPORT_RIG_BONES: usize = 1024;
+const MAX_IMPORT_RIG_CLIPS: usize = 256;
+const MAX_IMPORT_KEYFRAMES_PER_CHANNEL: usize = 16_384;
 
 /// Imports a Wavefront `.obj` text document into a `LowPolyMesh`, preserving `vt` UVs when present.
 pub fn import_obj_str(obj_text: &str, material: PaletteIndex) -> Result<LowPolyMesh, IoError> {
@@ -214,10 +219,14 @@ pub fn import_obj_str(obj_text: &str, material: PaletteIndex) -> Result<LowPolyM
         texture: None,
         normal_map: None,
         ao_map: None,
+        matcap_map: None,
+        face_sdf_map: None,
+        hatching_ramp_map: None,
         paint_layers: Vec::new(),
         active_paint_layer: None,
         vertex_colors: BTreeMap::new(),
         crease_edges: Vec::new(),
+        uv_seams: Vec::new(),
         proxy_normals: BTreeMap::new(),
         modifiers: Vec::new(),
         smooth_shading: false,
@@ -423,10 +432,14 @@ pub fn import_glb_bytes(bytes: &[u8], material: PaletteIndex) -> Result<LowPolyM
         texture: None,
         normal_map: None,
         ao_map: None,
+        matcap_map: None,
+        face_sdf_map: None,
+        hatching_ramp_map: None,
         paint_layers: Vec::new(),
         active_paint_layer: None,
         vertex_colors: BTreeMap::new(),
         crease_edges: Vec::new(),
+        uv_seams: Vec::new(),
         proxy_normals: BTreeMap::new(),
         modifiers: Vec::new(),
         smooth_shading: false,
@@ -434,6 +447,504 @@ pub fn import_glb_bytes(bytes: &[u8], material: PaletteIndex) -> Result<LowPolyM
         skin_weights,
         morphs,
     })
+}
+
+#[derive(Debug, Default)]
+struct GlbBoneTracks {
+    translations: Vec<(f32, Vec3, KeyframeInterpolation)>,
+    rotations: Vec<(f32, Quat, KeyframeInterpolation)>,
+    scales: Vec<(f32, Vec3, KeyframeInterpolation)>,
+}
+
+fn decompose_positive_trs(mat: Mat4) -> Option<Transform> {
+    if !mat.to_cols_array().iter().all(|v| v.is_finite()) {
+        return None;
+    }
+    if (mat.row(3) - Vec4::W).length_squared() > 1e-5 {
+        return None;
+    }
+    let sx = mat.x_axis.truncate().length();
+    let sy = mat.y_axis.truncate().length();
+    let sz = mat.z_axis.truncate().length();
+    if !sx.is_finite()
+        || !sy.is_finite()
+        || !sz.is_finite()
+        || sx <= 1e-6
+        || sy <= 1e-6
+        || sz <= 1e-6
+    {
+        return None;
+    }
+    let det = mat.determinant();
+    let scale_vol = sx * sy * sz;
+    if !det.is_finite() || det <= 0.0 || !scale_vol.is_finite() || scale_vol <= 0.0 {
+        return None;
+    }
+    let norm_det = det / scale_vol;
+    if !norm_det.is_finite() || norm_det <= 1e-3 {
+        return None;
+    }
+    let (cs, cr, ct) = mat.to_scale_rotation_translation();
+    if !ct.is_finite()
+        || !cr.is_finite()
+        || cr.length_squared() <= 1e-8
+        || !cs.is_finite()
+        || cs.x <= 1e-6
+        || cs.y <= 1e-6
+        || cs.z <= 1e-6
+    {
+        return None;
+    }
+    Some(Transform {
+        translation: ct,
+        rotation: cr.normalize(),
+        scale: cs,
+    })
+}
+
+fn time_bucket(t: f32) -> i64 {
+    (t * 10_000.0).round() as i64
+}
+
+fn normalize_track<T: Copy>(track: &mut Vec<(f32, T, KeyframeInterpolation)>) {
+    track.sort_by(|a, b| a.0.total_cmp(&b.0));
+    let mut deduped: Vec<(f32, T, KeyframeInterpolation)> = Vec::with_capacity(track.len());
+    for item in track.drain(..) {
+        if let Some(last) = deduped.last_mut() {
+            if time_bucket(last.0) == time_bucket(item.0) {
+                *last = item;
+                continue;
+            }
+        }
+        deduped.push(item);
+    }
+    *track = deduped;
+}
+
+fn sample_vec3_track(track: &[(f32, Vec3, KeyframeInterpolation)], t: f32) -> Option<Vec3> {
+    let first = track.first()?;
+    let last = track.last()?;
+    if t <= first.0 {
+        return Some(first.1);
+    }
+    if t >= last.0 {
+        return Some(last.1);
+    }
+    let idx = track.partition_point(|k| k.0 <= t);
+    let prev = track[idx.saturating_sub(1)];
+    let next = track[idx.min(track.len() - 1)];
+    if (prev.0 - t).abs() <= 1e-5 || prev.2 == KeyframeInterpolation::Step {
+        return Some(prev.1);
+    }
+    let span = next.0 - prev.0;
+    if span <= 1e-6 {
+        return Some(next.1);
+    }
+    let alpha = ((t - prev.0) / span).clamp(0.0, 1.0);
+    Some(prev.1.lerp(next.1, alpha))
+}
+
+fn sample_quat_track(track: &[(f32, Quat, KeyframeInterpolation)], t: f32) -> Option<Quat> {
+    let first = track.first()?;
+    let last = track.last()?;
+    if t <= first.0 {
+        return Some(first.1);
+    }
+    if t >= last.0 {
+        return Some(last.1);
+    }
+    let idx = track.partition_point(|k| k.0 <= t);
+    let prev = track[idx.saturating_sub(1)];
+    let next = track[idx.min(track.len() - 1)];
+    if (prev.0 - t).abs() <= 1e-5 || prev.2 == KeyframeInterpolation::Step {
+        return Some(prev.1);
+    }
+    let span = next.0 - prev.0;
+    if span <= 1e-6 {
+        return Some(next.1);
+    }
+    let alpha = ((t - prev.0) / span).clamp(0.0, 1.0);
+    Some(prev.1.slerp(next.1, alpha).normalize())
+}
+
+fn sanitize_glb_bone_name(raw: Option<&str>, fallback_idx: usize) -> String {
+    if let Some(s) = raw {
+        let cleaned: String = s
+            .trim()
+            .chars()
+            .filter(|c| !c.is_control())
+            .take(MAX_NODE_NAME_LEN)
+            .collect();
+        if validate_node_name(&cleaned).is_ok() {
+            return cleaned;
+        }
+    }
+    format!("Bone_{fallback_idx}")
+}
+
+/// Imports a skeletal hierarchy and bone animations from a binary glTF 2.0 (`.glb`) buffer
+/// into a standalone `CharacterRig`. Validates bounds, finiteness, and acyclicity, and
+/// topologically sorts bones parent-before-child.
+pub fn import_glb_rig_bytes(bytes: &[u8]) -> Result<CharacterRig, IoError> {
+    if bytes.len() > MAX_IMPORT_BYTES {
+        return Err(IoError::PayloadTooLarge(
+            "GLB buffer exceeds 64 MiB safety limit".into(),
+        ));
+    }
+    let gltf = gltf::Gltf::from_slice(bytes)
+        .map_err(|e| IoError::InvalidFormat(format!("invalid GLB: {e}")))?;
+    let blob = gltf.blob.as_deref();
+
+    let mut joint_node_indices: Vec<usize> = Vec::new();
+    let mut seen_joints: BTreeSet<usize> = BTreeSet::new();
+    for skin in gltf.skins() {
+        for joint in skin.joints() {
+            if seen_joints.insert(joint.index()) {
+                if joint_node_indices.len() >= MAX_IMPORT_RIG_BONES {
+                    return Err(IoError::PayloadTooLarge(format!(
+                        "GLB skeleton exceeds safety limit of {MAX_IMPORT_RIG_BONES} bones"
+                    )));
+                }
+                joint_node_indices.push(joint.index());
+            }
+        }
+    }
+    if joint_node_indices.is_empty() {
+        return Err(IoError::InvalidFormat(
+            "GLB file contains no skeleton skin".into(),
+        ));
+    }
+
+    let mut gltf_parent: BTreeMap<usize, usize> = BTreeMap::new();
+    let mut nodes_by_idx: BTreeMap<usize, gltf::Node<'_>> = BTreeMap::new();
+    for node in gltf.nodes() {
+        for child in node.children() {
+            gltf_parent.entry(child.index()).or_insert(node.index());
+        }
+        nodes_by_idx.insert(node.index(), node);
+    }
+
+    let mut gltf_node_to_bone: BTreeMap<usize, BoneId> = BTreeMap::new();
+    for (idx, &node_idx) in joint_node_indices.iter().enumerate() {
+        let bone_id = BoneId(
+            u32::try_from(idx)
+                .map_err(|_| IoError::PayloadTooLarge("GLB bone index overflow".into()))?,
+        );
+        gltf_node_to_bone.insert(node_idx, bone_id);
+    }
+
+    let mut bones = Vec::with_capacity(joint_node_indices.len());
+    let mut rest_by_bone: BTreeMap<BoneId, Transform> = BTreeMap::new();
+    // Track folded non-joint intermediate ancestor matrices between a joint and its nearest
+    // joint parent (or scene root) so both rest pose AND animation translations align.
+    let mut ancestor_by_bone: BTreeMap<BoneId, Mat4> = BTreeMap::new();
+    for (idx, &node_idx) in joint_node_indices.iter().enumerate() {
+        let Some(node) = nodes_by_idx.get(&node_idx) else {
+            return Err(IoError::InvalidFormat(format!(
+                "GLB skin references missing node index {node_idx}"
+            )));
+        };
+        let bone_id = gltf_node_to_bone[&node_idx];
+
+        let (t, r, s) = node.transform().decomposed();
+        let translation = Vec3::from_array(t);
+        let raw_rot = Quat::from_array(r);
+        let scale = Vec3::from_array(s);
+        if !translation.is_finite()
+            || !raw_rot.is_finite()
+            || raw_rot.length_squared() <= 1e-8
+            || !scale.is_finite()
+            || scale.x <= 1e-6
+            || scale.y <= 1e-6
+            || scale.z <= 1e-6
+        {
+            return Err(IoError::InvalidFormat(format!(
+                "GLB joint node {node_idx} has non-finite or non-positive scale transform"
+            )));
+        }
+        let local_tr = Transform {
+            translation,
+            rotation: raw_rot.normalize(),
+            scale,
+        };
+
+        // Walk up `gltf_parent` to find the nearest joint ancestor, collecting any intermediate
+        // non-joint wrapper nodes (e.g. Armature / offset empties) strictly between them.
+        let mut ancestor_chain = Vec::new();
+        let mut parent: Option<BoneId> = None;
+        let mut cur = gltf_parent.get(&node_idx).copied();
+        let mut hops = 0usize;
+        while let Some(pid) = cur {
+            if hops >= nodes_by_idx.len() {
+                return Err(IoError::InvalidFormat(
+                    "GLB node hierarchy contains a cycle".into(),
+                ));
+            }
+            if let Some(&parent_bone_id) = gltf_node_to_bone.get(&pid) {
+                parent = Some(parent_bone_id);
+                break;
+            }
+            if let Some(pnode) = nodes_by_idx.get(&pid) {
+                ancestor_chain.push(Mat4::from_cols_array_2d(&pnode.transform().matrix()));
+            }
+            cur = gltf_parent.get(&pid).copied();
+            hops += 1;
+        }
+
+        let mut anc_mat = Mat4::IDENTITY;
+        for m in ancestor_chain.into_iter().rev() {
+            anc_mat *= m;
+        }
+        let rest_local = if anc_mat != Mat4::IDENTITY {
+            let local_mat = Mat4::from_scale_rotation_translation(
+                local_tr.scale,
+                local_tr.rotation,
+                local_tr.translation,
+            );
+            let combined = anc_mat * local_mat;
+            let Some(composed) = decompose_positive_trs(combined) else {
+                return Err(IoError::InvalidFormat(format!(
+                    "GLB joint {node_idx} has degenerate or singular ancestor transform"
+                )));
+            };
+            ancestor_by_bone.insert(bone_id, anc_mat);
+            composed
+        } else {
+            local_tr
+        };
+        let name = sanitize_glb_bone_name(node.name(), idx);
+        // Keep raw glTF node local rest transform for converting animation channels cleanly.
+        rest_by_bone.insert(bone_id, local_tr);
+        bones.push(Bone::new(bone_id, name, parent, rest_local));
+    }
+
+    let mut animations: Vec<AnimationClip> = Vec::new();
+    for (clip_idx, anim) in gltf.animations().enumerate() {
+        if animations.len() >= MAX_IMPORT_RIG_CLIPS {
+            break;
+        }
+        let mut per_bone: BTreeMap<BoneId, GlbBoneTracks> = BTreeMap::new();
+        let mut max_time = 0.0f32;
+
+        for channel in anim.channels() {
+            let target = channel.target();
+            let Some(&bone_id) = gltf_node_to_bone.get(&target.node().index()) else {
+                continue;
+            };
+            let sampler = channel.sampler();
+            let is_cubic = matches!(
+                sampler.interpolation(),
+                gltf::animation::Interpolation::CubicSpline
+            );
+            let stride = if is_cubic { 3 } else { 1 };
+            let offset = if is_cubic { 1 } else { 0 };
+            let input_count = sampler.input().count();
+            let output_count = sampler.output().count();
+            if input_count > MAX_IMPORT_KEYFRAMES_PER_CHANNEL
+                || output_count > MAX_IMPORT_KEYFRAMES_PER_CHANNEL.saturating_mul(stride)
+                || input_count > MAX_IMPORT_ACCESSOR_ITEMS
+                || output_count > MAX_IMPORT_ACCESSOR_ITEMS
+            {
+                return Err(IoError::PayloadTooLarge(format!(
+                    "GLB animation channel exceeds limit of {MAX_IMPORT_KEYFRAMES_PER_CHANNEL} keyframes"
+                )));
+            }
+            let interp = match sampler.interpolation() {
+                gltf::animation::Interpolation::Step => KeyframeInterpolation::Step,
+                gltf::animation::Interpolation::Linear => KeyframeInterpolation::Linear,
+                gltf::animation::Interpolation::CubicSpline => KeyframeInterpolation::EaseInOut,
+            };
+            let reader = channel.reader(|_| blob);
+            let Some(inputs_iter) = reader.read_inputs() else {
+                continue;
+            };
+            let times: Vec<f32> = inputs_iter.collect();
+            let Some(outputs) = reader.read_outputs() else {
+                continue;
+            };
+
+            let tracks = per_bone.entry(bone_id).or_default();
+            let required_outputs = times.len().saturating_mul(stride);
+
+            match outputs {
+                gltf::animation::util::ReadOutputs::Translations(iter) => {
+                    let vals: Vec<[f32; 3]> = iter.collect();
+                    if vals.len() < required_outputs {
+                        return Err(IoError::InvalidFormat(
+                            "GLB translation animation output length mismatch".into(),
+                        ));
+                    }
+                    let mut track = Vec::with_capacity(times.len());
+                    for (i, &t) in times.iter().enumerate() {
+                        if !t.is_finite() || !(0.0..=600.0).contains(&t) {
+                            continue;
+                        }
+                        let Some(&raw) = vals.get(i * stride + offset) else {
+                            break;
+                        };
+                        let v = Vec3::from_array(raw);
+                        if !v.is_finite() {
+                            continue;
+                        }
+                        max_time = max_time.max(t);
+                        track.push((t, v, interp));
+                    }
+                    normalize_track(&mut track);
+                    if !track.is_empty() {
+                        tracks.translations = track;
+                    }
+                }
+                gltf::animation::util::ReadOutputs::Rotations(iter) => {
+                    let vals: Vec<[f32; 4]> = iter.into_f32().collect();
+                    if vals.len() < required_outputs {
+                        return Err(IoError::InvalidFormat(
+                            "GLB rotation animation output length mismatch".into(),
+                        ));
+                    }
+                    let mut track = Vec::with_capacity(times.len());
+                    for (i, &t) in times.iter().enumerate() {
+                        if !t.is_finite() || !(0.0..=600.0).contains(&t) {
+                            continue;
+                        }
+                        let Some(&raw) = vals.get(i * stride + offset) else {
+                            break;
+                        };
+                        let q = Quat::from_array(raw);
+                        if !q.is_finite() || q.length_squared() <= 1e-8 {
+                            continue;
+                        }
+                        max_time = max_time.max(t);
+                        track.push((t, q.normalize(), interp));
+                    }
+                    normalize_track(&mut track);
+                    if !track.is_empty() {
+                        tracks.rotations = track;
+                    }
+                }
+                gltf::animation::util::ReadOutputs::Scales(iter) => {
+                    let vals: Vec<[f32; 3]> = iter.collect();
+                    if vals.len() < required_outputs {
+                        return Err(IoError::InvalidFormat(
+                            "GLB scale animation output length mismatch".into(),
+                        ));
+                    }
+                    let mut track = Vec::with_capacity(times.len());
+                    for (i, &t) in times.iter().enumerate() {
+                        if !t.is_finite() || !(0.0..=600.0).contains(&t) {
+                            continue;
+                        }
+                        let Some(&raw) = vals.get(i * stride + offset) else {
+                            break;
+                        };
+                        let s = Vec3::from_array(raw);
+                        if !s.is_finite() || s.x <= 1e-6 || s.y <= 1e-6 || s.z <= 1e-6 {
+                            continue;
+                        }
+                        max_time = max_time.max(t);
+                        track.push((t, s, interp));
+                    }
+                    normalize_track(&mut track);
+                    if !track.is_empty() {
+                        tracks.scales = track;
+                    }
+                }
+                gltf::animation::util::ReadOutputs::MorphTargetWeights(_) => {}
+            }
+        }
+
+        let mut channels = Vec::new();
+        for (bone_id, tracks) in per_bone {
+            let Some(&rest) = rest_by_bone.get(&bone_id) else {
+                continue;
+            };
+            let mut union_times: BTreeMap<i64, (f32, KeyframeInterpolation)> = BTreeMap::new();
+            for &(t, _, interp) in &tracks.translations {
+                union_times.entry(time_bucket(t)).or_insert((t, interp));
+            }
+            for &(t, _, interp) in &tracks.rotations {
+                union_times.entry(time_bucket(t)).or_insert((t, interp));
+            }
+            for &(t, _, interp) in &tracks.scales {
+                union_times.entry(time_bucket(t)).or_insert((t, interp));
+            }
+            if union_times.len() > MAX_IMPORT_KEYFRAMES_PER_CHANNEL {
+                return Err(IoError::PayloadTooLarge(format!(
+                    "GLB merged animation channel exceeds limit of {MAX_IMPORT_KEYFRAMES_PER_CHANNEL} keyframes"
+                )));
+            }
+
+            let rest_rot_inv = rest.rotation.inverse();
+            let anc_mat = ancestor_by_bone.get(&bone_id).copied();
+            let safe_div = |num: f32, den: f32| -> f32 {
+                if den > 1e-6 {
+                    num / den
+                } else {
+                    1.0
+                }
+            };
+            let keyframes: Vec<Keyframe> = union_times
+                .into_values()
+                .map(|(t, interp)| {
+                    let raw_delta_t = sample_vec3_track(&tracks.translations, t)
+                        .map(|abs_t| abs_t - rest.translation)
+                        .unwrap_or(Vec3::ZERO);
+                    let translation = match anc_mat {
+                        Some(m) => m.transform_vector3(raw_delta_t),
+                        None => raw_delta_t,
+                    };
+                    let rotation = sample_quat_track(&tracks.rotations, t)
+                        .map(|abs_r| (rest_rot_inv * abs_r).normalize())
+                        .unwrap_or(Quat::IDENTITY);
+                    let scale = sample_vec3_track(&tracks.scales, t)
+                        .map(|abs_s| {
+                            Vec3::new(
+                                safe_div(abs_s.x, rest.scale.x),
+                                safe_div(abs_s.y, rest.scale.y),
+                                safe_div(abs_s.z, rest.scale.z),
+                            )
+                        })
+                        .unwrap_or(Vec3::ONE);
+                    Keyframe {
+                        time_secs: t,
+                        translation,
+                        rotation,
+                        scale,
+                        interpolation: interp,
+                    }
+                })
+                .collect();
+            if !keyframes.is_empty() {
+                channels.push(BoneChannel { bone_id, keyframes });
+            }
+        }
+
+        if !channels.is_empty() {
+            let clip_name = anim
+                .name()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(|s| s.chars().take(MAX_NODE_NAME_LEN).collect::<String>())
+                .unwrap_or_else(|| format!("Clip_{clip_idx}"));
+            let duration_secs = if max_time > 0.0 && max_time.is_finite() {
+                max_time.clamp(0.1, 600.0)
+            } else {
+                1.0
+            };
+            let mut clip = AnimationClip::new_empty(clip_name, duration_secs);
+            clip.channels = channels;
+            animations.push(clip);
+        }
+    }
+
+    let mut rig = CharacterRig {
+        bones,
+        animations,
+        ..CharacterRig::default()
+    };
+    rig.validate_and_sanitize().map_err(|_| {
+        IoError::InvalidFormat("GLB skeleton hierarchy or animation data is invalid".into())
+    })?;
+    Ok(rig)
 }
 
 /// Imports a `.obj` or `.glb` 3D mesh from disk, returning `(asset_name, mesh)`.
@@ -668,5 +1179,166 @@ mod tests {
         assert_eq!(exr_tex.rgba[3], 255);
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn g3_glb_rig_roundtrip_preserves_skeleton_and_animations() {
+        let mut scene = SceneState::new();
+        let mat = PaletteIndex::new(4).unwrap();
+        Command::CreatePrimitiveMesh {
+            name: "Hero".into(),
+            kind: PrimitiveKind::Cube,
+            size: 1.0,
+            material: mat,
+        }
+        .apply(&mut scene)
+        .unwrap();
+
+        // GLB without skin must fail cleanly
+        let (no_rig_glb, _) = export_glb_bytes(&scene, ExportPreset::Godot4).unwrap();
+        assert!(matches!(
+            import_glb_rig_bytes(&no_rig_glb),
+            Err(IoError::InvalidFormat(_))
+        ));
+
+        // Apply humanoid 19-bone rig + starter Idle/Walk clips and export GLB
+        Command::ApplyHumanoidRig.apply(&mut scene).unwrap();
+        let (glb, _) = export_glb_bytes(&scene, ExportPreset::Godot4).unwrap();
+        let imported = import_glb_rig_bytes(&glb).unwrap();
+
+        let orig = scene.character_rig.as_ref().unwrap();
+        assert_eq!(imported.bones.len(), orig.bones.len());
+        assert_eq!(imported.animations.len(), orig.animations.len());
+        for (a, b) in orig.bones.iter().zip(imported.bones.iter()) {
+            assert_eq!(a.name, b.name);
+            assert_eq!(a.parent, b.parent);
+            assert!((a.rest_local.translation - b.rest_local.translation).length() < 1e-4);
+        }
+        assert_eq!(imported.animations[0].name, "Idle");
+        assert_eq!(imported.animations[1].name, "Walk");
+        assert!(!imported.animations[1].channels.is_empty());
+    }
+
+    fn build_minimal_glb(json_val: serde_json::Value, bin: &[u8]) -> Vec<u8> {
+        let mut json_bytes = serde_json::to_vec(&json_val).unwrap();
+        while !json_bytes.len().is_multiple_of(4) {
+            json_bytes.push(b' ');
+        }
+        let mut bin_padded = bin.to_vec();
+        while !bin_padded.len().is_multiple_of(4) {
+            bin_padded.push(0);
+        }
+        let has_bin = !bin_padded.is_empty();
+        let total_len = 12 + 8 + json_bytes.len() + if has_bin { 8 + bin_padded.len() } else { 0 };
+        let mut out = Vec::with_capacity(total_len);
+        out.extend_from_slice(b"glTF");
+        out.extend_from_slice(&2u32.to_le_bytes());
+        out.extend_from_slice(&(total_len as u32).to_le_bytes());
+        out.extend_from_slice(&(json_bytes.len() as u32).to_le_bytes());
+        out.extend_from_slice(b"JSON");
+        out.extend_from_slice(&json_bytes);
+        if has_bin {
+            out.extend_from_slice(&(bin_padded.len() as u32).to_le_bytes());
+            out.extend_from_slice(b"BIN\0");
+            out.extend_from_slice(&bin_padded);
+        }
+        out
+    }
+
+    #[test]
+    fn g3_glb_rig_import_handles_intermediate_wrapper_async_channels_and_singular_matrix() {
+        // 1. Intermediate non-joint wrapper between JointA (0) and JointB (2) + async T/R channels.
+        let mut bin = Vec::new();
+        let push_floats = |buf: &mut Vec<u8>, vals: &[f32]| -> (usize, usize) {
+            let offset = buf.len();
+            for &v in vals {
+                buf.extend_from_slice(&v.to_le_bytes());
+            }
+            (offset, buf.len() - offset)
+        };
+        // Translation times [0.0, 1.0], values [0,0,0] -> [0,2,0]
+        let (t_in_off, t_in_len) = push_floats(&mut bin, &[0.0, 1.0]);
+        let (t_out_off, t_out_len) = push_floats(&mut bin, &[0.0, 0.0, 0.0, 0.0, 2.0, 0.0]);
+        // Rotation times [0.0, 0.5, 1.0], values identity -> 90deg Y -> 180deg Y
+        let q0 = Quat::IDENTITY.to_array();
+        let q1 = Quat::from_rotation_y(std::f32::consts::FRAC_PI_2).to_array();
+        let q2 = Quat::from_rotation_y(std::f32::consts::PI).to_array();
+        let (r_in_off, r_in_len) = push_floats(&mut bin, &[0.0, 0.5, 1.0]);
+        let mut r_vals = Vec::new();
+        r_vals.extend_from_slice(&q0);
+        r_vals.extend_from_slice(&q1);
+        r_vals.extend_from_slice(&q2);
+        let (r_out_off, r_out_len) = push_floats(&mut bin, &r_vals);
+
+        let gltf_json = serde_json::json!({
+            "asset": { "version": "2.0" },
+            "buffers": [{ "byteLength": bin.len() }],
+            "bufferViews": [
+                { "buffer": 0, "byteOffset": t_in_off, "byteLength": t_in_len },
+                { "buffer": 0, "byteOffset": t_out_off, "byteLength": t_out_len },
+                { "buffer": 0, "byteOffset": r_in_off, "byteLength": r_in_len },
+                { "buffer": 0, "byteOffset": r_out_off, "byteLength": r_out_len }
+            ],
+            "accessors": [
+                { "bufferView": 0, "componentType": 5126, "count": 2, "type": "SCALAR", "min": [0.0], "max": [1.0] },
+                { "bufferView": 1, "componentType": 5126, "count": 2, "type": "VEC3" },
+                { "bufferView": 2, "componentType": 5126, "count": 3, "type": "SCALAR", "min": [0.0], "max": [1.0] },
+                { "bufferView": 3, "componentType": 5126, "count": 3, "type": "VEC4" }
+            ],
+            "nodes": [
+                { "name": "RootJoint", "children": [1] },
+                { "name": "NonJointWrapper", "translation": [0.0, 1.0, 0.0], "children": [2] },
+                { "name": "ChildJoint", "translation": [0.0, 0.5, 0.0] }
+            ],
+            "skins": [{ "joints": [0, 2] }],
+            "animations": [{
+                "name": "AsyncClip",
+                "samplers": [
+                    { "input": 0, "output": 1, "interpolation": "LINEAR" },
+                    { "input": 2, "output": 3, "interpolation": "LINEAR" }
+                ],
+                "channels": [
+                    { "sampler": 0, "target": { "node": 0, "path": "translation" } },
+                    { "sampler": 1, "target": { "node": 0, "path": "rotation" } }
+                ]
+            }]
+        });
+        let glb = build_minimal_glb(gltf_json, &bin);
+        let rig = import_glb_rig_bytes(&glb).expect("valid wrapper + async GLB rig");
+        assert_eq!(rig.bones.len(), 2);
+        let root = rig.bones.iter().find(|b| b.name == "RootJoint").unwrap();
+        let child = rig.bones.iter().find(|b| b.name == "ChildJoint").unwrap();
+        assert_eq!(child.parent, Some(root.id));
+        assert!((child.rest_local.translation - Vec3::new(0.0, 1.5, 0.0)).length() < 1e-4);
+
+        let clip = &rig.animations[0];
+        let ch = clip.channels.iter().find(|c| c.bone_id == root.id).unwrap();
+        assert_eq!(ch.keyframes.len(), 3);
+        let mid = ch
+            .keyframes
+            .iter()
+            .find(|k| (k.time_secs - 0.5).abs() < 1e-3)
+            .unwrap();
+        // At t=0.5, translation must be interpolated to [0, 1, 0], NOT snapped to rest [0, 0, 0].
+        assert!(
+            (mid.translation - Vec3::new(0.0, 1.0, 0.0)).length() < 1e-4,
+            "async T/R channel must interpolate translation at rotation-only keyframe, got {:?}",
+            mid.translation
+        );
+
+        // 2. Singular (zero-scale) ancestor matrix must fail cleanly without panicking.
+        let singular_json = serde_json::json!({
+            "asset": { "version": "2.0" },
+            "nodes": [
+                { "name": "BadWrapper", "scale": [0.0, 1.0, 1.0], "children": [1] },
+                { "name": "RootJoint" }
+            ],
+            "skins": [{ "joints": [1] }]
+        });
+        let bad_glb = build_minimal_glb(singular_json, &[]);
+        assert!(matches!(
+            import_glb_rig_bytes(&bad_glb),
+            Err(IoError::InvalidFormat(_))
+        ));
     }
 }

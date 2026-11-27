@@ -124,7 +124,7 @@ pub enum Command {
     },
     ImportLowPolyMesh {
         name: String,
-        mesh: LowPolyMesh,
+        mesh: Box<LowPolyMesh>,
     },
     ConvertVoxelToLowPoly {
         voxel_node_id: NodeId,
@@ -302,6 +302,27 @@ pub enum Command {
         node_id: NodeId,
         ao_map: Option<MeshTexture>,
     },
+    SetMeshNprSlot {
+        node_id: NodeId,
+        slot: crate::mesh::NprTextureSlot,
+        texture: Option<MeshTexture>,
+    },
+    SetMeshUvSeams {
+        node_id: NodeId,
+        edges: Vec<(usize, usize)>,
+        replace: bool,
+        unwrap: bool,
+    },
+    NormalizeMeshTexelDensity {
+        node_id: NodeId,
+        texture_size: u32,
+        target_px_per_unit: Option<f32>,
+        padding_uv: f32,
+    },
+    SculptMeshStroke {
+        node_id: NodeId,
+        params: crate::mesh::SculptStrokeParams,
+    },
     AddMeshPaintLayer {
         node_id: NodeId,
         name: String,
@@ -353,10 +374,21 @@ pub enum Command {
     },
     ApplyBipedRig,
     ApplyHumanoidRig,
+    SetCharacterRig {
+        rig: Option<CharacterRig>,
+    },
     AddBone {
         name: String,
         parent: Option<BoneId>,
         position: glam::Vec3,
+    },
+    RenameBone {
+        bone_id: BoneId,
+        name: String,
+    },
+    ReparentBone {
+        bone_id: BoneId,
+        parent: Option<BoneId>,
     },
     SetBoneRestPosition {
         bone_id: BoneId,
@@ -388,6 +420,10 @@ pub enum Command {
     SetNodeBoneMask {
         node_id: NodeId,
         bone_ids: Option<Vec<BoneId>>,
+    },
+    SetNodeRigSkinned {
+        node_id: NodeId,
+        skinned: bool,
     },
     AddAnimationClip {
         name: String,
@@ -689,6 +725,15 @@ pub enum UndoDelta {
         node_id: NodeId,
         previous: Option<MeshTexture>,
     },
+    RestoreMeshNprSlot {
+        node_id: NodeId,
+        slot: crate::mesh::NprTextureSlot,
+        previous: Option<MeshTexture>,
+    },
+    RestoreMeshVertexPositions {
+        node_id: NodeId,
+        previous: Vec<(usize, glam::Vec3)>,
+    },
     RestoreMeshPaintLayers {
         node_id: NodeId,
         previous_layers: Vec<MeshPaintLayer>,
@@ -717,6 +762,10 @@ pub enum UndoDelta {
         previous: MeshMaterial,
     },
     RestoreCharacterRig(Option<CharacterRig>),
+    RestoreBoneName {
+        bone_id: BoneId,
+        previous: String,
+    },
     RestoreBoneRotation {
         bone_id: BoneId,
         previous: Quat,
@@ -746,6 +795,10 @@ pub enum UndoDelta {
     RestoreNodeBoneBinding {
         node_id: NodeId,
         previous: Option<BoneId>,
+    },
+    RestoreNodeRigSkinned {
+        node_id: NodeId,
+        previous_unrigged: bool,
     },
     PopAnimationClip {
         previous_active: usize,
@@ -900,6 +953,10 @@ impl Command {
             | Self::SetMeshTexture { .. }
             | Self::SetMeshNormalMap { .. }
             | Self::SetMeshAoMap { .. }
+            | Self::SetMeshNprSlot { .. }
+            | Self::SetMeshUvSeams { .. }
+            | Self::NormalizeMeshTexelDensity { .. }
+            | Self::SculptMeshStroke { .. }
             | Self::AddMeshPaintLayer { .. }
             | Self::SetMeshPaintLayer { .. }
             | Self::DeleteMeshPaintLayer { .. }
@@ -917,7 +974,10 @@ impl Command {
             Self::UpdateAnimationClipMeta { .. }
             | Self::ApplyBipedRig
             | Self::ApplyHumanoidRig
+            | Self::SetCharacterRig { .. }
             | Self::AddBone { .. }
+            | Self::RenameBone { .. }
+            | Self::ReparentBone { .. }
             | Self::SetBoneRotation { .. }
             | Self::SetBoneTranslation { .. }
             | Self::SetBoneRestPosition { .. }
@@ -925,6 +985,7 @@ impl Command {
             | Self::SolveTwoBoneIk { .. }
             | Self::BindNodeToBone { .. }
             | Self::SetNodeBoneMask { .. }
+            | Self::SetNodeRigSkinned { .. }
             | Self::AddAnimationClip { .. }
             | Self::SetAnimationKeyframe { .. }
             | Self::RemoveAnimationKeyframe { .. }

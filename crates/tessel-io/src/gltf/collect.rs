@@ -22,10 +22,30 @@ pub(crate) struct CollectedMesh {
 }
 
 impl CollectedMesh {
+    pub fn empty() -> Self {
+        Self {
+            positions: Vec::new(),
+            normals: Vec::new(),
+            uvs: Vec::new(),
+            joints: Vec::new(),
+            weights: Vec::new(),
+            indices: Vec::new(),
+        }
+    }
+
     pub fn from_scene_untextured(
         scene: &SceneState,
         preset: ExportPreset,
         skin: Option<&AutoSkinSolver>,
+    ) -> Self {
+        Self::from_scene_untextured_filtered(scene, preset, skin, |_| true)
+    }
+
+    pub fn from_scene_untextured_filtered(
+        scene: &SceneState,
+        preset: ExportPreset,
+        skin: Option<&AutoSkinSolver>,
+        mut include_node: impl FnMut(tessel_core::NodeId) -> bool,
     ) -> Self {
         let scale = preset.scale_factor();
         let mut positions = Vec::new();
@@ -37,7 +57,7 @@ impl CollectedMesh {
 
         for (node_id, vol) in &scene.voxel_volumes {
             let visible = scene.nodes.get(node_id).map(|n| n.visible).unwrap_or(true);
-            if !visible || vol.is_empty() {
+            if !visible || vol.is_empty() || !include_node(*node_id) {
                 continue;
             }
             let (node_mat, normal_mat) = node_world_matrices(scene, *node_id);
@@ -67,7 +87,7 @@ impl CollectedMesh {
             let visible = scene.nodes.get(node_id).map(|n| n.visible).unwrap_or(true);
             let is_custom =
                 is_custom_export_mesh(scene, *node_id, mesh, &vis_animated, &node_trs_animated);
-            if !visible || mesh.faces.is_empty() || is_custom {
+            if !visible || mesh.faces.is_empty() || is_custom || !include_node(*node_id) {
                 continue;
             }
             let (node_mat, normal_mat) = node_world_matrices(scene, *node_id);

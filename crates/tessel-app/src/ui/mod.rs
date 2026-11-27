@@ -4,6 +4,7 @@ pub mod icons;
 pub mod inspector;
 pub mod mcp_dialog;
 pub mod quick_start;
+pub mod rotate_gizmo;
 pub mod settings_dialog;
 pub mod status_bar;
 pub mod theme;

@@ -5,6 +5,7 @@ use tessel_core::{AppMode, Command, FaceId, HistoryStack, NodeId, SceneState};
 
 use super::icons::{self, IconItem, ToolbarAction};
 use super::theme::tokens;
+use super::viewport::ViewportInteractionTool;
 use super::AsyncJobSlot;
 
 type TextureLoadResult = Option<(
@@ -71,7 +72,13 @@ fn poll_texture_load_job(ctx: &egui::Context, scene: &mut SceneState, history: &
     }
 }
 
-pub fn show_toolbar(ctx: &egui::Context, scene: &mut SceneState, history: &mut HistoryStack) {
+pub fn show_toolbar(
+    ctx: &egui::Context,
+    scene: &mut SceneState,
+    history: &mut HistoryStack,
+    interaction_tool: &mut ViewportInteractionTool,
+    free_view: &mut bool,
+) {
     poll_texture_load_job(ctx, scene, history);
     let frame = Frame::NONE
         .fill(tokens::SURFACE_LOW)
@@ -98,7 +105,14 @@ pub fn show_toolbar(ctx: &egui::Context, scene: &mut SceneState, history: &mut H
                         })
                         .collect();
                     if let Some(action) = icons::icon_group(ui, "pixel_tools", "TOOLS", &items) {
-                        fire_toolbar_action(ui.ctx(), action, scene, history);
+                        fire_toolbar_action(
+                            ui.ctx(),
+                            action,
+                            scene,
+                            history,
+                            interaction_tool,
+                            free_view,
+                        );
                     }
                     ui.separator();
                     let sym = [
@@ -116,7 +130,14 @@ pub fn show_toolbar(ctx: &egui::Context, scene: &mut SceneState, history: &mut H
                         },
                     ];
                     if let Some(action) = icons::icon_group(ui, "pixel_sym", "SYM", &sym) {
-                        fire_toolbar_action(ui.ctx(), action, scene, history);
+                        fire_toolbar_action(
+                            ui.ctx(),
+                            action,
+                            scene,
+                            history,
+                            interaction_tool,
+                            free_view,
+                        );
                     }
                     ui.separator();
                     if scene.active_pixel_node().is_some() {
@@ -129,11 +150,37 @@ pub fn show_toolbar(ctx: &egui::Context, scene: &mut SceneState, history: &mut H
                         if let Some(action) =
                             icons::icon_group(ui, "pixel_convert", "CONVERT", &convert)
                         {
-                            fire_toolbar_action(ui.ctx(), action, scene, history);
+                            fire_toolbar_action(
+                                ui.ctx(),
+                                action,
+                                scene,
+                                history,
+                                interaction_tool,
+                                free_view,
+                            );
                         }
                     }
                 }
                 AppMode::Voxel => {
+                    let select_group = [IconItem {
+                        icon: icons::ToolIcon::Select,
+                        tip: "Select / Transform Object (no voxel edit)",
+                        active: *interaction_tool == ViewportInteractionTool::Select,
+                        action: ToolbarAction::SelectObject,
+                    }];
+                    if let Some(action) =
+                        icons::icon_group(ui, "voxel_select", "OBJECT", &select_group)
+                    {
+                        fire_toolbar_action(
+                            ui.ctx(),
+                            action,
+                            scene,
+                            history,
+                            interaction_tool,
+                            free_view,
+                        );
+                    }
+                    ui.separator();
                     let items: Vec<IconItem> = tessel_core::VoxelTool::ALL
                         .iter()
                         .map(|tool| {
@@ -141,13 +188,21 @@ pub fn show_toolbar(ctx: &egui::Context, scene: &mut SceneState, history: &mut H
                             IconItem {
                                 icon,
                                 tip,
-                                active: scene.voxel_tool == *tool,
+                                active: *interaction_tool == ViewportInteractionTool::Edit
+                                    && scene.voxel_tool == *tool,
                                 action: ToolbarAction::VoxelTool(*tool),
                             }
                         })
                         .collect();
-                    if let Some(action) = icons::icon_group(ui, "voxel_tools", "TOOLS", &items) {
-                        fire_toolbar_action(ui.ctx(), action, scene, history);
+                    if let Some(action) = icons::icon_group(ui, "voxel_tools", "VOXEL", &items) {
+                        fire_toolbar_action(
+                            ui.ctx(),
+                            action,
+                            scene,
+                            history,
+                            interaction_tool,
+                            free_view,
+                        );
                     }
                     ui.separator();
                     let mirror = [
@@ -171,7 +226,14 @@ pub fn show_toolbar(ctx: &egui::Context, scene: &mut SceneState, history: &mut H
                         },
                     ];
                     if let Some(action) = icons::icon_group(ui, "voxel_mirror", "MIRROR", &mirror) {
-                        fire_toolbar_action(ui.ctx(), action, scene, history);
+                        fire_toolbar_action(
+                            ui.ctx(),
+                            action,
+                            scene,
+                            history,
+                            interaction_tool,
+                            free_view,
+                        );
                     }
                     ui.separator();
                     if scene.active_voxel_node().is_some() {
@@ -184,11 +246,39 @@ pub fn show_toolbar(ctx: &egui::Context, scene: &mut SceneState, history: &mut H
                         if let Some(action) =
                             icons::icon_group(ui, "voxel_convert", "CONVERT", &convert)
                         {
-                            fire_toolbar_action(ui.ctx(), action, scene, history);
+                            fire_toolbar_action(
+                                ui.ctx(),
+                                action,
+                                scene,
+                                history,
+                                interaction_tool,
+                                free_view,
+                            );
                         }
                     }
                 }
                 AppMode::LowPoly => {
+                    let select_group = [IconItem {
+                        icon: icons::ToolIcon::Select,
+                        tip: "Select / Transform Object",
+                        active: *interaction_tool == ViewportInteractionTool::Select
+                            && !scene.lowpoly_paint_mode
+                            && !scene.sculpt_mode,
+                        action: ToolbarAction::SelectObject,
+                    }];
+                    if let Some(action) =
+                        icons::icon_group(ui, "lowpoly_select", "OBJECT", &select_group)
+                    {
+                        fire_toolbar_action(
+                            ui.ctx(),
+                            action,
+                            scene,
+                            history,
+                            interaction_tool,
+                            free_view,
+                        );
+                    }
+                    ui.separator();
                     let shapes: Vec<IconItem> = tessel_core::PrimitiveKind::ALL
                         .iter()
                         .map(|kind| {
@@ -196,13 +286,21 @@ pub fn show_toolbar(ctx: &egui::Context, scene: &mut SceneState, history: &mut H
                             IconItem {
                                 icon,
                                 tip,
-                                active: false,
+                                active: *interaction_tool
+                                    == ViewportInteractionTool::PlacePrimitive(*kind),
                                 action: ToolbarAction::Primitive(*kind),
                             }
                         })
                         .collect();
-                    if let Some(action) = icons::icon_group(ui, "prim_shapes", "SHAPE", &shapes) {
-                        fire_toolbar_action(ui.ctx(), action, scene, history);
+                    if let Some(action) = icons::icon_group(ui, "prim_shapes", "PLACE", &shapes) {
+                        fire_toolbar_action(
+                            ui.ctx(),
+                            action,
+                            scene,
+                            history,
+                            interaction_tool,
+                            free_view,
+                        );
                     }
                     if icons::text_icon_button(
                         ui,
@@ -210,7 +308,14 @@ pub fn show_toolbar(ctx: &egui::Context, scene: &mut SceneState, history: &mut H
                         "Create Low-Poly Terrain (v4.1)",
                         false,
                     ) {
-                        fire_toolbar_action(ui.ctx(), ToolbarAction::CreateTerrain, scene, history);
+                        fire_toolbar_action(
+                            ui.ctx(),
+                            ToolbarAction::CreateTerrain,
+                            scene,
+                            history,
+                            interaction_tool,
+                            free_view,
+                        );
                     }
                     ui.separator();
                     if scene.active_lowpoly_node().is_some() {
@@ -249,7 +354,14 @@ pub fn show_toolbar(ctx: &egui::Context, scene: &mut SceneState, history: &mut H
                             });
                         }
                         if let Some(action) = icons::icon_group(ui, "mesh_paint", "PAINT", &paint) {
-                            fire_toolbar_action(ui.ctx(), action, scene, history);
+                            fire_toolbar_action(
+                                ui.ctx(),
+                                action,
+                                scene,
+                                history,
+                                interaction_tool,
+                                free_view,
+                            );
                         }
                         ui.separator();
                         let is_smooth = scene
@@ -319,7 +431,14 @@ pub fn show_toolbar(ctx: &egui::Context, scene: &mut SceneState, history: &mut H
                             },
                         ];
                         if let Some(action) = icons::icon_group(ui, "mesh_edit", "EDIT", &edit) {
-                            fire_toolbar_action(ui.ctx(), action, scene, history);
+                            fire_toolbar_action(
+                                ui.ctx(),
+                                action,
+                                scene,
+                                history,
+                                interaction_tool,
+                                free_view,
+                            );
                         }
                         if scene.lowpoly_paint_mode {
                             ui.label(
@@ -332,6 +451,72 @@ pub fn show_toolbar(ctx: &egui::Context, scene: &mut SceneState, history: &mut H
                                 egui::Slider::new(&mut scene.lowpoly_brush_radius, 2.0..=40.0)
                                     .show_value(false),
                             );
+                        }
+                        ui.separator();
+                        if ui
+                            .selectable_label(scene.sculpt_mode, "Sculpt")
+                            .on_hover_text(
+                                "Toggle organic sculpting brush (Smooth/Inflate/Grab/Crease)",
+                            )
+                            .clicked()
+                        {
+                            scene.sculpt_mode = !scene.sculpt_mode;
+                            if scene.sculpt_mode {
+                                scene.lowpoly_paint_mode = false;
+                                *interaction_tool = ViewportInteractionTool::Edit;
+                                *free_view = false;
+                            } else {
+                                *interaction_tool = ViewportInteractionTool::Select;
+                            }
+                        }
+                        if scene.sculpt_mode {
+                            for brush in tessel_core::SculptBrushKind::ALL {
+                                if ui
+                                    .selectable_label(scene.sculpt_brush == brush, brush.label())
+                                    .clicked()
+                                {
+                                    scene.sculpt_brush = brush;
+                                }
+                            }
+                            ui.label(
+                                RichText::new(format!("R:{:.2}", scene.sculpt_radius))
+                                    .monospace()
+                                    .size(10.0)
+                                    .color(tokens::ON_SURFACE_VARIANT),
+                            );
+                            ui.add(
+                                egui::Slider::new(&mut scene.sculpt_radius, 0.05..=2.0)
+                                    .show_value(false),
+                            );
+                            ui.label(
+                                RichText::new(format!("S:{:.2}", scene.sculpt_strength))
+                                    .monospace()
+                                    .size(10.0)
+                                    .color(tokens::ON_SURFACE_VARIANT),
+                            );
+                            ui.add(
+                                egui::Slider::new(&mut scene.sculpt_strength, 0.05..=1.0)
+                                    .show_value(false),
+                            );
+                        }
+                        if ui
+                            .button("TD")
+                            .on_hover_text("Normalize UV Texel Density")
+                            .clicked()
+                        {
+                            if let Some(node_id) = scene.active_lowpoly_node() {
+                                super::exec_history(
+                                    ui.ctx(),
+                                    history,
+                                    scene,
+                                    Command::NormalizeMeshTexelDensity {
+                                        node_id,
+                                        texture_size: tessel_core::DEFAULT_MESH_TEX_SIZE,
+                                        target_px_per_unit: None,
+                                        padding_uv: 0.01,
+                                    },
+                                );
+                            }
                         }
                     }
                 }
@@ -351,7 +536,14 @@ pub fn show_toolbar(ctx: &egui::Context, scene: &mut SceneState, history: &mut H
                         },
                     ];
                     if let Some(action) = icons::icon_group(ui, "char_rig", "RIG", &rig) {
-                        fire_toolbar_action(ui.ctx(), action, scene, history);
+                        fire_toolbar_action(
+                            ui.ctx(),
+                            action,
+                            scene,
+                            history,
+                            interaction_tool,
+                            free_view,
+                        );
                     }
                     if scene.character_rig.is_some() && scene.active_lowpoly_node().is_some() {
                         ui.separator();
@@ -372,7 +564,14 @@ pub fn show_toolbar(ctx: &egui::Context, scene: &mut SceneState, history: &mut H
                         if let Some(action) =
                             icons::icon_group(ui, "char_weights", "WEIGHT", &weight_tools)
                         {
-                            fire_toolbar_action(ui.ctx(), action, scene, history);
+                            fire_toolbar_action(
+                                ui.ctx(),
+                                action,
+                                scene,
+                                history,
+                                interaction_tool,
+                                free_view,
+                            );
                         }
                         if scene.weight_paint_mode {
                             ui.label(
@@ -413,22 +612,31 @@ fn fire_toolbar_action(
     action: ToolbarAction,
     scene: &mut SceneState,
     history: &mut HistoryStack,
+    interaction_tool: &mut ViewportInteractionTool,
+    free_view: &mut bool,
 ) {
     match action {
+        ToolbarAction::SelectObject => {
+            *interaction_tool = ViewportInteractionTool::Select;
+            scene.lowpoly_paint_mode = false;
+            scene.sculpt_mode = false;
+            *free_view = false;
+        }
         ToolbarAction::PixelTool(tool) => scene.pixel_tool = tool,
-        ToolbarAction::VoxelTool(tool) => scene.voxel_tool = tool,
+        ToolbarAction::VoxelTool(tool) => {
+            scene.voxel_tool = tool;
+            *interaction_tool = ViewportInteractionTool::Edit;
+            *free_view = false;
+        }
         ToolbarAction::Primitive(kind) => {
-            super::exec_history(
-                ctx,
-                history,
-                scene,
-                Command::CreatePrimitiveMesh {
-                    name: kind.label().into(),
-                    kind,
-                    size: 0.8,
-                    material: scene.active_color,
-                },
-            );
+            if *interaction_tool == ViewportInteractionTool::PlacePrimitive(kind) {
+                *interaction_tool = ViewportInteractionTool::Select;
+            } else {
+                *interaction_tool = ViewportInteractionTool::PlacePrimitive(kind);
+                scene.lowpoly_paint_mode = false;
+                scene.sculpt_mode = false;
+                *free_view = false;
+            }
         }
         ToolbarAction::CreateTerrain => {
             super::exec_history(
@@ -491,6 +699,13 @@ fn fire_toolbar_action(
         }
         ToolbarAction::TogglePaint => {
             scene.lowpoly_paint_mode = !scene.lowpoly_paint_mode;
+            if scene.lowpoly_paint_mode {
+                scene.sculpt_mode = false;
+                *interaction_tool = ViewportInteractionTool::Edit;
+                *free_view = false;
+            } else {
+                *interaction_tool = ViewportInteractionTool::Select;
+            }
         }
         ToolbarAction::LoadTexture { normal } => {
             let Some(node_id) = scene.active_lowpoly_node() else {
