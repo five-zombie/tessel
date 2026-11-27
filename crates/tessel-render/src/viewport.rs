@@ -76,7 +76,8 @@ impl ViewportRenderer {
         let grid_pass = GridPass::new(device, HDR_VIEWPORT_FORMAT, DEPTH_FORMAT, sample_count);
         let shadow_pass = ShadowPass::new(device, HDR_VIEWPORT_FORMAT, DEPTH_FORMAT, sample_count);
         let mesh_pass = MeshPass::new(device, HDR_VIEWPORT_FORMAT, DEPTH_FORMAT, sample_count);
-        let post_process_pass = PostProcessPass::new(device, VIEWPORT_FORMAT, &hdr_color_view);
+        let post_process_pass =
+            PostProcessPass::new(device, VIEWPORT_FORMAT, safe_size, &hdr_color_view);
         let overlay_pass = OverlayPass::new(device, VIEWPORT_FORMAT);
         let pixel_pass = PixelPass::new(device, VIEWPORT_FORMAT);
         Self {
@@ -177,7 +178,7 @@ impl ViewportRenderer {
         self.depth_texture = dtex;
         self.depth_view = dview;
         self.post_process_pass
-            .rebind_hdr(device, &self.hdr_color_view);
+            .resize(device, next, &self.hdr_color_view);
         true
     }
 
@@ -720,14 +721,14 @@ impl ViewportRenderer {
                     self.mesh_pass.draw(&mut pass, scene.shading_mode);
                 }
 
-                // Pass 4: Final HDR -> LDR Composite (Exposure + ACES Filmic, NPR bypass)
-                self.post_process_pass.update_params(
+                // Pass 3 & 4: Dual-Kawase Bloom + Final HDR -> LDR Composite (Exposure + ACES, NPR bypass)
+                self.post_process_pass.execute(
                     queue,
+                    encoder,
                     &scene.post_process,
                     scene.shading_mode,
+                    &self.color_view,
                 );
-                self.post_process_pass
-                    .draw_composite(encoder, &self.color_view);
 
                 // Pass 5: Crisp UI & Overlay Pass directly over post-ACES LDR color_view
                 if !render_preview {

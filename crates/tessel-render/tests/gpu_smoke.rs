@@ -386,3 +386,103 @@ fn smoke_h1_hdr_aces_fog_palette_lut_and_minimized_resize() {
         "unexpected wgpu validation error on H1 HDR pipeline: {validation_err:?}"
     );
 }
+
+#[test]
+fn smoke_h2_dual_kawase_bloom_glow_and_npr_bypass() {
+    let Some((device, queue, _info)) = request_test_device() else {
+        eprintln!("skipping GPU smoke test: no compatible GPU or software adapter available");
+        return;
+    };
+
+    device.push_error_scope(wgpu::ErrorFilter::Validation);
+
+    let mut viewport = ViewportRenderer::new(&device, 64, 64);
+    let mut scene = SceneState::new();
+    scene.active_mode = AppMode::Voxel;
+
+    let neon_idx = PaletteIndex::new(12).unwrap();
+    let mut neon =
+        tessel_core::PaletteEntry::matte("BrightCore", tessel_core::Rgba8::rgb(255, 220, 120));
+    neon.emissive = 12.0;
+    scene.palette.set(neon_idx, neon);
+
+    let vox_id = scene.allocate_node_id();
+    scene.nodes.insert(
+        vox_id,
+        SceneNode {
+            id: vox_id,
+            name: "BloomBeacon".into(),
+            kind: NodeKind::VoxelVolume,
+            visible: true,
+            parent: None,
+            transform: Transform::default(),
+        },
+    );
+    let mut vol = VoxelVolume::new();
+    vol.set(VoxelCoord::new(0, 0, 0), Some(neon_idx));
+    scene.voxel_volumes.insert(vox_id, vol);
+    scene.mark_modified();
+
+    let mut cam = OrbitCamera::new();
+    cam.distance = 2.0;
+    let cam_2d = PixelCamera2D::new();
+
+    let render_frame = |vp: &mut ViewportRenderer, sc: &SceneState| -> Vec<u8> {
+        vp.sync_scene(&device, &queue, sc, None, None);
+        let mut enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("tessel-smoke-h2-bloom"),
+        });
+        vp.render(&queue, &mut enc, sc, &cam, &cam_2d, 1.0, true);
+        queue.submit(Some(enc.finish()));
+        let (_, _, rgba) = vp
+            .capture_rgba_bytes_with_timeout(&device, &queue, Duration::from_secs(5))
+            .expect("H2 readback must succeed");
+        rgba
+    };
+
+    // 1. PBR mode: bloom OFF vs bloom ON must increase surrounding brightness via mip halo.
+    scene.shading_mode = ViewportShadingMode::Pbr;
+    scene.post_process.bloom_enabled = false;
+    let rgba_off = render_frame(&mut viewport, &scene);
+    let sum_off: u64 = rgba_off
+        .chunks_exact(4)
+        .map(|p| u64::from(p[0]) + u64::from(p[1]) + u64::from(p[2]))
+        .sum();
+
+    scene.post_process.bloom_enabled = true;
+    scene.post_process.bloom_threshold = 0.8;
+    scene.post_process.bloom_intensity = 1.25;
+    let rgba_on = render_frame(&mut viewport, &scene);
+    let sum_on: u64 = rgba_on
+        .chunks_exact(4)
+        .map(|p| u64::from(p[0]) + u64::from(p[1]) + u64::from(p[2]))
+        .sum();
+    assert!(
+        sum_on > sum_off,
+        "Dual-Kawase bloom must spread visible HDR glow into surrounding pixels (sum_on={sum_on}, sum_off={sum_off})"
+    );
+
+    // 2. NPR Sumi-e mode: bloom must be bypassed completely (bit-identical output).
+    scene.shading_mode = ViewportShadingMode::NprSumie;
+    scene.post_process.bloom_enabled = false;
+    let npr_off = render_frame(&mut viewport, &scene);
+    scene.post_process.bloom_enabled = true;
+    let npr_on = render_frame(&mut viewport, &scene);
+    assert_eq!(
+        npr_off, npr_on,
+        "NPR Sumi-e mode must bypass Dual-Kawase bloom completely"
+    );
+
+    // 3. Minimized resize (0x0 -> 1x1 -> 64x64) with bloom ON must stay valid.
+    scene.shading_mode = ViewportShadingMode::Pbr;
+    assert!(viewport.resize(&device, 0, 0));
+    let _ = render_frame(&mut viewport, &scene);
+    assert!(viewport.resize(&device, 64, 64));
+    let _ = render_frame(&mut viewport, &scene);
+
+    let validation_err = pollster::block_on(device.pop_error_scope());
+    assert!(
+        validation_err.is_none(),
+        "unexpected wgpu validation error on H2 Dual-Kawase bloom pipeline: {validation_err:?}"
+    );
+}

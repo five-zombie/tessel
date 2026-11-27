@@ -47,8 +47,11 @@ fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
         return vec4<f32>(clamp(hdr_rgba.rgb, vec3<f32>(0.0), vec3<f32>(1.0)), hdr_rgba.a);
     }
 
-    let bloom_rgb = textureSample(bloom_tex, linear_sampler, in.uv).rgb;
-    var color = max(hdr_rgba.rgb, vec3<f32>(0.0)) + max(bloom_rgb, vec3<f32>(0.0)) * params.tone.y;
+    var color = max(hdr_rgba.rgb, vec3<f32>(0.0));
+    if (params.tone.y > 0.0) {
+        let bloom_rgb = textureSample(bloom_tex, linear_sampler, in.uv).rgb;
+        color = color + max(bloom_rgb, vec3<f32>(0.0)) * params.tone.y;
+    }
     color = color * params.tone.x;
 
     if (params.tone.z > 0.5) {
