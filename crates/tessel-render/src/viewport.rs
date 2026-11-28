@@ -50,7 +50,10 @@ pub struct ViewportRenderer {
     post_process_pass: PostProcessPass,
     overlay_pass: OverlayPass,
     pixel_pass: PixelPass,
+    last_uploaded_scene_uid: u64,
     last_uploaded_revision: u64,
+    last_pixel_cache_key: Option<(u64, u64, Option<tessel_core::NodeId>)>,
+    has_active_pixel_canvas: bool,
     last_playback_time_bits: Option<u32>,
     last_hover_voxel: Option<VoxelCoord>,
     last_gizmo_axis: Option<GizmoAxis>,
@@ -64,6 +67,8 @@ pub struct ViewportRenderer {
     scene_bounds: ([f32; 3], [f32; 3]),
     scratch_vertices: Vec<StudioVertex3D>,
     scratch_indices: Vec<u32>,
+    scratch_pixel_rgba: Vec<u8>,
+    scratch_onion_rgba: Vec<u8>,
 }
 
 impl ViewportRenderer {
@@ -109,7 +114,10 @@ impl ViewportRenderer {
             post_process_pass,
             overlay_pass,
             pixel_pass,
+            last_uploaded_scene_uid: 0,
             last_uploaded_revision: u64::MAX,
+            last_pixel_cache_key: None,
+            has_active_pixel_canvas: false,
             last_playback_time_bits: None,
             last_hover_voxel: None,
             last_gizmo_axis: None,
@@ -123,6 +131,8 @@ impl ViewportRenderer {
             scene_bounds: ([f32::INFINITY; 3], [f32::NEG_INFINITY; 3]),
             scratch_vertices: Vec::new(),
             scratch_indices: Vec::new(),
+            scratch_pixel_rgba: Vec::new(),
+            scratch_onion_rgba: Vec::new(),
         }
     }
 
@@ -234,6 +244,7 @@ impl ViewportRenderer {
             .as_ref()
             .map(|r| r.playback_time.to_bits());
         let scene_changed = msaa_changed
+            || self.last_uploaded_scene_uid != scene.scene_uid()
             || self.last_uploaded_revision != scene.revision
             || self.last_playback_time_bits != playback_time_bits
             || scene.dirty_viewport;
@@ -262,23 +273,75 @@ impl ViewportRenderer {
             self.last_placement_ghost = self.placement_ghost;
             self.last_light_angles = light_angles;
         }
+        const SHRINK_THRESHOLD_BYTES: usize = 4 * 1024 * 1024;
+        if scene.active_mode != AppMode::Pixel {
+            if self.scratch_pixel_rgba.capacity() > SHRINK_THRESHOLD_BYTES {
+                self.scratch_pixel_rgba.clear();
+                self.scratch_pixel_rgba.shrink_to_fit();
+            }
+            if self.scratch_onion_rgba.capacity() > SHRINK_THRESHOLD_BYTES {
+                self.scratch_onion_rgba.clear();
+                self.scratch_onion_rgba.shrink_to_fit();
+            }
+        }
+        let active_pixel_node = scene.active_pixel_node();
+        let pixel_key = (scene.scene_uid(), scene.revision, active_pixel_node);
+        let pixel_needs_sync = scene.active_mode == AppMode::Pixel
+            && (self.last_pixel_cache_key != Some(pixel_key) || scene.dirty_viewport);
+        if !scene_changed && !pixel_needs_sync {
+            return;
+        }
+        if pixel_needs_sync {
+            if let Some(canvas) = active_pixel_node.and_then(|id| scene.pixel_canvases.get(&id)) {
+                canvas.composite_viewport_rgba_with_scratch(
+                    &scene.palette,
+                    &mut self.scratch_pixel_rgba,
+                    &mut self.scratch_onion_rgba,
+                );
+                if self.scratch_pixel_rgba.capacity() > SHRINK_THRESHOLD_BYTES
+                    && self.scratch_pixel_rgba.len().saturating_mul(4)
+                        < self.scratch_pixel_rgba.capacity()
+                {
+                    self.scratch_pixel_rgba.shrink_to_fit();
+                }
+                if !canvas.onion_skin && self.scratch_onion_rgba.capacity() > SHRINK_THRESHOLD_BYTES
+                {
+                    self.scratch_onion_rgba.clear();
+                    self.scratch_onion_rgba.shrink_to_fit();
+                } else if self.scratch_onion_rgba.capacity() > SHRINK_THRESHOLD_BYTES
+                    && self.scratch_onion_rgba.len().saturating_mul(4)
+                        < self.scratch_onion_rgba.capacity()
+                {
+                    self.scratch_onion_rgba.shrink_to_fit();
+                }
+                match self.pixel_pass.upload_canvas(
+                    device,
+                    queue,
+                    canvas.width,
+                    canvas.height,
+                    &self.scratch_pixel_rgba,
+                ) {
+                    Ok(()) => self.has_active_pixel_canvas = true,
+                    Err(err) => {
+                        tracing::warn!(error = %err, "Skipping pixel canvas GPU upload");
+                        self.has_active_pixel_canvas = false;
+                    }
+                }
+            } else {
+                self.has_active_pixel_canvas = false;
+                if self.scratch_pixel_rgba.capacity() > SHRINK_THRESHOLD_BYTES {
+                    self.scratch_pixel_rgba.clear();
+                    self.scratch_pixel_rgba.shrink_to_fit();
+                }
+            }
+            self.last_pixel_cache_key = Some(pixel_key);
+        }
         if !scene_changed {
             return;
         }
+        self.last_uploaded_scene_uid = scene.scene_uid();
         self.last_playback_time_bits = playback_time_bits;
         self.mesh_pass.upload_palette(queue, &scene.palette);
-
-        if let Some(node_id) = scene.active_pixel_node() {
-            if let Some(canvas) = scene.pixel_canvases.get(&node_id) {
-                let rgba = canvas.composite_viewport_rgba(&scene.palette);
-                if let Err(err) =
-                    self.pixel_pass
-                        .upload_canvas(device, queue, canvas.width, canvas.height, &rgba)
-                {
-                    tracing::warn!(error = %err, "Skipping pixel canvas GPU upload");
-                }
-            }
-        }
 
         let skin_solver = scene
             .character_rig
@@ -710,7 +773,9 @@ impl ViewportRenderer {
                     occlusion_query_set: None,
                     timestamp_writes: None,
                 });
-                self.pixel_pass.draw(&mut pass);
+                if self.has_active_pixel_canvas {
+                    self.pixel_pass.draw(&mut pass);
+                }
             }
             AppMode::Voxel | AppMode::LowPoly | AppMode::Character => {
                 let aspect = self.size.0 as f32 / self.size.1.max(1) as f32;

@@ -90,12 +90,18 @@ pub fn show_status_bar(
                     }
 
                     let right_text = match scene.active_mode {
-                        AppMode::Pixel => format!(
-                            "Mode: Pixel  |  Zoom: {:.0}x  |  Nodes: {}  |  Undo: {}",
-                            camera_2d.zoom,
-                            scene.nodes.len(),
-                            history.undo_len()
-                        ),
+                        AppMode::Pixel => {
+                            let zoom_label = if camera_2d.zoom < 1.0 {
+                                format!("{:.0}%", camera_2d.zoom * 100.0)
+                            } else {
+                                format!("{:.1}x", camera_2d.zoom)
+                            };
+                            format!(
+                                "Mode: Pixel  |  Zoom: {zoom_label}  |  Nodes: {}  |  Undo: {}",
+                                scene.nodes.len(),
+                                history.undo_len()
+                            )
+                        }
                         _ => {
                             let pos = camera_3d.position();
                             let tris = compute_scene_triangle_count(scene);

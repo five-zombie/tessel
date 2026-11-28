@@ -3785,7 +3785,7 @@ fn pixel_tools_create_layer_draw_animate_and_export() {
     // 2. Oversized canvas is rejected before allocation.
     assert!(execute_tool_call(
         "pixel_create_canvas",
-        &json!({ "width": 513, "height": 32 }),
+        &json!({ "width": tessel_core::MAX_PIXEL_CANVAS_DIM + 1, "height": 32 }),
         &mut scene,
         &mut history,
         &dir,
@@ -4733,6 +4733,112 @@ fn phase_i3_v55_to_v59_mcp_tools_roundtrip_and_undo() {
     )
     .unwrap();
     assert_eq!(preflight["status"], "pass");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn pixel_canvas_4k_and_resize_mcp_tools_roundtrip() {
+    let dir = std::env::temp_dir().join("tessel_pixel_4k_resize_mcp_test");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut scene = SceneState::new();
+    let mut history = HistoryStack::new();
+
+    // Creating a 4097-wide canvas must be rejected.
+    let err = execute_tool_call(
+        "pixel_create_canvas",
+        &json!({ "name": "TooBig", "width": 4097, "height": 16 }),
+        &mut scene,
+        &mut history,
+        &dir,
+    );
+    assert!(err.is_err());
+
+    // Creating up to 4096 succeeds.
+    let wide = execute_tool_call(
+        "pixel_create_canvas",
+        &json!({ "name": "Banner4K", "width": 4096, "height": 8 }),
+        &mut scene,
+        &mut history,
+        &dir,
+    )
+    .unwrap();
+    assert_eq!(wide["width"], 4096);
+    assert_eq!(wide["height"], 8);
+
+    // Paint a pixel, resize down/up via pixel_resize_canvas, verify undo/redo.
+    let small = execute_tool_call(
+        "pixel_create_canvas",
+        &json!({ "name": "Sprite", "width": 16, "height": 16 }),
+        &mut scene,
+        &mut history,
+        &dir,
+    )
+    .unwrap();
+    let node_id = small["node_id"].as_u64().unwrap();
+    execute_tool_call(
+        "pixel_draw",
+        &json!({
+            "node_id": node_id,
+            "pixels": [
+                { "x": 2, "y": 3, "palette_index": 4 },
+                { "x": 12, "y": 14, "palette_index": 5 }
+            ]
+        }),
+        &mut scene,
+        &mut history,
+        &dir,
+    )
+    .unwrap();
+
+    let resized = execute_tool_call(
+        "pixel_resize_canvas",
+        &json!({ "node_id": node_id, "width": 64, "height": 32 }),
+        &mut scene,
+        &mut history,
+        &dir,
+    )
+    .unwrap();
+    assert_eq!(resized["ok"], true);
+    assert_eq!(resized["width"], 64);
+    assert_eq!(resized["height"], 32);
+    assert_eq!(resized["previous_width"], 16);
+    assert_eq!(resized["previous_height"], 16);
+
+    let inspected = execute_tool_call(
+        "pixel_inspect",
+        &json!({ "node_id": node_id }),
+        &mut scene,
+        &mut history,
+        &dir,
+    )
+    .unwrap();
+    assert_eq!(inspected["width"], 64);
+    assert_eq!(inspected["height"], 32);
+
+    // Out-of-bounds resize rejected.
+    assert!(execute_tool_call(
+        "pixel_resize_canvas",
+        &json!({ "node_id": node_id, "width": 4097, "height": 32 }),
+        &mut scene,
+        &mut history,
+        &dir,
+    )
+    .is_err());
+
+    // Undo restores 16x16.
+    execute_tool_call("history_undo", &json!({}), &mut scene, &mut history, &dir).unwrap();
+    let after_undo = execute_tool_call(
+        "pixel_inspect",
+        &json!({ "node_id": node_id }),
+        &mut scene,
+        &mut history,
+        &dir,
+    )
+    .unwrap();
+    assert_eq!(after_undo["width"], 16);
+    assert_eq!(after_undo["height"], 16);
 
     let _ = std::fs::remove_dir_all(&dir);
 }

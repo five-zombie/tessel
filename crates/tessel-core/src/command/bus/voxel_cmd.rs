@@ -85,6 +85,11 @@ pub(super) fn apply(cmd: &Command, scene: &mut SceneState) -> Result<UndoDelta, 
                 .pixel_canvases
                 .get(pixel_node_id)
                 .ok_or(CoreError::PixelCanvasNotFound(*pixel_node_id))?;
+            if canvas.width > voxel_ops::MAX_PIXEL_TO_VOXEL_DIM
+                || canvas.height > voxel_ops::MAX_PIXEL_TO_VOXEL_DIM
+            {
+                return Err(CoreError::OutOfBounds);
+            }
             let vol = voxel_ops::pixel_to_voxel_volume(canvas, *depth);
             let (id, previous_selection) = insert_validated_scene_node(
                 scene,

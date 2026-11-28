@@ -49,6 +49,7 @@ struct StudioState {
     display_light_azimuth: f32,
     display_light_elevation: f32,
     camera_2d: PixelCamera2D,
+    last_fitted_pixel_canvas: Option<(tessel_core::NodeId, u32, u32)>,
     pixel_drag_start: Option<PixelCoord>,
     gizmo_drag: Option<ui::viewport::GizmoDragState>,
     gizmo_mode: tessel_render::TransformGizmoMode,
@@ -801,6 +802,7 @@ impl StudioState {
         self.display_light_azimuth = self.scene.light_azimuth;
         self.display_light_elevation = self.scene.light_elevation;
         self.camera_2d.reset();
+        self.last_fitted_pixel_canvas = None;
         self.pixel_drag_start = None;
         self.gizmo_drag = None;
         self.gizmo_mode = tessel_render::TransformGizmoMode::Move;
@@ -889,6 +891,7 @@ impl Default for StudioState {
             display_light_azimuth,
             display_light_elevation,
             camera_2d: PixelCamera2D::new(),
+            last_fitted_pixel_canvas: None,
             pixel_drag_start: None,
             gizmo_drag: None,
             gizmo_mode: tessel_render::TransformGizmoMode::Move,
@@ -1169,6 +1172,9 @@ impl GpuState {
                 || studio.pending_quick_start_confirm.is_some()
                 || studio.quick_start.open
                 || studio.last_error.is_some();
+            let vp_phys = self.viewport_renderer.size();
+            let ppp_cur = ctx.pixels_per_point().max(0.5);
+            let viewport_logical_size = [vp_phys.0 as f32 / ppp_cur, vp_phys.1 as f32 / ppp_cur];
             if !modal_blocking_shortcuts
                 && studio.gizmo_drag.is_none()
                 && studio.scene_gadget_drag.is_none()
@@ -1179,6 +1185,7 @@ impl GpuState {
                     &mut studio.history,
                     &mut studio.camera_3d,
                     &mut studio.camera_2d,
+                    viewport_logical_size,
                     &mut requested_mode,
                 ) {
                     tracing::error!("{err}");
@@ -1336,6 +1343,7 @@ impl GpuState {
                     history: &mut studio.history,
                     camera_3d: &mut studio.camera_3d,
                     camera_2d: &mut studio.camera_2d,
+                    viewport_logical_size,
                     export_open: &mut studio.export_dialog.open,
                     import_mesh: &mut top_actions.import_mesh,
                     new_project: &mut top_actions.new_project,
@@ -2233,6 +2241,33 @@ impl GpuState {
             });
 
         let pixels_per_point = full_output.pixels_per_point;
+        if studio.scene.active_mode == tessel_core::AppMode::Pixel {
+            let active_key = studio.scene.active_pixel_node().and_then(|nid| {
+                studio
+                    .scene
+                    .pixel_canvases
+                    .get(&nid)
+                    .map(|c| (nid, c.width, c.height))
+            });
+            if active_key != studio.last_fitted_pixel_canvas {
+                if let Some((_nid, cw, ch)) = active_key {
+                    let ppp = pixels_per_point.max(0.5);
+                    let logical_vp = [
+                        desired_viewport.0 as f32 / ppp,
+                        desired_viewport.1 as f32 / ppp,
+                    ];
+                    if logical_vp[0] > 1.0 && logical_vp[1] > 1.0 {
+                        studio.camera_2d.fit_canvas(logical_vp, (cw, ch));
+                        studio.last_fitted_pixel_canvas = active_key;
+                        self.egui_ctx.request_repaint();
+                    }
+                } else {
+                    studio.last_fitted_pixel_canvas = None;
+                }
+            }
+        } else {
+            studio.last_fitted_pixel_canvas = None;
+        }
         self.viewport_renderer.render_with_light(
             &self.queue,
             &mut encoder,

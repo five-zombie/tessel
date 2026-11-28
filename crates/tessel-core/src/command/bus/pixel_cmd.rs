@@ -38,6 +38,32 @@ pub(super) fn apply(cmd: &Command, scene: &mut SceneState) -> Result<UndoDelta, 
                 previous_selection,
             }
         }
+        Command::ResizePixelCanvas {
+            node_id,
+            width,
+            height,
+        } => {
+            if *width == 0
+                || *height == 0
+                || *width > crate::pixel::MAX_PIXEL_CANVAS_DIM
+                || *height > crate::pixel::MAX_PIXEL_CANVAS_DIM
+            {
+                return Err(CoreError::OutOfBounds);
+            }
+            let canvas = scene
+                .pixel_canvases
+                .get_mut(node_id)
+                .ok_or(CoreError::PixelCanvasNotFound(*node_id))?;
+            if canvas.width == *width && canvas.height == *height {
+                return Ok(UndoDelta::Transaction(Vec::new()));
+            }
+            let previous = Box::new(canvas.clone());
+            canvas.resize(*width, *height)?;
+            UndoDelta::RestorePixelCanvas {
+                node_id: *node_id,
+                previous,
+            }
+        }
         Command::DrawPixels {
             node_id,
             frame,
@@ -55,20 +81,65 @@ pub(super) fn apply(cmd: &Command, scene: &mut SceneState) -> Result<UndoDelta, 
                 .layer_mut(*layer_id)
                 .ok_or(CoreError::PixelLayerNotFound(*layer_id))?;
 
-            let mut previous_pixels = Vec::with_capacity(edits.len());
-            for edit in edits {
-                if let Some(prev) = layer.set(edit.coord, edit.color) {
-                    previous_pixels.push(PixelEdit {
-                        coord: edit.coord,
-                        color: prev,
-                    });
+            if edits.len() > layer.pixels().len() / 8 {
+                let rle_pixels = layer.encode_rle();
+                for edit in edits {
+                    let _ = layer.set(edit.coord, edit.color);
+                }
+                UndoDelta::RestorePixelLayerRle {
+                    node_id: *node_id,
+                    frame: *frame,
+                    layer_id: *layer_id,
+                    rle_pixels,
+                }
+            } else {
+                let mut previous_pixels = Vec::with_capacity(edits.len());
+                for edit in edits {
+                    if let Some(prev) = layer.set(edit.coord, edit.color) {
+                        previous_pixels.push(PixelEdit {
+                            coord: edit.coord,
+                            color: prev,
+                        });
+                    }
+                }
+                UndoDelta::RestorePixels {
+                    node_id: *node_id,
+                    frame: *frame,
+                    layer_id: *layer_id,
+                    previous_pixels,
                 }
             }
-            UndoDelta::RestorePixels {
+        }
+        Command::FloodFillPixels {
+            node_id,
+            frame,
+            layer_id,
+            start,
+            color,
+        } => {
+            let canvas = scene
+                .pixel_canvases
+                .get_mut(node_id)
+                .ok_or(CoreError::PixelCanvasNotFound(*node_id))?;
+            if start.x >= canvas.width || start.y >= canvas.height {
+                return Err(CoreError::OutOfBounds);
+            }
+            let frame_ref = canvas
+                .frame_mut(*frame)
+                .ok_or(CoreError::PixelFrameNotFound(*frame))?;
+            let layer = frame_ref
+                .layer_mut(*layer_id)
+                .ok_or(CoreError::PixelLayerNotFound(*layer_id))?;
+            if layer.get(*start) == *color {
+                return Ok(UndoDelta::Transaction(Vec::new()));
+            }
+            let rle_pixels = layer.encode_rle();
+            crate::pixel::ops::flood_fill_layer_in_place(layer, *start, *color);
+            UndoDelta::RestorePixelLayerRle {
                 node_id: *node_id,
                 frame: *frame,
                 layer_id: *layer_id,
-                previous_pixels,
+                rle_pixels,
             }
         }
         Command::AddPixelLayer {

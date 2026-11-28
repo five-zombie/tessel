@@ -587,6 +587,32 @@ impl UndoDelta {
                 scene.post_process = *previous;
                 scene.npr_look.bloom_strength = *previous_npr_bloom;
             }
+            Self::RestorePixelCanvas { node_id, previous } => {
+                if !scene.pixel_canvases.contains_key(node_id) {
+                    return Err(CoreError::PixelCanvasNotFound(*node_id));
+                }
+                scene.pixel_canvases.insert(*node_id, (**previous).clone());
+            }
+            Self::RestorePixelLayerRle {
+                node_id,
+                frame,
+                layer_id,
+                rle_pixels,
+            } => {
+                let canvas = scene
+                    .pixel_canvases
+                    .get_mut(node_id)
+                    .ok_or(CoreError::PixelCanvasNotFound(*node_id))?;
+                let frame_ref = canvas
+                    .frame_mut(*frame)
+                    .ok_or(CoreError::PixelFrameNotFound(*frame))?;
+                let layer = frame_ref
+                    .layer_mut(*layer_id)
+                    .ok_or(CoreError::PixelLayerNotFound(*layer_id))?;
+                if !layer.restore_rle(rle_pixels) {
+                    return Err(CoreError::OutOfBounds);
+                }
+            }
             Self::Transaction(deltas) => {
                 for delta in deltas.iter().rev() {
                     delta.revert(scene)?;

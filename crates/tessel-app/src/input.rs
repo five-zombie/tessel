@@ -68,6 +68,7 @@ pub fn handle_global_shortcuts(
     history: &mut HistoryStack,
     camera_3d: &mut OrbitCamera,
     camera_2d: &mut PixelCamera2D,
+    viewport_logical_size: [f32; 2],
     requested_mode: &mut Option<AppMode>,
 ) -> Option<String> {
     if ctx.wants_keyboard_input() {
@@ -184,7 +185,7 @@ pub fn handle_global_shortcuts(
 
     if reset_cam {
         match scene.active_mode {
-            AppMode::Pixel => camera_2d.reset(),
+            AppMode::Pixel => camera_2d.fit_active_canvas(viewport_logical_size, scene),
             _ => camera_3d.reset(),
         }
     }

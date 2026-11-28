@@ -769,3 +769,256 @@ fn h1_post_process_and_material_contracts_validate_sync_and_undo() {
     assert!((mat.transmission - 0.9).abs() < 1e-6);
     assert_eq!(mat.ior, 2.5);
 }
+
+#[test]
+fn pixel_canvas_4k_bounds_and_resize_undo_redo() {
+    use crate::pixel::{PixelCoord, MAX_PIXEL_CANVAS_DIM};
+    use crate::HistoryStack;
+
+    let mut scene = SceneState::new();
+    let mut history = HistoryStack::new();
+
+    // Exceeding 4096 or 0 must fail cleanly.
+    assert_eq!(
+        history.execute(
+            &mut scene,
+            Command::CreatePixelCanvas {
+                name: "TooWide".into(),
+                width: MAX_PIXEL_CANVAS_DIM + 1,
+                height: 16,
+            },
+        ),
+        Err(CoreError::OutOfBounds)
+    );
+    assert_eq!(
+        history.execute(
+            &mut scene,
+            Command::CreatePixelCanvas {
+                name: "Zero".into(),
+                width: 0,
+                height: 16,
+            },
+        ),
+        Err(CoreError::OutOfBounds)
+    );
+
+    // 4096-wide canvas is supported.
+    history
+        .execute(
+            &mut scene,
+            Command::CreatePixelCanvas {
+                name: "Wide4K".into(),
+                width: MAX_PIXEL_CANVAS_DIM,
+                height: 4,
+            },
+        )
+        .unwrap();
+    let wide_id = scene.selected_node.unwrap();
+    assert_eq!(scene.pixel_canvases[&wide_id].width, 4096);
+    assert_eq!(scene.pixel_canvases[&wide_id].height, 4);
+
+    // Create a small canvas, paint inside and outside crop region, add a 2nd frame, then resize.
+    history
+        .execute(
+            &mut scene,
+            Command::CreatePixelCanvas {
+                name: "Resizable".into(),
+                width: 8,
+                height: 8,
+            },
+        )
+        .unwrap();
+    let id = scene.selected_node.unwrap();
+    let layer_id = scene.pixel_canvases[&id].frames[0].layers[0].id;
+    let color = PaletteIndex::new(4).unwrap();
+    history
+        .execute(
+            &mut scene,
+            Command::DrawPixels {
+                node_id: id,
+                frame: FrameIndex(0),
+                layer_id,
+                edits: vec![
+                    PixelEdit {
+                        coord: PixelCoord::new(1, 2),
+                        color: Some(color),
+                    },
+                    PixelEdit {
+                        coord: PixelCoord::new(6, 7),
+                        color: Some(color),
+                    },
+                ],
+            },
+        )
+        .unwrap();
+    history
+        .execute(&mut scene, Command::AddPixelFrame { node_id: id })
+        .unwrap();
+
+    // Grow to 16x12: both pixels and both frames stay intact.
+    history
+        .execute(
+            &mut scene,
+            Command::ResizePixelCanvas {
+                node_id: id,
+                width: 16,
+                height: 12,
+            },
+        )
+        .unwrap();
+    {
+        let c = &scene.pixel_canvases[&id];
+        assert_eq!((c.width, c.height), (16, 12));
+        assert_eq!(c.frames.len(), 2);
+        assert_eq!(
+            c.frames[0].layers[0].get(PixelCoord::new(1, 2)),
+            Some(color)
+        );
+        assert_eq!(
+            c.frames[0].layers[0].get(PixelCoord::new(6, 7)),
+            Some(color)
+        );
+        assert_eq!(c.frames[1].layers[0].width(), 16);
+        assert_eq!(c.frames[1].layers[0].height(), 12);
+    }
+
+    // Shrink to 4x4: (1,2) survives, (6,7) is cropped.
+    history
+        .execute(
+            &mut scene,
+            Command::ResizePixelCanvas {
+                node_id: id,
+                width: 4,
+                height: 4,
+            },
+        )
+        .unwrap();
+    {
+        let c = &scene.pixel_canvases[&id];
+        assert_eq!((c.width, c.height), (4, 4));
+        assert_eq!(
+            c.frames[0].layers[0].get(PixelCoord::new(1, 2)),
+            Some(color)
+        );
+        assert_eq!(c.frames[0].layers[0].get(PixelCoord::new(6, 7)), None);
+    }
+
+    // Out-of-bounds resize fails without mutating canvas.
+    assert_eq!(
+        history.execute(
+            &mut scene,
+            Command::ResizePixelCanvas {
+                node_id: id,
+                width: MAX_PIXEL_CANVAS_DIM + 1,
+                height: 4,
+            },
+        ),
+        Err(CoreError::OutOfBounds)
+    );
+    assert_eq!(scene.pixel_canvases[&id].width, 4);
+
+    // Undo restores 16x12 and cropped pixel (6,7).
+    history.undo(&mut scene).unwrap();
+    {
+        let c = &scene.pixel_canvases[&id];
+        assert_eq!((c.width, c.height), (16, 12));
+        assert_eq!(
+            c.frames[0].layers[0].get(PixelCoord::new(6, 7)),
+            Some(color)
+        );
+    }
+
+    // Redo reapplies 4x4 shrink.
+    history.redo(&mut scene).unwrap();
+    assert_eq!(scene.pixel_canvases[&id].width, 4);
+    assert_eq!(scene.pixel_canvases[&id].height, 4);
+}
+
+#[test]
+fn flood_fill_pixels_uses_compact_rle_undo_and_roundtrips_undo_redo() {
+    use crate::pixel::{FrameIndex, PixelCoord};
+
+    let mut scene = SceneState::new();
+    let mut history = crate::HistoryStack::default();
+    history
+        .execute(
+            &mut scene,
+            Command::CreatePixelCanvas {
+                name: "Fill4KTest".into(),
+                width: 64,
+                height: 64,
+            },
+        )
+        .unwrap();
+    let id = scene.active_pixel_node().unwrap();
+    let layer_id = scene.pixel_canvases[&id].frames[0].layers[0].id;
+    let fill_color = PaletteIndex::new(3).unwrap();
+
+    // Direct apply verifies compact RLE undo delta (1 run for empty layer).
+    let delta = (Command::FloodFillPixels {
+        node_id: id,
+        frame: FrameIndex(0),
+        layer_id,
+        start: PixelCoord::new(0, 0),
+        color: Some(fill_color),
+    })
+    .apply(&mut scene)
+    .unwrap();
+    match &delta {
+        UndoDelta::RestorePixelLayerRle { rle_pixels, .. } => {
+            assert_eq!(rle_pixels.len(), 1);
+            assert_eq!(rle_pixels[0], (64 * 64, None));
+        }
+        other => panic!("expected RestorePixelLayerRle, got {other:?}"),
+    }
+    assert_eq!(
+        scene.pixel_canvases[&id].frames[0].layers[0].get(PixelCoord::new(63, 63)),
+        Some(fill_color)
+    );
+    delta.revert(&mut scene).unwrap();
+    assert_eq!(
+        scene.pixel_canvases[&id].frames[0].layers[0].get(PixelCoord::new(63, 63)),
+        None
+    );
+
+    // HistoryStack execute -> undo -> redo roundtrip + OOB rejection.
+    history
+        .execute(
+            &mut scene,
+            Command::FloodFillPixels {
+                node_id: id,
+                frame: FrameIndex(0),
+                layer_id,
+                start: PixelCoord::new(10, 10),
+                color: Some(fill_color),
+            },
+        )
+        .unwrap();
+    assert_eq!(
+        scene.pixel_canvases[&id].frames[0].layers[0].get(PixelCoord::new(0, 0)),
+        Some(fill_color)
+    );
+    history.undo(&mut scene).unwrap();
+    assert_eq!(
+        scene.pixel_canvases[&id].frames[0].layers[0].get(PixelCoord::new(0, 0)),
+        None
+    );
+    history.redo(&mut scene).unwrap();
+    assert_eq!(
+        scene.pixel_canvases[&id].frames[0].layers[0].get(PixelCoord::new(0, 0)),
+        Some(fill_color)
+    );
+    assert_eq!(
+        history.execute(
+            &mut scene,
+            Command::FloodFillPixels {
+                node_id: id,
+                frame: FrameIndex(0),
+                layer_id,
+                start: PixelCoord::new(64, 0),
+                color: Some(fill_color),
+            },
+        ),
+        Err(CoreError::OutOfBounds)
+    );
+}

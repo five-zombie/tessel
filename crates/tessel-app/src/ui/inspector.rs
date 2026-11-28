@@ -449,7 +449,7 @@ fn show_pixel_layers_section(
             );
             ui.add(
                 egui::DragValue::new(&mut w)
-                    .range(8..=256)
+                    .range(1..=tessel_core::MAX_PIXEL_CANVAS_DIM)
                     .prefix("")
                     .suffix("px"),
             );
@@ -460,7 +460,7 @@ fn show_pixel_layers_section(
             );
             ui.add(
                 egui::DragValue::new(&mut h)
-                    .range(8..=256)
+                    .range(1..=tessel_core::MAX_PIXEL_CANVAS_DIM)
                     .prefix("")
                     .suffix("px"),
             );
@@ -489,6 +489,72 @@ fn show_pixel_layers_section(
         }
         return;
     };
+
+    if let Some((cur_w, cur_h)) = scene
+        .pixel_canvases
+        .get(&node_id)
+        .map(|c| (c.width, c.height))
+    {
+        let draft_id = egui::Id::new(("pixel_resize_draft", scene.scene_uid(), node_id));
+        let (last_w, last_h, mut draft_w, mut draft_h) = ui.ctx().data_mut(|data| {
+            data.get_temp::<(u32, u32, u32, u32)>(draft_id)
+                .unwrap_or((cur_w, cur_h, cur_w, cur_h))
+        });
+        if (last_w, last_h) != (cur_w, cur_h) {
+            draft_w = cur_w;
+            draft_h = cur_h;
+        }
+        ui.horizontal(|ui| {
+            ui.label(
+                RichText::new("W")
+                    .size(11.0)
+                    .color(tokens::ON_SURFACE_VARIANT),
+            );
+            ui.add(
+                egui::DragValue::new(&mut draft_w)
+                    .range(1..=tessel_core::MAX_PIXEL_CANVAS_DIM)
+                    .suffix("px"),
+            );
+            ui.label(
+                RichText::new("H")
+                    .size(11.0)
+                    .color(tokens::ON_SURFACE_VARIANT),
+            );
+            ui.add(
+                egui::DragValue::new(&mut draft_h)
+                    .range(1..=tessel_core::MAX_PIXEL_CANVAS_DIM)
+                    .suffix("px"),
+            );
+            let changed = (draft_w, draft_h) != (cur_w, cur_h);
+            let resize_btn =
+                egui::Button::new(RichText::new("Resize").size(11.0).color(if changed {
+                    tokens::ON_PRIMARY
+                } else {
+                    tokens::ON_SURFACE_VARIANT
+                }))
+                .fill(if changed {
+                    tokens::PRIMARY_CONTAINER
+                } else {
+                    tokens::SURFACE_CONTAINER
+                })
+                .corner_radius(egui::CornerRadius::same(4));
+            if ui.add_enabled(changed, resize_btn).clicked() {
+                super::exec_history(
+                    ui.ctx(),
+                    history,
+                    scene,
+                    Command::ResizePixelCanvas {
+                        node_id,
+                        width: draft_w,
+                        height: draft_h,
+                    },
+                );
+            }
+        });
+        ui.ctx()
+            .data_mut(|data| data.insert_temp(draft_id, (cur_w, cur_h, draft_w, draft_h)));
+        ui.add_space(4.0);
+    }
 
     let snapshot = scene.pixel_canvases.get(&node_id).and_then(|c| {
         c.current_frame().map(|f| {

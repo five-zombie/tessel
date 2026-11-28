@@ -1544,7 +1544,8 @@ fn show_viewport_hud(
                             false,
                         ) {
                             match mode {
-                                AppMode::Pixel => camera_2d.reset(),
+                                AppMode::Pixel => camera_2d
+                                    .fit_active_canvas([rect.width(), rect.height()], scene),
                                 _ => *camera_3d_target = Some(OrbitCamera::new()),
                             }
                         }
@@ -1912,13 +1913,27 @@ fn handle_pixel_viewport_input(
             if !response.clicked_by(egui::PointerButton::Primary) {
                 return;
             }
-            scene
+            let already_same = scene
                 .pixel_canvases
                 .get(&node_id)
                 .and_then(|c| c.frame(FrameIndex(active_frame)))
                 .and_then(|f| f.layer(layer_id))
-                .map(|layer| pixel_ops::flood_fill_edits(layer, coord, Some(scene.active_color)))
-                .unwrap_or_default()
+                .is_some_and(|layer| layer.get(coord) == Some(scene.active_color));
+            if !already_same {
+                super::exec_history(
+                    ui.ctx(),
+                    history,
+                    scene,
+                    Command::FloodFillPixels {
+                        node_id,
+                        frame: FrameIndex(active_frame),
+                        layer_id,
+                        start: coord,
+                        color: Some(scene.active_color),
+                    },
+                );
+            }
+            return;
         }
         PixelTool::Eyedropper => return,
     };

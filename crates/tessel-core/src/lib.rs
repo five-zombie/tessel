@@ -40,7 +40,7 @@ pub use mesh::{
 pub use palette::{Palette, PaletteEntry, PaletteIndex, Rgba8};
 pub use pixel::{
     FrameIndex, LayerId, PixelCanvas, PixelCoord, PixelEdit, PixelFrame, PixelLayer, PixelTool,
-    Symmetry2D,
+    Symmetry2D, MAX_PIXEL_CANVAS_DIM,
 };
 pub use scene::{
     validate_node_name, AppMode, CameraBookmark, LookDevPreset, NodeId, NodeKind, NprLookParams,

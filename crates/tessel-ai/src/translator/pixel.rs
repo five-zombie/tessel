@@ -29,17 +29,32 @@ pub(super) fn execute(
 ) -> Result<Value, AiError> {
     match name {
         "pixel_create_canvas" => {
+            let max_dim = u64::from(tessel_core::MAX_PIXEL_CANVAS_DIM);
             let name = args
                 .get("name")
                 .and_then(Value::as_str)
                 .unwrap_or("Pixel Sprite")
                 .to_string();
-            let width = args.get("width").and_then(Value::as_u64).unwrap_or(32);
-            let height = args.get("height").and_then(Value::as_u64).unwrap_or(32);
-            if width == 0 || height == 0 || width > 512 || height > 512 {
-                return Err(AiError::InvalidArguments(
-                    "pixel canvas dimensions must be 1..=512".into(),
-                ));
+            let width = match args.get("width") {
+                None | Some(Value::Null) => 32,
+                Some(v) => v.as_u64().ok_or_else(|| {
+                    AiError::InvalidArguments(format!(
+                        "'width' must be a positive integer in 1..={max_dim}"
+                    ))
+                })?,
+            };
+            let height = match args.get("height") {
+                None | Some(Value::Null) => 32,
+                Some(v) => v.as_u64().ok_or_else(|| {
+                    AiError::InvalidArguments(format!(
+                        "'height' must be a positive integer in 1..={max_dim}"
+                    ))
+                })?,
+            };
+            if width == 0 || height == 0 || width > max_dim || height > max_dim {
+                return Err(AiError::InvalidArguments(format!(
+                    "pixel canvas dimensions must be 1..={max_dim}"
+                )));
             }
             history.execute(
                 scene,
@@ -66,6 +81,62 @@ pub(super) fn execute(
                 "height": canvas.height,
                 "active_frame": canvas.active_frame,
                 "layers": pixel_frame_summary(frame),
+            }))
+        }
+        "pixel_resize_canvas" => {
+            let max_dim = u64::from(tessel_core::MAX_PIXEL_CANVAS_DIM);
+            let node_id = match args.get("node_id") {
+                None | Some(Value::Null) => scene.active_pixel_node().ok_or_else(|| {
+                    AiError::InvalidArguments("no pixel canvas found in scene".into())
+                })?,
+                Some(v) => {
+                    let raw = v.as_u64().ok_or_else(|| {
+                        AiError::InvalidArguments("'node_id' must be a positive integer".into())
+                    })?;
+                    let id = NodeId(raw);
+                    if !scene.pixel_canvases.contains_key(&id) {
+                        return Err(AiError::InvalidArguments(format!(
+                            "pixel canvas node {raw} not found"
+                        )));
+                    }
+                    id
+                }
+            };
+            let width = args
+                .get("width")
+                .and_then(Value::as_u64)
+                .ok_or_else(|| AiError::InvalidArguments("missing 'width'".into()))?;
+            let height = args
+                .get("height")
+                .and_then(Value::as_u64)
+                .ok_or_else(|| AiError::InvalidArguments("missing 'height'".into()))?;
+            if width == 0 || height == 0 || width > max_dim || height > max_dim {
+                return Err(AiError::InvalidArguments(format!(
+                    "pixel canvas dimensions must be 1..={max_dim}"
+                )));
+            }
+            let (previous_width, previous_height) = scene
+                .pixel_canvases
+                .get(&node_id)
+                .map(|c| (c.width, c.height))
+                .ok_or_else(|| AiError::InvalidArguments("pixel canvas not found".into()))?;
+            if (width as u32, height as u32) != (previous_width, previous_height) {
+                history.execute(
+                    scene,
+                    Command::ResizePixelCanvas {
+                        node_id,
+                        width: width as u32,
+                        height: height as u32,
+                    },
+                )?;
+            }
+            Ok(json!({
+                "ok": true,
+                "node_id": node_id.0,
+                "width": width,
+                "height": height,
+                "previous_width": previous_width,
+                "previous_height": previous_height,
             }))
         }
         "pixel_add_layer" => {
@@ -295,23 +366,30 @@ pub(super) fn execute(
                 ));
             }
             let color = parse_opt_palette_index(args, None)?;
-            let edits = tessel_core::pixel::ops::flood_fill_edits(
-                layer,
-                PixelCoord::new(x as u32, y as u32),
-                color,
-            );
-            let filled = edits.len();
-            if !edits.is_empty() {
+            let start = PixelCoord::new(x as u32, y as u32);
+            let filled = if layer.get(start) == color {
+                0
+            } else {
+                let before_count = layer.pixels().iter().filter(|&&c| c == color).count();
                 history.execute(
                     scene,
-                    Command::DrawPixels {
+                    Command::FloodFillPixels {
                         node_id,
                         frame: FrameIndex(frame_idx),
                         layer_id,
-                        edits,
+                        start,
+                        color,
                     },
                 )?;
-            }
+                let after_count = scene
+                    .pixel_canvases
+                    .get(&node_id)
+                    .and_then(|c| c.frame(FrameIndex(frame_idx)))
+                    .and_then(|f| f.layer(layer_id))
+                    .map(|l| l.pixels().iter().filter(|&&c| c == color).count())
+                    .unwrap_or(before_count);
+                after_count.saturating_sub(before_count)
+            };
             Ok(json!({
                 "ok": true,
                 "node_id": node_id.0,

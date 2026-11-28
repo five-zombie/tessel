@@ -10,7 +10,7 @@ use zip::{CompressionMethod, DateTime, ZipArchive, ZipWriter};
 use crate::error::IoError;
 
 pub const PROJECT_FORMAT_ID: &str = "tessel-project";
-pub const CURRENT_SCHEMA_VERSION: u32 = 1;
+pub const CURRENT_SCHEMA_VERSION: u32 = 2;
 
 fn default_unit_scale() -> f32 {
     0.1
@@ -69,12 +69,20 @@ pub fn encode_tessel_project_with_thumbnail(
 }
 
 const MAX_MANIFEST_JSON_BYTES: u64 = 64 * 1024;
-const MAX_SCENE_JSON_BYTES: u64 = 64 * 1024 * 1024;
-const MAX_PIXEL_CANVAS_DIM: u32 = 512;
+const MAX_SCENE_JSON_BYTES: u64 = 256 * 1024 * 1024;
+const MAX_SCENE_DECODED_PIXELS: usize = 256 * 1024 * 1024;
+const MAX_PIXEL_CANVASES: usize = 64;
+const MAX_PIXEL_CANVAS_DIM: u32 = tessel_core::MAX_PIXEL_CANVAS_DIM;
 const MAX_PIXEL_CANVAS_FRAMES: usize = 128;
 const MAX_PIXEL_LAYERS_PER_FRAME: usize = 32;
 
 fn validate_loaded_scene(scene: &SceneState) -> Result<(), IoError> {
+    if scene.pixel_canvases.len() > MAX_PIXEL_CANVASES {
+        return Err(IoError::PayloadTooLarge(format!(
+            "pixel canvas count {} exceeds limit {MAX_PIXEL_CANVASES}",
+            scene.pixel_canvases.len()
+        )));
+    }
     for canvas in scene.pixel_canvases.values() {
         if canvas.width == 0
             || canvas.height == 0
@@ -82,6 +90,11 @@ fn validate_loaded_scene(scene: &SceneState) -> Result<(), IoError> {
             || canvas.height > MAX_PIXEL_CANVAS_DIM
         {
             return Err(IoError::InvalidDimensions(canvas.width, canvas.height));
+        }
+        if canvas.frames.is_empty() || canvas.active_frame >= canvas.frames.len() {
+            return Err(IoError::InvalidFormat(
+                "pixel canvas must have at least one frame and a valid active_frame".into(),
+            ));
         }
         if canvas.frames.len() > MAX_PIXEL_CANVAS_FRAMES {
             return Err(IoError::PayloadTooLarge(format!(
@@ -93,6 +106,11 @@ fn validate_loaded_scene(scene: &SceneState) -> Result<(), IoError> {
             .checked_mul(canvas.height as usize)
             .ok_or(IoError::InvalidDimensions(canvas.width, canvas.height))?;
         for frame in &canvas.frames {
+            if frame.layers.is_empty() || frame.active_layer >= frame.layers.len() {
+                return Err(IoError::InvalidFormat(
+                    "pixel frame must have at least one layer and a valid active_layer".into(),
+                ));
+            }
             if frame.layers.len() > MAX_PIXEL_LAYERS_PER_FRAME {
                 return Err(IoError::PayloadTooLarge(format!(
                     "pixel frame layer count {} exceeds limit {MAX_PIXEL_LAYERS_PER_FRAME}",
@@ -143,10 +161,13 @@ pub fn decode_tessel_project(bytes: &[u8]) -> Result<SceneState, IoError> {
         .read_to_string(&mut scene_buf)?;
     if read_bytes as u64 > MAX_SCENE_JSON_BYTES {
         return Err(IoError::PayloadTooLarge(
-            "scene.json exceeds 64 MiB decompressed limit".into(),
+            "scene.json exceeds 256 MiB decompressed limit".into(),
         ));
     }
-    let scene: SceneState = serde_json::from_str(&scene_buf)?;
+    let scene: SceneState =
+        tessel_core::pixel::with_pixel_decode_budget(MAX_SCENE_DECODED_PIXELS, || {
+            serde_json::from_str(&scene_buf)
+        })?;
     validate_loaded_scene(&scene)?;
     Ok(scene)
 }
@@ -350,16 +371,188 @@ mod tests {
             Err(IoError::InvalidFormat(_))
         ));
 
-        // Oversized PixelCanvas (> 512) must be rejected post-deserialization.
+        // 4K-wide PixelCanvas (<= 4096) must round-trip cleanly.
+        let mut valid_4k = SceneState::new();
+        let ok_node_id = valid_4k.allocate_node_id();
+        let ok_canvas = tessel_core::PixelCanvas::new(MAX_PIXEL_CANVAS_DIM, 4).unwrap();
+        valid_4k.pixel_canvases.insert(ok_node_id, ok_canvas);
+        let encoded_4k = encode_tessel_project(&valid_4k).unwrap();
+        let decoded_4k = decode_tessel_project(&encoded_4k).unwrap();
+        assert_eq!(
+            decoded_4k.pixel_canvases[&ok_node_id].width,
+            MAX_PIXEL_CANVAS_DIM
+        );
+
+        // Oversized PixelCanvas (> 4096) must be rejected post-deserialization.
         let mut oversized = SceneState::new();
         let node_id = oversized.allocate_node_id();
         let mut bad_canvas = tessel_core::PixelCanvas::new(16, 16).unwrap();
-        bad_canvas.width = 1024;
+        bad_canvas.width = MAX_PIXEL_CANVAS_DIM + 1;
         oversized.pixel_canvases.insert(node_id, bad_canvas);
         let encoded_oversized = encode_tessel_project(&oversized).unwrap();
         assert!(matches!(
             decode_tessel_project(&encoded_oversized),
-            Err(IoError::InvalidDimensions(1024, 16))
+            Err(IoError::InvalidDimensions(4097, 16))
         ));
+    }
+
+    #[test]
+    fn five_layer_4k_pixel_project_roundtrips_compactly_under_scene_json_limit() {
+        let mut scene = SceneState::new();
+        Command::CreatePixelCanvas {
+            name: "Artwork4K".into(),
+            width: MAX_PIXEL_CANVAS_DIM,
+            height: MAX_PIXEL_CANVAS_DIM,
+        }
+        .apply(&mut scene)
+        .unwrap();
+        let node_id = scene.active_pixel_node().unwrap();
+        for idx in 2..=5 {
+            Command::AddPixelLayer {
+                node_id,
+                frame: tessel_core::FrameIndex(0),
+                name: format!("Layer {idx}"),
+            }
+            .apply(&mut scene)
+            .unwrap();
+        }
+        let color = PaletteIndex::new(5).unwrap();
+        let layer_id = scene.pixel_canvases[&node_id].frames[0].layers[4].id;
+        Command::DrawPixels {
+            node_id,
+            frame: tessel_core::FrameIndex(0),
+            layer_id,
+            edits: vec![
+                tessel_core::PixelEdit {
+                    coord: tessel_core::PixelCoord::new(0, 0),
+                    color: Some(color),
+                },
+                tessel_core::PixelEdit {
+                    coord: tessel_core::PixelCoord::new(4095, 4095),
+                    color: Some(color),
+                },
+            ],
+        }
+        .apply(&mut scene)
+        .unwrap();
+
+        let encoded = encode_tessel_project(&scene).unwrap();
+        let mut archive = ZipArchive::new(Cursor::new(&encoded)).unwrap();
+        let scene_json_len = archive.by_name("scene.json").unwrap().size();
+        assert!(
+            scene_json_len < 1024 * 1024,
+            "5-layer 4K RLE scene.json must stay well below 1 MiB, got {scene_json_len} bytes"
+        );
+
+        let decoded = decode_tessel_project(&encoded).unwrap();
+        let canvas = &decoded.pixel_canvases[&node_id];
+        assert_eq!(canvas.width, MAX_PIXEL_CANVAS_DIM);
+        assert_eq!(canvas.height, MAX_PIXEL_CANVAS_DIM);
+        assert_eq!(canvas.frames[0].layers.len(), 5);
+        assert_eq!(
+            canvas.frames[0].layers[4].get(tessel_core::PixelCoord::new(4095, 4095)),
+            Some(color)
+        );
+    }
+
+    #[test]
+    fn pixel_layer_serde_supports_legacy_flat_array_and_rejects_rle_bombs() {
+        use tessel_core::{LayerId, PixelCoord, PixelLayer};
+
+        let mut layer = PixelLayer::new(LayerId(1), "Sky", 4096, 4096);
+        let c1 = PaletteIndex::new(3).unwrap();
+        let c2 = PaletteIndex::new(7).unwrap();
+        layer.set(PixelCoord::new(0, 0), Some(c1));
+        layer.set(PixelCoord::new(1, 0), Some(c1));
+        layer.set(PixelCoord::new(4095, 4095), Some(c2));
+
+        let json = serde_json::to_string(&layer).unwrap();
+        assert!(
+            json.len() < 256,
+            "4K RLE layer JSON should be compact, got {} bytes",
+            json.len()
+        );
+        let decoded: PixelLayer = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded, layer);
+
+        // Legacy flat array compatibility.
+        let legacy = r#"{
+            "id": 1,
+            "name": "Legacy",
+            "visible": true,
+            "opacity": 1.0,
+            "width": 2,
+            "height": 2,
+            "pixels": [null, 2, 2, null]
+        }"#;
+        let legacy_decoded: PixelLayer = serde_json::from_str(legacy).unwrap();
+        assert_eq!(legacy_decoded.get(PixelCoord::new(0, 0)), None);
+        assert_eq!(
+            legacy_decoded.get(PixelCoord::new(1, 0)),
+            Some(PaletteIndex::new(2).unwrap())
+        );
+        assert_eq!(
+            legacy_decoded.get(PixelCoord::new(0, 1)),
+            Some(PaletteIndex::new(2).unwrap())
+        );
+        assert_eq!(legacy_decoded.get(PixelCoord::new(1, 1)), None);
+
+        // Zero-count run, oversized RLE bomb, and unknown field must fail closed.
+        let zero_run = r#"{
+            "id": 1, "name": "Bad", "visible": true, "opacity": 1.0,
+            "width": 2, "height": 2, "pixels": {"rle": [[0, 1]]}
+        }"#;
+        assert!(serde_json::from_str::<PixelLayer>(zero_run).is_err());
+
+        let bomb = r#"{
+            "id": 1, "name": "Bomb", "visible": true, "opacity": 1.0,
+            "width": 2, "height": 2, "pixels": {"rle": [[16777216, null], [1, 1]]}
+        }"#;
+        assert!(serde_json::from_str::<PixelLayer>(bomb).is_err());
+
+        let unknown_key = r#"{
+            "id": 1, "name": "BadKey", "visible": true, "opacity": 1.0,
+            "width": 2, "height": 2, "pixels": {"unknown": []}
+        }"#;
+        assert!(serde_json::from_str::<PixelLayer>(unknown_key).is_err());
+
+        // PaletteIndex(0) must be rejected in both RLE and legacy flat arrays.
+        let zero_palette_rle = r#"{
+            "id": 1, "name": "ZeroRle", "visible": true, "opacity": 1.0,
+            "width": 2, "height": 2, "pixels": {"rle": [[4, 0]]}
+        }"#;
+        assert!(serde_json::from_str::<PixelLayer>(zero_palette_rle).is_err());
+
+        let zero_palette_flat = r#"{
+            "id": 1, "name": "ZeroFlat", "visible": true, "opacity": 1.0,
+            "width": 2, "height": 2, "pixels": [0, null, null, null]
+        }"#;
+        assert!(serde_json::from_str::<PixelLayer>(zero_palette_flat).is_err());
+
+        // Mismatched pixel length vs declared width*height must be rejected.
+        let truncated = r#"{
+            "id": 1, "name": "Trunc", "visible": true, "opacity": 1.0,
+            "width": 4, "height": 4, "pixels": {"rle": [[1, 1]]}
+        }"#;
+        assert!(serde_json::from_str::<PixelLayer>(truncated).is_err());
+
+        // Multi-layer RLE OOM amplification bomb must fail closed under decode budget.
+        let bomb_layers = (1..=20)
+            .map(|i| {
+                format!(
+                    r#"{{"id":{i},"name":"L{i}","visible":true,"opacity":1.0,"width":4096,"height":4096,"pixels":{{"rle":[[16777216,null]]}}}}"#
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        let bomb_frame = format!(r#"[{bomb_layers}]"#);
+        let budgeted =
+            tessel_core::pixel::with_pixel_decode_budget(MAX_SCENE_DECODED_PIXELS, || {
+                serde_json::from_str::<Vec<PixelLayer>>(&bomb_frame)
+            });
+        assert!(
+            budgeted.is_err(),
+            "20x 4K RLE layers (335M pixels) must exceed 256M scene decode budget"
+        );
     }
 }

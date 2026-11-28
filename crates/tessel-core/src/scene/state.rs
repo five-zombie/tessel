@@ -264,6 +264,32 @@ pub struct SceneState {
     next_node_id: u64,
     pub revision: u64,
     pub dirty_viewport: bool,
+    #[serde(skip, default = "SceneUid::next")]
+    scene_uid: SceneUid,
+}
+
+/// Process-unique monotonic scene identity excluded from serialization and logical equality,
+/// used by renderer caches to distinguish freshly created or loaded scenes sharing `revision`.
+#[derive(Debug)]
+struct SceneUid(u64);
+
+impl Clone for SceneUid {
+    fn clone(&self) -> Self {
+        Self::next()
+    }
+}
+
+impl SceneUid {
+    fn next() -> Self {
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        Self(COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
+    }
+}
+
+impl PartialEq for SceneUid {
+    fn eq(&self, _other: &Self) -> bool {
+        true
+    }
 }
 
 fn default_light_azimuth() -> f32 {
@@ -339,7 +365,13 @@ impl SceneState {
             next_node_id: 1,
             revision: 0,
             dirty_viewport: true,
+            scene_uid: SceneUid::next(),
         }
+    }
+
+    /// Process-unique monotonic identifier distinguishing independent `SceneState` instances.
+    pub const fn scene_uid(&self) -> u64 {
+        self.scene_uid.0
     }
 
     pub fn allocate_node_id(&mut self) -> NodeId {

@@ -4,14 +4,27 @@ pub(super) fn pixel_tools() -> Vec<Value> {
     vec![
         json!({
             "name": "pixel_create_canvas",
-            "description": "Create a layered frame-by-frame pixel canvas (default 32x32) with one transparent layer. Each frame owns its own layers; use pixel_add_layer / pixel_add_frame to grow the sprite.",
+            "description": "Create a layered frame-by-frame pixel canvas (default 32x32, up to 4096x4096) with one transparent layer. Each frame owns its own layers; use pixel_add_layer / pixel_add_frame to grow the sprite.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "name": { "type": "string" },
-                    "width": { "type": "integer", "minimum": 1, "maximum": 512 },
-                    "height": { "type": "integer", "minimum": 1, "maximum": 512 }
+                    "width": { "type": "integer", "minimum": 1, "maximum": 4096 },
+                    "height": { "type": "integer", "minimum": 1, "maximum": 4096 }
                 }
+            }
+        }),
+        json!({
+            "name": "pixel_resize_canvas",
+            "description": "Resize an existing pixel canvas to new dimensions (1..=4096). Preserves pixels within the overlapping top-left bounds across all frames and layers; supports undo/redo.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "node_id": { "type": "integer" },
+                    "width": { "type": "integer", "minimum": 1, "maximum": 4096 },
+                    "height": { "type": "integer", "minimum": 1, "maximum": 4096 }
+                },
+                "required": ["width", "height"]
             }
         }),
         json!({

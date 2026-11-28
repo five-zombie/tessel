@@ -124,21 +124,33 @@ pub fn ellipsoid_fill_edits(
     edits
 }
 
+/// Maximum source pixel canvas dimension allowed for voxel extrusion (`512×512`).
+pub const MAX_PIXEL_TO_VOXEL_DIM: u32 = 512;
+/// Hard ceiling on total voxels written by a single pixel-to-voxel extrusion.
+pub const MAX_PIXEL_TO_VOXEL_COUNT: usize = 500_000;
+
 /// Converts the active frame of a `PixelCanvas` into a `VoxelVolume` extruded along `Z`.
 /// Maps pixel top row `y = 0` to voxel `y = height - 1` (Right-Handed Y-Up).
 pub fn pixel_to_voxel_volume(canvas: &PixelCanvas, depth: u32) -> VoxelVolume {
     let mut vol = VoxelVolume::new();
+    let w = canvas.width.min(MAX_PIXEL_TO_VOXEL_DIM);
+    let h = canvas.height.min(MAX_PIXEL_TO_VOXEL_DIM);
     let d = depth.clamp(1, 32) as i32;
-    let half_w = (canvas.width as i32) / 2;
+    let half_w = (w as i32) / 2;
     let half_d = d / 2;
+    let mut written: usize = 0;
 
-    for py in 0..canvas.height {
-        for px in 0..canvas.width {
+    'outer: for py in 0..h {
+        for px in 0..w {
             if let Some(color) = canvas.sample_active_pixel(PixelCoord::new(px, py)) {
                 let vx = px as i32 - half_w;
-                let vy = (canvas.height - 1 - py) as i32;
+                let vy = (h - 1 - py) as i32;
                 for z in 0..d {
+                    if written >= MAX_PIXEL_TO_VOXEL_COUNT {
+                        break 'outer;
+                    }
                     vol.set(VoxelCoord::new(vx, vy, z - half_d), Some(color));
+                    written += 1;
                 }
             }
         }

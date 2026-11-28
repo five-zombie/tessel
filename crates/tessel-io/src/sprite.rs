@@ -33,8 +33,10 @@ pub struct SpriteSheetMetadata {
     pub frames: Vec<SpriteFrameRect>,
 }
 
-const MAX_SPRITE_DIM: u32 = 512;
+const MAX_SPRITE_DIM: u32 = tessel_core::MAX_PIXEL_CANVAS_DIM;
 const MAX_SPRITE_FRAMES: usize = 128;
+const MAX_SPRITE_SHEET_DIM: u32 = 16_384;
+const MAX_SPRITE_SHEET_BYTES: usize = 256 * 1024 * 1024;
 
 /// Encodes a single frame of `PixelCanvas` to PNG bytes.
 pub fn export_png_bytes(
@@ -86,10 +88,20 @@ pub fn export_sprite_sheet_bytes(
         .checked_mul(frame_count as u32)
         .ok_or(IoError::InvalidDimensions(canvas.width, canvas.height))?;
     let sheet_h = canvas.height;
+    if sheet_w > MAX_SPRITE_SHEET_DIM {
+        return Err(IoError::PayloadTooLarge(format!(
+            "sprite sheet width {sheet_w} exceeds limit {MAX_SPRITE_SHEET_DIM}"
+        )));
+    }
     let total_bytes = (sheet_w as usize)
         .checked_mul(sheet_h as usize)
         .and_then(|p| p.checked_mul(4))
         .ok_or(IoError::InvalidDimensions(sheet_w, sheet_h))?;
+    if total_bytes > MAX_SPRITE_SHEET_BYTES {
+        return Err(IoError::PayloadTooLarge(format!(
+            "sprite sheet buffer {total_bytes} bytes exceeds limit {MAX_SPRITE_SHEET_BYTES}"
+        )));
+    }
     let expected_frame_bytes = (canvas.width as usize)
         .checked_mul(canvas.height as usize)
         .and_then(|p| p.checked_mul(4))
@@ -138,9 +150,26 @@ pub fn export_sprite_sheet_bytes(
 
 /// Encodes all frames of `PixelCanvas` into an animated looping GIF.
 pub fn export_gif_bytes(canvas: &PixelCanvas, palette: &Palette) -> Result<Vec<u8>, IoError> {
+    if canvas.width == 0
+        || canvas.height == 0
+        || canvas.width > MAX_SPRITE_DIM
+        || canvas.height > MAX_SPRITE_DIM
+    {
+        return Err(IoError::InvalidDimensions(canvas.width, canvas.height));
+    }
     if canvas.frames.is_empty() {
         return Err(IoError::EmptyCanvas);
     }
+    if canvas.frames.len() > MAX_SPRITE_FRAMES {
+        return Err(IoError::PayloadTooLarge(format!(
+            "GIF frame count {} exceeds limit {MAX_SPRITE_FRAMES}",
+            canvas.frames.len()
+        )));
+    }
+    let expected_frame_bytes = (canvas.width as usize)
+        .checked_mul(canvas.height as usize)
+        .and_then(|p| p.checked_mul(4))
+        .ok_or(IoError::InvalidDimensions(canvas.width, canvas.height))?;
     let w = u16::try_from(canvas.width)
         .map_err(|_| IoError::InvalidDimensions(canvas.width, canvas.height))?;
     let h = u16::try_from(canvas.height)
@@ -153,6 +182,9 @@ pub fn export_gif_bytes(canvas: &PixelCanvas, palette: &Palette) -> Result<Vec<u
         encoder.set_repeat(gif::Repeat::Infinite)?;
         for f in 0..canvas.frames.len() {
             let mut rgba = canvas.composite_frame_rgba(f, palette);
+            if rgba.len() != expected_frame_bytes {
+                return Err(IoError::InvalidDimensions(canvas.width, canvas.height));
+            }
             let mut frame = gif::Frame::from_rgba_speed(w, h, &mut rgba, 10);
             frame.delay = delay_cs;
             frame.dispose = gif::DisposalMethod::Background;
@@ -191,5 +223,39 @@ mod tests {
 
         let gif_bytes = export_gif_bytes(&canvas, &palette).unwrap();
         assert!(gif_bytes.starts_with(b"GIF89a"));
+    }
+
+    #[test]
+    fn png_export_accepts_4k_and_rejects_oversized() {
+        let palette = Palette::studio_default();
+        let wide = PixelCanvas::new(MAX_SPRITE_DIM, 4).unwrap();
+        let png = export_png_bytes(&wide, 0, &palette).unwrap();
+        let decoded = image::load_from_memory(&png).unwrap();
+        assert_eq!(decoded.width(), MAX_SPRITE_DIM);
+        assert_eq!(decoded.height(), 4);
+
+        let mut bad = PixelCanvas::new(4, 4).unwrap();
+        bad.width = MAX_SPRITE_DIM + 1;
+        assert!(matches!(
+            export_png_bytes(&bad, 0, &palette),
+            Err(IoError::InvalidDimensions(4097, 4))
+        ));
+        assert!(matches!(
+            export_gif_bytes(&bad, &palette),
+            Err(IoError::InvalidDimensions(4097, 4))
+        ));
+
+        // 4K canvas with 5 frames (sheet_w = 20480 > MAX_SPRITE_SHEET_DIM) must fail closed before OOM.
+        let mut huge_sheet = PixelCanvas::new(MAX_SPRITE_DIM, MAX_SPRITE_DIM).unwrap();
+        for _ in 0..4 {
+            let lid = huge_sheet.allocate_layer_id();
+            huge_sheet
+                .frames
+                .push(PixelFrame::new(lid, MAX_SPRITE_DIM, MAX_SPRITE_DIM));
+        }
+        assert!(matches!(
+            export_sprite_sheet_bytes(&huge_sheet, &palette),
+            Err(IoError::PayloadTooLarge(_))
+        ));
     }
 }

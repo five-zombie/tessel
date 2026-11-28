@@ -56,6 +56,16 @@ pub fn parse_screenshot_args(args: &Value) -> Result<ScreenshotArgs, AiError> {
     })
 }
 
+/// Builds a `PixelCamera2D` fitted to the active pixel canvas (if in Pixel mode) so
+/// headless screenshots capture full 4K canvases instead of a cropped corner.
+fn pixel_camera_for_scene(scene: &SceneState, width: u32, height: u32) -> PixelCamera2D {
+    let mut cam = PixelCamera2D::new();
+    if scene.active_mode == tessel_core::AppMode::Pixel {
+        cam.fit_active_canvas([width as f32, height as f32], scene);
+    }
+    cam
+}
+
 /// Renders `scene` offscreen using any `wgpu::Device`/`Queue` + `ViewportRenderer` and returns
 /// the MCP `content` array (text + sRGB PNG image block). Shared by stdio MCP and live GUI HTTP MCP.
 pub fn render_screenshot_mcp_content(
@@ -70,20 +80,13 @@ pub fn render_screenshot_mcp_content(
     let h = parsed.height;
     let preview = parsed.preview;
     let cam = parsed.camera;
+    let cam_2d = pixel_camera_for_scene(scene, w, h);
     viewport.resize(device, w, h);
     viewport.sync_scene(device, queue, scene, None, None);
     let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
         label: Some("tessel-offscreen-screenshot"),
     });
-    viewport.render(
-        queue,
-        &mut encoder,
-        scene,
-        &cam,
-        &PixelCamera2D::new(),
-        1.0,
-        preview,
-    );
+    viewport.render(queue, &mut encoder, scene, &cam, &cam_2d, 1.0, preview);
     queue.submit(Some(encoder.finish()));
     let png = viewport
         .capture_png_bytes(device, queue)
@@ -224,15 +227,17 @@ pub fn render_turntable_gif_with_renderer(
                 }
             }
             viewport.sync_scene(device, queue, &work_scene, None, None);
+            work_scene.dirty_viewport = false;
             let mut cmd = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("tessel-turntable-frame"),
             });
+            let cam_2d = pixel_camera_for_scene(&work_scene, parsed.width, parsed.height);
             viewport.render(
                 queue,
                 &mut cmd,
                 &work_scene,
                 &cam,
-                &PixelCamera2D::new(),
+                &cam_2d,
                 1.0,
                 parsed.preview,
             );
@@ -346,12 +351,13 @@ impl HeadlessRenderer {
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("tessel-headless-frame"),
             });
+        let cam_2d = pixel_camera_for_scene(scene, w, h);
         self.viewport.render(
             &self.queue,
             &mut encoder,
             scene,
             cam,
-            &PixelCamera2D::new(),
+            &cam_2d,
             1.0,
             render_preview,
         );

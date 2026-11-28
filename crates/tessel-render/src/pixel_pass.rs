@@ -3,6 +3,11 @@ use wgpu::util::DeviceExt;
 
 const PIXEL_SHADER_WGSL: &str = include_str!("../../../assets/shaders/pixel_2d.wgsl");
 
+/// Minimum 2D pixel zoom (1%), allowing a 4096×4096 canvas to fit even in small viewports/screenshots.
+pub const MIN_PIXEL_ZOOM: f32 = 0.01;
+/// Maximum 2D pixel zoom (6400%).
+pub const MAX_PIXEL_ZOOM: f32 = 64.0;
+
 /// 2D pan/zoom camera state for `AppMode::Pixel`.
 #[derive(Debug, Clone, Copy)]
 pub struct PixelCamera2D {
@@ -25,13 +30,56 @@ impl PixelCamera2D {
         self.zoom = 14.0;
     }
 
+    /// Centers the canvas and adjusts zoom so the entire canvas fits inside `viewport_size` with margin.
+    pub fn fit_canvas(&mut self, viewport_size: [f32; 2], canvas_size: (u32, u32)) {
+        self.pan = [0.0, 0.0];
+        let vw = viewport_size[0];
+        let vh = viewport_size[1];
+        let cw = canvas_size.0 as f32;
+        let ch = canvas_size.1 as f32;
+        if vw.is_finite() && vh.is_finite() && vw > 1.0 && vh > 1.0 && cw > 0.0 && ch > 0.0 {
+            let fit = ((vw * 0.90) / cw).min((vh * 0.90) / ch);
+            self.zoom = fit.clamp(MIN_PIXEL_ZOOM, MAX_PIXEL_ZOOM);
+        } else {
+            self.zoom = 14.0;
+        }
+    }
+
+    /// Fits the camera to the scene's active pixel canvas if present, otherwise resets to defaults.
+    pub fn fit_active_canvas(&mut self, viewport_size: [f32; 2], scene: &tessel_core::SceneState) {
+        if let Some(canvas) = scene
+            .active_pixel_node()
+            .and_then(|id| scene.pixel_canvases.get(&id))
+        {
+            self.fit_canvas(viewport_size, (canvas.width, canvas.height));
+        } else {
+            self.reset();
+        }
+    }
+
     pub fn zoom_by(&mut self, scroll_delta: f32) {
+        if !scroll_delta.is_finite() {
+            return;
+        }
+        let base = if self.zoom.is_finite() {
+            self.zoom
+        } else {
+            14.0
+        };
         let factor = (1.0 + scroll_delta * 0.002).clamp(0.75, 1.35);
-        self.zoom = (self.zoom * factor).clamp(2.0, 64.0);
+        self.zoom = (base * factor).clamp(MIN_PIXEL_ZOOM, MAX_PIXEL_ZOOM);
     }
 
     pub fn zoom_step(&mut self, multiplier: f32) {
-        self.zoom = (self.zoom * multiplier).clamp(2.0, 64.0);
+        if !multiplier.is_finite() || multiplier <= 0.0 {
+            return;
+        }
+        let base = if self.zoom.is_finite() {
+            self.zoom
+        } else {
+            14.0
+        };
+        self.zoom = (base * multiplier).clamp(MIN_PIXEL_ZOOM, MAX_PIXEL_ZOOM);
     }
 
     /// Converts a local viewport pixel position (logical or physical matching `viewport_size`)
@@ -42,10 +90,15 @@ impl PixelCamera2D {
         viewport_size: [f32; 2],
         canvas_size: (u32, u32),
     ) -> Option<(u32, u32)> {
+        let zoom = if self.zoom.is_finite() {
+            self.zoom.max(0.01)
+        } else {
+            1.0
+        };
         let cx = viewport_size[0] * 0.5 + self.pan[0];
         let cy = viewport_size[1] * 0.5 + self.pan[1];
-        let px = (local_pos[0] - cx) / self.zoom.max(1.0) + canvas_size.0 as f32 * 0.5;
-        let py = (local_pos[1] - cy) / self.zoom.max(1.0) + canvas_size.1 as f32 * 0.5;
+        let px = (local_pos[0] - cx) / zoom + canvas_size.0 as f32 * 0.5;
+        let py = (local_pos[1] - cy) / zoom + canvas_size.1 as f32 * 0.5;
         if px >= 0.0 && py >= 0.0 && px < canvas_size.0 as f32 && py < canvas_size.1 as f32 {
             Some((px.floor() as u32, py.floor() as u32))
         } else {
@@ -68,6 +121,8 @@ struct PixelViewUniform {
     pan: [f32; 2],
     zoom: f32,
     show_grid: f32,
+    pixels_per_point: f32,
+    _pad: [f32; 3],
 }
 
 /// Renders a crisp nearest-neighbor 2D pixel canvas with checkerboard and optional grid overlay.
@@ -94,6 +149,8 @@ impl PixelPass {
             pan: [0.0, 0.0],
             zoom: 14.0,
             show_grid: 1.0,
+            pixels_per_point: 1.0,
+            _pad: [0.0; 3],
         };
         let uniform_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("tessel-pixel-view-uniform"),
@@ -269,15 +326,34 @@ impl PixelPass {
         camera: &PixelCamera2D,
         pixels_per_point: f32,
     ) {
+        let ppp = if pixels_per_point.is_finite() {
+            pixels_per_point.max(0.5)
+        } else {
+            1.0
+        };
+        let pan_x = if camera.pan[0].is_finite() {
+            camera.pan[0]
+        } else {
+            0.0
+        };
+        let pan_y = if camera.pan[1].is_finite() {
+            camera.pan[1]
+        } else {
+            0.0
+        };
+        let zoom = if camera.zoom.is_finite() {
+            camera.zoom.clamp(MIN_PIXEL_ZOOM, MAX_PIXEL_ZOOM)
+        } else {
+            14.0
+        };
         let uniform = PixelViewUniform {
             viewport_size: [viewport_size.0 as f32, viewport_size.1 as f32],
             canvas_size: [self.canvas_size.0 as f32, self.canvas_size.1 as f32],
-            pan: [
-                camera.pan[0] * pixels_per_point,
-                camera.pan[1] * pixels_per_point,
-            ],
-            zoom: camera.zoom * pixels_per_point,
+            pan: [pan_x * ppp, pan_y * ppp],
+            zoom: zoom * ppp,
             show_grid: if camera.show_grid { 1.0 } else { 0.0 },
+            pixels_per_point: ppp,
+            _pad: [0.0; 3],
         };
         queue.write_buffer(&self.uniform_buffer, 0, bytemuck::bytes_of(&uniform));
     }
@@ -337,4 +413,35 @@ fn create_bind_group(
             },
         ],
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pixel_camera_fits_4k_canvas_and_maps_sub_unit_zoom_coordinates() {
+        let mut cam = PixelCamera2D::new();
+        cam.fit_canvas([1280.0, 720.0], (4096, 4096));
+        assert_eq!(cam.pan, [0.0, 0.0]);
+        assert!(
+            cam.zoom > 0.14 && cam.zoom < 0.17,
+            "expected ~0.158 zoom for 4K in 720p viewport, got {}",
+            cam.zoom
+        );
+        // Center of viewport maps to center of 4096x4096 canvas.
+        assert_eq!(
+            cam.screen_to_canvas([640.0, 360.0], [1280.0, 720.0], (4096, 4096)),
+            Some((2048, 2048))
+        );
+        // Zooming out clamps cleanly to MIN_PIXEL_ZOOM (0.01), never stuck at 2.0,
+        // and non-finite inputs must never poison zoom state.
+        cam.zoom_step(0.001);
+        assert!((cam.zoom - MIN_PIXEL_ZOOM).abs() < 1e-6);
+        cam.zoom_by(f32::NAN);
+        cam.zoom_step(f32::INFINITY);
+        cam.zoom_step(-2.0);
+        assert!(cam.zoom.is_finite());
+        assert!((cam.zoom - MIN_PIXEL_ZOOM).abs() < 1e-6);
+    }
 }

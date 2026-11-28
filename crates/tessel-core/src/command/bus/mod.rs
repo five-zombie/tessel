@@ -20,7 +20,9 @@ use crate::mesh::{
     UvProjection, DEFAULT_MESH_TEX_SIZE,
 };
 use crate::palette::{PaletteEntry, PaletteIndex, Rgba8};
-use crate::pixel::{FrameIndex, LayerId, PixelCanvas, PixelEdit, PixelFrame, PixelLayer};
+use crate::pixel::{
+    FrameIndex, LayerId, PixelCanvas, PixelCoord, PixelEdit, PixelFrame, PixelLayer,
+};
 use crate::scene::{AppMode, NodeId, NodeKind, SceneNode, SceneState, Transform};
 use crate::voxel::{ops as voxel_ops, VoxelCoord, VoxelEdit, VoxelVolume};
 
@@ -35,6 +37,11 @@ pub enum Command {
     },
     CreatePixelCanvas {
         name: String,
+        width: u32,
+        height: u32,
+    },
+    ResizePixelCanvas {
+        node_id: NodeId,
         width: u32,
         height: u32,
     },
@@ -62,6 +69,13 @@ pub enum Command {
         frame: FrameIndex,
         layer_id: LayerId,
         edits: Vec<PixelEdit>,
+    },
+    FloodFillPixels {
+        node_id: NodeId,
+        frame: FrameIndex,
+        layer_id: LayerId,
+        start: PixelCoord,
+        color: Option<PaletteIndex>,
     },
     AddPixelLayer {
         node_id: NodeId,
@@ -689,6 +703,12 @@ pub enum UndoDelta {
         layer_id: LayerId,
         previous: bool,
     },
+    RestorePixelLayerRle {
+        node_id: NodeId,
+        frame: FrameIndex,
+        layer_id: LayerId,
+        rle_pixels: Vec<(u32, Option<PaletteIndex>)>,
+    },
     PopPixelFrame {
         node_id: NodeId,
         previous_active: usize,
@@ -827,6 +847,10 @@ pub enum UndoDelta {
         node_id: NodeId,
         previous: bool,
     },
+    RestorePixelCanvas {
+        node_id: NodeId,
+        previous: Box<PixelCanvas>,
+    },
     RestoreMeshProxyNormals {
         node_id: NodeId,
         previous: std::collections::BTreeMap<usize, glam::Vec3>,
@@ -914,10 +938,12 @@ impl Command {
             | Self::ConvertPixelToVoxel { .. }
             | Self::ConvertVoxelToLowPoly { .. } => voxel_cmd::apply(self, scene),
             Self::CreatePixelCanvas { .. }
+            | Self::ResizePixelCanvas { .. }
             | Self::DrawPixels { .. }
             | Self::AddPixelLayer { .. }
             | Self::SetPixelLayerVisible { .. }
             | Self::AddPixelFrame { .. }
+            | Self::FloodFillPixels { .. }
             | Self::SetActivePixelFrame { .. }
             | Self::SetPixelFps { .. }
             | Self::SetPixelLayerOpacity { .. }

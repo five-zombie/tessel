@@ -34,7 +34,7 @@ mod tests {
     #[test]
     fn tool_definitions_has_160_unique_tools() {
         let defs = tool_definitions();
-        assert_eq!(defs.len(), 168);
+        assert_eq!(defs.len(), 169);
         let names: HashSet<&str> = defs
             .iter()
             .filter_map(|d| d.get("name").and_then(|v| v.as_str()))
